@@ -1,0 +1,43 @@
+# Python cache
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Run outputs (large, machine-specific)
+outputs/
+
+# Ops subdirectories (analysis scratch work)
+ops/*/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data artifacts
+*.pkl
+*.parquet
+
+# Logs and process files
+*.log
+*.pid
+nohup.out
+
+# Environment
+.env
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
