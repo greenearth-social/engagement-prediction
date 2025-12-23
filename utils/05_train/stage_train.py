@@ -322,9 +322,8 @@ def run_training_pipeline(
     tqdm_miniters: Optional[int] = None,
 ) -> Dict[str, Any]:
     # This is the consolidated version adapted from src/train.py
-    clear_cuda_memory()
-    set_random_seeds(random_seed)
-    # Create output dirs
+    
+    # Create output dirs FIRST so we can create a logger
     ROOT = Path(__file__).resolve().parents[2]
     DEFAULT_OUTPUTS_DIR = ROOT / "outputs"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -339,8 +338,15 @@ def run_training_pipeline(
     plots_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize logger
+    # Initialize logger BEFORE any potentially slow operations
     logger = get_stage_logger('STAGE_05_TRAIN', log_file=base_dir / 'stage.log')
+    log_operation_start('run_training_pipeline started', 'STAGE_05_TRAIN', logger)
+    
+    # Now do potentially slow operations with logging
+    log_operation_start('Clear CUDA memory', 'STAGE_05_TRAIN', logger)
+    clear_cuda_memory()
+    log_operation_start('Set random seeds', 'STAGE_05_TRAIN', logger)
+    set_random_seeds(random_seed)
 
     # Load bundle + splits (preferred path)
     if not (embedding_bundle and user_splits):
@@ -562,8 +568,17 @@ def run_training_pipeline(
 def run(context, args) -> Dict[str, Any]:
 
     run_dir = Path(context.run_dir).resolve()
+    
+    # Create a temporary logger for the stage entry point
+    from datetime import datetime
+    temp_log_dir = run_dir / '05_train'
+    temp_log_dir.mkdir(parents=True, exist_ok=True)
+    entry_logger = get_stage_logger('STAGE_05_TRAIN', log_file=temp_log_dir / 'stage_entry.log')
+    
+    log_operation_start('Stage 5 entry point', 'STAGE_05_TRAIN', entry_logger)
 
     # Locate embedding bundle
+    log_operation_start('Locate embedding bundle', 'STAGE_05_TRAIN', entry_logger)
     prior_featurize = select_prior_output(run_dir, '02_featurize', use_latest=context.use_latest, prior_path=context.prior_outputs.get('02_featurize'))
     if prior_featurize is None:
         raise FileNotFoundError("Featurize output not found.")
@@ -571,16 +586,20 @@ def run(context, args) -> Dict[str, Any]:
     if not bundle_candidates:
         raise FileNotFoundError(f"No embedding_bundle_*.pkl found under {prior_featurize}")
     bundle_path = bundle_candidates[0]
+    entry_logger.info(f"Found bundle: {bundle_path}")
 
     # Locate user_splits
+    log_operation_start('Locate user splits', 'STAGE_05_TRAIN', entry_logger)
     prior_split = select_prior_output(run_dir, '04_split', use_latest=context.use_latest, prior_path=context.prior_outputs.get('04_split'))
     if prior_split is None:
         raise FileNotFoundError("Split output not found.")
     splits_path = (prior_split / 'user_splits.json')
     if not splits_path.exists():
         raise FileNotFoundError(f"user_splits.json not found under {prior_split}")
+    entry_logger.info(f"Found splits: {splits_path}")
 
     # Collect training knobs from args (fallback to defaults handled by run_training_pipeline)
+    log_operation_start('Call run_training_pipeline', 'STAGE_05_TRAIN', entry_logger)
     t0 = time.time()
     results = run_training_pipeline(
         embedding_bundle=str(bundle_path.resolve()),

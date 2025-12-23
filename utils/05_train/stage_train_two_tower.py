@@ -37,6 +37,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from utils.pipeline.core import select_prior_output
+from utils.helpers import get_stage_logger, log_operation_start
 
 
 # =============================================================================
@@ -423,6 +424,8 @@ def build_user_history_sequences(
             'prediction_post_ids': List[str],
         }
     """
+    print(f"Building history sequences for {len(user_ids)} users...")
+    
     # Get post embedding columns
     emb_cols = [c for c in posts_emb_df.columns if c.startswith('post_emb_') or c.startswith('image_emb_')]
     embedding_dim = len(emb_cols)
@@ -437,6 +440,8 @@ def build_user_history_sequences(
     likes_local = likes_df[likes_df['did'].isin(user_ids)].copy()
     likes_local[join_like] = likes_local[join_like].astype(str)
     likes_local = likes_local[likes_local[join_like].isin(available_posts)]
+    
+    print(f"Processing {len(likes_local)} likes from target users...")
     
     user_histories = {}
     
@@ -474,6 +479,7 @@ def build_user_history_sequences(
             'prediction_post_ids': prediction_posts,
         }
     
+    print(f"Built {len(user_histories)} user histories (with sufficient data)")
     return user_histories
 
 
@@ -490,6 +496,7 @@ def create_training_items(
     
     Creates both positive and negative pairs for BCE loss training.
     """
+    print(f"Creating training items for {len(user_histories)} users...")
     rng = np.random.RandomState(random_seed)
     
     # Get embedding columns and lookup
@@ -499,11 +506,16 @@ def create_training_items(
     posts_emb_df = posts_emb_df.copy()
     posts_emb_df[join_post] = posts_emb_df[join_post].astype(str)
     post_emb_lookup = posts_emb_df.set_index(join_post)[emb_cols].to_dict('index')
-    all_post_ids = list(post_emb_lookup.keys())
+    all_post_ids_list = list(post_emb_lookup.keys())
+    all_post_ids_set = set(all_post_ids_list)  # For fast set operations
+    
+    print(f"Total posts available: {len(all_post_ids_list)}, embedding dim: {embedding_dim}")
     
     items = []
     
-    for user_id, user_data in user_histories.items():
+    # Progress tracking
+    from tqdm import tqdm
+    for user_idx, (user_id, user_data) in enumerate(tqdm(user_histories.items(), desc="Creating pairs", disable=False)):
         history_emb = user_data['history_embeddings']
         history_len = len(history_emb)
         
@@ -534,7 +546,8 @@ def create_training_items(
         
         # Create negative items (posts the user did NOT like)
         user_liked = set(user_data['history_post_ids'] + user_data['prediction_post_ids'])
-        available_negatives = [p for p in all_post_ids if p not in user_liked]
+        # OPTIMIZED: Use set difference instead of list comprehension - O(n) instead of O(n*m)
+        available_negatives = list(all_post_ids_set - user_liked)
         
         n_negatives = int(len(user_data['prediction_post_ids']) * neg_ratio)
         if n_negatives > 0 and len(available_negatives) > 0:
@@ -556,6 +569,7 @@ def create_training_items(
                     label=0,
                 ))
     
+    print(f"Created {len(items)} training items total (pos/neg pairs)")
     return items
 
 
@@ -878,13 +892,7 @@ def run_two_tower_pipeline(
     """
     Run the two-tower training pipeline with BCE loss.
     """
-    # Set seeds
-    np.random.seed(random_seed)
-    torch.manual_seed(random_seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(random_seed)
-    
-    # Create output directories
+    # Create output directories FIRST so we can create a logger
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     if output_dir is None:
         output_dir = Path(__file__).resolve().parents[2] / "outputs"
@@ -896,7 +904,19 @@ def run_two_tower_pipeline(
     for d in [checkpoints_dir, plots_dir, logs_dir]:
         d.mkdir(parents=True, exist_ok=True)
     
+    # Initialize logger BEFORE any potentially slow operations
+    logger = get_stage_logger('STAGE_05_TRAIN_TWO_TOWER', log_file=base_dir / 'stage.log')
+    log_operation_start('run_two_tower_pipeline started', 'STAGE_05_TRAIN_TWO_TOWER', logger)
+    
+    # Set seeds
+    log_operation_start('Set random seeds', 'STAGE_05_TRAIN_TWO_TOWER', logger)
+    np.random.seed(random_seed)
+    torch.manual_seed(random_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(random_seed)
+    
     # Load data
+    log_operation_start('Load embedding bundle and user splits', 'STAGE_05_TRAIN_TWO_TOWER', logger)
     print("Loading embedding bundle and user splits...")
     with open(embedding_bundle, 'rb') as f:
         bundle = pickle.load(f)
@@ -921,6 +941,7 @@ def run_two_tower_pipeline(
     print(f"Post embedding dimension: {post_embedding_dim}")
     
     # Build user histories
+    log_operation_start('Build user history sequences', 'STAGE_05_TRAIN_TWO_TOWER', logger)
     print("Building user history sequences...")
     train_histories = build_user_history_sequences(
         likes_df, posts_emb_df, join_like, join_post,
@@ -942,6 +963,7 @@ def run_two_tower_pipeline(
     print(f"{'='*60}")
     
     # Create training items
+    log_operation_start('Create training items (pairs)', 'STAGE_05_TRAIN_TWO_TOWER', logger)
     train_items = create_training_items(
         train_histories, posts_emb_df, join_post,
         max_history_len, neg_ratio=1.0, random_seed=random_seed
@@ -973,6 +995,7 @@ def run_two_tower_pipeline(
     )
     
     # Create model
+    log_operation_start('Create two-tower model', 'STAGE_05_TRAIN_TWO_TOWER', logger)
     model = TwoTowerEngagement(
         post_embedding_dim=post_embedding_dim,
         shared_dim=shared_dim,
@@ -985,6 +1008,7 @@ def run_two_tower_pipeline(
     )
     
     # Train
+    log_operation_start(f'Train two-tower model (epochs={epochs}, batch_size={batch_size})', 'STAGE_05_TRAIN_TWO_TOWER', logger)
     training_result = train_two_tower_model(
         model=model,
         train_loader=train_loader,
@@ -1152,7 +1176,15 @@ def run(context, args) -> Dict[str, Any]:
     """
     run_dir = Path(context.run_dir).resolve()
     
+    # Create a temporary logger for the stage entry point
+    temp_log_dir = run_dir / '05_train'
+    temp_log_dir.mkdir(parents=True, exist_ok=True)
+    entry_logger = get_stage_logger('STAGE_05_TRAIN_TWO_TOWER', log_file=temp_log_dir / 'stage_entry.log')
+    
+    log_operation_start('Stage 5 entry point (two-tower)', 'STAGE_05_TRAIN_TWO_TOWER', entry_logger)
+    
     # Locate embedding bundle
+    log_operation_start('Locate embedding bundle', 'STAGE_05_TRAIN_TWO_TOWER', entry_logger)
     prior_featurize = select_prior_output(
         run_dir, '02_featurize',
         use_latest=context.use_latest,
@@ -1169,8 +1201,10 @@ def run(context, args) -> Dict[str, Any]:
     if not bundle_candidates:
         raise FileNotFoundError(f"No embedding_bundle_*.pkl found under {prior_featurize}")
     bundle_path = bundle_candidates[0]
+    entry_logger.info(f"Found bundle: {bundle_path}")
     
     # Locate user_splits
+    log_operation_start('Locate user splits', 'STAGE_05_TRAIN_TWO_TOWER', entry_logger)
     prior_split = select_prior_output(
         run_dir, '04_split',
         use_latest=context.use_latest,
@@ -1182,8 +1216,10 @@ def run(context, args) -> Dict[str, Any]:
     splits_path = prior_split / 'user_splits.json'
     if not splits_path.exists():
         raise FileNotFoundError(f"user_splits.json not found under {prior_split}")
+    entry_logger.info(f"Found splits: {splits_path}")
     
     # Get parameters from args
+    log_operation_start('Call run_two_tower_pipeline', 'STAGE_05_TRAIN_TWO_TOWER', entry_logger)
     t0 = time.time()
     results = run_two_tower_pipeline(
         embedding_bundle=str(bundle_path.resolve()),

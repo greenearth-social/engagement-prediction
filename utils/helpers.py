@@ -225,14 +225,35 @@ def find_text_column(posts_df: pd.DataFrame) -> str:
 # ----------------------------------------
 def compute_post_embeddings(posts_df: pd.DataFrame, text_column: str, model_name: str = DEFAULT_EMBED_MODEL) -> Tuple[pd.DataFrame, int]:
     """Compute sentence-transformer embeddings for all posts."""
+    import time
     if SentenceTransformer is None:
         raise RuntimeError("sentence-transformers not available")
+    
+    print(f"  Loading embedding model: {model_name}...")
+    t0 = time.time()
     model = SentenceTransformer(model_name)
+    
+    # Check if GPU is available
+    import torch
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if device == 'cuda':
+        print(f"  Model loaded in {time.time()-t0:.2f}s (using GPU)")
+    else:
+        print(f"  Model loaded in {time.time()-t0:.2f}s (using CPU)")
+    
     sample_text = posts_df[text_column].fillna("").astype(str).iloc[0] if len(posts_df) else ""
     emb = model.encode([sample_text])
     dim = emb.shape[1]
+    
     texts = posts_df[text_column].fillna("").astype(str).tolist()
-    all_emb = model.encode(texts, batch_size=512, show_progress_bar=True)
+    # Use larger batch size for GPU, smaller for CPU
+    batch_size = 1024 if device == 'cuda' else 256
+    print(f"  Computing embeddings for {len(texts)} posts (dim={dim}, batch_size={batch_size})...")
+    t1 = time.time()
+    all_emb = model.encode(texts, batch_size=batch_size, show_progress_bar=True, device=device)
+    rate = len(texts) / (time.time() - t1) if time.time() - t1 > 0 else 0
+    print(f"  Embeddings computed in {time.time()-t1:.2f}s ({rate:.1f} posts/sec)")
+    
     emb_cols = [f"post_emb_{i}" for i in range(dim)]
     emb_df = pd.DataFrame(all_emb, columns=emb_cols)
     posts_emb_df = pd.concat([posts_df.reset_index(drop=True), emb_df], axis=1)
@@ -759,26 +780,47 @@ def build_candidate_posts(
     - Always include posts that appear in likes_df[join_like].
     - Augment with up to `max_posts_per_author` posts per author (random selection).
     """
+    import time
+    t0 = time.time()
+    
     rng = np.random.RandomState(int(rng_seed))
     join_like_str = likes_df[join_like].astype(str)
     liked_post_ids = set(join_like_str.dropna().unique().tolist())
+    print(f"  Found {len(liked_post_ids)} unique liked posts")
 
     posts_df_local = posts_df.copy()
     posts_df_local[join_post] = posts_df_local[join_post].astype(str)
 
     liked_posts = posts_df_local[posts_df_local[join_post].isin(liked_post_ids)]
+    print(f"  Matched {len(liked_posts)} liked posts from posts_df")
+    
     extra_rows: List[pd.DataFrame] = []
     if author_col in posts_df_local.columns and max_posts_per_author > 0:
-        for author, g in posts_df_local.groupby(author_col):
+        print(f"  Sampling {max_posts_per_author} posts per author...")
+        grouped = posts_df_local.groupby(author_col)
+        num_authors = len(grouped)
+        print(f"  Processing {num_authors} authors...")
+        
+        # OPTIMIZED: Use vectorized sampling instead of loop
+        sampled_indices = []
+        for author, g in grouped:
             if len(g) <= max_posts_per_author:
-                extra_rows.append(g)
+                sampled_indices.extend(g.index.tolist())
             else:
                 idx = rng.choice(g.index.values, size=int(max_posts_per_author), replace=False)
-                extra_rows.append(g.loc[idx])
+                sampled_indices.extend(idx.tolist())
+        
+        if sampled_indices:
+            extra_rows = [posts_df_local.loc[sampled_indices]]
+            print(f"  Sampled {len(sampled_indices)} posts from authors")
+    
     pool = [liked_posts] + extra_rows if extra_rows else [liked_posts]
     if not pool:
         return posts_df_local
+    
+    print(f"  Concatenating and deduplicating...")
     candidates = pd.concat(pool, ignore_index=True).drop_duplicates(subset=[join_post])
+    print(f"  Built {len(candidates)} candidate posts (took {time.time()-t0:.2f}s)")
     return candidates
 
 

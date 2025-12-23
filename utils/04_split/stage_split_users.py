@@ -108,6 +108,7 @@ def run(context, args) -> Dict[str, Any]:
     splits_path = out_dir / 'user_splits.json'
     with open(splits_path, 'w') as f:
         json.dump(splits, f, indent=2)
+    logger.info(f"Saved user splits to {splits_path}")
 
     summary = {
         'counts': {
@@ -132,6 +133,8 @@ def run(context, args) -> Dict[str, Any]:
         f"N_holdout_users: {len(holdout_users)}",
     ]
     (out_dir / 'stage_info.txt').write_text('\n'.join(info_lines) + '\n')
+    
+    logger.info(f"Stage 4 complete (runtime: {time.time()-t0:.2f}s)")
 
     return {
         'output_dir': out_dir,
