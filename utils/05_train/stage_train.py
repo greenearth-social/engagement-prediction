@@ -373,9 +373,15 @@ def run_training_pipeline(
 
     # Allocate per-user embedding vs prediction posts
     log_operation_start('Allocate per-user embedding vs prediction posts', 'STAGE_05_TRAIN', logger)
+    
+    t_alloc = time.time()
+    grouped = list(likes_local.groupby('did'))
+    num_users_to_process = len(grouped)
+    logger.info(f"Allocating posts for {num_users_to_process} users...")
+    
     embedding_likes_list: List[pd.DataFrame] = []
     prediction_likes_list: List[pd.DataFrame] = []
-    for user_id, g in likes_local.groupby('did'):
+    for user_id, g in grouped:
         user_posts = sorted(list(set(g[join_like].astype(str).unique())))
         if len(user_posts) < max(min_likes_per_user, prediction_posts_per_user + 1):
             continue
@@ -387,8 +393,11 @@ def run_training_pipeline(
             embedding_likes_list.append(g[g[join_like].isin(posts_for_embedding)])
         if posts_for_prediction:
             prediction_likes_list.append(g[g[join_like].isin(posts_for_prediction)])
+    
     embedding_likes_df = pd.concat(embedding_likes_list, ignore_index=True) if embedding_likes_list else pd.DataFrame()
     prediction_likes_df = pd.concat(prediction_likes_list, ignore_index=True) if prediction_likes_list else pd.DataFrame()
+    
+    logger.info(f"Allocated posts in {time.time()-t_alloc:.2f}s: {len(embedding_likes_df)} embedding likes, {len(prediction_likes_df)} prediction likes")
 
     # Build user features (multi_centroid by default)
     effective_schema = 'multi_centroid' if schema in ('auto', 'topic_mixture', 'multi_centroid') else 'mean'

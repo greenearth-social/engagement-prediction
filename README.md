@@ -182,3 +182,15 @@ Use `pytest` for lightweight tests where available.
 pip install -r requirements.txt pytest
 pytest -q
 ```
+
+# Specific Testing Examples
+
+Two-tower model:
+```bash
+python cli.py run-all --model-type two-tower   --max-files-per-table 14 --max-posts-per-author 5 --image-mode off   --global-topic-k 20 --relevel-strategy uniform_mixture_balanced --min-likes-per-user 10   --epochs 100 --batch-size 256 --device cuda
+```
+
+MLP model:
+```bash
+python cli.py run-all --model-type mlp   --max-files-per-table 14 --max-posts-per-author 5 --image-mode off   --global-topic-k 20 --relevel-strategy uniform_mixture_balanced --min-likes-per-user 10   --epochs 100 --batch-size 256 --device cuda
+```

@@ -401,6 +401,49 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
 # Data Preparation
 # =============================================================================
 
+def _process_single_user_history(
+    user_id: str,
+    user_likes_df: pd.DataFrame,
+    post_emb_lookup: Dict,
+    emb_cols: List[str],
+    join_like: str,
+    max_history_len: int,
+    prediction_posts_per_user: int,
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """Process a single user's history (for parallel execution)."""
+    liked_posts = user_likes_df[join_like].unique().tolist()
+    
+    # Need at least prediction_posts_per_user + 1 posts
+    if len(liked_posts) < prediction_posts_per_user + 1:
+        return None
+    
+    # Split: last N for prediction, rest for history
+    prediction_posts = liked_posts[-prediction_posts_per_user:]
+    history_posts = liked_posts[:-prediction_posts_per_user]
+    
+    # Cap history length
+    if len(history_posts) > max_history_len:
+        history_posts = history_posts[-max_history_len:]  # Keep most recent
+    
+    # Get embeddings for history posts
+    history_embeddings = []
+    valid_history_posts = []
+    for pid in history_posts:
+        if pid in post_emb_lookup:
+            emb = np.array([post_emb_lookup[pid][c] for c in emb_cols], dtype=np.float32)
+            history_embeddings.append(emb)
+            valid_history_posts.append(pid)
+    
+    if len(history_embeddings) == 0:
+        return None
+    
+    return (user_id, {
+        'history_embeddings': np.stack(history_embeddings),  # [seq_len, D]
+        'history_post_ids': valid_history_posts,
+        'prediction_post_ids': prediction_posts,
+    })
+
+
 def build_user_history_sequences(
     likes_df: pd.DataFrame,
     posts_emb_df: pd.DataFrame,
@@ -409,13 +452,17 @@ def build_user_history_sequences(
     user_ids: List[str],
     max_history_len: int = 20,
     prediction_posts_per_user: int = 1,
+    n_jobs: int = -1,
 ) -> Dict[str, Dict[str, Any]]:
     """
-    Build user history sequences from likes data.
+    Build user history sequences from likes data (parallelized).
     
     For each user:
     - Reserve the last `prediction_posts_per_user` likes for prediction targets
     - Use the remaining likes (up to max_history_len) as history
+    
+    Args:
+        n_jobs: Number of parallel jobs. -1 = use all CPUs, 1 = sequential
     
     Returns:
         Dict mapping user_id -> {
@@ -424,6 +471,11 @@ def build_user_history_sequences(
             'prediction_post_ids': List[str],
         }
     """
+    import time
+    import os
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    t0 = time.time()
     print(f"Building history sequences for {len(user_ids)} users...")
     
     # Get post embedding columns
@@ -443,114 +495,110 @@ def build_user_history_sequences(
     
     print(f"Processing {len(likes_local)} likes from target users...")
     
-    user_histories = {}
+    # Group by user
+    grouped = list(likes_local.groupby('did'))
+    num_users = len(grouped)
     
-    for user_id, user_likes in likes_local.groupby('did'):
-        user_id = str(user_id)
-        liked_posts = user_likes[join_like].unique().tolist()
-        
-        # Need at least prediction_posts_per_user + 1 posts
-        if len(liked_posts) < prediction_posts_per_user + 1:
-            continue
-        
-        # Split: last N for prediction, rest for history
-        prediction_posts = liked_posts[-prediction_posts_per_user:]
-        history_posts = liked_posts[:-prediction_posts_per_user]
-        
-        # Cap history length
-        if len(history_posts) > max_history_len:
-            history_posts = history_posts[-max_history_len:]  # Keep most recent
-        
-        # Get embeddings for history posts
-        history_embeddings = []
-        valid_history_posts = []
-        for pid in history_posts:
-            if pid in post_emb_lookup:
-                emb = np.array([post_emb_lookup[pid][c] for c in emb_cols], dtype=np.float32)
-                history_embeddings.append(emb)
-                valid_history_posts.append(pid)
-        
-        if len(history_embeddings) == 0:
-            continue
-        
-        user_histories[user_id] = {
-            'history_embeddings': np.stack(history_embeddings),  # [seq_len, D]
-            'history_post_ids': valid_history_posts,
-            'prediction_post_ids': prediction_posts,
-        }
+    # Determine number of workers
+    if n_jobs == -1:
+        n_workers = os.cpu_count() or 4
+    elif n_jobs == 1:
+        n_workers = 1
+    else:
+        n_workers = max(1, min(n_jobs, os.cpu_count() or 4))
     
-    print(f"Built {len(user_histories)} user histories (with sufficient data)")
+    # Use sequential processing for small datasets
+    if num_users < 100 or n_workers == 1:
+        print(f"Processing {num_users} users sequentially...")
+        user_histories = {}
+        for user_id, user_likes in grouped:
+            result = _process_single_user_history(
+                str(user_id), user_likes, post_emb_lookup, emb_cols,
+                join_like, max_history_len, prediction_posts_per_user
+            )
+            if result:
+                user_histories[result[0]] = result[1]
+    else:
+        # Parallel processing
+        print(f"Processing {num_users} users with {n_workers} workers...")
+        user_histories = {}
+        
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = []
+            for user_id, user_likes in grouped:
+                future = executor.submit(
+                    _process_single_user_history,
+                    str(user_id), user_likes, post_emb_lookup, emb_cols,
+                    join_like, max_history_len, prediction_posts_per_user
+                )
+                futures.append(future)
+            
+            # Collect results with progress
+            from tqdm import tqdm
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Building histories"):
+                result = future.result()
+                if result:
+                    user_histories[result[0]] = result[1]
+    
+    elapsed = time.time() - t0
+    rate = len(user_histories) / elapsed if elapsed > 0 else 0
+    print(f"Built {len(user_histories)} user histories in {elapsed:.2f}s ({rate:.1f} users/sec)")
     return user_histories
 
 
-def create_training_items(
-    user_histories: Dict[str, Dict[str, Any]],
-    posts_emb_df: pd.DataFrame,
-    join_post: str,
-    max_history_len: int = 20,
-    neg_ratio: float = 1.0,
-    random_seed: int = 42,
+def _create_items_for_single_user(
+    user_id: str,
+    user_data: Dict[str, Any],
+    post_emb_lookup: Dict,
+    negative_candidate_pool: List[str],
+    emb_cols: List[str],
+    embedding_dim: int,
+    max_history_len: int,
+    neg_ratio: float,
+    user_seed: int,
 ) -> List[UserHistoryItem]:
-    """
-    Create training items (user history + target post pairs).
-    
-    Creates both positive and negative pairs for BCE loss training.
-    """
-    print(f"Creating training items for {len(user_histories)} users...")
-    rng = np.random.RandomState(random_seed)
-    
-    # Get embedding columns and lookup
-    emb_cols = [c for c in posts_emb_df.columns if c.startswith('post_emb_') or c.startswith('image_emb_')]
-    embedding_dim = len(emb_cols)
-    
-    posts_emb_df = posts_emb_df.copy()
-    posts_emb_df[join_post] = posts_emb_df[join_post].astype(str)
-    post_emb_lookup = posts_emb_df.set_index(join_post)[emb_cols].to_dict('index')
-    all_post_ids_list = list(post_emb_lookup.keys())
-    all_post_ids_set = set(all_post_ids_list)  # For fast set operations
-    
-    print(f"Total posts available: {len(all_post_ids_list)}, embedding dim: {embedding_dim}")
-    
+    """Create training items for a single user using pre-sampled negative pool."""
+    rng = np.random.RandomState(user_seed)
     items = []
     
-    # Progress tracking
-    from tqdm import tqdm
-    for user_idx, (user_id, user_data) in enumerate(tqdm(user_histories.items(), desc="Creating pairs", disable=False)):
-        history_emb = user_data['history_embeddings']
-        history_len = len(history_emb)
+    history_emb = user_data['history_embeddings']
+    history_len = len(history_emb)
+    
+    # Pad history to max_history_len
+    if history_len < max_history_len:
+        padding = np.zeros((max_history_len - history_len, embedding_dim), dtype=np.float32)
+        padded_history = np.concatenate([history_emb, padding], axis=0)
+        mask = np.concatenate([np.ones(history_len, dtype=bool), np.zeros(max_history_len - history_len, dtype=bool)])
+    else:
+        padded_history = history_emb[:max_history_len]
+        mask = np.ones(max_history_len, dtype=bool)
+    
+    # Create positive items (prediction targets the user actually liked)
+    for target_pid in user_data['prediction_post_ids']:
+        if target_pid not in post_emb_lookup:
+            continue
         
-        # Pad history to max_history_len
-        if history_len < max_history_len:
-            padding = np.zeros((max_history_len - history_len, embedding_dim), dtype=np.float32)
-            padded_history = np.concatenate([history_emb, padding], axis=0)
-            mask = np.concatenate([np.ones(history_len, dtype=bool), np.zeros(max_history_len - history_len, dtype=bool)])
-        else:
-            padded_history = history_emb[:max_history_len]
-            mask = np.ones(max_history_len, dtype=bool)
+        target_emb = np.array([post_emb_lookup[target_pid][c] for c in emb_cols], dtype=np.float32)
         
-        # Create positive items (prediction targets the user actually liked)
-        for target_pid in user_data['prediction_post_ids']:
-            if target_pid not in post_emb_lookup:
-                continue
-            
-            target_emb = np.array([post_emb_lookup[target_pid][c] for c in emb_cols], dtype=np.float32)
-            
-            items.append(UserHistoryItem(
-                user_id=user_id,
-                history_embeddings=padded_history,
-                history_mask=mask,
-                target_post_embedding=target_emb,
-                target_post_id=target_pid,
-                label=1,
-            ))
+        items.append(UserHistoryItem(
+            user_id=user_id,
+            history_embeddings=padded_history,
+            history_mask=mask,
+            target_post_embedding=target_emb,
+            target_post_id=target_pid,
+            label=1,
+        ))
+    
+    # Create negative items - OPTIMIZED: Use global pre-sampled pool
+    user_liked = set(user_data['history_post_ids'] + user_data['prediction_post_ids'])
+    n_negatives = int(len(user_data['prediction_post_ids']) * neg_ratio)
+    
+    if n_negatives > 0:
+        # Filter global pool to exclude user's liked posts (fast set operation)
+        available_negatives = [p for p in negative_candidate_pool if p not in user_liked]
         
-        # Create negative items (posts the user did NOT like)
-        user_liked = set(user_data['history_post_ids'] + user_data['prediction_post_ids'])
-        # OPTIMIZED: Use set difference instead of list comprehension - O(n) instead of O(n*m)
-        available_negatives = list(all_post_ids_set - user_liked)
-        
-        n_negatives = int(len(user_data['prediction_post_ids']) * neg_ratio)
-        if n_negatives > 0 and len(available_negatives) > 0:
+        # Sample what we need from the filtered pool
+        if len(available_negatives) > 0:
             neg_samples = rng.choice(
                 available_negatives,
                 size=min(n_negatives, len(available_negatives)),
@@ -569,7 +617,82 @@ def create_training_items(
                     label=0,
                 ))
     
-    print(f"Created {len(items)} training items total (pos/neg pairs)")
+    return items
+
+
+def create_training_items(
+    user_histories: Dict[str, Dict[str, Any]],
+    posts_emb_df: pd.DataFrame,
+    join_post: str,
+    max_history_len: int = 20,
+    neg_ratio: float = 1.0,
+    random_seed: int = 42,
+    n_jobs: int = -1,
+    max_negative_candidates: int = 10000,
+) -> List[UserHistoryItem]:
+    """
+    Create training items (user history + target post pairs) - parallelized.
+    
+    Creates both positive and negative pairs for BCE loss training.
+    
+    Args:
+        n_jobs: Number of parallel jobs. -1 = use all CPUs, 1 = sequential
+        max_negative_candidates: Max posts to sample for negatives per user (reduces compute cost)
+    """
+    import time
+    import os
+    
+    t0 = time.time()
+    print(f"Creating training items for {len(user_histories)} users...")
+    
+    # Get embedding columns and lookup
+    emb_cols = [c for c in posts_emb_df.columns if c.startswith('post_emb_') or c.startswith('image_emb_')]
+    embedding_dim = len(emb_cols)
+    
+    posts_emb_df = posts_emb_df.copy()
+    posts_emb_df[join_post] = posts_emb_df[join_post].astype(str)
+    post_emb_lookup = posts_emb_df.set_index(join_post)[emb_cols].to_dict('index')
+    all_post_ids_list = list(post_emb_lookup.keys())
+    
+    print(f"Total posts available: {len(all_post_ids_list)}, embedding dim: {embedding_dim}")
+    
+    # GLOBAL pre-sampling: Do this ONCE for all users!
+    negative_candidate_pool = all_post_ids_list
+    if len(all_post_ids_list) > max_negative_candidates:
+        speedup = len(all_post_ids_list) // max_negative_candidates
+        print(f"✨ Global pre-sampling optimization:")
+        print(f"   Creating ONE shared pool of {max_negative_candidates:,} candidates (from {len(all_post_ids_list):,} total posts)")
+        print(f"   All {len(user_histories)} users will sample negatives from this shared pool")
+        print(f"   Expected speedup: ~{speedup}x faster!")
+        
+        # Do the ONE expensive sampling operation
+        rng_global = np.random.RandomState(random_seed)
+        negative_candidate_pool = rng_global.choice(
+            all_post_ids_list, 
+            size=max_negative_candidates, 
+            replace=False
+        ).tolist()
+        print(f"   ✓ Global pool created with {len(negative_candidate_pool):,} posts")
+    
+    # Convert to list for indexing
+    user_items = list(user_histories.items())
+    num_users = len(user_items)
+    
+    # Sequential processing (now very fast with global pre-sampled pool!)
+    print(f"Processing {num_users} users with shared negative pool...")
+    from tqdm import tqdm
+    items = []
+    for idx, (user_id, user_data) in enumerate(tqdm(user_items, desc="Creating pairs")):
+        user_seed = random_seed + idx
+        user_items_list = _create_items_for_single_user(
+            user_id, user_data, post_emb_lookup, negative_candidate_pool,
+            emb_cols, embedding_dim, max_history_len, neg_ratio, user_seed
+        )
+        items.extend(user_items_list)
+    
+    elapsed = time.time() - t0
+    rate = len(items) / elapsed if elapsed > 0 else 0
+    print(f"Created {len(items)} training items in {elapsed:.2f}s ({rate:.1f} items/sec)")
     return items
 
 
