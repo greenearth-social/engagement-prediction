@@ -25,6 +25,8 @@ from functools import partial
 import warnings
 from io import BytesIO
 import multiprocessing as mp
+from google.cloud import storage
+import re
 
 import numpy as np
 import pandas as pd
@@ -93,6 +95,10 @@ os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
 # ----------------------------------------
 # Datetime helpers
 # ----------------------------------------
+# For parsing GCS Ingex filenames
+TIMESTAMP_SUFFIX_GCS = "_(\\d{8})_(\\d{6})\\.parquet$"
+
+# For parsing CLI arg strings
 KNOWN_TS_FORMATS = [
     "%Y-%m-%dT%H:%M:%S%z",     # 2024-02-10T13:45:00+0000
     "%Y-%m-%dT%H:%M:%S%z",     # 2024-02-10T13:45:00+00:00
@@ -110,6 +116,44 @@ def parse_one_ts(raw_ts: str) -> datetime:
         except ValueError:
             continue
     raise ValueError(f"Unrecognized datetime format: {raw_ts!r}")
+
+
+
+# ----------------------------------------
+# Data IO helpers (Green Earth Ingex + GCS)
+# ----------------------------------------
+def parse_ts_from_name_ingex_gcs(
+        blob_name: str, 
+        blob_prefix: str
+    ) -> Optional[datetime]:
+    """Parse timestamp from GCS blob name based on Ingex naming convention."""
+    pattern = re.compile(blob_prefix + TIMESTAMP_SUFFIX_GCS)
+    m = pattern.match(blob_name)
+    if not m:
+        return None
+    ymd, hms = m.group(1), m.group(2)
+    return datetime.strptime(ymd + hms, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+
+def list_files_in_range_ingex_gcs(
+        bucket: str, 
+        blob_prefix: str, 
+        start: Optional[datetime], 
+        end: Optional[datetime],
+        ) -> list[str]:
+    """List GCS blob URIs within specified time range based on Ingex naming convention."""
+    client = storage.Client()
+    blobs = client.list_blobs(bucket)
+    out = []
+    for b in blobs:
+        ts = parse_ts_from_name_ingex_gcs(blob_name=b.name, blob_prefix=blob_prefix)
+        if ts is None:
+            continue
+        if start is not None and ts < start:
+            continue
+        if end is not None and ts >= end:
+            continue
+        out.append(f"gs://{bucket}/{b.name}")
+    return out
 
 
 # ----------------------------------------
