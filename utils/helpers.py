@@ -177,19 +177,21 @@ def load_raw_data_ingex(
     )
 
     # LazyFrame (from polars)
-    lf = pl.scan_parquet(paths)
-
-    result = (
-        lf
+    lf = (
+        pl
+        .scan_parquet(paths)
         .with_columns(
             pl.col("inserted_at").str.to_datetime(time_zone="UTC").alias("inserted_at_dt")
         )
-        .filter((pl.col("inserted_at_dt") >= start_dt) & (pl.col("inserted_at_dt") < end_dt))
-        .collect()
-        .to_pandas()
     )
+    if start_dt is not None:
+        lf = lf.filter(pl.col("inserted_at_dt") >= start_dt)
+    if end_dt is not None:
+        lf = lf.filter(pl.col("inserted_at_dt") < end_dt)
+    pandas_df = lf.collect().to_pandas()
 
-    return result
+    return pandas_df
+
 
 # ----------------------------------------
 # Data IO helpers (Digital Ocean Spaces/S3 + parquet)
