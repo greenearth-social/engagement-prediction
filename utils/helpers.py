@@ -306,6 +306,8 @@ def find_join_key(posts_df: pd.DataFrame, likes_df: pd.DataFrame) -> Tuple[str, 
     """Find joins between posts and likes with common cases and overlap fallback."""
     if "subject_cid" in likes_df.columns and "commit_cid" in posts_df.columns:
         return "subject_cid", "commit_cid"
+    if "subject_uri" in likes_df.columns and "at_uri" in posts_df.columns:
+        return "subject_uri", "at_uri"
     common = set(posts_df.columns) & set(likes_df.columns)
     if not common:
         raise ValueError("No common column names between likes and posts tables")
@@ -317,6 +319,8 @@ def find_join_key(posts_df: pd.DataFrame, likes_df: pd.DataFrame) -> Tuple[str, 
 
 def find_text_column(posts_df: pd.DataFrame) -> str:
     """Heuristic to find the text column."""
+    if "record_text" in posts_df.columns:
+        return "record_text"
     text_cols = [c for c in posts_df.columns if "text" in c.lower()]
     if not text_cols:
         raise ValueError("No text column found in posts table for embedding")

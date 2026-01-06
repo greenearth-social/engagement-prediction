@@ -18,8 +18,6 @@ from utils.pipeline.core import new_stage_timestamp_dir
 from utils.helpers import load_most_recent_raw_data_digital_ocean, get_stage_logger, log_operation_start, load_raw_data_ingex
 import time
 
-DEFAULT_GCS_BUCKET = 'greenearth-471522-ingex-extract-stage'
-
 def run(context, args) -> Dict[str, Any]:
     run_dir = Path(context.run_dir).resolve()
     out_dir = new_stage_timestamp_dir(run_dir, '01_get_data')
@@ -27,15 +25,15 @@ def run(context, args) -> Dict[str, Any]:
     # Initialize logger
     logger = get_stage_logger('STAGE_01_GET_DATA', log_file=out_dir / 'stage.log')
 
-    # Parameters
-    data_source = getattr(args, 'data_source', 'greenearth')
+    # Parameters (defaults are set in cli.py)
+    data_source = getattr(args, 'data_source')
 
     # Inputs for GreenEarth Ingex version
-    gcs_bucket = getattr(args, 'gcs_bucket', DEFAULT_GCS_BUCKET)
-    posts_start = getattr(args, 'posts_start', None)
-    posts_end = getattr(args, 'posts_end', None)
-    likes_start = getattr(args, 'likes_start', None)
-    likes_end = getattr(args, 'likes_end', None)
+    gcs_bucket = getattr(args, 'gcs_bucket')
+    posts_start = getattr(args, 'posts_start')
+    posts_end = getattr(args, 'posts_end')
+    likes_start = getattr(args, 'likes_start')
+    likes_end = getattr(args, 'likes_end')
     
     # Inputs for DigitalOcean version
     max_files = int(getattr(args, 'max_files_per_table', 5))
