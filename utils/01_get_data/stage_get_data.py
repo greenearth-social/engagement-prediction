@@ -44,7 +44,8 @@ def run(context, args) -> Dict[str, Any]:
     
     if data_source == 'greenearth':
         log_operation_start('Load data from GreenEarth Ingex', 'STAGE_01_GET_DATA', logger)
-        posts_df, likes_df = load_raw_data_ingex(gcs_bucket, posts_start, posts_end, likes_start, likes_end)
+        posts_df = load_raw_data_ingex(gcs_bucket, 'bsky_posts', posts_start, posts_end)
+        likes_df = load_raw_data_ingex(gcs_bucket, 'bsky_likes', likes_start, likes_end)
         metadata_df = None
     elif data_source == 'digitalocean': 
         log_operation_start('Load data from DigitalOcean Spaces', 'STAGE_01_GET_DATA', logger)

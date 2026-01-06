@@ -27,6 +27,7 @@ from io import BytesIO
 import multiprocessing as mp
 from google.cloud import storage
 import re
+import polars as pl
 
 import numpy as np
 import pandas as pd
@@ -106,7 +107,10 @@ KNOWN_TS_FORMATS = [
     "%Y-%m-%d",                # 2024-02-10
 ]
 
-def parse_one_ts(raw_ts: str) -> datetime:
+def parse_one_ts(raw_ts: Optional[str]) -> Optional[datetime]:
+    """Parse a single timestamp string into a timezone-aware datetime (UTC)."""
+    if raw_ts is None:
+        return None
     for fmt in KNOWN_TS_FORMATS:
         try:
             dt = datetime.strptime(raw_ts, fmt)
@@ -116,7 +120,6 @@ def parse_one_ts(raw_ts: str) -> datetime:
         except ValueError:
             continue
     raise ValueError(f"Unrecognized datetime format: {raw_ts!r}")
-
 
 
 # ----------------------------------------
@@ -135,14 +138,14 @@ def parse_ts_from_name_ingex_gcs(
     return datetime.strptime(ymd + hms, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
 
 def list_files_in_range_ingex_gcs(
-        bucket: str, 
+        gcs_bucket: str, 
         blob_prefix: str, 
         start: Optional[datetime], 
         end: Optional[datetime],
         ) -> list[str]:
     """List GCS blob URIs within specified time range based on Ingex naming convention."""
     client = storage.Client()
-    blobs = client.list_blobs(bucket)
+    blobs = client.list_blobs(gcs_bucket)
     out = []
     for b in blobs:
         ts = parse_ts_from_name_ingex_gcs(blob_name=b.name, blob_prefix=blob_prefix)
@@ -152,9 +155,41 @@ def list_files_in_range_ingex_gcs(
             continue
         if end is not None and ts >= end:
             continue
-        out.append(f"gs://{bucket}/{b.name}")
+        out.append(f"gs://{gcs_bucket}/{b.name}")
     return out
 
+def load_raw_data_ingex(
+        gcs_bucket: str, 
+        blob_prefix: str,
+        start_str: Optional[str], 
+        end_str: Optional[str], 
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Load raw data from GreenEarth Ingex on GCS within specified time ranges."""
+    
+    start_dt: Optional[datetime] = parse_one_ts(start_str)
+    end_dt: Optional[datetime] = parse_one_ts(end_str)
+    
+    paths = list_files_in_range_ingex_gcs(
+        gcs_bucket = gcs_bucket,
+        blob_prefix = blob_prefix,
+        start = start_dt,
+        end = end_dt,
+    )
+
+    # LazyFrame (from polars)
+    lf = pl.scan_parquet(paths)
+
+    result = (
+        lf
+        .with_columns(
+            pl.col("inserted_at").str.to_datetime(time_zone="UTC").alias("inserted_at_dt")
+        )
+        .filter((pl.col("inserted_at_dt") >= start_dt) & (pl.col("inserted_at_dt") < end_dt))
+        .collect()
+        .to_pandas()
+    )
+
+    return result
 
 # ----------------------------------------
 # Data IO helpers (Digital Ocean Spaces/S3 + parquet)

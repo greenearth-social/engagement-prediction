@@ -15,6 +15,7 @@ dependencies:
   - pyarrow
   - pip
   - google-cloud-storage
+  - polars
   - pip:
     - torch
     - torchvision
