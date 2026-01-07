@@ -90,7 +90,6 @@ except Exception:  # pragma: no cover
 SPACES_BUCKET = "parquet-dumps"
 SPACES_REGION = "sfo3"
 SPACES_HOST = f"{SPACES_REGION}.digitaloceanspaces.com"
-DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 # Avoid HF tokenizers fork warnings/deadlocks in multiprocessing contexts
 os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
@@ -338,7 +337,7 @@ def get_embed_col_names(dim: int) -> List[str]:
     return [f"post_emb_{i}" for i in range(dim)]
 
 
-def compute_post_embeddings(posts_df: pd.DataFrame, text_column: str, model_name: str = DEFAULT_EMBED_MODEL) -> Tuple[pd.DataFrame, int]:
+def compute_post_embeddings(posts_df: pd.DataFrame, text_column: str, model_name: str) -> Tuple[pd.DataFrame, int]:
     """Compute sentence-transformer embeddings for all posts."""
     import time
     if SentenceTransformer is None:
@@ -409,7 +408,7 @@ def extract_encoded_embedding_ingex(emb_list: Optional[list[dict]], model_name: 
     return None
 
 
-def load_embeddings_ingex(posts_df: pd.DataFrame, model_name: str = DEFAULT_EMBED_MODEL) -> Tuple[pd.DataFrame, int]:
+def load_embeddings_ingex(posts_df: pd.DataFrame, model_name: str) -> Tuple[pd.DataFrame, int]:
     """Load precomputed embeddings from GreenEarth Ingex."""
 
     # get the dimension of the embeddings by finding one example:
@@ -1015,14 +1014,15 @@ def build_candidate_posts(
     return candidates
 
 
-def compute_post_feature_frame(candidate_posts: pd.DataFrame, data_source: str, image_mode: str = 'auto') -> Tuple[pd.DataFrame, int]:
+def compute_post_feature_frame(candidate_posts: pd.DataFrame, data_source: str, model_name: str, image_mode: str = 'auto') -> Tuple[pd.DataFrame, int]:
     """Compute embeddings for candidate posts (text always; optional image).
 
     image_mode: 'off' | 'on' | 'auto' (currently same as 'off' unless image_url present)
     """
     if data_source == 'digitalocean':
         text_col = find_text_column(candidate_posts)
-        posts_emb_df, text_dim = compute_post_embeddings(candidate_posts, text_col)
+        model_name_st = 'sentence-transformers/' + model_name.replace('_', '-')
+        posts_emb_df, text_dim = compute_post_embeddings(candidate_posts, text_col, model_name_st)
         img_dim = 0
         if image_mode in ('on', 'auto') and 'image_url' in candidate_posts.columns:
             try:
@@ -1031,7 +1031,7 @@ def compute_post_feature_frame(candidate_posts: pd.DataFrame, data_source: str, 
                 img_dim = 0
         return posts_emb_df, (text_dim + img_dim)
     elif data_source == 'greenearth':
-        posts_emb_df, text_dim = load_embeddings_ingex(candidate_posts, model_name='all_MiniLM_L6_v2')
+        posts_emb_df, text_dim = load_embeddings_ingex(candidate_posts, model_name)
         return posts_emb_df, text_dim
     else:
         raise ValueError(f"Unsupported data_source: {data_source}")

@@ -721,6 +721,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_all.add_argument("--val-ratio", type=float, default=0.2)
     p_all.add_argument("--holdout-ratio", type=float, default=0.2)
     p_all.add_argument("--random-seed", type=int, default=42)
+    p_all.add_argument("--embedding-model", type=str, choices=["all_MiniLM_L6_v2", "all_MiniLM_L12_v2"], default='all_MiniLM_L6_v2', help="The SentenceTransformers model to use to look up precomputed embeddings or generate them.")
     # Stage 5 (train) model selection
     p_all.add_argument("--model-type", type=str, choices=["mlp", "two-tower"], default="mlp",
                       help="Model architecture: 'mlp' (default MLP) or 'two-tower' (two-tower with attention)")
