@@ -8,6 +8,56 @@ New design goals:
 - Reuse the same user-featurization logic in both training and evaluation.
 - Support multiple model architectures (MLP and Two-Tower) for comparison.
 
+### Setup instructions
+1. Install conda (recommended: Miniforge).  
+
+    We recommend Miniforge, a minimal conda distribution that defaults to conda-forge.  
+    Download from: https://github.com/conda-forge/miniforge
+
+    Follow the installer for your platform. Restart your shell after installation
+
+    Verify:
+
+    ```bash
+    conda --version
+    ```
+
+    You might have to activate conda from the install location e.g.:
+    ```bash
+    source /opt/miniconda3/bin/activate
+    ```
+
+2. Install conda-lock
+
+    Install conda-lock into your base environment:
+
+    ```bash
+    conda install -n base conda-lock
+    ```
+    Verify:
+    ```bash
+    conda-lock --version
+    ```
+
+3. Create the environment from the lock file and activate it
+
+    This installs exactly the pinned dependencies known to work. You can name your environment whatever you like, e.g. "eng-pred":
+    ```bash
+    conda-lock install -n eng-pred conda-lock.yml
+    conda activate eng-pred
+    ```
+
+4. Sanity check
+    ```bash
+    python -c "import torch; print(torch.__version__)"
+    ```
+
+Note: If you modify environment.yml, regenerate the lockfile:
+```bash
+conda-lock -f environment.yml -p linux-64
+```
+
+
 ### Repository layout (stages under `utils/`)
 
 - `utils/01_get_data/stage_get_data.py`: Stage 1 — Load most recent parquet dumps from Green Earth Ingex or Spaces and save a compact raw bundle.
