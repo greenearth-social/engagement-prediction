@@ -1,9 +1,10 @@
-name: vox
+name: eng-pred
 channels:
   - conda-forge
-  - defaults
+  - pytorch
+  - nvidia
 dependencies:
-  - python=3.9
+  - python=3.11
   - numpy
   - pandas
   - scikit-learn
@@ -13,11 +14,14 @@ dependencies:
   - pillow
   - boto3
   - pyarrow
-  - pip
   - google-cloud-storage
   - polars
-  - pip:
-    - torch
-    - torchvision
-    - sentence-transformers
-    - requests
+  - requests
+  - sentence-transformers
+
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+
+  - pip
