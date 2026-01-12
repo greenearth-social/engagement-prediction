@@ -20,6 +20,9 @@ import json
 import time
 import copy
 
+from clearml import Task 
+# task = Task.init(project_name="Green Earth Engagement Prediction", task_name="Training Pipeline") 
+
 # Avoid heavy imports at module import time; import lazily inside handlers
 
 TINKERING_DIR = Path(__file__).parent
