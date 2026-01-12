@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Callable, List
 
 
+from ..experiment_tracking import ExperimentTracker, NoOpExperimentTracker
+
 # Resolve repo root as two levels up from this file: utils/pipeline/core.py → repo/
 CURR = Path(__file__).resolve()
 UTILS_DIR = CURR.parent.parent
@@ -31,6 +33,7 @@ class Context:
     use_latest: bool = True
     prior_outputs: Dict[str, Optional[Path]] = field(default_factory=dict)
     artifacts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    tracker: ExperimentTracker = field(default_factory=NoOpExperimentTracker)
 
     def record_artifact(self, stage: str, output_dir: Path, extras: Optional[Dict[str, Any]] = None) -> None:
         self.artifacts[stage] = {

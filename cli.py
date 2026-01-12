@@ -20,8 +20,8 @@ import json
 import time
 import copy
 
-from clearml import Task 
-# task = Task.init(project_name="Green Earth Engagement Prediction", task_name="Training Pipeline") 
+from utils.experiment_tracking import build_experiment_tracker
+
 
 # Avoid heavy imports at module import time; import lazily inside handlers
 
@@ -258,8 +258,14 @@ def cmd__run_all_exec(args) -> int:
     from utils.pipeline import registry as reg
 
     run_dir = Path(args.output_dir).resolve()
+    tracker = build_experiment_tracker(
+        getattr(args, "experiment_tracker", "none"),
+        project_name=getattr(args, "experiment_project", "Engagement Prediction"),
+        task_name=getattr(args, "experiment_task", None) or run_dir.name,
+        tags=getattr(args, "experiment_tags", None),
+    )
     # In sequential execution, always allow stages to resolve latest artifacts from prior stages
-    ctx = Context(run_dir=run_dir, use_latest=True)
+    ctx = Context(run_dir=run_dir, use_latest=True, tracker=tracker)
 
     # Helper: map stage keys to enumerated folder names
     # Override relevel stage key if --relevel-method is specified
@@ -271,7 +277,7 @@ def cmd__run_all_exec(args) -> int:
         relevel_key = 'relevel_simple'
     elif relevel_method == 'uniform':
         relevel_key = 'relevel'
-    
+
     # Override train stage key if --model-type is specified
     # Do not default to MLP if model name is not recognized - raise error instead
     model_type = args.model_type
@@ -351,31 +357,36 @@ def cmd__run_all_exec(args) -> int:
             pass
 
     # Execute selected subset
-    for idx, key in enumerate(stage_order):
-        if idx < start_idx or idx > stop_idx:
-            continue
-        # Before running, offer prior selection for this stage's dependency (if any)
-        if key != 'get_data':
-            prev_key = stage_order[idx - 1]
-            if stage_folder[prev_key] not in ctx.prior_outputs:
-                _maybe_choose_prior(prev_key)
-        label_map = {
-            'get_data': "Stage 1: Get data…",
-            'featurize': "Stage 2: Featurize…",
-            'relevel': "Stage 3: Relevel (uniform mixture)…",
-            'relevel_gini': "Stage 3: Relevel (Gini-optimized)…",
-            'relevel_simple': "Stage 3: Relevel (simple)…",
-            'split': "Stage 4: Split users…",
-            'train': "Stage 5: Train model (MLP)…",
-            'train_two_tower': "Stage 5: Train model (Two-Tower)…",
-            'evaluate': "Stage 6: Evaluate model…",
-        }
-        label = label_map.get(key, f"Stage {idx+1}: {key}…")
-        print(f"\n[{idx+1}/6] ▶️  {label}")
-        reg.run_stage(key, ctx, args)
+    try:
+        for idx, key in enumerate(stage_order):
+            if idx < start_idx or idx > stop_idx:
+                continue
+            # Before running, offer prior selection for this stage's dependency (if any)
+            if key != 'get_data':
+                prev_key = stage_order[idx - 1]
+                if stage_folder[prev_key] not in ctx.prior_outputs:
+                    _maybe_choose_prior(prev_key)
+            label_map = {
+                'get_data': "Stage 1: Get data…",
+                'featurize': "Stage 2: Featurize…",
+                'relevel': "Stage 3: Relevel (uniform mixture)…",
+                'relevel_gini': "Stage 3: Relevel (Gini-optimized)…",
+                'relevel_simple': "Stage 3: Relevel (simple)…",
+                'split': "Stage 4: Split users…",
+                'train': "Stage 5: Train model (MLP)…",
+                'train_two_tower': "Stage 5: Train model (Two-Tower)…",
+                'evaluate': "Stage 6: Evaluate model…",
+            }
+            label = label_map.get(key, f"Stage {idx+1}: {key}…")
+            print(f"\n[{idx+1}/6] ▶️  {label}")
+            reg.run_stage(key, ctx, args)
+    finally:
+        ctx.tracker.close()
 
     print("\n✅ run-all completed successfully")
     return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Engagement Prediction Pipeline CLI",
@@ -514,6 +525,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--foreground", action="store_true", default=argparse.SUPPRESS,
                           help_text="Run in foreground (default: background with nohup)")
     p_all.add_argument("--_initial-log", type=str, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p_all.add_argument("--experiment-tracker", type=str, choices=["none", "clearml"], default="none",
+                      help="Experiment tracker backend: 'clearml' or 'none' (default)")
+    p_all.add_argument("--experiment-project", type=str, default="Engagement Prediction",
+                      help="Experiment tracking project name")
+    p_all.add_argument("--experiment-task", type=str, default=None,
+                      help="Experiment tracking task name (defaults to run directory name)")
+    p_all.add_argument("--experiment-tags", type=str, nargs="*", default=None,
+                      help="Optional tags for the experiment tracker")
     p_all.set_defaults(func=cmd_run_all)
 
     return parser
