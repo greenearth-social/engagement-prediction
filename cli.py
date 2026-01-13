@@ -70,7 +70,8 @@ DEFAULTS: Dict[str, Any] = {
     "weight_decay_mlp": 0.1,
     "weight_decay_two_tower": 0.01,
     "hidden_dims": [64, 32, 16],
-    "dropout_rate": 0.5,
+    "dropout_rate_mlp": 0.5,
+    "dropout_rate_two_tower": 0.1,
     "device": "cpu",
     "patience": 50,
     "no_plots": False,
@@ -455,8 +456,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Weight decay for two tower model")
     _add_arg_with_default(p_all, "--hidden-dims", type=int, nargs="+", default=argparse.SUPPRESS,
                           help_text="Hidden layer sizes")
-    _add_arg_with_default(p_all, "--dropout-rate", type=float, default=argparse.SUPPRESS,
-                          help_text="Dropout rate")
+    _add_arg_with_default(p_all, "--dropout-rate-mlp", type=float, default=argparse.SUPPRESS,
+                          help_text="Dropout rate for MLP model")
+    _add_arg_with_default(p_all, "--dropout-rate-two-tower", type=float, default=argparse.SUPPRESS,
+                          help_text="Dropout rate for two tower model")
     _add_arg_with_default(p_all, "--device", type=str, default=argparse.SUPPRESS,
                           help_text="Device for training")
     _add_arg_with_default(p_all, "--patience", type=int, default=argparse.SUPPRESS,

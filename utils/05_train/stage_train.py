@@ -619,7 +619,7 @@ def run(context, args) -> Dict[str, Any]:
         epochs=int(args.epochs),
         patience=int(args.patience),
         hidden_dims=args.hidden_dims,
-        dropout_rate=float(args.dropout_rate),
+        dropout_rate=float(args.dropout_rate_mlp),
         device=str(args.device),
         random_seed=int(args.random_seed),
         save_model=not bool(args.no_save_model),
