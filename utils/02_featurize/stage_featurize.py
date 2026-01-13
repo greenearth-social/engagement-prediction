@@ -57,7 +57,7 @@ def run(context, args) -> Dict[str, Any]:
         posts_df, likes_df, metadata_df = _load_raw_from_prior(prior_get)
     else:
         log_operation_start('Load raw data from DigitalOcean Spaces', 'STAGE_02_FEATURIZE', logger)
-        max_files = int(getattr(args, 'max_files_per_table', 5))
+        max_files = int(args.max_files_per_table)
         posts_df, likes_df, metadata_df = load_most_recent_raw_data_digital_ocean(max_files)
 
     join_like, join_post = find_join_key(posts_df, likes_df)
@@ -65,10 +65,10 @@ def run(context, args) -> Dict[str, Any]:
     if author_col is None:
         raise ValueError("Author column 'did' not found in posts data")
 
-    max_posts_per_author = int(getattr(args, 'max_posts_per_author', 3))
-    max_liked_posts_per_user = int(getattr(args, 'max_liked_posts_per_user', 100))
-    cap_seed = int(getattr(args, 'cap_random_seed', 42))
-    image_mode = str(getattr(args, 'image_mode', 'auto'))
+    max_posts_per_author = int(args.max_posts_per_author)
+    max_liked_posts_per_user = int(args.max_liked_posts_per_user)
+    cap_seed = int(args.cap_random_seed)
+    image_mode = str(args.image_mode)
 
     # Candidate posts
     t0 = time.time()
@@ -111,8 +111,8 @@ def run(context, args) -> Dict[str, Any]:
     log_operation_start('Compute text embeddings', 'STAGE_02_FEATURIZE', logger)
     if image_mode != 'off':
         logger.info(f"Image mode: {image_mode} - will compute image embeddings")
-    data_source = getattr(args, 'data_source')
-    model_name = getattr(args, 'embedding_model')
+    data_source = args.data_source
+    model_name = args.embedding_model
     posts_emb_df, embedding_dim = compute_post_feature_frame(candidate_posts, data_source, model_name, image_mode=image_mode)
     text_col = find_text_column(posts_emb_df)
 
@@ -160,5 +160,4 @@ def run(context, args) -> Dict[str, Any]:
             'liked_posts_by_user_texts_path': str(liked_texts_by_user_path),
         }
     }
-
 

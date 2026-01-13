@@ -1347,21 +1347,21 @@ def run(context, args) -> Dict[str, Any]:
     results = run_two_tower_pipeline(
         embedding_bundle=str(bundle_path.resolve()),
         user_splits=str(splits_path.resolve()),
-        shared_dim=int(getattr(args, 'shared_dim', 128)),
-        user_hidden_dim=int(getattr(args, 'user_hidden_dim', 256)),
-        post_hidden_dim=int(getattr(args, 'post_hidden_dim', 256)),
-        num_attention_heads=int(getattr(args, 'num_attention_heads', 4)),
-        num_attention_layers=int(getattr(args, 'num_attention_layers', 2)),
-        max_history_len=int(getattr(args, 'max_history_len', 20)),
+        shared_dim=int(args.shared_dim),
+        user_hidden_dim=int(args.user_hidden_dim),
+        post_hidden_dim=int(args.post_hidden_dim),
+        num_attention_heads=int(args.num_attention_heads),
+        num_attention_layers=int(args.num_attention_layers),
+        max_history_len=int(args.max_history_len),
         prediction_posts_per_user=int(getattr(args, 'prediction_posts_per_user', 1)),
-        dropout_rate=float(getattr(args, 'dropout_rate', 0.1)),
-        batch_size=int(getattr(args, 'batch_size', 256)),
-        learning_rate=float(getattr(args, 'learning_rate', 1e-3)),
-        weight_decay=float(getattr(args, 'weight_decay', 0.01)),
-        epochs=int(getattr(args, 'epochs', 100)),
-        patience=int(getattr(args, 'patience', 20)),
-        device=str(getattr(args, 'device', 'cpu')),
-        random_seed=int(getattr(args, 'random_seed', 42)),
+        dropout_rate=float(args.dropout_rate),
+        batch_size=int(args.batch_size),
+        learning_rate=float(args.learning_rate),
+        weight_decay=float(args.weight_decay),
+        epochs=int(args.epochs),
+        patience=int(args.patience),
+        device=str(args.device),
+        random_seed=int(args.random_seed),
         output_dir=run_dir,
         disable_progress=bool(getattr(args, 'disable_progress', False)),
     )
@@ -1419,4 +1419,3 @@ if __name__ == '__main__':
     )
     
     print(f"\nResults: {json.dumps(results['training_config'], indent=2)}")
-

@@ -257,7 +257,7 @@ def cmd__run_all_exec(args) -> int:
 
     # Helper: map stage keys to enumerated folder names
     # Override relevel stage key if --relevel-method is specified
-    relevel_method = getattr(args, 'relevel_method', None)
+    relevel_method = args.relevel_method
     relevel_key = 'relevel'  # default
     if relevel_method == 'gini':
         relevel_key = 'relevel_gini'
@@ -267,7 +267,7 @@ def cmd__run_all_exec(args) -> int:
         relevel_key = 'relevel'
     
     # Override train stage key if --model-type is specified
-    model_type = getattr(args, 'model_type', 'mlp')
+    model_type = args.model_type
     train_key = 'train'  # default MLP
     if model_type == 'two-tower':
         train_key = 'train_two_tower'
@@ -279,8 +279,8 @@ def cmd__run_all_exec(args) -> int:
         stage_folder[key] = _folder
 
     # Respect selective reruns
-    start_from = getattr(args, 'start_from', None)
-    stop_after = getattr(args, 'stop_after', None)
+    start_from = args.start_from
+    stop_after = args.stop_after
     # Map 'relevel' to the actual relevel key if specified
     if start_from == 'relevel':
         start_from = relevel_key
@@ -310,7 +310,7 @@ def cmd__run_all_exec(args) -> int:
 
     # Optional interactive chooser (foreground only)
     def _maybe_choose_prior(stage_key: str):
-        if not getattr(args, 'pick_prior', False):
+        if not args.pick_prior:
             return
         folder = stage_folder[stage_key]
         base = (run_dir / folder)
@@ -320,7 +320,7 @@ def cmd__run_all_exec(args) -> int:
         if len(subdirs) <= 1:
             return
         # Prompt only in foreground mode
-        if not bool(getattr(args, 'foreground', False)):
+        if not bool(args.foreground):
             return
         subdirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         print(f"\nPick prior output for stage '{stage_key}' under {base}:")
