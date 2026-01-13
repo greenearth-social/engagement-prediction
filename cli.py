@@ -269,10 +269,15 @@ def cmd__run_all_exec(args) -> int:
         relevel_key = 'relevel'
     
     # Override train stage key if --model-type is specified
+    # Do not default to MLP if model name is not recognized - raise error instead
     model_type = args.model_type
     train_key = 'train'  # default MLP
-    if model_type == 'two-tower':
+    if model_type == 'mlp':
+        train_key = 'train'
+    elif model_type == 'two-tower':
         train_key = 'train_two_tower'
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
     
     stage_order = ['get_data', 'featurize', relevel_key, 'split', train_key, 'evaluate']
     stage_folder = {}
