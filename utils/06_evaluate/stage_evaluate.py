@@ -206,7 +206,7 @@ def run(context, args) -> Dict[str, Any]:
     selected_users = [u for u in holdout_users if str(u) in eligible_set]
 
     # Allocation for pairs/matrix
-    prediction_posts_per_user = int(getattr(args, 'prediction_posts_per_user', 1))
+    prediction_posts_per_user = int(args.prediction_posts_per_user)
     max_embedding_posts_per_user = int(getattr(args, 'max_embedding_posts_per_user', 50))
     negatives_liked_only = bool(getattr(args, 'negatives_liked_only', False))
     cap_seed = int(args.cap_random_seed)

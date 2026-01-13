@@ -1353,7 +1353,7 @@ def run(context, args) -> Dict[str, Any]:
         num_attention_heads=int(args.num_attention_heads),
         num_attention_layers=int(args.num_attention_layers),
         max_history_len=int(args.max_history_len),
-        prediction_posts_per_user=int(getattr(args, 'prediction_posts_per_user', 1)),
+        prediction_posts_per_user=int(args.prediction_posts_per_user),
         dropout_rate=float(args.dropout_rate_two_tower),
         batch_size=int(args.batch_size),
         learning_rate=float(args.learning_rate),

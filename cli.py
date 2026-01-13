@@ -72,6 +72,7 @@ DEFAULTS: Dict[str, Any] = {
     "hidden_dims": [64, 32, 16],
     "dropout_rate_mlp": 0.5,
     "dropout_rate_two_tower": 0.1,
+    "prediction_posts_per_user": 1,
     "device": "cpu",
     "patience": 50,
     "no_plots": False,
@@ -115,7 +116,7 @@ def _add_arg_with_default(parser: argparse.ArgumentParser, flag: str, *, key: Op
     """Add an argument with standardized default-aware help text."""
     if help_text is not None:
         effective_key = key or _arg_key_from_flag(flag)
-        kwargs["help"] = _help_with_default(help_text, effective_key)
+        kwargs["help"] = _help_with_default(help_text or "", effective_key)
     parser.add_argument(flag, **kwargs)
 
 
@@ -465,6 +466,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Dropout rate for MLP model")
     _add_arg_with_default(p_all, "--dropout-rate-two-tower", type=float, default=argparse.SUPPRESS,
                           help_text="Dropout rate for two tower model")
+    _add_arg_with_default(p_all, "--prediction-posts-per-user", type=float, default=argparse.SUPPRESS,
+                          help_text="Prediction posts per user")
     _add_arg_with_default(p_all, "--device", type=str, default=argparse.SUPPRESS,
                           help_text="Device for training")
     _add_arg_with_default(p_all, "--patience", type=int, default=argparse.SUPPRESS,

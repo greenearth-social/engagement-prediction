@@ -628,6 +628,7 @@ def run(context, args) -> Dict[str, Any]:
         disable_progress=bool(getattr(args, 'disable_progress', False)),
         tqdm_mininterval=getattr(args, 'tqdm_mininterval', None),
         tqdm_miniters=getattr(args, 'tqdm_miniters', None),
+        prediction_posts_per_user=int(args.prediction_posts_per_user)
     )
 
     model_path = results.get('model_path')
