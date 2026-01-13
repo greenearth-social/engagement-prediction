@@ -249,35 +249,46 @@ def _merge_args_with_config(raw_args: argparse.Namespace) -> argparse.Namespace:
     setattr(final_ns, "func", func)
     return final_ns
 
-def cmd_run_all(args) -> int:
-    """Run the 4-stage pipeline.
 
-    Creates a run directory up front and backgrounds itself with nohup unless --foreground.
-    """
-    outputs_dir = OUTPUTS_DIR
-    outputs_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
+def _generate_run_name(args: argparse.Namespace, timestamp_str: str) -> str:
+    d_part = f"d{int(args.max_files_per_table)}"
+    cap_part = f"mppa{int(args.max_posts_per_author)}"
+    suffix = f"{d_part}_{cap_part}"
+    if args.run_name:
+        rn = str(args.run_name).strip().replace(' ', '_')
+        if rn:
+            suffix = f"{suffix}_{rn}"
+    return f"{timestamp_str}_run_{suffix}"
 
+
+def _create_run_dir(args: argparse.Namespace, run_name: str) -> Path:
     # Create run_dir deterministically up front
     if args.output_dir:
         run_dir = Path(args.output_dir)
     else:
-        d_part = f"d{int(args.max_files_per_table)}"
-        cap_part = f"mppa{int(args.max_posts_per_author)}"
-        suffix = f"{d_part}_{cap_part}"
-        if args.run_name:
-            rn = str(args.run_name).strip().replace(' ', '_')
-            if rn:
-                suffix = f"{suffix}_{rn}"
-        run_dir = outputs_dir / f"{timestamp}_run_{suffix}"
+        outputs_dir = OUTPUTS_DIR
+        outputs_dir.mkdir(parents=True, exist_ok=True)
+        run_dir = outputs_dir / run_name
+
     run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def cmd_run_all(args: argparse.Namespace) -> int:
+    """Run the 4-stage pipeline.
+
+    Creates a run directory up front and backgrounds itself with nohup unless --foreground.
+    """
+    timestamp_str = time.strftime("%Y%m%d_%H%M%S")
+    run_name: str = _generate_run_name(args, timestamp_str)
+    run_dir: Path = _create_run_dir(args, run_name)
 
     # Choose log path inside run_dir
     initial_log = Path(args._initial_log) if args._initial_log else (run_dir / "run-all.log")
     try:
         initial_log.parent.mkdir(parents=True, exist_ok=True)
         with open(initial_log, 'a') as f:
-            f.write(f"run-all started at {timestamp}\n")
+            f.write(f"run-all started at {timestamp_str}\n")
     except Exception:
         pass
 
@@ -330,7 +341,7 @@ def cmd_run_all(args) -> int:
     return cmd__run_all_exec(args)
 
 
-def cmd__run_all_exec(args) -> int:
+def cmd__run_all_exec(args: argparse.Namespace) -> int:
     """Execute the 6-stage modular pipeline in the foreground sequentially."""
     # Build Context and invoke stages via registry
     from utils.pipeline.core import Context
