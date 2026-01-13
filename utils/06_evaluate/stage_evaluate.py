@@ -140,7 +140,7 @@ def run(context, args) -> Dict[str, Any]:
     log_operation_start('Resolve assets (model, bundle, splits)', 'STAGE_06_EVALUATE', logger)
     model_path, bundle_path, splits_path = _resolve_assets(run_dir, context, args)
     device = str(args.device)
-    batch_size = int(args.batch_size)
+    batch_size = int(args.eval_batch_size)
     enforce_training_config = bool(getattr(args, 'enforce_training_config', True))
 
     # Load model & bundle

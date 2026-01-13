@@ -1357,7 +1357,7 @@ def run(context, args) -> Dict[str, Any]:
         dropout_rate=float(args.dropout_rate),
         batch_size=int(args.batch_size),
         learning_rate=float(args.learning_rate),
-        weight_decay=float(args.weight_decay),
+        weight_decay=float(args.weight_decay_two_tower),
         epochs=int(args.epochs),
         patience=int(args.patience),
         device=str(args.device),

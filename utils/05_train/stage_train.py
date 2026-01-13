@@ -615,7 +615,7 @@ def run(context, args) -> Dict[str, Any]:
         user_splits=str(splits_path.resolve()),
         batch_size=int(args.batch_size),
         learning_rate=float(args.learning_rate),
-        weight_decay=float(args.weight_decay),
+        weight_decay=float(args.weight_decay_mlp),
         epochs=int(args.epochs),
         patience=int(args.patience),
         hidden_dims=args.hidden_dims,
