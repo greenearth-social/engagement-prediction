@@ -288,7 +288,11 @@ def cmd__run_all_exec(args) -> int:
 
     # Respect selective reruns
     start_from = args.start_from
+    if start_from and start_from not in stage_order:
+        raise ValueError(f"Unrecognized start_from: {start_from}. Please choose from: {stage_order}")
     stop_after = args.stop_after
+    if stop_after and stop_after not in stage_order:
+        raise ValueError(f"Unrecognized stop_after: {stop_after}. Please choose from: {stage_order}")
     # Map 'relevel' to the actual relevel key if specified
     if start_from == 'relevel':
         start_from = relevel_key
