@@ -95,7 +95,25 @@ A retrieval-optimized architecture with separate user and post encoders:
 
 ### Quick start
 
-Below, replace paths with your actual workspace if different.
+Below, replace paths with your actual workspace if different.  
+
+The `run-all` command can be run with command-line args (as in the examples below), or with a YAML config file, e.g.:
+
+```bash
+python cli.py --config config.yml run-all
+```
+
+Example config file:
+```yaml
+posts_start: "2026-01-04"
+posts_end: "2026-01-04T02:00:00"
+likes_start: "2026-01-04"
+likes_end: "2026-01-04T02:00:00"
+foreground: true
+output_dir: "/path/to/outputs"
+start_from: "train"
+model_type: "two-tower" 
+```
 
 1) Stage 1 — Get data (creates a run dir)  
 The default behavior is to use data from [Green Earth ingex](https://github.com/greenearth-social/ingex) with date filters. For example:
