@@ -21,6 +21,7 @@ import time
 import copy
 
 from utils.experiment_tracking import build_experiment_tracker, normalize_params
+from utils.pipeline.core import Context
 
 
 # Avoid heavy imports at module import time; import lazily inside handlers
@@ -250,35 +251,23 @@ def _merge_args_with_config(raw_args: argparse.Namespace) -> argparse.Namespace:
     return final_ns
 
 
-def _generate_run_name(args: argparse.Namespace, timestamp_str: str) -> str:
-    stages_str = f"{timestamp_str}_run_"
+def _generate_run_name(args: argparse.Namespace) -> str:
+    stages_str = "all"
     if args.start_from is not None or args.stop_after is not None:
-        if args.start_from is None:
-            stages_str += "start_to_"
+        if args.start_from == args.stop_after:
+            stages_str = args.start_from
         else:
-            stages_str += f"{args.start_from}_to_"
-        if args.stop_after is None:
-            stages_str += "end"
-        else:
-            stages_str += args.stop_after
-    else:
-        stages_str += "all"
+            if args.start_from is None:
+                stages_str = "start_to_"
+            else:
+                stages_str = f"{args.start_from}_to_"
+            if args.stop_after is None:
+                stages_str += "end"
+            else:
+                stages_str += args.stop_after
 
     stages_str += f"_{args.model_type}_{args.relevel_method}"
     return stages_str
-
-
-def _create_run_dir(args: argparse.Namespace, run_name: str) -> Path:
-    # Create run_dir deterministically up front
-    if args.output_dir:
-        run_dir = Path(args.output_dir) / run_name
-    else:
-        outputs_dir = OUTPUTS_DIR
-        outputs_dir.mkdir(parents=True, exist_ok=True)
-        run_dir = outputs_dir / run_name
-
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir
 
 
 def cmd_run_all(args: argparse.Namespace) -> int:
@@ -286,9 +275,36 @@ def cmd_run_all(args: argparse.Namespace) -> int:
 
     Creates a run directory up front and backgrounds itself with nohup unless --foreground.
     """
-    timestamp_str = time.strftime("%Y%m%d_%H%M%S")
-    run_name: str = _generate_run_name(args, timestamp_str)
-    run_dir: Path = _create_run_dir(args, run_name)
+    outputs_dir = OUTPUTS_DIR
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+    # Create run_dir deterministically up front
+    run_name = f"{timestamp}_{_generate_run_name(args)}"
+    if args.output_dir:
+        run_dir = Path(args.output_dir)
+    else:
+        if args.run_name:
+            rn = str(args.run_name).strip().replace(' ', '_')
+            if rn:
+                run_name = f"{run_name}_{rn}"
+        run_dir = outputs_dir / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # initialize experiment tracker
+    tracker = build_experiment_tracker(
+        args.experiment_tracker,
+        project_name=args.experiment_project,
+        task_name=args.experiment_task or run_name,
+        tags=args.experiment_tags,
+    )
+    tracking_payload = {
+        "run": _build_tracking_params(args, run_dir),
+        "overrides": _extract_overrides(args),
+    }
+    tracker.log_params(normalize_params(tracking_payload))
+    # In sequential execution, always allow stages to resolve latest artifacts from prior stages
+    ctx = Context(run_dir=run_dir, use_latest=True, tracker=tracker)
 
     # Choose log path inside run_dir
     initial_log = Path(args._initial_log) if args._initial_log else (run_dir / "run-all.log")
@@ -344,30 +360,16 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     # Foreground execution: call the internal exec directly
     # Ensure args.output_dir is set so subsequent stages use this run_dir
     setattr(args, 'output_dir', str(run_dir.resolve()))
-    return cmd__run_all_exec(args)
+    return cmd__run_all_exec(args, ctx)
 
 
-def cmd__run_all_exec(args: argparse.Namespace) -> int:
+def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     """Execute the 6-stage modular pipeline in the foreground sequentially."""
     # Build Context and invoke stages via registry
-    from utils.pipeline.core import Context
     from utils.pipeline import registry as reg
 
     run_dir = Path(args.output_dir).resolve()
-    tracker = build_experiment_tracker(
-        args.experiment_tracker,
-        project_name=args.experiment_project,
-        task_name=args.experiment_task or run_dir.name,
-        tags=args.experiment_tags,
-    )
-    tracking_payload = {
-        "run": _build_tracking_params(args, run_dir),
-        "overrides": _extract_overrides(args),
-    }
-    tracker.log_params(normalize_params(tracking_payload))
-    # In sequential execution, always allow stages to resolve latest artifacts from prior stages
-    ctx = Context(run_dir=run_dir, use_latest=True, tracker=tracker)
-
+    
     # Helper: map stage keys to enumerated folder names
     # Override relevel stage key if --relevel-method is specified
     relevel_method = args.relevel_method
