@@ -14,13 +14,16 @@ if TYPE_CHECKING:
 
 
 class ExperimentTracker(Protocol):
-    def log_metric(self, name: str, value: float, step: Optional[int] = None) -> None:
+    def log_scalar(self, title: str, series: str, value: float, iteration: int) -> None:
         ...
 
     def log_artifact(self, name: str, path: Path) -> None:
         ...
 
     def log_params(self, params: Dict[str, Any]) -> None:
+        ...
+
+    def log_single_value(self, name: str, value: float) -> None:
         ...
 
     def close(self) -> None:
@@ -28,13 +31,16 @@ class ExperimentTracker(Protocol):
 
 
 class NoOpExperimentTracker:
-    def log_metric(self, name: str, value: float, step: Optional[int] = None) -> None:
+    def log_scalar(self, title: str, series: str, value: float, iteration: int) -> None:
         return None
 
     def log_artifact(self, name: str, path: Path) -> None:
         return None
 
     def log_params(self, params: Dict[str, Any]) -> None:
+        return None
+
+    def log_single_value(self, name: str, value: float) -> None:
         return None
 
     def close(self) -> None:
@@ -58,18 +64,14 @@ class ClearMLExperimentTracker:
             auto_connect_frameworks=True, # for auto-logging from PyTorch, matplotlib, etc
         )
         self._logger = self._task.get_logger()
-        self._iteration = 0
 
-    def log_metric(self, name: str, value: float, step: Optional[int] = None) -> None:
-        iteration = step if step is not None else self._iteration
+    def log_scalar(self, title: str, series: str, value: float, iteration: int) -> None:
         self._logger.report_scalar(
-            title=name,
-            series="value",
+            title=title,
+            series=series,
             value=value,
             iteration=iteration,
         )
-        if step is None:
-            self._iteration += 1
 
     def log_artifact(self, name: str, path: Path) -> None:
         p = Path(path)
@@ -79,6 +81,9 @@ class ClearMLExperimentTracker:
 
     def log_params(self, params: Dict[str, Any]) -> None:
         self._task.connect(params)
+
+    def log_single_value(self, name: str, value: float) -> None:
+        self._logger.report_single_value(name=name, value=value)
 
     def close(self) -> None:
         self._task.close()
