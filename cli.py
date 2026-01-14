@@ -251,14 +251,21 @@ def _merge_args_with_config(raw_args: argparse.Namespace) -> argparse.Namespace:
 
 
 def _generate_run_name(args: argparse.Namespace, timestamp_str: str) -> str:
-    d_part = f"d{int(args.max_files_per_table)}"
-    cap_part = f"mppa{int(args.max_posts_per_author)}"
-    suffix = f"{d_part}_{cap_part}"
-    if args.run_name:
-        rn = str(args.run_name).strip().replace(' ', '_')
-        if rn:
-            suffix = f"{suffix}_{rn}"
-    return f"{timestamp_str}_run_{suffix}"
+    stages_str = f"{timestamp_str}_run_"
+    if args.start_from is not None or args.stop_after is not None:
+        if args.start_from is None:
+            stages_str += "start_to_"
+        else:
+            stages_str += f"{args.start_from}_to_"
+        if args.stop_after is None:
+            stages_str += "end"
+        else:
+            stages_str += args.stop_after
+    else:
+        stages_str += "all"
+
+    stages_str += f"_{args.model_type}_{args.relevel_method}"
+    return stages_str
 
 
 def _create_run_dir(args: argparse.Namespace, run_name: str) -> Path:
