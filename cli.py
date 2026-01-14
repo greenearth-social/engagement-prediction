@@ -264,7 +264,7 @@ def _generate_run_name(args: argparse.Namespace, timestamp_str: str) -> str:
 def _create_run_dir(args: argparse.Namespace, run_name: str) -> Path:
     # Create run_dir deterministically up front
     if args.output_dir:
-        run_dir = Path(args.output_dir)
+        run_dir = Path(args.output_dir) / run_name
     else:
         outputs_dir = OUTPUTS_DIR
         outputs_dir.mkdir(parents=True, exist_ok=True)
@@ -336,8 +336,7 @@ def cmd_run_all(args: argparse.Namespace) -> int:
 
     # Foreground execution: call the internal exec directly
     # Ensure args.output_dir is set so subsequent stages use this run_dir
-    if not args.output_dir:
-        setattr(args, 'output_dir', str(run_dir.resolve()))
+    setattr(args, 'output_dir', str(run_dir.resolve()))
     return cmd__run_all_exec(args)
 
 
