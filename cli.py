@@ -5,29 +5,20 @@ Unified CLI for Engagement Prediction Pipeline
 =============================================
 
 Subcommands:
-- preprocess: Run data preprocessing and save processed dataset
-- train: Train model using preprocessed data
-- evaluate: Evaluate trained model on held-out users
-- train-eval: Train using an embedding bundle + user splits, then run full-feed evaluation
+- run-all: Run the 6-stage pipeline end-to-end (ingest → featurize → relevel → split → train → evaluate)
 
 Usage examples:
-    python cli.py preprocess --days 5 --min-likes 5 --prediction-posts-per-user 2
-    python cli.py train --load-processed auto --epochs 150
-    python cli.py evaluate --model-path auto --data-path auto --create-plots
-    python cli.py train-eval \
-        --embedding-bundle /srv/vox/engagement_prediction/wills_tinkering_folder/outputs/<ts>_run_.../precompute/embedding_bundle_<ts>.pkl \
-        --user-splits /srv/vox/engagement_prediction/wills_tinkering_folder/outputs/<ts>_run_.../relevel/user_splits.json
+    python cli.py run-all --epochs 150 --embedding-model all_MiniLM_L12_v2
+    python cli.py run-all --config configs/pipeline.yml --foreground
 """
 
 import argparse
 import sys
-import subprocess
 from pathlib import Path
-from typing import Optional
-import os
+from typing import Optional, Dict, Any
 import json
 import time
-import importlib.util
+import copy
 
 # Avoid heavy imports at module import time; import lazily inside handlers
 
@@ -37,351 +28,144 @@ CHECKPOINT_DIR = OUTPUTS_DIR / "checkpoints"
 PROCESSED_DATA_DIR = TINKERING_DIR / "processed_data"
 RESULTS_DIR = OUTPUTS_DIR / "holdout_evaluation_results"
 
-# Mirror defaults to avoid importing training module for help text
-DEFAULT_HIDDEN_DIMS = [64, 32, 16]
-DEFAULT_DROPOUT_RATE = 0.5
-DEFAULT_WEIGHT_DECAY = 0.1
-DEFAULT_BATCH_SIZE = 256
-DEFAULT_LEARNING_RATE = 0.001
-DEFAULT_EPOCHS = 300
-DEFAULT_PATIENCE = 10
-DEFAULT_DEVICE = "cuda" if False else "cpu"  # will be overridden by training module at runtime
-
-DEFAULT_GCS_BUCKET = 'greenearth-471522-ingex-extract-stage'
-
-def _load_run_training_pipeline():
-    """Dynamically load run_training_pipeline from utils/05_train/stage_train.py (numeric folder)."""
-    stage_path = Path(__file__).parent / "utils" / "05_train" / "stage_train.py"
-    spec = importlib.util.spec_from_file_location("utils_stage_train", str(stage_path))
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Failed to load training stage module at {stage_path}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)  # type: ignore[attr-defined]
-    return getattr(mod, "run_training_pipeline")
-
-
-def _load_run_two_tower_pipeline():
-    """Dynamically load run_two_tower_pipeline from utils/05_train/stage_train_two_tower.py."""
-    stage_path = Path(__file__).parent / "utils" / "05_train" / "stage_train_two_tower.py"
-    spec = importlib.util.spec_from_file_location("utils_stage_train_two_tower", str(stage_path))
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Failed to load two-tower training stage module at {stage_path}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)  # type: ignore[attr-defined]
-    return getattr(mod, "run_two_tower_pipeline")
-
-
-def _load_stage_evaluate():
-    """Dynamically load utils/06_evaluate/stage_evaluate.py module."""
-    stage_path = Path(__file__).parent / "utils" / "06_evaluate" / "stage_evaluate.py"
-    spec = importlib.util.spec_from_file_location("utils_stage_evaluate", str(stage_path))
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Failed to load evaluate stage module at {stage_path}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)  # type: ignore[attr-defined]
-    return mod
-
-
-def _auto_latest_processed() -> Optional[str]:
-    """Return latest processed data file path or None if not found."""
-    if not PROCESSED_DATA_DIR.exists():
-        return None
-    candidates = list(PROCESSED_DATA_DIR.glob("processed_data_*.pkl"))
-    if not candidates:
-        return None
-    latest = max(candidates, key=lambda p: p.stat().st_mtime)
-    return str(latest)
-
-
-def _auto_latest_model() -> Optional[str]:
-    """Return latest model checkpoint path or None if not found."""
-    if not CHECKPOINT_DIR.exists():
-        return None
-    patterns = ["final_engagement_model_*.pth", "engagement_model_*.pth", "*.pth"]
-    candidates = []
-    for pat in patterns:
-        candidates.extend(CHECKPOINT_DIR.glob(pat))
-    if not candidates:
-        return None
-    latest = max(candidates, key=lambda p: p.stat().st_mtime)
-    return str(latest)
+# Central default map for all run-all parameters
+DEFAULTS: Dict[str, Any] = {
+    # Stage 1
+    "data_source": "greenearth",
+    "gcs_bucket": 'greenearth-471522-ingex-extract-stage',
+    "posts_start": None,
+    "posts_end": None,
+    "likes_start": None,
+    "likes_end": None,
+    "max_files_per_table": 5,
+    "image_mode": "auto",
+    "max_posts_per_author": 3,
+    "max_liked_posts_per_user": 100,
+    "cap_random_seed": 42,
+    "output_dir": None,
+    "run_name": None,
+    "debug": False,
+    # Stage 2/3/4
+    "global_topic_k": 20,
+    "relevel_method": "uniform",
+    "relevel_strategy": "uniform_mixture_balanced",
+    "relevel_alpha": 0.35,
+    "relevel_min_users_per_topic": 0,
+    "min_likes_per_user": 10,
+    "val_ratio": 0.2,
+    "holdout_ratio": 0.2,
+    "random_seed": 42,
+    "embedding_model": "all_MiniLM_L6_v2",
+    # Stage 5 (train)
+    "model_type": "mlp",
+    "shared_dim": 128,
+    "user_hidden_dim": 256,
+    "post_hidden_dim": 256,
+    "num_attention_heads": 4,
+    "num_attention_layers": 2,
+    "max_history_len": 20,
+    "epochs": 300,
+    "batch_size": 256,
+    "learning_rate": 0.001,
+    "weight_decay_mlp": 0.1,
+    "weight_decay_two_tower": 0.01,
+    "hidden_dims": [64, 32, 16],
+    "dropout_rate_mlp": 0.5,
+    "dropout_rate_two_tower": 0.1,
+    "prediction_posts_per_user": 1,
+    "device": "cpu",
+    "patience": 50,
+    "no_plots": False,
+    "no_save_model": False,
+    # Stage 6 (eval)
+    "eval_batch_size": 8192,
+    "eval_max_users": 0,
+    # Selection/prior behavior
+    "use_latest": False,
+    "start_from": None,
+    "stop_after": None,
+    "prior_get_data": None,
+    "prior_featurize": None,
+    "prior_relevel": None,
+    "prior_split": None,
+    "prior_train": None,
+    "pick_prior": False,
+    # Execution behavior
+    "foreground": False,
+    "_initial_log": None,
+}
 
 
-def cmd_preprocess(args) -> int:
-    # Lazy import from src
-    # Deprecated: preprocess now handled by stage scripts; keep stub to avoid src import
-    class DataPreprocessor:  # type: ignore
-        def __init__(self, *args, **kwargs):
-            pass
-        def run(self, *args, **kwargs):
-            print("Preprocess via stage scripts under utils/, not src.preprocess. (stub)")
-
-    pre = DataPreprocessor(
-        days=args.days,
-        min_likes_per_user=args.min_likes,
-        max_likes_per_liker=args.max_likes_per_liker,
-        val_ratio=args.test_ratio,
-        holdout_ratio=args.holdout_ratio,
-        random_seed=args.random_seed,
-        max_samples=args.max_samples,
-        drop_unliked_posts=args.drop_unliked,
-        limit_images=args.limit_images,
-        prediction_posts_per_user=args.prediction_posts_per_user,
-        require_liked_negatives=args.require_liked_negatives,
-        verbose_logging=args.verbose,
-        # New topic discovery + releveling
-        global_topic_k=getattr(args, 'global_topic_k', 20),
-        relevel_strategy=getattr(args, 'relevel_strategy', None),
-        relevel_alpha=getattr(args, 'relevel_alpha', 0.35),
-        relevel_min_users_per_topic=getattr(args, 'relevel_min_users_per_topic', 0),
-        # User features
-        user_features=getattr(args, 'user_features', 'topic_mixture'),
-        user_k=getattr(args, 'user_k', 3),
-        min_cluster_size=getattr(args, 'min_cluster_size', 3),
-        max_embedding_posts_per_user=getattr(args, 'max_embedding_posts_per_user', 20),
-    )
-    out_path = pre.run_complete_preprocessing()
-    print(f"\n✅ Preprocessing complete: {out_path}")
-    print(f"Next: python cli.py train --load-processed {out_path}")
-    return 0
+def _help_with_default(text: Optional[str], key: str) -> Optional[str]:
+    """Append default value text without duplicating default assignments."""
+    default_val = DEFAULTS.get(key, None)
+    if text is None:
+        text = ""
+    if default_val is None:
+        return text
+    return f"{text} (default: {default_val})"
 
 
-def cmd_train(args) -> int:
-    processed_path = args.load_processed
-    if processed_path in (None, "auto"):
-        processed_path = _auto_latest_processed()
-        if not processed_path:
-            print("❌ No processed data found. Run 'preprocess' first or provide --load-processed path.")
-            return 1
-        print(f"📂 Using latest processed data: {Path(processed_path).name}")
+def _arg_key_from_flag(flag: str) -> str:
+    """Convert a CLI flag (e.g., --posts-start) to the DEFAULTS key."""
+    return flag.lstrip("-").replace("-", "_")
 
-    # Use stage-based training pipeline (dynamic import due to numeric folder name)
-    run_training_pipeline = _load_run_training_pipeline()
 
-    results = run_training_pipeline(
-        days=args.days,
-        min_likes_per_user=args.min_likes_per_user,
-        test_ratio=args.test_ratio,
-        batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        epochs=args.epochs,
-        patience=args.patience,
-        hidden_dims=args.hidden_dims,
-        dropout_rate=args.dropout_rate,
-        device=args.device,
-        random_seed=args.random_seed,
-        save_model=not args.no_save_model,
-        generate_plots=not args.no_plots,
-        max_samples=args.max_samples,
-        drop_unliked_posts=args.drop_unliked_posts,
-        limit_images=args.limit_images,
-        load_processed=processed_path,
-        output_dir=Path(args.output_dir) if args.output_dir else None,
-        disable_progress=getattr(args, 'disable_progress', False),
-        tqdm_mininterval=getattr(args, 'tqdm_mininterval', None),
-        tqdm_miniters=getattr(args, 'tqdm_miniters', None),
-    )
+def _add_arg_with_default(parser: argparse.ArgumentParser, flag: str, *, key: Optional[str] = None,
+                          help_text: Optional[str] = None, **kwargs: Any) -> None:
+    """Add an argument with standardized default-aware help text."""
+    if help_text is not None:
+        effective_key = key or _arg_key_from_flag(flag)
+        kwargs["help"] = _help_with_default(help_text or "", effective_key)
+    parser.add_argument(flag, **kwargs)
 
-    if results.get("model_path"):
-        print(f"\n✅ Training complete. Model: {results['model_path']}")
-        print("Next: python cli.py evaluate --model-path auto --data-path auto")
+
+def _load_config_file(path_str: str) -> Dict[str, Any]:
+    """Load a YAML (or JSON) config file mapping CLI args to values."""
+    path = Path(path_str).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        yaml = None  # type: ignore
+    if yaml is not None:
+        data = yaml.safe_load(path.read_text())
     else:
-        print("\n✅ Training complete. Use 'evaluate' to evaluate on holdout users.")
-    return 0
-
-
-def cmd_evaluate(args) -> int:
-    model_path = args.model_path
-    if model_path in (None, "auto"):
-        model_path = _auto_latest_model()
-        if not model_path:
-            print("❌ No model found in checkpoints. Train a model first or provide --model-path.")
-            return 1
-        print(f"🤖 Using latest model: {Path(model_path).name}")
-    else:
-        print(f"🤖 Using model: {Path(model_path).name}")
-
-    data_path = args.data_path
-    if data_path in (None, "auto"):
-        data_path = _auto_latest_processed()
-        if not data_path:
-            print("❌ No processed data found. Run 'preprocess' first or provide --data-path.")
-            return 1
-        print(f"📊 Using latest data: {Path(data_path).name}")
-    else:
-        print(f"📊 Using data: {Path(data_path).name}")
-
-    # Route to stage 6 evaluator run function using a minimal context (dynamic import)
-    _stage_eval = _load_stage_evaluate()
-    class _Ctx:
-        def __init__(self, run_dir: str):
-            self.run_dir = run_dir
-            self.use_latest = True
-            self.prior_outputs = {}
-    # Resolve run_dir heuristically from provided paths
-    rd = Path(args.output_dir or RESULTS_DIR)
-    ctx = _Ctx(str(rd))
-    eval_args = args  # pass through
-    _stage_eval.run(ctx, eval_args)
-    print("\n✅ Evaluation completed.")
-    return 0
-
-
-def cmd_train_eval(args) -> int:
-    """Train using an embedding bundle + splits (auto-discovered from run-dir when provided), then run full-feed evaluation."""
-    # Determine model type
-    model_type = getattr(args, 'model_type', 'mlp')
-    
-    # Resolve run_dir (preferred) and auto-select bundle/splits if not explicitly provided
-    run_dir: Optional[Path] = Path(args.run_dir).resolve() if args.run_dir else None
-
-    def _infer_run_dir_from_path(p: Optional[str]) -> Optional[Path]:
-        if not p:
-            return None
         try:
-            path_obj = Path(p).resolve()
-            # .../precompute/embedding_bundle_*.pkl → run_dir
-            if path_obj.parent.name == 'precompute':
-                return path_obj.parent.parent
-            # .../relevel(_and_split_custom)/user_splits.json → run_dir
-            if path_obj.parent.name in ('relevel', 'relevel_and_split_custom'):
-                return path_obj.parent.parent
-            # .../train/(<ts>/)checkpoints/*.pth → run_dir
-            if path_obj.parent.name == 'checkpoints' and path_obj.parent.parent.name == 'train':
-                # support optional timestamp level
-                maybe_ts = path_obj.parent.parent
-                if maybe_ts.parent.name == 'train':
-                    return maybe_ts.parent.parent
-                return path_obj.parent.parent.parent
-        except Exception:
-            return None
-        return None
-
-    if run_dir is None:
-        run_dir = _infer_run_dir_from_path(args.embedding_bundle) or _infer_run_dir_from_path(args.user_splits)
-
-    # Resolve embedding bundle
-    if args.embedding_bundle:
-        bundle_path = Path(args.embedding_bundle).resolve()
-    else:
-        if not run_dir:
-            print("❌ Provide --run-dir or --embedding-bundle so I can locate the embedding bundle")
-            return 2
-        precompute_dir = run_dir / 'precompute'
-        candidates = sorted(precompute_dir.glob('embedding_bundle_*.pkl'), key=lambda p: p.stat().st_mtime, reverse=True)
-        if not candidates:
-            print(f"❌ No embedding_bundle_*.pkl found under {precompute_dir}")
-            return 2
-        bundle_path = candidates[0].resolve()
-        print(f"📦 Auto-selected embedding bundle: {bundle_path}")
-
-    # Resolve user_splits
-    if args.user_splits:
-        splits_path = Path(args.user_splits).resolve()
-    else:
-        if not run_dir:
-            print("❌ Provide --run-dir or --user-splits so I can locate user_splits.json")
-            return 2
-        custom_splits = run_dir / 'relevel_and_split_custom' / 'user_splits.json'
-        default_splits = run_dir / 'relevel' / 'user_splits.json'
-        if custom_splits.exists():
-            splits_path = custom_splits.resolve()
-            print(f"🧩 Auto-selected custom user splits: {splits_path}")
-        elif default_splits.exists():
-            splits_path = default_splits.resolve()
-            print(f"🧩 Auto-selected default user splits: {splits_path}")
-        else:
-            print(f"❌ Could not find user_splits.json under {run_dir}/relevel_and_split_custom or {run_dir}/relevel")
-            return 2
-
-    # Ensure run_dir set for downstream saves
-    if run_dir is None:
-        try:
-            # Fallback to outputs root
-            run_dir = OUTPUTS_DIR
-        except Exception:
-            run_dir = OUTPUTS_DIR
-
-    # Train based on model type
-    if model_type == 'two-tower':
-        print("🏗️  Using Two-Tower model architecture")
-        run_two_tower_pipeline = _load_run_two_tower_pipeline()
-        results = run_two_tower_pipeline(
-            embedding_bundle=str(bundle_path),
-            user_splits=str(splits_path),
-            shared_dim=getattr(args, 'shared_dim', 128),
-            user_hidden_dim=getattr(args, 'user_hidden_dim', 256),
-            post_hidden_dim=getattr(args, 'post_hidden_dim', 256),
-            num_attention_heads=getattr(args, 'num_attention_heads', 4),
-            num_attention_layers=getattr(args, 'num_attention_layers', 2),
-            max_history_len=getattr(args, 'max_history_len', 20),
-            dropout_rate=args.dropout_rate,
-            batch_size=args.batch_size,
-            learning_rate=args.learning_rate,
-            weight_decay=args.weight_decay,
-            epochs=args.epochs,
-            patience=args.patience,
-            device=args.device,
-            random_seed=args.random_seed,
-            output_dir=run_dir,
-            disable_progress=getattr(args, 'disable_progress', False),
-        )
-    else:
-        print("🏗️  Using MLP model architecture")
-        run_training_pipeline = _load_run_training_pipeline()
-        results = run_training_pipeline(
-            batch_size=args.batch_size,
-            learning_rate=args.learning_rate,
-            weight_decay=args.weight_decay,
-            epochs=args.epochs,
-            patience=args.patience,
-            hidden_dims=args.hidden_dims,
-            dropout_rate=args.dropout_rate,
-            device=args.device,
-            random_seed=args.random_seed,
-            save_model=not args.no_save_model,
-            generate_plots=not args.no_plots,
-            embedding_bundle=str(bundle_path),
-            user_splits=str(splits_path),
-            # Schema is set internally by training (multi_centroid by default)
-            topic_model_path=args.topic_model_path,
-            topic_pca_path=args.topic_pca_path,
-            output_dir=run_dir,
-            disable_progress=getattr(args, 'disable_progress', False),
-            tqdm_mininterval=getattr(args, 'tqdm_mininterval', None),
-            tqdm_miniters=getattr(args, 'tqdm_miniters', None),
-        )
-
-    # Report training results
-    if model_type == 'two-tower':
-        training_results = results.get("results", {})
-        print(f"\n✅ Two-Tower training complete.")
-        if 'model_path' in training_results:
-            print(f"   Model: {training_results['model_path']}")
-    else:
-        trained_model_path = results.get("model_path")
-        if trained_model_path:
-            print(f"\n✅ Training complete. Model: {trained_model_path}")
-        else:
-            print("\n✅ Training complete.")
-
-    # Directly invoke stage 6 run (pairs mode)
-    _stage_eval = _load_stage_evaluate()
-    class _Ctx:
-        def __init__(self, run_dir: str):
-            self.run_dir = run_dir
-            self.use_latest = True
-            self.prior_outputs = {}
-    ctx = _Ctx(str(run_dir.resolve()))
-    _stage_eval.run(ctx, args)
-    print("\n✅ Train → Evaluate completed")
-    return 0
+            data = json.loads(path.read_text())
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("PyYAML is not installed and the config file is not valid JSON") from exc
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError("Config file must contain a mapping of argument names to values")
+    # Normalize kebab-case to snake_case to match argparse dest names
+    return {k.replace("-", "_"): v for k, v in data.items()}
 
 
-def _build_python_cmd(script_path: Path, args_list: list[str]) -> list[str]:
-    return [sys.executable, str(script_path)] + args_list
+def _merge_args_with_config(raw_args: argparse.Namespace) -> argparse.Namespace:
+    """Apply defaults, then config file values, then CLI overrides."""
+    args_dict = vars(raw_args).copy()
+    command = args_dict.get("command")
+    func = args_dict.get("func")
+    config_path = args_dict.pop("config", None)
+    config_data: Dict[str, Any] = {}
+    if config_path:
+        config_data = _load_config_file(config_path)
 
+    merged: Dict[str, Any] = copy.deepcopy(DEFAULTS)
+    if config_data:
+        unknown_keys = set(config_data.keys()) - set(DEFAULTS.keys())
+        if unknown_keys:
+            raise ValueError(f"Unknown config keys: {', '.join(sorted(unknown_keys))}")
+        merged.update(config_data)
+    merged.update({k: v for k, v in args_dict.items() if k not in ("command", "func")})
+    final_ns = argparse.Namespace(**merged)
+    # Preserve argparse-injected metadata
+    setattr(final_ns, "command", command)
+    setattr(final_ns, "func", func)
+    return final_ns
 
 def cmd_run_all(args) -> int:
     """Run the 4-stage pipeline.
@@ -476,7 +260,7 @@ def cmd__run_all_exec(args) -> int:
 
     # Helper: map stage keys to enumerated folder names
     # Override relevel stage key if --relevel-method is specified
-    relevel_method = getattr(args, 'relevel_method', None)
+    relevel_method = args.relevel_method
     relevel_key = 'relevel'  # default
     if relevel_method == 'gini':
         relevel_key = 'relevel_gini'
@@ -486,10 +270,15 @@ def cmd__run_all_exec(args) -> int:
         relevel_key = 'relevel'
     
     # Override train stage key if --model-type is specified
-    model_type = getattr(args, 'model_type', 'mlp')
+    # Do not default to MLP if model name is not recognized - raise error instead
+    model_type = args.model_type
     train_key = 'train'  # default MLP
-    if model_type == 'two-tower':
+    if model_type == 'mlp':
+        train_key = 'train'
+    elif model_type == 'two-tower':
         train_key = 'train_two_tower'
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
     
     stage_order = ['get_data', 'featurize', relevel_key, 'split', train_key, 'evaluate']
     stage_folder = {}
@@ -498,8 +287,12 @@ def cmd__run_all_exec(args) -> int:
         stage_folder[key] = _folder
 
     # Respect selective reruns
-    start_from = getattr(args, 'start_from', None)
-    stop_after = getattr(args, 'stop_after', None)
+    start_from = args.start_from
+    if start_from and start_from not in stage_order:
+        raise ValueError(f"Unrecognized start_from: {start_from}. Please choose from: {stage_order}")
+    stop_after = args.stop_after
+    if stop_after and stop_after not in stage_order:
+        raise ValueError(f"Unrecognized stop_after: {stop_after}. Please choose from: {stage_order}")
     # Map 'relevel' to the actual relevel key if specified
     if start_from == 'relevel':
         start_from = relevel_key
@@ -529,7 +322,7 @@ def cmd__run_all_exec(args) -> int:
 
     # Optional interactive chooser (foreground only)
     def _maybe_choose_prior(stage_key: str):
-        if not getattr(args, 'pick_prior', False):
+        if not args.pick_prior:
             return
         folder = stage_folder[stage_key]
         base = (run_dir / folder)
@@ -539,7 +332,7 @@ def cmd__run_all_exec(args) -> int:
         if len(subdirs) <= 1:
             return
         # Prompt only in foreground mode
-        if not bool(getattr(args, 'foreground', False)):
+        if not bool(args.foreground):
             return
         subdirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         print(f"\nPick prior output for stage '{stage_key}' under {base}:")
@@ -581,187 +374,143 @@ def cmd__run_all_exec(args) -> int:
     print("\n✅ run-all completed successfully")
     return 0
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Engagement Prediction Pipeline CLI")
+    parser = argparse.ArgumentParser(
+        description="Engagement Prediction Pipeline CLI",
+        argument_default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        help="YAML/JSON config file with run-all parameters (CLI flags override config)",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
-
-    # preprocess
-    p_pre = subparsers.add_parser("preprocess", help="Run data preprocessing")
-    p_pre.add_argument("--days", type=int, default=5)
-    p_pre.add_argument("--min-likes", type=int, default=4)
-    p_pre.add_argument("--max-likes-per-liker", type=int, default=None)
-    p_pre.add_argument("--test-ratio", type=float, default=0.2)
-    p_pre.add_argument("--holdout-ratio", type=float, default=0.2)
-    p_pre.add_argument("--random-seed", type=int, default=42)
-    p_pre.add_argument("--max-samples", type=int, default=None)
-    p_pre.add_argument("--drop-unliked", action="store_true")
-    p_pre.add_argument("--limit-images", action="store_true")
-    p_pre.add_argument("--prediction-posts-per-user", type=int, default=1)
-    p_pre.add_argument("--require-liked-negatives", action="store_true", 
-                       help="Sample negative examples only from posts liked by someone else in dataset")
-    p_pre.add_argument("--verbose", action="store_true")
-    # Topic discovery + releveling options
-    p_pre.add_argument("--global-topic-k", type=int, default=20)
-    p_pre.add_argument("--relevel-strategy", type=str, default=None,
-                       help="Set to 'uniform_mixture_balanced' to enable user-level topic releveling")
-    p_pre.add_argument("--relevel-alpha", type=float, default=0.35)
-    p_pre.add_argument("--relevel-min-users-per-topic", type=int, default=0)
-    # User feature options
-    p_pre.add_argument("--user-features", type=str, default='topic_mixture',
-                      choices=['topic_mixture','multi_centroid','mean'],
-                      help="User feature representation for training data")
-    p_pre.add_argument("--user-k", type=int, default=3, help="K for multi-centroid user features")
-    p_pre.add_argument("--min-cluster-size", type=int, default=3, help="Min posts per cluster for per-user KMeans")
-    p_pre.add_argument("--max-embedding-posts-per-user", type=int, default=20,
-                      help="Cap embedding posts per user used to compute user features")
-    p_pre.set_defaults(func=cmd_preprocess)
-
-    # train
-    p_train = subparsers.add_parser("train", help="Train model using preprocessed data")
-    p_train.add_argument("--load-processed", type=str, default="auto", help="Path to processed data .pkl or 'auto'")
-    p_train.add_argument("--days", type=int, default=5)
-    p_train.add_argument("--min-likes-per-user", type=int, default=4)
-    p_train.add_argument("--test-ratio", type=float, default=0.2)
-    p_train.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
-    p_train.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
-    p_train.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
-    p_train.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
-    p_train.add_argument("--patience", type=int, default=DEFAULT_PATIENCE)
-    p_train.add_argument("--hidden-dims", type=int, nargs="+", default=None)
-    p_train.add_argument("--dropout-rate", type=float, default=DEFAULT_DROPOUT_RATE)
-    p_train.add_argument("--device", type=str, default=DEFAULT_DEVICE)
-    p_train.add_argument("--random-seed", type=int, default=42)
-    p_train.add_argument("--no-save-model", action="store_true")
-    p_train.add_argument("--no-plots", action="store_true")
-    p_train.add_argument("--max-samples", type=int, default=None)
-    p_train.add_argument("--drop-unliked-posts", action="store_true")
-    p_train.add_argument("--limit-images", action="store_true")
-    p_train.add_argument("--output-dir", type=str, default=None, help="Optional run directory; checkpoints/plots/logs will be created under this path")
-    # Progress controls
-    p_train.add_argument("--disable-progress", action="store_true", help="Disable tqdm progress bars during training")
-    p_train.add_argument("--tqdm-mininterval", type=float, default=None, help="Min seconds between tqdm refreshes during training")
-    p_train.add_argument("--tqdm-miniters", type=int, default=None, help="Min iterations between tqdm refreshes during training")
-    p_train.set_defaults(func=cmd_train)
-
-    # evaluate
-    p_eval = subparsers.add_parser("evaluate", help="Evaluate trained model on holdout users")
-    p_eval.add_argument("--model-path", type=str, default="auto", help="Path to .pth or 'auto'")
-    p_eval.add_argument("--data-path", type=str, default="auto", help="Path to processed .pkl or 'auto'")
-    p_eval.add_argument("--output-dir", type=str, default=str(RESULTS_DIR))
-    p_eval.add_argument("--device", type=str, default=DEFAULT_DEVICE)
-    p_eval.add_argument("--random-seed", type=int, default=42)
-    p_eval.add_argument("--batch-size", type=int, default=256)
-    p_eval.add_argument("--create-plots", action="store_true")
-    p_eval.set_defaults(func=cmd_evaluate)
-
-    # train-eval
-    p_te = subparsers.add_parser("train-eval", help="Train, then run full-feed evaluation using bundle + splits")
-    # IO resolution: allow --run-dir to auto-discover, or explicit paths
-    p_te.add_argument("--run-dir", type=str, default=None, help="Run directory; auto-discovers bundle and splits when provided")
-    p_te.add_argument("--embedding-bundle", type=str, default=None, help="Optional path to embedding_bundle_*.pkl (auto from --run-dir if omitted)")
-    p_te.add_argument("--user-splits", type=str, default=None, help="Optional path to user_splits.json (auto from --run-dir if omitted)")
-    # Model type selection
-    p_te.add_argument("--model-type", type=str, choices=["mlp", "two-tower"], default="mlp",
-                      help="Model architecture: 'mlp' (default) or 'two-tower'")
-    # Two-tower specific options
-    p_te.add_argument("--shared-dim", type=int, default=128, help="Two-tower shared embedding dimension")
-    p_te.add_argument("--user-hidden-dim", type=int, default=256, help="Two-tower user encoder hidden dimension")
-    p_te.add_argument("--post-hidden-dim", type=int, default=256, help="Two-tower post encoder hidden dimension")
-    p_te.add_argument("--num-attention-heads", type=int, default=4, help="Two-tower attention heads")
-    p_te.add_argument("--num-attention-layers", type=int, default=2, help="Two-tower attention layers")
-    p_te.add_argument("--max-history-len", type=int, default=20, help="Two-tower max user history length")
-    # Topic-model options are ignored by training (default multi_centroid); kept for eval compatibility if needed
-    p_te.add_argument("--topic-model-path", type=str, default=None)
-    p_te.add_argument("--topic-pca-path", type=str, default=None)
-    # Training knobs (subset of train)
-    p_te.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
-    p_te.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
-    p_te.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
-    p_te.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
-    p_te.add_argument("--patience", type=int, default=DEFAULT_PATIENCE)
-    p_te.add_argument("--hidden-dims", type=int, nargs="+", default=None)
-    p_te.add_argument("--dropout-rate", type=float, default=DEFAULT_DROPOUT_RATE)
-    p_te.add_argument("--device", type=str, default=DEFAULT_DEVICE)
-    p_te.add_argument("--random-seed", type=int, default=42)
-    p_te.add_argument("--no-save-model", action="store_true")
-    p_te.add_argument("--no-plots", action="store_true")
-    # Progress / logging controls for training
-    p_te.add_argument("--disable-progress", action="store_true", help="Disable tqdm progress bars during training")
-    p_te.add_argument("--tqdm-mininterval", type=float, default=None, help="Min seconds between tqdm refreshes during training")
-    p_te.add_argument("--tqdm-miniters", type=int, default=None, help="Min iterations between tqdm refreshes during training")
-    # Evaluation knobs
-    p_te.add_argument("--max-users", type=int, default=0, help="0 = all eligible holdout users")
-    p_te.add_argument("--eval-batch-size", type=int, default=None, help="Override eval scoring batch size (defaults to script)")
-    p_te.set_defaults(func=cmd_train_eval)
 
     # run-all (modular 6-stage end-to-end)
     p_all = subparsers.add_parser("run-all", help="Run all 6 stages end-to-end. Defaults to background with nohup.")
     # Stage 1 options
-    p_all.add_argument("--data-source", type=str, choices=["greenearth", "digitalocean"], default="greenearth")
-    p_all.add_argument("--gcs-bucket", type=str, default=DEFAULT_GCS_BUCKET, help="GCS bucket name for ingex data")
-    p_all.add_argument("--posts-start", type=str, default=None, help="ISO date string for ingex GCS posts start (inclusive)")
-    p_all.add_argument("--posts-end", type=str, default=None, help="ISO date string for ingex GCS posts end (exclusive)")
-    p_all.add_argument("--likes-start", type=str, default=None, help="ISO date string for ingex GCS likes start (inclusive)")
-    p_all.add_argument("--likes-end", type=str, default=None, help="ISO date string for ingex GCS likes end (exclusive)")
-    p_all.add_argument("--max-files-per-table", type=int, default=5)
-    p_all.add_argument("--image-mode", type=str, choices=["auto", "off", "on"], default="auto")
-    p_all.add_argument("--max-posts-per-author", type=int, default=3)
-    p_all.add_argument("--max-liked-posts-per-user", type=int, default=100)
-    p_all.add_argument("--cap-random-seed", type=int, default=42)
-    p_all.add_argument("--output-dir", type=str, default=None, help="Optional explicit run directory root")
-    p_all.add_argument("--run-name", type=str, default=None, help="Optional suffix for Stage 1 run dir name")
-    p_all.add_argument("--debug", action="store_true", help="Enable verbose debug logging for Stage 1")
+    _add_arg_with_default(p_all, "--data-source", type=str, choices=["greenearth", "digitalocean"],
+                          default=argparse.SUPPRESS, help_text="Source for raw input data - posts and likes")
+    _add_arg_with_default(p_all, "--gcs-bucket", type=str, default=argparse.SUPPRESS,
+                          help_text="GCS bucket name for ingex data")
+    _add_arg_with_default(p_all, "--posts-start", type=str, default=argparse.SUPPRESS,
+                          help_text="ISO date string for ingex GCS posts start (inclusive)")
+    _add_arg_with_default(p_all, "--posts-end", type=str, default=argparse.SUPPRESS,
+                          help_text="ISO date string for ingex GCS posts end (exclusive)")
+    _add_arg_with_default(p_all, "--likes-start", type=str, default=argparse.SUPPRESS,
+                          help_text="ISO date string for ingex GCS likes start (inclusive)")
+    _add_arg_with_default(p_all, "--likes-end", type=str, default=argparse.SUPPRESS,
+                          help_text="ISO date string for ingex GCS likes end (exclusive)")
+    _add_arg_with_default(p_all, "--max-files-per-table", type=int, default=argparse.SUPPRESS,
+                          help_text="Maximum files to read per ingex table")
+    _add_arg_with_default(p_all, "--image-mode", type=str, choices=["auto", "off", "on"],
+                          default=argparse.SUPPRESS, help_text="Control image handling during data pull")
+    _add_arg_with_default(p_all, "--max-posts-per-author", type=int, default=argparse.SUPPRESS,
+                          help_text="Cap on posts per author during ingestion")
+    _add_arg_with_default(p_all, "--max-liked-posts-per-user", type=int, default=argparse.SUPPRESS,
+                          help_text="Cap on liked posts per user during ingestion")
+    _add_arg_with_default(p_all, "--cap-random-seed", type=int, default=argparse.SUPPRESS,
+                          help_text="Random seed for ingestion capping")
+    _add_arg_with_default(p_all, "--output-dir", type=str, default=argparse.SUPPRESS,
+                          help_text="Optional explicit run directory root")
+    _add_arg_with_default(p_all, "--run-name", type=str, default=argparse.SUPPRESS,
+                          help_text="Optional suffix for Stage 1 run dir name")
+    _add_arg_with_default(p_all, "--debug", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Enable verbose debug logging for Stage 1")
     # Stage 2 options
-    p_all.add_argument("--global-topic-k", type=int, default=20)
-    p_all.add_argument("--relevel-method", type=str, choices=["uniform", "gini", "simple"], default="uniform",
-                      help="Which relevel script to use: 'uniform' (default), 'gini' (Gini-optimized), or 'simple'")
-    p_all.add_argument("--relevel-strategy", type=str, choices=["none", "uniform_mixture_balanced"], default="uniform_mixture_balanced")
-    p_all.add_argument("--relevel-alpha", type=float, default=0.35)
-    p_all.add_argument("--relevel-min-users-per-topic", type=int, default=0)
-    p_all.add_argument("--min-likes-per-user", type=int, default=10)
-    p_all.add_argument("--val-ratio", type=float, default=0.2)
-    p_all.add_argument("--holdout-ratio", type=float, default=0.2)
-    p_all.add_argument("--random-seed", type=int, default=42)
-    p_all.add_argument("--embedding-model", type=str, choices=["all_MiniLM_L6_v2", "all_MiniLM_L12_v2"], default='all_MiniLM_L6_v2', help="The SentenceTransformers model to use to look up precomputed embeddings or generate them.")
+    _add_arg_with_default(p_all, "--global-topic-k", type=int, default=argparse.SUPPRESS,
+                          help_text="Number of global topics")
+    _add_arg_with_default(p_all, "--relevel-method", type=str, choices=["uniform", "gini", "simple"],
+                          default=argparse.SUPPRESS, help_text="Which relevel script to use: uniform, gini, or simple")
+    _add_arg_with_default(p_all, "--relevel-strategy", type=str, choices=["none", "uniform_mixture_balanced"],
+                          default=argparse.SUPPRESS, help_text="Relevel weighting strategy")
+    _add_arg_with_default(p_all, "--relevel-alpha", type=float, default=argparse.SUPPRESS,
+                          help_text="Alpha parameter for relevel weighting")
+    _add_arg_with_default(p_all, "--relevel-min-users-per-topic", type=int, default=argparse.SUPPRESS,
+                          help_text="Minimum users per topic when releveling")
+    _add_arg_with_default(p_all, "--min-likes-per-user", type=int, default=argparse.SUPPRESS,
+                          help_text="Minimum likes per user for inclusion")
+    _add_arg_with_default(p_all, "--val-ratio", type=float, default=argparse.SUPPRESS,
+                          help_text="Validation ratio")
+    _add_arg_with_default(p_all, "--holdout-ratio", type=float, default=argparse.SUPPRESS,
+                          help_text="Holdout ratio")
+    _add_arg_with_default(p_all, "--random-seed", type=int, default=argparse.SUPPRESS,
+                          help_text="Random seed for splitting")
+    _add_arg_with_default(p_all, "--embedding-model", type=str, choices=["all_MiniLM_L6_v2", "all_MiniLM_L12_v2"],
+                          default=argparse.SUPPRESS, help_text="SentenceTransformers model for embeddings")
     # Stage 5 (train) model selection
-    p_all.add_argument("--model-type", type=str, choices=["mlp", "two-tower"], default="mlp",
-                      help="Model architecture: 'mlp' (default MLP) or 'two-tower' (two-tower with attention)")
+    _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower"],
+                          default=argparse.SUPPRESS, help_text="Model architecture: mlp or two-tower")
     # Two-tower specific options
-    p_all.add_argument("--shared-dim", type=int, default=128, help="Two-tower shared embedding dimension")
-    p_all.add_argument("--user-hidden-dim", type=int, default=256, help="Two-tower user encoder hidden dimension")
-    p_all.add_argument("--post-hidden-dim", type=int, default=256, help="Two-tower post encoder hidden dimension")
-    p_all.add_argument("--num-attention-heads", type=int, default=4, help="Two-tower attention heads")
-    p_all.add_argument("--num-attention-layers", type=int, default=2, help="Two-tower attention layers")
-    p_all.add_argument("--max-history-len", type=int, default=20, help="Two-tower max user history length")
+    _add_arg_with_default(p_all, "--shared-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="Two-tower shared embedding dimension")
+    _add_arg_with_default(p_all, "--user-hidden-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="Two-tower user encoder hidden dimension")
+    _add_arg_with_default(p_all, "--post-hidden-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="Two-tower post encoder hidden dimension")
+    _add_arg_with_default(p_all, "--num-attention-heads", type=int, default=argparse.SUPPRESS,
+                          help_text="Two-tower attention heads")
+    _add_arg_with_default(p_all, "--num-attention-layers", type=int, default=argparse.SUPPRESS,
+                          help_text="Two-tower attention layers")
+    _add_arg_with_default(p_all, "--max-history-len", type=int, default=argparse.SUPPRESS,
+                          help_text="Two-tower max user history length")
     # Stage 5 options (shared)
-    p_all.add_argument("--epochs", type=int, default=300)
-    p_all.add_argument("--batch-size", type=int, default=256)
-    p_all.add_argument("--learning-rate", type=float, default=0.001)
-    p_all.add_argument("--weight-decay", type=float, default=0.1)
-    p_all.add_argument("--hidden-dims", type=int, nargs="+", default=None)
-    p_all.add_argument("--dropout-rate", type=float, default=0.5)
-    p_all.add_argument("--device", type=str, default=DEFAULT_DEVICE)
-    p_all.add_argument("--patience", type=int, default=50, help="Early stopping patience")
-    p_all.add_argument("--no-plots", action="store_true")
-    p_all.add_argument("--no-save-model", action="store_true")
+    _add_arg_with_default(p_all, "--epochs", type=int, default=argparse.SUPPRESS,
+                          help_text="Training epochs")
+    _add_arg_with_default(p_all, "--batch-size", type=int, default=argparse.SUPPRESS,
+                          help_text="Training batch size")
+    _add_arg_with_default(p_all, "--learning-rate", type=float, default=argparse.SUPPRESS,
+                          help_text="Learning rate")
+    _add_arg_with_default(p_all, "--weight-decay-mlp", type=float, default=argparse.SUPPRESS,
+                          help_text="Weight decay for MLP model")
+    _add_arg_with_default(p_all, "--weight-decay-two-tower", type=float, default=argparse.SUPPRESS,
+                          help_text="Weight decay for two tower model")
+    _add_arg_with_default(p_all, "--hidden-dims", type=int, nargs="+", default=argparse.SUPPRESS,
+                          help_text="Hidden layer sizes")
+    _add_arg_with_default(p_all, "--dropout-rate-mlp", type=float, default=argparse.SUPPRESS,
+                          help_text="Dropout rate for MLP model")
+    _add_arg_with_default(p_all, "--dropout-rate-two-tower", type=float, default=argparse.SUPPRESS,
+                          help_text="Dropout rate for two tower model")
+    _add_arg_with_default(p_all, "--prediction-posts-per-user", type=float, default=argparse.SUPPRESS,
+                          help_text="Prediction posts per user")
+    _add_arg_with_default(p_all, "--device", type=str, default=argparse.SUPPRESS,
+                          help_text="Device for training")
+    _add_arg_with_default(p_all, "--patience", type=int, default=argparse.SUPPRESS,
+                          help_text="Early stopping patience")
+    _add_arg_with_default(p_all, "--no-plots", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Disable training plots")
+    _add_arg_with_default(p_all, "--no-save-model", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Skip saving model checkpoints")
     # Stage 4 options (subset)
-    p_all.add_argument("--eval-batch-size", type=int, default=8192)
-    p_all.add_argument("--eval-max-users", type=int, default=0, help="0 = all eligible")
+    _add_arg_with_default(p_all, "--eval-batch-size", type=int, default=argparse.SUPPRESS,
+                          help_text="Batch size for evaluation")
+    _add_arg_with_default(p_all, "--eval-max-users", type=int, default=argparse.SUPPRESS,
+                          help_text="0 = all eligible users for evaluation")
     # Selection behavior
-    p_all.add_argument("--use-latest", action="store_true", help="(Deprecated) Always enabled during sequential run-all")
+    _add_arg_with_default(p_all, "--use-latest", action="store_true", default=argparse.SUPPRESS,
+                          help_text="(Deprecated) Always enabled during sequential run-all")
     # Selective reruns and prior pinning
-    p_all.add_argument("--start-from", type=str, choices=["get_data","featurize","relevel","split","train","evaluate"], default=None,
-                      help="Begin execution at this stage")
-    p_all.add_argument("--stop-after", type=str, choices=["get_data","featurize","relevel","split","train","evaluate"], default=None,
-                      help="Stop after this stage completes")
-    p_all.add_argument("--prior-get-data", type=str, default=None, help="Path to a specific 01_get_data/<ts> directory")
-    p_all.add_argument("--prior-featurize", type=str, default=None, help="Path to a specific 02_featurize/<ts> directory")
-    p_all.add_argument("--prior-relevel", type=str, default=None, help="Path to a specific 03_relevel/<ts> directory")
-    p_all.add_argument("--prior-split", type=str, default=None, help="Path to a specific 04_split/<ts> directory")
-    p_all.add_argument("--prior-train", type=str, default=None, help="Path to a specific 05_train/<ts> directory")
-    p_all.add_argument("--pick-prior", action="store_true", help="If multiple prior outputs exist, prompt to pick (foreground only)")
+    _add_arg_with_default(p_all, "--start-from", type=str,
+                          choices=["get_data", "featurize", "relevel", "split", "train", "evaluate"],
+                          default=argparse.SUPPRESS, help_text="Begin execution at this stage")
+    _add_arg_with_default(p_all, "--stop-after", type=str,
+                          choices=["get_data", "featurize", "relevel", "split", "train", "evaluate"],
+                          default=argparse.SUPPRESS, help_text="Stop after this stage completes")
+    _add_arg_with_default(p_all, "--prior-get-data", type=str, default=argparse.SUPPRESS,
+                          help_text="Path to a specific 01_get_data/<ts> directory")
+    _add_arg_with_default(p_all, "--prior-featurize", type=str, default=argparse.SUPPRESS,
+                          help_text="Path to a specific 02_featurize/<ts> directory")
+    _add_arg_with_default(p_all, "--prior-relevel", type=str, default=argparse.SUPPRESS,
+                          help_text="Path to a specific 03_relevel/<ts> directory")
+    _add_arg_with_default(p_all, "--prior-split", type=str, default=argparse.SUPPRESS,
+                          help_text="Path to a specific 04_split/<ts> directory")
+    _add_arg_with_default(p_all, "--prior-train", type=str, default=argparse.SUPPRESS,
+                          help_text="Path to a specific 05_train/<ts> directory")
+    _add_arg_with_default(p_all, "--pick-prior", action="store_true", default=argparse.SUPPRESS,
+                          help_text="If multiple prior outputs exist, prompt to pick (foreground only)")
     # Execution behavior
-    p_all.add_argument("--foreground", action="store_true", help="Run in foreground (default: background with nohup)")
-    p_all.add_argument("--_initial-log", type=str, default=None, help=argparse.SUPPRESS)
+    _add_arg_with_default(p_all, "--foreground", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Run in foreground (default: background with nohup)")
+    p_all.add_argument("--_initial-log", type=str, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     p_all.set_defaults(func=cmd_run_all)
 
     return parser
@@ -769,8 +518,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     parser = build_parser()
-    args = parser.parse_args()
-    return args.func(args)
+    raw_args = parser.parse_args()
+    merged_args = _merge_args_with_config(raw_args)
+    return merged_args.func(merged_args)
 
 
 if __name__ == "__main__":

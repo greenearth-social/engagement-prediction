@@ -26,17 +26,17 @@ def run(context, args) -> Dict[str, Any]:
     logger = get_stage_logger('STAGE_01_GET_DATA', log_file=out_dir / 'stage.log')
 
     # Parameters (defaults are set in cli.py)
-    data_source = getattr(args, 'data_source')
+    data_source = args.data_source
 
     # Inputs for GreenEarth Ingex version
-    gcs_bucket = getattr(args, 'gcs_bucket')
-    posts_start = getattr(args, 'posts_start')
-    posts_end = getattr(args, 'posts_end')
-    likes_start = getattr(args, 'likes_start')
-    likes_end = getattr(args, 'likes_end')
+    gcs_bucket = args.gcs_bucket
+    posts_start = args.posts_start
+    posts_end = args.posts_end
+    likes_start = args.likes_start
+    likes_end = args.likes_end
     
     # Inputs for DigitalOcean version
-    max_files = int(getattr(args, 'max_files_per_table', 5))
+    max_files = int(args.max_files_per_table)
     
     t0 = time.time()
     
@@ -95,5 +95,4 @@ def run(context, args) -> Dict[str, Any]:
             'raw_data_path': str(raw_path),
         },
     }
-
 

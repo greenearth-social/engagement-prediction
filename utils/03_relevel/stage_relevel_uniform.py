@@ -68,8 +68,8 @@ def run(context, args) -> Dict[str, Any]:
     likes_joinable = likes_df_local[likes_df_local[join_like].isin(available_posts)]
 
     # Topic discovery
-    global_topic_k = int(getattr(args, 'global_topic_k', 20))
-    random_seed = int(getattr(args, 'random_seed', 42))
+    global_topic_k = int(args.global_topic_k)
+    random_seed = int(args.random_seed)
     t0 = time.time()
     log_operation_start(f'Topic discovery (PCA + KMeans, k={global_topic_k})', 'STAGE_03_RELEVEL', logger)
     artifacts = discover_topics(posts_emb_df, likes_joinable, join_like, join_post, global_topic_k=global_topic_k, random_seed=random_seed)
@@ -88,15 +88,15 @@ def run(context, args) -> Dict[str, Any]:
     mixtures.to_parquet(mixtures_path, index=True)
 
     # Optional selection
-    relevel_strategy = str(getattr(args, 'relevel_strategy', 'uniform_mixture_balanced'))
-    relevel_alpha = float(getattr(args, 'relevel_alpha', 0.35))
-    relevel_min_users_per_topic = int(getattr(args, 'relevel_min_users_per_topic', 0))
+    relevel_strategy = str(args.relevel_strategy)
+    relevel_alpha = float(args.relevel_alpha)
+    relevel_min_users_per_topic = int(args.relevel_min_users_per_topic)
 
     retained_users_path = None
     if relevel_strategy == 'uniform_mixture_balanced' and artifacts.global_topic_k:
         log_operation_start(f'Relevel user selection (strategy={relevel_strategy}, alpha={relevel_alpha})', 'STAGE_03_RELEVEL', logger)
         # Eligible users based on min likes per user
-        min_likes_per_user = int(getattr(args, 'min_likes_per_user', 4))
+        min_likes_per_user = int(args.min_likes_per_user)
         counts = likes_joinable.groupby('did', observed=True)[join_like].nunique().astype(int)
         eligible_users = counts[counts >= min_likes_per_user].index.astype(str).tolist()
         kept_users = relevel_uniform_mixture(
@@ -145,6 +145,5 @@ def run(context, args) -> Dict[str, Any]:
             'embedding_bundle_path': str(bundle_path.resolve()),
         }
     }
-
 
 

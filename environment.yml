@@ -18,6 +18,7 @@ dependencies:
   - polars
   - requests
   - sentence-transformers
+  - pyyaml
 
   - pytorch
   - torchvision

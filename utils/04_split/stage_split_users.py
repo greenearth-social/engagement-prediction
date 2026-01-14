@@ -59,7 +59,7 @@ def run(context, args) -> Dict[str, Any]:
         raise KeyError(f"likes_df missing join_like column: {join_like}")
     likes_df_local[join_like] = likes_df_local[join_like].astype(str)
     likes_joinable = likes_df_local[likes_df_local[join_like].isin(available_posts)]
-    min_likes_per_user = int(getattr(args, 'min_likes_per_user', 4))
+    min_likes_per_user = int(args.min_likes_per_user)
     
     log_operation_start(f'Compute eligible users (min_likes_per_user={min_likes_per_user})', 'STAGE_04_SPLIT', logger)
     counts = likes_joinable.groupby('did', observed=True)[join_like].nunique().astype(int)
@@ -85,11 +85,11 @@ def run(context, args) -> Dict[str, Any]:
     t0 = time.time()
     log_operation_start('Split users into train/val/holdout', 'STAGE_04_SPLIT', logger)
     import numpy as np
-    rng = np.random.RandomState(int(getattr(args, 'random_seed', 42)))
+    rng = np.random.RandomState(int(args.random_seed))
     users_shuffled = eligible_users.copy()
     rng.shuffle(users_shuffled)
-    holdout_ratio = float(getattr(args, 'holdout_ratio', 0.2))
-    val_ratio = float(getattr(args, 'val_ratio', 0.2))
+    holdout_ratio = float(args.holdout_ratio)
+    val_ratio = float(args.val_ratio)
 
     n_holdout = int(np.floor(len(users_shuffled) * holdout_ratio))
     holdout_users = users_shuffled[:n_holdout]
@@ -143,5 +143,4 @@ def run(context, args) -> Dict[str, Any]:
             'embedding_bundle_path': str(bundle_path.resolve()),
         }
     }
-
 

@@ -139,8 +139,8 @@ def run(context, args) -> Dict[str, Any]:
 
     log_operation_start('Resolve assets (model, bundle, splits)', 'STAGE_06_EVALUATE', logger)
     model_path, bundle_path, splits_path = _resolve_assets(run_dir, context, args)
-    device = str(getattr(args, 'device', 'cpu'))
-    batch_size = int(getattr(args, 'batch_size', 8192))
+    device = str(args.device)
+    batch_size = int(args.eval_batch_size)
     enforce_training_config = bool(getattr(args, 'enforce_training_config', True))
 
     # Load model & bundle
@@ -195,7 +195,7 @@ def run(context, args) -> Dict[str, Any]:
     available_posts = set(posts_emb_df[join_post].astype(str).unique())
     likes_hou[join_like] = likes_hou[join_like].astype(str)
     likes_joinable = likes_hou[likes_hou[join_like].isin(available_posts)]
-    min_likes_per_user = int(getattr(args, 'min_likes_per_user', 10))
+    min_likes_per_user = int(args.min_likes_per_user)
     counts = (
         likes_joinable.groupby('did', observed=True)[join_like]
         .nunique()
@@ -206,10 +206,10 @@ def run(context, args) -> Dict[str, Any]:
     selected_users = [u for u in holdout_users if str(u) in eligible_set]
 
     # Allocation for pairs/matrix
-    prediction_posts_per_user = int(getattr(args, 'prediction_posts_per_user', 1))
+    prediction_posts_per_user = int(args.prediction_posts_per_user)
     max_embedding_posts_per_user = int(getattr(args, 'max_embedding_posts_per_user', 50))
     negatives_liked_only = bool(getattr(args, 'negatives_liked_only', False))
-    cap_seed = int(getattr(args, 'cap_random_seed', 42))
+    cap_seed = int(args.cap_random_seed)
 
     # Filter likes to selected users & joinable
     likes_local = likes_df[likes_df['did'].isin(set(selected_users))].copy()
@@ -309,7 +309,7 @@ def run(context, args) -> Dict[str, Any]:
                 embedding_dim=int(embedding_dim),
                 selected_users=selected_users,
                 feature_columns=feature_columns,
-                random_seed=int(getattr(args, 'random_seed', 42)),
+                random_seed=int(args.random_seed),
             )
             pos_df = prediction_likes_df.merge(
                 posts_emb_df[[join_post] + post_emb_cols], left_on=join_like, right_on=join_post, how='inner'
@@ -534,5 +534,4 @@ def run(context, args) -> Dict[str, Any]:
         'output_dir': out_dir,
         'artifacts': summary,
     }
-
 

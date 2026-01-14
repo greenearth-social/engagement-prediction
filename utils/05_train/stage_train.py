@@ -613,21 +613,22 @@ def run(context, args) -> Dict[str, Any]:
     results = run_training_pipeline(
         embedding_bundle=str(bundle_path.resolve()),
         user_splits=str(splits_path.resolve()),
-        batch_size=int(getattr(args, 'batch_size', 256)),
-        learning_rate=float(getattr(args, 'learning_rate', 0.001)),
-        weight_decay=float(getattr(args, 'weight_decay', 0.1)),
-        epochs=int(getattr(args, 'epochs', 300)),
-        patience=int(getattr(args, 'patience', 50)),
-        hidden_dims=getattr(args, 'hidden_dims', None),
-        dropout_rate=float(getattr(args, 'dropout_rate', 0.5)),
-        device=str(getattr(args, 'device', 'cpu')),
-        random_seed=int(getattr(args, 'random_seed', 42)),
-        save_model=not bool(getattr(args, 'no_save_model', False)),
-        generate_plots=not bool(getattr(args, 'no_plots', False)),
+        batch_size=int(args.batch_size),
+        learning_rate=float(args.learning_rate),
+        weight_decay=float(args.weight_decay_mlp),
+        epochs=int(args.epochs),
+        patience=int(args.patience),
+        hidden_dims=args.hidden_dims,
+        dropout_rate=float(args.dropout_rate_mlp),
+        device=str(args.device),
+        random_seed=int(args.random_seed),
+        save_model=not bool(args.no_save_model),
+        generate_plots=not bool(args.no_plots),
         output_dir=run_dir,  # training module will create train/<ts>/ under this; we'll relocate to 05_train
         disable_progress=bool(getattr(args, 'disable_progress', False)),
         tqdm_mininterval=getattr(args, 'tqdm_mininterval', None),
         tqdm_miniters=getattr(args, 'tqdm_miniters', None),
+        prediction_posts_per_user=int(args.prediction_posts_per_user)
     )
 
     model_path = results.get('model_path')
@@ -635,7 +636,7 @@ def run(context, args) -> Dict[str, Any]:
     trained_model = results.get('model_obj') or results.get('model')
     if trained_model is not None:
         try:
-            trained_model.to(str(getattr(args, 'device', 'cpu')))
+            trained_model.to(str(args.device))
             trained_model.eval()
         except Exception:
             pass
@@ -677,7 +678,7 @@ def run(context, args) -> Dict[str, Any]:
     info_lines = [
         f"stage: train",
         f"runtime_seconds: {time.time()-t0:.2f}",
-        f"settings: batch_size={getattr(args,'batch_size',256)}, lr={getattr(args,'learning_rate',0.001)}, epochs={getattr(args,'epochs',300)}",
+        f"settings: batch_size={args.batch_size}, lr={args.learning_rate}, epochs={args.epochs}",
         f"inputs: embedding_bundle, user_splits",
         f"N_train_users: {len(_spl.get('train_users',[]))}",
         f"N_val_users: {len(_spl.get('val_users',[]))}",
@@ -748,7 +749,7 @@ def run(context, args) -> Dict[str, Any]:
                     embedding_dim=int(embedding_dim) if embedding_dim else len([c for c in posts_emb_df.columns if c.startswith('post_emb_')]),
                     selected_users=list(set(prediction_likes_df['did'].astype(str).unique())) if len(prediction_likes_df) else holdout_users,
                     feature_columns=feature_columns,
-                    random_seed=int(getattr(args, 'random_seed', 42)),
+                    random_seed=int(args.random_seed),
                 )
 
                 print(f"[TRAIN] user_emb_df shape: {user_emb_df.shape}")
@@ -761,7 +762,7 @@ def run(context, args) -> Dict[str, Any]:
                     try:
                         prediction_pairs_df = create_pairs_dataset(
                             prediction_likes_df, posts_emb_df, join_like, join_post, neg_ratio=0.5,
-                            random_seed=int(getattr(args, 'random_seed', 42)), use_parallel=True
+                            random_seed=int(args.random_seed), use_parallel=True
                         )
                     except Exception:
                         # Fallback to positive-only merge if pair creation fails
@@ -779,7 +780,7 @@ def run(context, args) -> Dict[str, Any]:
                     pass
 
                 # Inference
-                device = str(getattr(args, 'device', 'cpu'))
+                device = str(args.device)
                 model = trained_model
                 user_cols = feature_columns[0]
                 post_cols = feature_columns[1]
@@ -796,7 +797,7 @@ def run(context, args) -> Dict[str, Any]:
                     with torch.no_grad():
                         for start in range(0, X.shape[0], bs):
                             end = min(start + bs, X.shape[0])
-                            xb = torch.as_tensor(X[start:end], dtype=torch.float32, device=str(getattr(args, 'device', 'cpu')))
+                            xb = torch.as_tensor(X[start:end], dtype=torch.float32, device=str(args.device))
                             pb = model(xb).squeeze().detach().cpu().numpy()
                             preds_list.append(pb)
                 y_pred = np.concatenate(preds_list, axis=0) if preds_list else np.array([])
@@ -888,5 +889,3 @@ def run(context, args) -> Dict[str, Any]:
             'user_splits_path': str(splits_path.resolve()),
         }
     }
-
-
