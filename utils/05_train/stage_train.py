@@ -17,7 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 
-from utils.pipeline.core import select_prior_output
+from utils.pipeline.core import select_prior_output, Context
 from utils.helpers import (
     build_user_feature_frame,
     get_actual_feature_columns,
@@ -34,12 +34,8 @@ import torch
 
 
 import argparse
-import logging
-import os
-import sys
 from datetime import datetime
 from typing import List
-import random
 
 import numpy as np
 import pandas as pd
@@ -284,6 +280,7 @@ def save_test_results(results: Dict[str, Any], test_name: str = "model_results",
 
 
 def run_training_pipeline(
+    context: Context,
     min_likes_per_user: int,
     batch_size: int,
     learning_rate: float,
@@ -493,6 +490,12 @@ def run_training_pipeline(
         except Exception:
             best_epoch = None
         plot_training_history(hist, plots_dir / f"training_history_{timestamp}.png", best_epoch=best_epoch)
+
+        # try using ClearML logging to replicate above:
+        for e in range(len(hist['train_loss'])):
+            context.tracker.log_scalar(title="Training History", series="Train Loss", value=hist['train_loss'][e], iteration=e+1)
+            context.tracker.log_scalar(title="Training History", series="Validation Loss", value=hist['val_loss'][e], iteration=e+1)
+
         # Train/Val performance plots
         try:
             from torch.utils.data import DataLoader as _DL
@@ -568,7 +571,7 @@ def run_training_pipeline(
     return results
 
 
-def run(context, args) -> Dict[str, Any]:
+def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     run_dir = Path(context.run_dir).resolve()
     
@@ -605,6 +608,7 @@ def run(context, args) -> Dict[str, Any]:
     log_operation_start('Call run_training_pipeline', 'STAGE_05_TRAIN', entry_logger)
     t0 = time.time()
     results = run_training_pipeline(
+        context=context,
         min_likes_per_user=int(args.min_likes_per_user),
         embedding_bundle=str(bundle_path.resolve()),
         user_splits=str(splits_path.resolve()),
