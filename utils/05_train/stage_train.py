@@ -643,6 +643,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # Infer training subdir from model path
     training_dir = None
     if model_path:
+        # store the model artifact in the experiment tracker
+        context.tracker.log_artifact(name="trained_model_mlp", path=Path(model_path))
         mp = Path(model_path).resolve()
         if mp.parent.name == 'checkpoints':
             training_dir = mp.parent.parent
