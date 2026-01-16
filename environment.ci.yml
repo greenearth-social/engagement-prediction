@@ -23,6 +23,7 @@ dependencies:
   - pyyaml
   - pytest
   - conda-lock
+  - plotly
 
   - pytorch::pytorch
   - pytorch::torchvision
