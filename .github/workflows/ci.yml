@@ -18,10 +18,14 @@ jobs:
           cache-downloads: true
           init-shell: bash
 
+      - name: Verify env sync
+        run: |
+          python -m pip install --upgrade pip pyyaml conda-lock
+          python scripts/check_env_sync.py
+
       - name: Install env from lockfile
         shell: bash -l {0}
         run: |
-          python -m pip install --upgrade pip conda-lock
           conda-lock install --name eng-pred-ci conda-lock.ci.yml --micromamba
 
       - name: Run pytest
