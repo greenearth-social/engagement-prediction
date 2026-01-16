@@ -41,3 +41,6 @@ ENV/
 .DS_Store
 Thumbs.db
 
+# Config
+config.yml
+
