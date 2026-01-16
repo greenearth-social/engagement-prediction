@@ -52,7 +52,7 @@ New design goals:
     python -c "import torch; print(torch.__version__)"
     ```
 
-If you modify or add new dependencies, please update environment.yml to reflect the change. Also please update environment.ci.yml. (The latter is the environment file for running tests in github actions. It does not include the large CUDA dependencies because the server that runs the tests does not have a GPU, and they would significantly increase the time to run the tests. The github actions CI will fail if environment.yml and environment.ci.yml are not in sync (see `scripts/check_env_sync.py)). Then regenerate the conda-lock files for both environments: 
+If you modify or add new dependencies, please update environment.yml to reflect the change. Also please update environment.ci.yml. (The latter is the environment file for running tests in github actions. It does not include the large CUDA dependencies because the server that runs the tests does not have a GPU, and they would significantly increase the time to run the tests. The github actions CI will fail if environment.yml and environment.ci.yml are not in sync (see `scripts/check_env_sync.py`)). Then regenerate the conda-lock files for both environments:
 
 ```bash
 conda-lock -f environment.yml -p linux-64 --mamba --lockfile conda-lock.yml
