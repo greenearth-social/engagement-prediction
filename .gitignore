@@ -1,6 +1,5 @@
 # Python cache
 __pycache__/
-.pytest_cache/
 *.py[cod]
 *.pyo
 *.pyd
@@ -41,3 +40,9 @@ ENV/
 .DS_Store
 Thumbs.db
 
+# Config
+config.yml
+
+# Pytest
+.pytest_cache/
+pytest-of-*/

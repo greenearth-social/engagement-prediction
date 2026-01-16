@@ -52,11 +52,23 @@ New design goals:
     python -c "import torch; print(torch.__version__)"
     ```
 
-Note: If you modify environment.yml, regenerate the lockfile:
+If you modify or add new dependencies, please update environment.yml to reflect the change. Also please update environment.ci.yml. (The latter is the environment file for running tests in github actions. It does not include the large CUDA dependencies because the server that runs the tests does not have a GPU, and they would significantly increase the time to run the tests. The github actions CI will fail if environment.yml and environment.ci.yml are not in sync (see `scripts/check_env_sync.py`)). Then regenerate the conda-lock files for both environments:
+
 ```bash
-conda-lock -f environment.yml -p linux-64
+conda-lock -f environment.yml -p linux-64 --mamba --lockfile conda-lock.yml
+conda-lock -f environment.ci.yml -p linux-64 --mamba --lockfile conda-lock.ci.yml
 ```
 
+5. Experiment tracking setup
+   The only currently implemented experiment tracker is ClearML. If you'd like to use it, make sure you have ClearML installed (it should be installed via the conda-lock above), and run `clearml-init` in the repo. 
+
+### Testing
+This repo utilizes `pytest`. To run the tests locally, simply run the `pytest` command. The tests will automatically be run in github actions for all commits to `main` or any pull request (see `.github/workflows/ci.yml`). The default behavior is to store tmp files in the `/tmp/pytest-of-{username}` directory. To use the current directory, instead run:
+
+```bash
+TMPDIR=$PWD pytest
+```
+Tests all reside in the `tests/` directory and should use the file naming convention: `test_*.py`.
 
 ### Repository layout (stages under `utils/`)
 
