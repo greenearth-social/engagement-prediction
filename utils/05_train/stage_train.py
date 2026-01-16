@@ -15,9 +15,9 @@ Outputs:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Tuple
 
-from utils.pipeline.core import select_prior_output
+from utils.pipeline.core import select_prior_output, Context
 from utils.helpers import (
     build_user_feature_frame,
     get_actual_feature_columns,
@@ -25,24 +25,20 @@ from utils.helpers import (
     create_pairs_dataset,
     get_stage_logger,
     log_operation_start,
+    get_device,
 )
 import json
 import numpy as np
 import pandas as pd
 import time
-import torch
-
 
 import argparse
-import logging
-import os
-import sys
 from datetime import datetime
 from typing import List
-import random
 
 import numpy as np
 import pandas as pd
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
@@ -50,7 +46,7 @@ from torch.utils.data import DataLoader, Dataset
 
 class EngagementDataset(Dataset):
     """Simple dataset for engagement prediction (stage-local)."""
-    def __init__(self, features: np.ndarray, labels: np.ndarray, user_ids: List[str] = None, post_ids: List[str] = None):
+    def __init__(self, features: np.ndarray, labels: np.ndarray, user_ids: Optional[List[str]] = None, post_ids: Optional[List[str]] = None):
         self.features = torch.FloatTensor(features)
         self.labels = torch.FloatTensor(labels)
         self.user_ids = user_ids if user_ids else [f"user_{i}" for i in range(len(features))]
@@ -68,7 +64,7 @@ class EngagementDataset(Dataset):
 
 
 class EngagementPredictor(nn.Module):
-    def __init__(self, input_dim: int, hidden_dims: List[int] = [64, 32, 16], dropout_rate: float = 0.5):
+    def __init__(self, input_dim: int, hidden_dims: List[int], dropout_rate: float):
         super().__init__()
         layers = []
         prev = input_dim
@@ -88,7 +84,7 @@ class EngagementPredictor(nn.Module):
         return self.network(x)
 
 
-def create_data_loaders(train_dataset: Dataset, val_dataset: Dataset, test_dataset: Dataset = None, batch_size: int = 256):
+def create_data_loaders(train_dataset: Dataset, val_dataset: Dataset, batch_size: int, test_dataset: Optional[Dataset] = None):
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False) if test_dataset else None
@@ -99,18 +95,16 @@ def train_model(
     model: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
-    device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
-    epochs: int = 300,
-    learning_rate: float = 1e-3,
-    weight_decay: float = 0.1,
-    patience: int = 50,
+    device: str,
+    epochs: int,
+    learning_rate: float,
+    weight_decay: float,
+    patience: int,
     model_name: str = "engagement_model",
     load_best_checkpoint: bool = False,
-    holdout_data: Dict[str, Any] = None,
+    holdout_data: Optional[Dict[str, Any]] = None,
     checkpoints_dir: Optional[Path] = None,
     disable_progress: bool = False,
-    tqdm_mininterval: Optional[float] = None,
-    tqdm_miniters: Optional[int] = None,
 ) -> Dict[str, Any]:
     try:
         from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -119,7 +113,7 @@ def train_model(
     except Exception:
         ReduceLROnPlateau = None  # type: ignore
         import torch.optim as optim  # type: ignore
-        def roc_auc_score(y_true, y_score):  # type: ignore
+        def roc_auc_score(y_true, y_score) -> Float:  # type: ignore
             return 0.5
     model = model.to(device)
     criterion = nn.BCELoss()
@@ -207,7 +201,7 @@ def clear_cuda_memory():
         print("🧹 CUDA Memory cleared")
 
 
-def set_random_seeds(seed: int = 42):
+def set_random_seeds(seed: int):
     print(f"🎲 Setting random seeds to {seed}")
     import random as _random
     _random.seed(seed)
@@ -235,7 +229,7 @@ def _log_pos_neg_balance(df: pd.DataFrame, label_col: str = 'liked', user_col: s
         print(f"   ⚠️  {context} balance check failed: {_e}")
 
 
-def _enforce_strict_5050_balance(df: pd.DataFrame, label_col: str = 'liked', random_seed: int = 42, context: str = "") -> pd.DataFrame:
+def _enforce_strict_5050_balance(df: pd.DataFrame, random_seed: int, label_col: str = 'liked', context: str = "") -> pd.DataFrame:
     if df is None or len(df) == 0:
         return df
     if label_col not in df.columns:
@@ -258,9 +252,7 @@ def _enforce_strict_5050_balance(df: pd.DataFrame, label_col: str = 'liked', ran
     return balanced
 
 
-def create_model(input_dim: int, hidden_dims: List[int] = None, dropout_rate: float = 0.5) -> EngagementPredictor:
-    if hidden_dims is None:
-        hidden_dims = [64, 32, 16]
+def create_model(input_dim: int, hidden_dims: List[int], dropout_rate: float) -> EngagementPredictor:
     print(f"🤖 Creating model: {input_dim} -> {' -> '.join(map(str, hidden_dims))} -> 1")
     return EngagementPredictor(input_dim, hidden_dims, dropout_rate)
 
@@ -288,38 +280,29 @@ def save_test_results(results: Dict[str, Any], test_name: str = "model_results",
 
 
 def run_training_pipeline(
-    days: int = 5,
-    min_likes_per_user: int = 4,
-    test_ratio: float = 0.2,
-    batch_size: int = 256,
-    learning_rate: float = 0.001,
-    weight_decay: float = 0.1,
-    epochs: int = 300,
-    patience: int = 50,
-    hidden_dims: List[int] = None,
-    dropout_rate: float = 0.5,
-    device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
-    random_seed: int = 42,
+    context: Context,
+    min_likes_per_user: int,
+    batch_size: int,
+    learning_rate: float,
+    weight_decay: float,
+    epochs: int,
+    patience: int,
+    hidden_dims: List[int],
+    dropout_rate: float,
+    prediction_posts_per_user: int,
+    device: str,
+    random_seed: int,
     save_model: bool = True,
     generate_plots: bool = True,
-    max_samples: int = None,
-    drop_unliked_posts: bool = False,
-    limit_images: bool = False,
-    load_processed: str = None,
     embedding_bundle: Optional[str] = None,
     user_splits: Optional[str] = None,
     schema: str = 'auto',
-    topic_model_path: Optional[str] = None,
-    topic_pca_path: Optional[str] = None,
-    prediction_posts_per_user: int = 1,
     negatives_liked_only: bool = False,
     user_k: int = 3,
     min_cluster_size: int = 3,
     max_embedding_posts_per_user: int = 50,
     output_dir: Optional[Path] = None,
     disable_progress: bool = False,
-    tqdm_mininterval: Optional[float] = None,
-    tqdm_miniters: Optional[int] = None,
 ) -> Dict[str, Any]:
     # This is the consolidated version adapted from src/train.py
     
@@ -463,11 +446,21 @@ def run_training_pipeline(
     
     # Datasets
     log_operation_start('Create datasets and data loaders', 'STAGE_05_TRAIN', logger)
-    train_dataset = EngagementDataset(train_df[feature_cols].values, train_df['liked'].values, train_df['did'].tolist(), train_df[join_post].tolist())
-    val_dataset = EngagementDataset(val_df[feature_cols].values, val_df['liked'].values, val_df['did'].tolist(), val_df[join_post].tolist())
+    train_dataset = EngagementDataset(
+        train_df[feature_cols].values, 
+        train_df['liked'].to_numpy(), 
+        train_df['did'].tolist(), 
+        train_df[join_post].tolist()
+    )
+    val_dataset = EngagementDataset(
+        val_df[feature_cols].values, 
+        val_df['liked'].to_numpy(), 
+        val_df['did'].tolist(), 
+        val_df[join_post].tolist()
+    )
     input_dim = train_dataset.features.shape[1]
     model = create_model(input_dim, hidden_dims, dropout_rate)
-    train_loader, val_loader, _ = create_data_loaders(train_dataset, val_dataset, None, batch_size)
+    train_loader, val_loader, _ = create_data_loaders(train_dataset, val_dataset, batch_size, test_dataset=None)
     
     log_operation_start(f'Training model (epochs={epochs}, batch_size={batch_size})', 'STAGE_05_TRAIN', logger)
     print("\n🏋️  Training model...")
@@ -484,8 +477,6 @@ def run_training_pipeline(
         holdout_data=None,
         checkpoints_dir=checkpoints_dir,
         disable_progress=disable_progress,
-        tqdm_mininterval=tqdm_mininterval,
-        tqdm_miniters=tqdm_miniters,
     )
     clear_cuda_memory()
     evaluation_metrics = {'note': 'Holdout evaluation happens in Stage 6'}
@@ -499,6 +490,14 @@ def run_training_pipeline(
         except Exception:
             best_epoch = None
         plot_training_history(hist, plots_dir / f"training_history_{timestamp}.png", best_epoch=best_epoch)
+
+        # store training history in experiment tracker
+        for e in range(len(hist['train_loss'])):
+            context.tracker.log_scalar(title="Training Loss History", series="Train Loss", value=hist['train_loss'][e], iteration=e+1)
+            context.tracker.log_scalar(title="Training Loss History", series="Validation Loss", value=hist['val_loss'][e], iteration=e+1)
+            context.tracker.log_scalar(title="Training AUC History", series="Train AUC", value=hist['train_auc'][e], iteration=e+1)
+            context.tracker.log_scalar(title="Training AUC History", series="Validation AUC", value=hist['val_auc'][e], iteration=e+1)
+
         # Train/Val performance plots
         try:
             from torch.utils.data import DataLoader as _DL
@@ -535,7 +534,7 @@ def run_training_pipeline(
         payload = {
             'model_state_dict': model.state_dict(),
             'input_dim': input_dim,
-            'hidden_dims': hidden_dims or [64, 32, 16],
+            'hidden_dims': hidden_dims,
             'dropout_rate': dropout_rate,
             'training_results': tr_sanitized,
             'evaluation_metrics': evaluation_metrics,
@@ -574,9 +573,10 @@ def run_training_pipeline(
     return results
 
 
-def run(context, args) -> Dict[str, Any]:
+def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     run_dir = Path(context.run_dir).resolve()
+    device = get_device(args.device)
     
     # Create a temporary logger for the stage entry point
     from datetime import datetime
@@ -611,6 +611,8 @@ def run(context, args) -> Dict[str, Any]:
     log_operation_start('Call run_training_pipeline', 'STAGE_05_TRAIN', entry_logger)
     t0 = time.time()
     results = run_training_pipeline(
+        context=context,
+        min_likes_per_user=int(args.min_likes_per_user),
         embedding_bundle=str(bundle_path.resolve()),
         user_splits=str(splits_path.resolve()),
         batch_size=int(args.batch_size),
@@ -620,14 +622,12 @@ def run(context, args) -> Dict[str, Any]:
         patience=int(args.patience),
         hidden_dims=args.hidden_dims,
         dropout_rate=float(args.dropout_rate_mlp),
-        device=str(args.device),
+        device=device,
         random_seed=int(args.random_seed),
         save_model=not bool(args.no_save_model),
         generate_plots=not bool(args.no_plots),
         output_dir=run_dir,  # training module will create train/<ts>/ under this; we'll relocate to 05_train
         disable_progress=bool(getattr(args, 'disable_progress', False)),
-        tqdm_mininterval=getattr(args, 'tqdm_mininterval', None),
-        tqdm_miniters=getattr(args, 'tqdm_miniters', None),
         prediction_posts_per_user=int(args.prediction_posts_per_user)
     )
 
@@ -636,13 +636,15 @@ def run(context, args) -> Dict[str, Any]:
     trained_model = results.get('model_obj') or results.get('model')
     if trained_model is not None:
         try:
-            trained_model.to(str(args.device))
+            trained_model.to(device)
             trained_model.eval()
         except Exception:
             pass
     # Infer training subdir from model path
     training_dir = None
     if model_path:
+        # store the model artifact in the experiment tracker
+        context.tracker.log_artifact(name="trained_model_mlp", path=Path(model_path))
         mp = Path(model_path).resolve()
         if mp.parent.name == 'checkpoints':
             training_dir = mp.parent.parent
@@ -780,7 +782,6 @@ def run(context, args) -> Dict[str, Any]:
                     pass
 
                 # Inference
-                device = str(args.device)
                 model = trained_model
                 user_cols = feature_columns[0]
                 post_cols = feature_columns[1]
@@ -797,7 +798,7 @@ def run(context, args) -> Dict[str, Any]:
                     with torch.no_grad():
                         for start in range(0, X.shape[0], bs):
                             end = min(start + bs, X.shape[0])
-                            xb = torch.as_tensor(X[start:end], dtype=torch.float32, device=str(args.device))
+                            xb = torch.as_tensor(X[start:end], dtype=torch.float32, device=device)
                             pb = model(xb).squeeze().detach().cpu().numpy()
                             preds_list.append(pb)
                 y_pred = np.concatenate(preds_list, axis=0) if preds_list else np.array([])
@@ -822,7 +823,7 @@ def run(context, args) -> Dict[str, Any]:
                     print(f"Saved heldout predictions: {csv_out.resolve()} rows={len(out_df)}")
 
                 # Metrics
-                metrics_overall = {
+                metrics_overall: Dict[str, Any] = {
                     'total_samples': int(len(out_df)),
                     'positive': int(int(out_df['y_true'].sum()) if len(out_df) else 0),
                 }

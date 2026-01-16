@@ -20,6 +20,10 @@ import json
 import time
 import copy
 
+from utils.experiment_tracking import build_experiment_tracker, normalize_params
+from utils.pipeline.core import Context
+
+
 # Avoid heavy imports at module import time; import lazily inside handlers
 
 TINKERING_DIR = Path(__file__).parent
@@ -73,7 +77,7 @@ DEFAULTS: Dict[str, Any] = {
     "dropout_rate_mlp": 0.5,
     "dropout_rate_two_tower": 0.1,
     "prediction_posts_per_user": 1,
-    "device": "cpu",
+    "device": None,
     "patience": 50,
     "no_plots": False,
     "no_save_model": False,
@@ -93,6 +97,11 @@ DEFAULTS: Dict[str, Any] = {
     # Execution behavior
     "foreground": False,
     "_initial_log": None,
+    # Experiment tracking
+    "experiment_tracker": "clearml",
+    "experiment_project": "Engagement Prediction",
+    "experiment_task": None,
+    "experiment_tags": None,
 }
 
 
@@ -118,6 +127,80 @@ def _add_arg_with_default(parser: argparse.ArgumentParser, flag: str, *, key: Op
         effective_key = key or _arg_key_from_flag(flag)
         kwargs["help"] = _help_with_default(help_text or "", effective_key)
     parser.add_argument(flag, **kwargs)
+
+
+def _extract_overrides(args: argparse.Namespace) -> Dict[str, Any]:
+    overrides: Dict[str, Any] = {}
+    for key, default in DEFAULTS.items():
+        if hasattr(args, key):
+            value = getattr(args, key)
+            if value != default:
+                overrides[key] = value
+    return overrides
+
+
+def _build_tracking_params(args: argparse.Namespace, run_dir: Path) -> Dict[str, Any]:
+    return {
+        "meta": {
+            "run_dir": str(run_dir),
+            "start_from": args.start_from,
+            "stop_after": args.stop_after,
+            "cap_random_seed": args.cap_random_seed,
+            "random_seed": args.random_seed,
+            "foreground": args.foreground,
+        },
+        "data": {
+            "data_source": args.data_source,
+            "gcs_bucket": args.gcs_bucket,
+            "posts_start": args.posts_start,
+            "posts_end": args.posts_end,
+            "likes_start": args.likes_start,
+            "likes_end": args.likes_end,
+            "max_files_per_table": args.max_files_per_table,
+        },
+        "featurize": {
+            "max_posts_per_author": args.max_posts_per_author,
+            "max_liked_posts_per_user": args.max_liked_posts_per_user,
+            "image_mode": args.image_mode,
+            "embedding_model": args.embedding_model,
+            "global_topic_k": args.global_topic_k,
+            "min_likes_per_user": args.min_likes_per_user,
+        },
+        "relevel": {
+            "relevel_method": args.relevel_method,
+            "relevel_strategy": args.relevel_strategy,
+            "relevel_alpha": args.relevel_alpha,
+            "relevel_min_users_per_topic": args.relevel_min_users_per_topic,
+        },
+        "split": {
+            "val_ratio": 0.2,
+            "holdout_ratio": 0.2,
+        },
+        "train": {
+            "model_type": args.model_type,
+            "shared_dim": args.shared_dim,
+            "user_hidden_dim": args.user_hidden_dim,
+            "post_hidden_dim": args.post_hidden_dim,
+            "num_attention_heads": args.num_attention_heads,
+            "num_attention_layers": args.num_attention_layers,
+            "max_history_len": args.max_history_len,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "learning_rate": args.learning_rate,
+            "weight_decay_mlp": args.weight_decay_mlp,
+            "weight_decay_two_tower": args.weight_decay_two_tower,
+            "hidden_dims": args.hidden_dims,
+            "dropout_rate_mlp": args.dropout_rate_mlp,
+            "dropout_rate_two_tower": args.dropout_rate_two_tower,
+            "prediction_posts_per_user": args.prediction_posts_per_user,
+            "patience": args.patience,
+            "device": args.device,
+        },
+        "eval": {
+            "eval_batch_size": args.eval_batch_size,
+            "eval_max_users": args.eval_max_users,
+        },
+    }
 
 
 def _load_config_file(path_str: str) -> Dict[str, Any]:
@@ -167,7 +250,27 @@ def _merge_args_with_config(raw_args: argparse.Namespace) -> argparse.Namespace:
     setattr(final_ns, "func", func)
     return final_ns
 
-def cmd_run_all(args) -> int:
+
+def _generate_run_name(args: argparse.Namespace) -> str:
+    stages_str = "all"
+    if args.start_from is not None or args.stop_after is not None:
+        if args.start_from == args.stop_after:
+            stages_str = args.start_from
+        else:
+            if args.start_from is None:
+                stages_str = "start_to_"
+            else:
+                stages_str = f"{args.start_from}_to_"
+            if args.stop_after is None:
+                stages_str += "end"
+            else:
+                stages_str += args.stop_after
+
+    stages_str += f"_{args.model_type}_{args.relevel_method}"
+    return stages_str
+
+
+def cmd_run_all(args: argparse.Namespace) -> int:
     """Run the 4-stage pipeline.
 
     Creates a run directory up front and backgrounds itself with nohup unless --foreground.
@@ -177,18 +280,31 @@ def cmd_run_all(args) -> int:
     timestamp = time.strftime("%Y%m%d_%H%M%S")
 
     # Create run_dir deterministically up front
+    run_name = f"{timestamp}_{_generate_run_name(args)}"
     if args.output_dir:
         run_dir = Path(args.output_dir)
     else:
-        d_part = f"d{int(args.max_files_per_table)}"
-        cap_part = f"mppa{int(args.max_posts_per_author)}"
-        suffix = f"{d_part}_{cap_part}"
         if args.run_name:
             rn = str(args.run_name).strip().replace(' ', '_')
             if rn:
-                suffix = f"{suffix}_{rn}"
-        run_dir = outputs_dir / f"{timestamp}_run_{suffix}"
+                run_name = f"{run_name}_{rn}"
+        run_dir = outputs_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    # initialize experiment tracker
+    tracker = build_experiment_tracker(
+        args.experiment_tracker,
+        project_name=args.experiment_project,
+        task_name=args.experiment_task or run_name,
+        tags=args.experiment_tags,
+    )
+    tracking_payload = {
+        "run": _build_tracking_params(args, run_dir),
+        "overrides": _extract_overrides(args),
+    }
+    tracker.log_params(normalize_params(tracking_payload))
+    # In sequential execution, always allow stages to resolve latest artifacts from prior stages
+    ctx = Context(run_dir=run_dir, use_latest=True, tracker=tracker)
 
     # Choose log path inside run_dir
     initial_log = Path(args._initial_log) if args._initial_log else (run_dir / "run-all.log")
@@ -243,21 +359,17 @@ def cmd_run_all(args) -> int:
 
     # Foreground execution: call the internal exec directly
     # Ensure args.output_dir is set so subsequent stages use this run_dir
-    if not args.output_dir:
-        setattr(args, 'output_dir', str(run_dir.resolve()))
-    return cmd__run_all_exec(args)
+    setattr(args, 'output_dir', str(run_dir.resolve()))
+    return cmd__run_all_exec(args, ctx)
 
 
-def cmd__run_all_exec(args) -> int:
+def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     """Execute the 6-stage modular pipeline in the foreground sequentially."""
     # Build Context and invoke stages via registry
-    from utils.pipeline.core import Context
     from utils.pipeline import registry as reg
 
     run_dir = Path(args.output_dir).resolve()
-    # In sequential execution, always allow stages to resolve latest artifacts from prior stages
-    ctx = Context(run_dir=run_dir, use_latest=True)
-
+    
     # Helper: map stage keys to enumerated folder names
     # Override relevel stage key if --relevel-method is specified
     relevel_method = args.relevel_method
@@ -268,7 +380,7 @@ def cmd__run_all_exec(args) -> int:
         relevel_key = 'relevel_simple'
     elif relevel_method == 'uniform':
         relevel_key = 'relevel'
-    
+
     # Override train stage key if --model-type is specified
     # Do not default to MLP if model name is not recognized - raise error instead
     model_type = args.model_type
@@ -348,31 +460,36 @@ def cmd__run_all_exec(args) -> int:
             pass
 
     # Execute selected subset
-    for idx, key in enumerate(stage_order):
-        if idx < start_idx or idx > stop_idx:
-            continue
-        # Before running, offer prior selection for this stage's dependency (if any)
-        if key != 'get_data':
-            prev_key = stage_order[idx - 1]
-            if stage_folder[prev_key] not in ctx.prior_outputs:
-                _maybe_choose_prior(prev_key)
-        label_map = {
-            'get_data': "Stage 1: Get data…",
-            'featurize': "Stage 2: Featurize…",
-            'relevel': "Stage 3: Relevel (uniform mixture)…",
-            'relevel_gini': "Stage 3: Relevel (Gini-optimized)…",
-            'relevel_simple': "Stage 3: Relevel (simple)…",
-            'split': "Stage 4: Split users…",
-            'train': "Stage 5: Train model (MLP)…",
-            'train_two_tower': "Stage 5: Train model (Two-Tower)…",
-            'evaluate': "Stage 6: Evaluate model…",
-        }
-        label = label_map.get(key, f"Stage {idx+1}: {key}…")
-        print(f"\n[{idx+1}/6] ▶️  {label}")
-        reg.run_stage(key, ctx, args)
+    try:
+        for idx, key in enumerate(stage_order):
+            if idx < start_idx or idx > stop_idx:
+                continue
+            # Before running, offer prior selection for this stage's dependency (if any)
+            if key != 'get_data':
+                prev_key = stage_order[idx - 1]
+                if stage_folder[prev_key] not in ctx.prior_outputs:
+                    _maybe_choose_prior(prev_key)
+            label_map = {
+                'get_data': "Stage 1: Get data…",
+                'featurize': "Stage 2: Featurize…",
+                'relevel': "Stage 3: Relevel (uniform mixture)…",
+                'relevel_gini': "Stage 3: Relevel (Gini-optimized)…",
+                'relevel_simple': "Stage 3: Relevel (simple)…",
+                'split': "Stage 4: Split users…",
+                'train': "Stage 5: Train model (MLP)…",
+                'train_two_tower': "Stage 5: Train model (Two-Tower)…",
+                'evaluate': "Stage 6: Evaluate model…",
+            }
+            label = label_map.get(key, f"Stage {idx+1}: {key}…")
+            print(f"\n[{idx+1}/6] ▶️  {label}")
+            reg.run_stage(key, ctx, args)
+    finally:
+        ctx.tracker.close()
 
     print("\n✅ run-all completed successfully")
     return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Engagement Prediction Pipeline CLI",
@@ -472,7 +589,7 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Dropout rate for two tower model")
     _add_arg_with_default(p_all, "--prediction-posts-per-user", type=float, default=argparse.SUPPRESS,
                           help_text="Prediction posts per user")
-    _add_arg_with_default(p_all, "--device", type=str, default=argparse.SUPPRESS,
+    _add_arg_with_default(p_all, "--device", type=str, choices=["cpu", "cuda"], default=argparse.SUPPRESS,
                           help_text="Device for training")
     _add_arg_with_default(p_all, "--patience", type=int, default=argparse.SUPPRESS,
                           help_text="Early stopping patience")
@@ -511,6 +628,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--foreground", action="store_true", default=argparse.SUPPRESS,
                           help_text="Run in foreground (default: background with nohup)")
     p_all.add_argument("--_initial-log", type=str, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    # Experiment tracking
+    _add_arg_with_default(p_all, "--experiment-tracker", type=str, choices=["none", "clearml"], default=argparse.SUPPRESS,
+                          help_text="Type of experiment tracker to use")
+    _add_arg_with_default(p_all, "--experiment-project", type=str, default=argparse.SUPPRESS,
+                          help_text="Experiment tracking project name")
+    _add_arg_with_default(p_all, "--experiment-task", type=str, default=argparse.SUPPRESS,
+                          help_text="Experiment tracking task name")
+    _add_arg_with_default(p_all, "--experiment-tags", type=str, nargs="*", default=argparse.SUPPRESS,
+                          help_text="Optional tags for the experiment tracker")
     p_all.set_defaults(func=cmd_run_all)
 
     return parser

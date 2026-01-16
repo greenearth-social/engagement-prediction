@@ -541,7 +541,7 @@ def build_user_feature_frame(
     embedding_dim: int,
     *,
     selected_users: Optional[List[str]] = None,
-    feature_columns: Optional[Tuple[List[str], List[str], List[str]]] = None,
+    feature_columns: Optional[List[List[str]]] = None,
     random_seed: int = 42,
     topic_model: Optional[Any] = None,
     pca_model: Optional[Any] = None,
@@ -1269,3 +1269,12 @@ def log_operation_start(operation_name: str, stage_name: str, logger: Optional[l
         logger = get_stage_logger(stage_name)
     logger.info(f"Starting: {operation_name}")
     return logger
+
+
+def get_device(arg_device: Optional[str]) -> str:
+    import torch
+    if arg_device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        return device
+    else:
+        return arg_device
