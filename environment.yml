@@ -3,9 +3,12 @@ channels:
   - pytorch
   - nvidia
   - conda-forge
+channel_priority: strict
 
 dependencies:
   - python=3.11
+
+  # core
   - numpy
   - pandas
   - scikit-learn
@@ -13,21 +16,29 @@ dependencies:
   - seaborn
   - tqdm
   - pillow
-  - boto3
-  - pyarrow
-  - google-cloud-storage
-  - polars
-  - requests
-  - sentence-transformers
   - pyyaml
   - pytest
+  - requests
+
+  # data / IO
+  - pyarrow<21
+  - polars
+  - boto3
+  - google-cloud-storage
+
+  # HF / embeddings
+  - sentence-transformers
+
+  # pytorch + cuda (conda)
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+
+  # tooling
   - conda-lock
 
-  - pytorch::pytorch
-  - pytorch::torchvision
-  - pytorch::torchaudio
-  - pytorch::pytorch-cuda=12.1
-
+  # pip-only deps
   - pip
   - pip:
-    - clearml
+      - clearml

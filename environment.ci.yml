@@ -1,12 +1,13 @@
-name: eng-pred-ci
-# CI-focused environment: mirrors environment.yml but keeps CPU-only torch (no nvidia channel).
-# When adding/removing deps in environment.yml, update this file too.
+name: eng-pred
 channels:
   - pytorch
   - conda-forge
+channel_priority: strict
 
 dependencies:
   - python=3.11
+
+  # core
   - numpy
   - pandas
   - scikit-learn
@@ -14,20 +15,28 @@ dependencies:
   - seaborn
   - tqdm
   - pillow
-  - boto3
-  - pyarrow
-  - google-cloud-storage
-  - polars
-  - requests
-  - sentence-transformers
   - pyyaml
   - pytest
+  - requests
+
+  # data / IO
+  - pyarrow<21
+  - polars
+  - boto3
+  - google-cloud-storage
+
+  # HF / embeddings
+  - sentence-transformers
+
+  # pytorch + cuda (conda)
+  - pytorch
+  - torchvision
+  - torchaudio
+
+  # tooling
   - conda-lock
 
-  - pytorch::pytorch
-  - pytorch::torchvision
-  - pytorch::torchaudio
-
+  # pip-only deps
   - pip
   - pip:
-    - clearml
+      - clearml
