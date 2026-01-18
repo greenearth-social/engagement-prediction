@@ -17,7 +17,7 @@ ENV_CI = ROOT / "environment.ci.yml"
 
 # Differences we intentionally allow between local and CI envs
 ALLOWED_CHANNELS_ABSENT_IN_CI = {"nvidia"}
-ALLOWED_DEPS_ABSENT_IN_CI = {"pytorch::pytorch-cuda=12.1"}
+ALLOWED_DEPS_ABSENT_IN_CI = {"pytorch-cuda=12.1"}
 
 
 def load_yaml(path: Path) -> Any:
