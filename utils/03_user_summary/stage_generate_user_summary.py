@@ -12,7 +12,7 @@ Outputs under <run_dir>/featurize/<timestamp>/:
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List
 import argparse
 import polars as pl
 import time
@@ -21,25 +21,49 @@ from utils.pipeline.core import new_stage_timestamp_dir, select_prior_output, Co
 from utils.helpers import get_stage_logger, log_operation_start, validate_dataframe_schema, load_parquet_from_prior
 
 
-def calc_twema():
-    tau = 24
+def _calc_time_weighted_exp_mov_avg(
+    lf: pl.LazyFrame,
+    value_cols: list[str],
+    group_cols: list[str],
+    tau: int,
+) -> pl.LazyFrame:
+    lf = (
+        lf
+        .sort(group_cols + ["inserted_at"])
+        .with_columns(
+            pl.col("inserted_at").shift().over(group_cols).alias("prev_ts")
+        )
+        .with_columns(
+            (pl.col("inserted_at") - pl.col("prev_ts"))
+            .dt.total_hours(fractional=True)
+            .alias("time_diff")
+        )
+        .with_columns(
+            (-pl.col("time_diff") / pl.lit(tau)).exp().alias("one_minus_alpha_i")
+        )
+        .with_columns(
+            (pl.lit(1.0) - pl.col("one_minus_alpha_i")).fill_null(1.0).alias("alpha_i")
+        )
+        .with_columns(
+            pl.col("one_minus_alpha_i")
+            .shift(-1)
+            .cum_prod(reverse=True)
+            .over(group_cols)
+            .fill_null(1.0)
+            .alias("cumprod_one_minus_alpha")
+        )
+        .with_columns(
+            (pl.col("alpha_i") * pl.col("cumprod_one_minus_alpha")).alias("weight")
+        )
+    )
+    
+    return lf.group_by(group_cols).agg([
+        (pl.col("weight") * pl.col(c)).sum().alias(f"weighted_{c}")
+        for c in value_cols
+    ])
 
-    df.with_columns(
-        pl.col("timestamp").shift().alias("prev_timestamp")
-    ).with_columns(
-        (pl.col("timestamp") - pl.col("prev_timestamp")).dt.total_hours().alias("time_diff")
-    ).with_columns(
-        (-pl.col("time_diff") / pl.lit(tau)).exp().alias("one_minus_alpha_i")
-    ).with_columns(
-        (pl.lit(1.0) - pl.col("one_minus_alpha_i")).fill_null(1.0).alias("alpha_i")
-    ).with_columns(
-        pl.col("one_minus_alpha_i").shift(-1).cum_prod(reverse=True).fill_null(1.0).alias("cumprod_one_minus_alpha")
-    ).with_columns(
-        (pl.col("value") * pl.col("alpha_i") * pl.col("cumprod_one_minus_alpha")).alias("weighted_value")
-    ).select(pl.col("weighted_value").sum()).item()
 
-
-def get_embedding_cols():
+def _get_embedding_cols():
     return [f"post_emb_{i}" for i in range(128)]  # assuming 128-dim embeddings
 
 
@@ -47,8 +71,9 @@ def _generate_user_summary_from_history(
     posts_core_lf: pl.LazyFrame,
     user_history_lf: pl.LazyFrame, 
 ) -> pl.LazyFrame:
+    embedding_cols = _get_embedding_cols()
     # join user_history to posts_core to get embeddings and timestamps
-    posts_core_lf_cols = ["subject_uri", "inserted_at"] + get_embedding_cols()
+    posts_core_lf_cols = ["subject_uri", "inserted_at"] + embedding_cols
 
     user_history_lf = user_history_lf.join(
         posts_core_lf.select(posts_core_lf_cols),
@@ -56,10 +81,12 @@ def _generate_user_summary_from_history(
         how="inner",
     )
     # agg over did, bucket in some fashion to generate summary
-    user_history_lf.group_by(["did", "inserted_at_bucket"]).agg(
-
+    return _calc_time_weighted_exp_mov_avg(
+        user_history_lf,
+        value_cols=embedding_cols,
+        group_cols=["did"],
+        tau=24*7,  # 1 week time constant
     )
-    return user_history_lf
 
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
