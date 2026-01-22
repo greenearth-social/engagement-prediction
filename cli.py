@@ -34,7 +34,7 @@ RESULTS_DIR = OUTPUTS_DIR / "holdout_evaluation_results"
 
 # Central default map for all run-all parameters
 DEFAULTS: Dict[str, Any] = {
-    # Stage 1
+    # Stage 1: Data filtering
     "data_source": "greenearth",
     "gcs_bucket": 'greenearth-471522-ingex-extract-stage',
     "posts_start": None,
@@ -43,9 +43,12 @@ DEFAULTS: Dict[str, Any] = {
     "likes_end": None,
     "max_files_per_table": 5,
     "image_mode": "auto",
-    "max_posts_per_author": 3,
-    "max_liked_posts_per_user": 100,
+    "max_posts_per_author": 3,  # Legacy: used in stage 2 featurize
+    "max_liked_posts_per_user": 100,  # Legacy: used in stage 2 featurize
     "max_liking_users": 0,  # 0 = no limit; sample this many unique liking users
+    "max_likes_per_user": 100,  # Stage 1: random cap on likes per user (NOT recency-based)
+    "min_likes_per_user": 2,  # Stage 1: minimum likes for user inclusion
+    "negative_posts_sample": 100000,  # Stage 1: random posts for negative cases
     "cap_random_seed": 42,
     "output_dir": None,
     "run_name": None,
@@ -56,7 +59,6 @@ DEFAULTS: Dict[str, Any] = {
     "relevel_strategy": "uniform_mixture_balanced",
     "relevel_alpha": 0.35,
     "relevel_min_users_per_topic": 0,
-    "min_likes_per_user": 10,
     "val_ratio": 0.2,
     "holdout_ratio": 0.2,
     "random_seed": 42,
@@ -293,21 +295,6 @@ def cmd_run_all(args: argparse.Namespace) -> int:
         run_dir = outputs_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # initialize experiment tracker
-    tracker = build_experiment_tracker(
-        args.experiment_tracker,
-        project_name=args.experiment_project,
-        task_name=args.experiment_task or run_name,
-        tags=args.experiment_tags,
-    )
-    tracking_payload = {
-        "run": _build_tracking_params(args, run_dir),
-        "overrides": _extract_overrides(args),
-    }
-    tracker.log_params(normalize_params(tracking_payload))
-    # In sequential execution, always allow stages to resolve latest artifacts from prior stages
-    ctx = Context(run_dir=run_dir, use_latest=True, tracker=tracker)
-
     # Choose log path inside run_dir
     initial_log = Path(args._initial_log) if args._initial_log else (run_dir / "run-all.log")
     try:
@@ -359,7 +346,23 @@ def cmd_run_all(args: argparse.Namespace) -> int:
         print("❌ Failed to start run-all in background")
         return proc.returncode or 1
 
-    # Foreground execution: call the internal exec directly
+    # Foreground execution: initialize experiment tracker and run
+    # Only initialize ClearML here (not before backgrounding) to avoid creating
+    # a task in the parent process that gets "aborted" when the parent exits.
+    tracker = build_experiment_tracker(
+        args.experiment_tracker,
+        project_name=args.experiment_project,
+        task_name=args.experiment_task or run_name,
+        tags=args.experiment_tags,
+    )
+    tracking_payload = {
+        "run": _build_tracking_params(args, run_dir),
+        "overrides": _extract_overrides(args),
+    }
+    tracker.log_params(normalize_params(tracking_payload))
+    # In sequential execution, always allow stages to resolve latest artifacts from prior stages
+    ctx = Context(run_dir=run_dir, use_latest=True, tracker=tracker)
+
     # Ensure args.output_dir is set so subsequent stages use this run_dir
     setattr(args, 'output_dir', str(run_dir.resolve()))
     return cmd__run_all_exec(args, ctx)
@@ -529,6 +532,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Cap on liked posts per user during ingestion")
     _add_arg_with_default(p_all, "--max-liking-users", type=int, default=argparse.SUPPRESS,
                           help_text="Cap on total liking users to sample (0 = no limit)")
+    _add_arg_with_default(p_all, "--max-likes-per-user", type=int, default=argparse.SUPPRESS,
+                          help_text="Random cap on likes per user in Stage 1 (NOT recency-based)")
+    _add_arg_with_default(p_all, "--negative-posts-sample", type=int, default=argparse.SUPPRESS,
+                          help_text="Number of random posts to sample for negative cases in Stage 1")
     _add_arg_with_default(p_all, "--cap-random-seed", type=int, default=argparse.SUPPRESS,
                           help_text="Random seed for ingestion capping")
     _add_arg_with_default(p_all, "--output-dir", type=str, default=argparse.SUPPRESS,
@@ -549,7 +556,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--relevel-min-users-per-topic", type=int, default=argparse.SUPPRESS,
                           help_text="Minimum users per topic when releveling")
     _add_arg_with_default(p_all, "--min-likes-per-user", type=int, default=argparse.SUPPRESS,
-                          help_text="Minimum likes per user for inclusion")
+                          help_text="Minimum likes per user for inclusion (used in Stage 1 filtering and later stages)")
     _add_arg_with_default(p_all, "--val-ratio", type=float, default=argparse.SUPPRESS,
                           help_text="Validation ratio")
     _add_arg_with_default(p_all, "--holdout-ratio", type=float, default=argparse.SUPPRESS,

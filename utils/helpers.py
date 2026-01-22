@@ -196,6 +196,347 @@ def load_raw_data_ingex(
 
 
 # ----------------------------------------
+# Stage 1: Polars-based filtering for core datasets
+# ----------------------------------------
+def load_likes_core_polars(
+    gcs_bucket: str,
+    start_str: Optional[str],
+    end_str: Optional[str],
+    *,
+    max_liking_users: int = 0,
+    max_likes_per_user: int = 100,
+    min_likes_per_user: int = 2,
+    random_seed: int = 42,
+    logger: Optional[Any] = None,
+) -> Tuple[pl.DataFrame, Dict[str, Any]]:
+    """
+    Load and filter likes data using Polars lazy evaluation.
+    
+    Filtering sequence:
+    1. Scan likes parquets within time window
+    2. Sample liking users if cap is set
+    3. Filter likes to sampled users
+    4. Random cap likes per user (NOT recency-based)
+    5. Filter out users with fewer than min_likes_per_user
+    
+    Returns:
+        Tuple of (likes_df: pl.DataFrame, stats: Dict with filtering statistics)
+    """
+    def _log(msg: str):
+        if logger:
+            logger.info(msg)
+        else:
+            print(f"  {msg}")
+    
+    start_dt = parse_one_ts(start_str)
+    end_dt = parse_one_ts(end_str)
+    
+    # Get file paths for likes
+    paths = list_files_in_range_ingex_gcs(
+        gcs_bucket=gcs_bucket,
+        blob_prefix='bsky_likes',
+        start=start_dt,
+        end=end_dt,
+    )
+    
+    if not paths:
+        raise ValueError(f"No likes parquet files found for time range {start_str} to {end_str}")
+    
+    _log(f"Found {len(paths)} likes parquet files")
+    
+    # Step 1: Scan likes and apply time filter
+    likes_lf = pl.scan_parquet(paths)
+    
+    # Normalize column names (handle case variations)
+    col_mapping = {}
+    schema = likes_lf.collect_schema()
+    for col in schema.names():
+        if col.lower() == 'did':
+            col_mapping[col] = 'did'
+        elif col.lower() == 'subjecturi':
+            col_mapping[col] = 'subject_uri'
+        elif col.lower() == 'recordcreatedat':
+            col_mapping[col] = 'record_created_at'
+        elif col.lower() == 'insertedat':
+            col_mapping[col] = 'inserted_at'
+    
+    if col_mapping:
+        likes_lf = likes_lf.rename(col_mapping)
+    
+    # Parse timestamp for filtering
+    if 'inserted_at' in likes_lf.collect_schema().names():
+        likes_lf = likes_lf.with_columns(
+            pl.col("inserted_at").str.to_datetime(time_zone="UTC").alias("inserted_at_dt")
+        )
+        if start_dt is not None:
+            likes_lf = likes_lf.filter(pl.col("inserted_at_dt") >= start_dt)
+        if end_dt is not None:
+            likes_lf = likes_lf.filter(pl.col("inserted_at_dt") < end_dt)
+    
+    # Collect to get initial counts
+    likes_df = likes_lf.collect()
+    n_likes_initial = len(likes_df)
+    n_users_initial = likes_df['did'].n_unique()
+    _log(f"Scanned {n_likes_initial:,} likes from {n_users_initial:,} users")
+    
+    stats = {
+        'n_likes_initial': n_likes_initial,
+        'n_users_initial': n_users_initial,
+    }
+    
+    # Step 2: Sample liking users if cap is set
+    if max_liking_users > 0 and n_users_initial > max_liking_users:
+        unique_users = likes_df.select('did').unique()
+        sampled_users = unique_users.sample(n=max_liking_users, seed=random_seed)
+        sampled_user_set = set(sampled_users['did'].to_list())
+        
+        likes_df = likes_df.filter(pl.col('did').is_in(sampled_user_set))
+        n_after_user_sample = len(likes_df)
+        pct_retained = 100.0 * n_after_user_sample / n_likes_initial if n_likes_initial > 0 else 0
+        _log(f"Sampled {max_liking_users:,} liking users ({100*max_liking_users/n_users_initial:.1f}% of total)")
+        _log(f"After user sampling: {n_after_user_sample:,} likes ({pct_retained:.1f}% retained)")
+        stats['n_users_sampled'] = max_liking_users
+        stats['n_likes_after_user_sample'] = n_after_user_sample
+    else:
+        stats['n_users_sampled'] = n_users_initial
+        stats['n_likes_after_user_sample'] = n_likes_initial
+    
+    # Step 3: Random cap likes per user (NOT recency-based)
+    if max_likes_per_user > 0:
+        n_before_cap = len(likes_df)
+        
+        # Add random column for sampling within groups
+        likes_df = likes_df.with_columns(
+            pl.lit(1).cum_count().over('did').shuffle(seed=random_seed).alias('_rand_order')
+        )
+        likes_df = likes_df.filter(pl.col('_rand_order') <= max_likes_per_user)
+        likes_df = likes_df.drop('_rand_order')
+        
+        n_after_cap = len(likes_df)
+        pct_retained = 100.0 * n_after_cap / n_before_cap if n_before_cap > 0 else 0
+        _log(f"After per-user cap ({max_likes_per_user}): {n_after_cap:,} likes ({pct_retained:.1f}% retained)")
+        stats['n_likes_after_per_user_cap'] = n_after_cap
+    else:
+        stats['n_likes_after_per_user_cap'] = len(likes_df)
+    
+    # Step 4: Filter users with fewer than min_likes_per_user
+    if min_likes_per_user > 0:
+        n_before_min = len(likes_df)
+        user_counts = likes_df.group_by('did').agg(pl.len().alias('count'))
+        eligible_users = user_counts.filter(pl.col('count') >= min_likes_per_user)['did']
+        likes_df = likes_df.filter(pl.col('did').is_in(eligible_users))
+        
+        n_after_min = len(likes_df)
+        n_users_final = likes_df['did'].n_unique()
+        pct_retained = 100.0 * n_after_min / n_before_min if n_before_min > 0 else 0
+        _log(f"After min-likes filter ({min_likes_per_user}): {n_after_min:,} likes ({pct_retained:.1f}% retained)")
+        _log(f"Final: {n_users_final:,} users with {n_after_min:,} likes")
+        stats['n_likes_final'] = n_after_min
+        stats['n_users_final'] = n_users_final
+    else:
+        stats['n_likes_final'] = len(likes_df)
+        stats['n_users_final'] = likes_df['did'].n_unique()
+    
+    # Select output columns
+    output_cols = ['did', 'subject_uri', 'record_created_at']
+    available_cols = [c for c in output_cols if c in likes_df.columns]
+    likes_df = likes_df.select(available_cols)
+    
+    return likes_df, stats
+
+
+def load_posts_core_polars(
+    gcs_bucket: str,
+    start_str: Optional[str],
+    end_str: Optional[str],
+    liked_post_uris: Set[str],
+    *,
+    negative_posts_sample: int = 100000,
+    embedding_model: str = 'all_MiniLM_L6_v2',
+    random_seed: int = 42,
+    logger: Optional[Any] = None,
+) -> Tuple[pl.DataFrame, Dict[str, Any]]:
+    """
+    Load posts data using Polars lazy evaluation.
+    
+    Loads:
+    1. All posts matching liked_post_uris (for positive cases)
+    2. Random sample of posts for negative cases
+    3. Expands pre-computed embeddings into separate columns
+    
+    Returns:
+        Tuple of (posts_df: pl.DataFrame, stats: Dict with loading statistics)
+    """
+    def _log(msg: str):
+        if logger:
+            logger.info(msg)
+        else:
+            print(f"  {msg}")
+    
+    start_dt = parse_one_ts(start_str)
+    end_dt = parse_one_ts(end_str)
+    
+    # Get file paths for posts
+    paths = list_files_in_range_ingex_gcs(
+        gcs_bucket=gcs_bucket,
+        blob_prefix='bsky_posts',
+        start=start_dt,
+        end=end_dt,
+    )
+    
+    if not paths:
+        raise ValueError(f"No posts parquet files found for time range {start_str} to {end_str}")
+    
+    _log(f"Found {len(paths)} posts parquet files")
+    
+    # Scan posts with time filter
+    posts_lf = pl.scan_parquet(paths)
+    
+    # Parse timestamp for filtering
+    if 'inserted_at' in posts_lf.collect_schema().names():
+        posts_lf = posts_lf.with_columns(
+            pl.col("inserted_at").str.to_datetime(time_zone="UTC").alias("inserted_at_dt")
+        )
+        if start_dt is not None:
+            posts_lf = posts_lf.filter(pl.col("inserted_at_dt") >= start_dt)
+        if end_dt is not None:
+            posts_lf = posts_lf.filter(pl.col("inserted_at_dt") < end_dt)
+    
+    # Collect full posts to get counts and filter
+    posts_df = posts_lf.collect()
+    n_posts_total = len(posts_df)
+    _log(f"Scanned {n_posts_total:,} posts in time window")
+    
+    stats = {
+        'n_posts_total': n_posts_total,
+    }
+    
+    # Check for at_uri column (join key)
+    if 'at_uri' not in posts_df.columns:
+        raise ValueError("Posts data missing 'at_uri' column required for joining with likes")
+    
+    # Step 1: Load liked posts
+    liked_posts_df = posts_df.filter(pl.col('at_uri').is_in(liked_post_uris))
+    n_liked_posts = len(liked_posts_df)
+    match_rate = 100.0 * n_liked_posts / len(liked_post_uris) if liked_post_uris else 0
+    _log(f"Extracted {len(liked_post_uris):,} unique liked post IDs")
+    _log(f"Loaded {n_liked_posts:,} liked posts ({match_rate:.1f}% match rate)")
+    
+    # Add is_liked flag
+    liked_posts_df = liked_posts_df.with_columns(pl.lit(True).alias('is_liked'))
+    stats['n_liked_posts'] = n_liked_posts
+    stats['liked_post_match_rate'] = match_rate
+    
+    # Step 2: Sample posts for negative cases (excluding liked posts)
+    non_liked_posts = posts_df.filter(~pl.col('at_uri').is_in(liked_post_uris))
+    n_non_liked = len(non_liked_posts)
+    
+    if negative_posts_sample > 0 and n_non_liked > 0:
+        sample_size = min(negative_posts_sample, n_non_liked)
+        neg_sample_df = non_liked_posts.sample(n=sample_size, seed=random_seed)
+        neg_sample_df = neg_sample_df.with_columns(pl.lit(False).alias('is_liked'))
+        _log(f"Sampled {sample_size:,} posts for negative cases")
+        stats['n_negative_sample'] = sample_size
+    else:
+        neg_sample_df = pl.DataFrame()
+        stats['n_negative_sample'] = 0
+    
+    # Step 3: Combine liked and negative sample posts
+    if len(neg_sample_df) > 0:
+        posts_combined = pl.concat([liked_posts_df, neg_sample_df])
+    else:
+        posts_combined = liked_posts_df
+    
+    n_combined = len(posts_combined)
+    _log(f"posts_core: {n_combined:,} rows ({n_liked_posts:,} liked + {stats['n_negative_sample']:,} negative)")
+    stats['n_posts_core'] = n_combined
+    
+    return posts_combined, stats
+
+
+def expand_embeddings_polars(
+    posts_df: pl.DataFrame,
+    embedding_model: str = 'all_MiniLM_L6_v2',
+    logger: Optional[Any] = None,
+) -> Tuple[pl.DataFrame, int]:
+    """
+    Expand the 'embeddings' column into separate post_emb_* columns.
+    
+    The embeddings column contains a list of dicts like:
+    [{'key': 'all_MiniLM_L6_v2', 'value': '<base85-encoded>'}, ...]
+    
+    Returns:
+        Tuple of (posts_df with expanded embeddings, embedding_dim)
+    """
+    def _log(msg: str):
+        if logger:
+            logger.info(msg)
+        else:
+            print(f"  {msg}")
+    
+    if 'embeddings' not in posts_df.columns:
+        _log("No 'embeddings' column found, skipping expansion")
+        return posts_df, 0
+    
+    # Convert to pandas for embedding extraction (complex nested structure)
+    _log("Expanding embeddings column...")
+    pdf = posts_df.to_pandas()
+    
+    # Find embedding dimension from first valid example
+    embed_dim = None
+    for emb_list in pdf['embeddings']:
+        if emb_list is None:
+            continue
+        emb_str = extract_encoded_embedding_ingex(emb_list, embedding_model)
+        if emb_str is not None:
+            try:
+                sample_emb = embedding_loads(emb_str, decompress=True)
+                embed_dim = len(sample_emb)
+                break
+            except Exception:
+                continue
+    
+    if embed_dim is None:
+        _log(f"No valid embeddings found for model {embedding_model}")
+        return posts_df, 0
+    
+    _log(f"Embedding dimension: {embed_dim}")
+    
+    # Extract embeddings for all rows
+    n_rows = len(pdf)
+    emb_array = np.zeros((n_rows, embed_dim), dtype=np.float32)
+    n_valid = 0
+    
+    for i, emb_list in enumerate(pdf['embeddings']):
+        if emb_list is None:
+            continue
+        emb_str = extract_encoded_embedding_ingex(emb_list, embedding_model)
+        if emb_str is not None:
+            try:
+                emb_array[i] = embedding_loads(emb_str, decompress=True)
+                n_valid += 1
+            except Exception:
+                continue
+    
+    _log(f"Expanded {n_valid:,}/{n_rows:,} embeddings ({100*n_valid/n_rows:.1f}%)")
+    
+    # Create embedding column names
+    emb_col_names = [f'post_emb_{i}' for i in range(embed_dim)]
+    
+    # Add embedding columns to dataframe
+    emb_df = pd.DataFrame(emb_array, columns=emb_col_names)
+    pdf = pd.concat([pdf.reset_index(drop=True), emb_df], axis=1)
+    
+    # Drop the original embeddings column (too large for parquet)
+    pdf = pdf.drop(columns=['embeddings'])
+    
+    # Convert back to polars
+    result_df = pl.from_pandas(pdf)
+    
+    return result_df, embed_dim
+
+
+# ----------------------------------------
 # Data IO helpers (Digital Ocean Spaces/S3 + parquet)
 # ----------------------------------------
 def list_recent_objects_digital_ocean(bucket: str, prefix: str, days: int) -> Tuple[List[str], List[dict]]:
@@ -1081,6 +1422,8 @@ __all__ = [
     'parse_one_ts',
     # Data IO Green Earth Ingex GCS
     'load_raw_data_ingex',
+    # Stage 1: Polars-based filtering for core datasets
+    'load_likes_core_polars', 'load_posts_core_polars', 'expand_embeddings_polars',
     # Data IO Digital Ocean
     'list_recent_objects_digital_ocean', 'list_all_objects_digital_ocean', 'download_parquet_files_digital_ocean', 'load_and_combine_data_digital_ocean', 'load_most_recent_raw_data_digital_ocean',
     # Detection
