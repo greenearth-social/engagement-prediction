@@ -23,11 +23,10 @@ from utils.helpers import get_stage_logger, log_operation_start, validate_datafr
 
 def _load_likes_core_lf_from_prior(prior_path: Path) -> pl.LazyFrame:
     # Load the most recent likes_core_*.parquet found in the given directory
-    # candidates = sorted(prior_path.glob('likes_core_*.parquet'), key=lambda p: p.stat().st_mtime, reverse=True)
-    # if not candidates:
-    #     raise FileNotFoundError(f"No likes_core_*.parquet found under {prior_path}")
-    # return pl.scan_parquet(candidates[0])
-    return pl.scan_parquet(prior_path)
+    candidates = sorted(prior_path.glob('likes_core_*.parquet'), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not candidates:
+        raise FileNotFoundError(f"No likes_core_*.parquet found under {prior_path}")
+    return pl.scan_parquet(candidates[0])
 
 
 # TODO: Add an "end_window_lookback"?
@@ -98,8 +97,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     logger = get_stage_logger('STAGE_02_FEATURIZE', log_file=out_dir / 'stage.log')
 
     # Try to use prior get_data output when available
-    # prior_path = select_prior_output(run_dir, '01_get_data', use_latest=context.use_latest, prior_path=context.prior_outputs.get('01_get_data'))
-    prior_path = Path("/mnt/data/dave/outputs/01_get_data/20260120_210159/dummy_likes_core.parquet")
+    prior_path = select_prior_output(run_dir, '01_get_data', use_latest=context.use_latest, prior_path=context.prior_outputs.get('01_get_data'))
     if prior_path is None:
         raise FileNotFoundError(f"Could not find raw data in 01_get_data")
 
