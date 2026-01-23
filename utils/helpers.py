@@ -518,36 +518,85 @@ def estimate_filtered_data_memory(
     # Calculate actual average likes per user in THIS time window
     avg_likes_per_user_in_window = raw_likes_rows / max(estimated_raw_users, 1)
     
-    # Apply user cap
-    if max_liking_users > 0:
-        estimated_users = min(max_liking_users, estimated_raw_users)
+    # === IMPORTANT: Account for pre-filtering before user sampling ===
+    # With early filtering, we:
+    # 1. Pre-filter to users with >= min_likes_per_user (the "eligible" users)
+    # 2. Sample from those eligible users only
+    #
+    # Users with < min_likes_per_user have very few likes (at most min_likes - 1 each).
+    # The eligible users have MORE likes on average than the general population.
+    #
+    # Estimate how many users are excluded by min_likes_per_user:
+    # Observation: power-law distribution - many users have only 1-2 likes
+    # Typical exclusion rate: ~15-20% of users have < min_likes_per_user likes
+    # These excluded users contribute relatively few total likes
+    if min_likes_per_user > 1:
+        # Estimate fraction of users excluded (those with < min_likes_per_user)
+        # Based on observed data: ~16-17% of users have only 1 like
+        excluded_user_fraction = 0.17 * (min_likes_per_user - 1)  # Scale by threshold
+        excluded_user_fraction = min(excluded_user_fraction, 0.5)  # Cap at 50%
+        
+        estimated_eligible_users = int(estimated_raw_users * (1 - excluded_user_fraction))
+        
+        # Excluded users contribute very few likes (max of min_likes - 1 each)
+        excluded_user_likes = int(estimated_raw_users * excluded_user_fraction * (min_likes_per_user - 1))
+        eligible_user_likes = raw_likes_rows - excluded_user_likes
+        
+        avg_likes_per_eligible_user = eligible_user_likes / max(estimated_eligible_users, 1)
     else:
-        estimated_users = estimated_raw_users
+        # No pre-filtering
+        estimated_eligible_users = estimated_raw_users
+        eligible_user_likes = raw_likes_rows
+        avg_likes_per_eligible_user = avg_likes_per_user_in_window
+    
+    # Apply user cap to eligible users (sampling happens from eligible pool)
+    if max_liking_users > 0:
+        estimated_users = min(max_liking_users, estimated_eligible_users)
+    else:
+        estimated_users = estimated_eligible_users
     
     # IMPORTANT: Memory estimation should focus on INTERMEDIATE sizes during processing,
     # not final filtered output. The key insight from observations:
     #
     # Likes processing:
-    # - Pass 1: Scan all files to collect user DIDs (memory: user set ~200MB)
-    # - Pass 2: Collect ALL likes for sampled users before per-user cap/min-likes filter
-    #   -> This is proportional to (sampled_users / total_users) × raw_likes
+    # - Pass 1: Scan all files to count likes per user (memory: user_counts dict ~200MB)
+    # - Pre-filter: Keep only users with >= min_likes_per_user
+    # - Sample: Select max_liking_users from eligible pool
+    # - Pass 2: Collect ALL likes for sampled users
+    #   -> This is proportional to (sampled_users / eligible_users) × eligible_user_likes
     #   -> These likes are stored in chunks with significant overhead (~4KB/row)
     #
     # Posts processing:
     # - Batch through files, extracting liked posts + reservoir sampling negatives
     # - Final output is relatively small (liked posts + negative sample)
     
-    # Calculate INTERMEDIATE likes (before per-user cap and min-likes filter)
-    # This is what actually consumes memory during Pass 2
-    user_sampling_ratio = estimated_users / max(estimated_raw_users, 1)
-    intermediate_likes = int(raw_likes_rows * user_sampling_ratio)
+    # Calculate INTERMEDIATE likes (before per-user cap filter)
+    # Sampling ratio is now relative to ELIGIBLE users, not all users
+    user_sampling_ratio = estimated_users / max(estimated_eligible_users, 1)
+    intermediate_likes = int(eligible_user_likes * user_sampling_ratio)
     
     # Estimate final likes after filtering (for output size)
     # Per-user cap: users with > max_likes_per_user get truncated
-    # Min-likes filter: users with < min_likes_per_user get removed
-    # Observed: very aggressive filtering, especially with power-law distributions
-    expected_likes_per_user = min(avg_likes_per_user_in_window, max_likes_per_user)
-    estimated_likes = int(estimated_users * expected_likes_per_user * 0.95)  # 5% loss to min-likes
+    # 
+    # IMPORTANT: Like distributions are extremely heavy-tailed (power-law).
+    # A small fraction of "super-likers" contribute most of the likes before cap.
+    # When the cap is applied, total likes can drop to 5-10% of intermediate count.
+    #
+    # Observation from runs:
+    # - avg 73 likes/user before cap, cap=250, actual retention: 7%
+    # - This is because most likes come from users with >>250 likes
+    #
+    # For memory estimation, use a conservative approach based on intermediate likes
+    # rather than trying to model the exact cap effect.
+    
+    if max_likes_per_user > 0:
+        # Heavy-tail adjustment: assume cap reduces likes to ~10-30% of intermediate
+        # This is more realistic than assuming avg * cap_effect
+        cap_retention_factor = 0.15  # Conservative: assume 15% retention after cap
+        estimated_likes = int(intermediate_likes * cap_retention_factor)
+    else:
+        # No cap - use intermediate likes as estimate
+        estimated_likes = intermediate_likes
     
     # Estimate liked posts for final output
     unique_liked_uris_estimate = int(estimated_likes * 0.5)
@@ -560,22 +609,30 @@ def estimate_filtered_data_memory(
     # === Memory estimation with incremental processing ===
     
     # Bytes per row estimates (in-memory representation)
-    # IMPORTANT: These are based on observed actual memory usage, not theoretical sizes
+    # IMPORTANT: These are calibrated from observed actual memory usage across multiple runs
+    # 
+    # Observations from 2026-01-23 runs:
+    # - 10k users: 743,983 likes, ~25 GB memory → ~34 KB/row
+    # - 30k users: 2,284,802 likes, ~25 GB memory → ~11 KB/row
+    # - 50k users: 3,677,782 likes, ~30 GB memory → ~8 KB/row
+    # - Per-row overhead decreases with larger datasets (Polars consolidation)
+    #
+    # Using estimates calibrated for larger scales (more common use case):
     
-    # Likes during chunk accumulation have significant overhead (~4KB per row observed)
-    # This includes Polars DataFrame overhead per chunk, string storage, etc.
-    likes_bytes_per_row_intermediate = 4000  # During Pass 2 chunk accumulation
+    # Likes during chunk accumulation: 8-10 KB/row for larger datasets
+    likes_bytes_per_row_intermediate = 9_000  # During Pass 2 chunk accumulation
     likes_bytes_per_row_final = 200  # After combining into single DataFrame
     
     # Posts: use parquet metadata to estimate, with 4x expansion for in-memory
     posts_bytes_per_row_parquet = posts_raw['estimated_bytes'] / max(raw_posts_rows, 1)
     posts_bytes_per_row_raw = int(posts_bytes_per_row_parquet * 4)
     
-    # Expanded posts: ~31KB per post observed (text, author, embeddings as float32s, etc.)
-    posts_bytes_per_row_expanded = 32_000
+    # Expanded posts: ~40KB per post observed (text, author, embeddings as float32s, metadata)
+    posts_bytes_per_row_expanded = 40_000
     
-    # Component 1: User set during Pass 1 (strings in memory)
-    user_set_bytes = estimated_raw_users * 80  # ~80 bytes per DID string in set
+    # Component 1: User counts dict during Pass 1 (DID strings + int counts)
+    # Using dict instead of set adds ~8 bytes per entry for the int value
+    user_set_bytes = estimated_raw_users * 90  # ~90 bytes per DID string + count in dict
     
     # Component 2: Working memory per batch of files
     batch_size = 20  # Files per batch
@@ -603,32 +660,38 @@ def estimate_filtered_data_memory(
     # Component 5: Negative reservoir (100k posts with expanded embeddings)
     negative_reservoir_bytes = int(min(negative_posts_sample, raw_posts_rows) * posts_bytes_per_row_expanded)
     
+    # Component 6: Accumulated liked posts during loading (with expanded embeddings)
+    liked_posts_accumulated_bytes = int(estimated_liked_posts * posts_bytes_per_row_expanded)
+    
     # Phase 1: Likes loading (Pass 1 + Pass 2)
-    # - Pass 1: user_set_bytes (scanning for unique users)
+    # - Pass 1: user_counts dict (scanning for user like counts)
     # - Pass 2: accumulating all likes for sampled users in chunks
     # Peak is at end of Pass 2 when all intermediate likes are in memory
     phase_1_likes = user_set_bytes + likes_intermediate_bytes
     
     # Phase 2: Posts loading with early expansion
-    # After likes processing, we have ~likes_intermediate_bytes still in memory
-    # (not freed until GC), plus we're accumulating:
-    # - Liked posts (small: ~estimated_liked_posts × 32KB)
-    # - Negative reservoir (capped at negative_posts_sample × 32KB)
-    # - One raw batch being processed
-    phase_2_posts = (likes_intermediate_bytes +  # Likes still in memory
-                     posts_batch_bytes +          # Current batch being processed
-                     negative_reservoir_bytes)    # Negative sample (expanded)
+    # After likes processing, the final likes_df is in memory (smaller than intermediate)
+    # During posts loading, we accumulate:
+    # - Liked posts with expanded embeddings (grows during processing)
+    # - Negative reservoir with expanded embeddings (capped at sample size)
+    # - Current batch being processed
+    # Memory from likes phase is largely retained due to Python/Polars memory management
+    phase_2_posts = (likes_intermediate_bytes +       # Likes memory still held (fragmentation)
+                     liked_posts_accumulated_bytes +  # Accumulated liked posts (expanded)
+                     negative_reservoir_bytes +       # Negative sample (expanded)
+                     posts_batch_bytes)               # Current batch being processed
     
     # Phase 3: Final output (likes filtered, posts combined)
-    # Most intermediate likes memory should be freed at this point
+    # Most intermediate memory should be freed at this point
     phase_3_final = likes_output_bytes + posts_output_bytes
     
     peak_bytes = max(phase_1_likes, phase_2_posts, phase_3_final)
     
-    # Add Python/Polars baseline overhead (~0.7 GB typical for this pipeline)
-    # Use a modest 10% buffer since our estimates are now based on observed behavior
-    baseline_overhead_bytes = int(0.7 * (1024**3))
-    peak_bytes = int(peak_bytes * 1.1) + baseline_overhead_bytes  # 10% buffer
+    # Add Python/Polars baseline overhead
+    # Observed: ~2 GB fixed overhead for Polars/Python runtime, chunk management, etc.
+    # Use 15% buffer for GC timing and estimation variance
+    baseline_overhead_bytes = int(2.0 * (1024**3))
+    peak_bytes = int(peak_bytes * 1.15) + baseline_overhead_bytes  # 15% buffer
     
     result = {
         # Raw data stats
@@ -641,10 +704,13 @@ def estimate_filtered_data_memory(
         # Per-row estimates (KB)
         'likes_bytes_per_row_intermediate_kb': likes_bytes_per_row_intermediate / 1024,
         'posts_bytes_per_row_expanded_kb': posts_bytes_per_row_expanded / 1024,
-        # Estimated users
+        # Estimated users (with pre-filtering for min_likes_per_user)
         'estimated_raw_users': estimated_raw_users,
-        'estimated_filtered_users': estimated_users,
+        'estimated_eligible_users': estimated_eligible_users,  # Users meeting min_likes threshold
+        'estimated_filtered_users': estimated_users,           # After sampling cap
         'avg_likes_per_user_in_window': avg_likes_per_user_in_window,
+        'avg_likes_per_eligible_user': avg_likes_per_eligible_user,
+        'eligible_user_likes': eligible_user_likes,
         'user_sampling_ratio': user_sampling_ratio,
         # Estimated data sizes
         'intermediate_likes': intermediate_likes,  # Before per-user cap/min-likes filter
@@ -657,6 +723,7 @@ def estimate_filtered_data_memory(
         'mem_likes_intermediate_gb': likes_intermediate_bytes / (1024**3),
         'mem_posts_batch_gb': posts_batch_bytes / (1024**3),
         'mem_negative_reservoir_gb': negative_reservoir_bytes / (1024**3),
+        'mem_liked_posts_accumulated_gb': liked_posts_accumulated_bytes / (1024**3),
         'mem_likes_output_gb': likes_output_bytes / (1024**3),
         'mem_posts_output_gb': posts_output_bytes / (1024**3),
         # Phase peaks
@@ -680,8 +747,10 @@ def estimate_filtered_data_memory(
     
     _log("Memory estimation (batch processing with early embedding expansion):")
     _log(f"  Raw data: {raw_likes_rows:,} likes ({n_likes_files} files), {raw_posts_rows:,} posts ({n_posts_files} files)")
-    _log(f"  User sampling: {estimated_users:,} / {estimated_raw_users:,} users ({user_sampling_ratio*100:.1f}%)")
-    _log(f"  Intermediate likes (before cap/filter): {intermediate_likes:,} ({likes_bytes_per_row_intermediate/1024:.1f}KB/row)")
+    _log(f"  Users: {estimated_raw_users:,} total, ~{estimated_eligible_users:,} eligible (>={min_likes_per_user} likes)")
+    _log(f"  User sampling: {estimated_users:,} from {estimated_eligible_users:,} eligible ({user_sampling_ratio*100:.1f}%)")
+    _log(f"  Avg likes/eligible user: {avg_likes_per_eligible_user:.1f}")
+    _log(f"  Intermediate likes (before cap): {intermediate_likes:,} ({likes_bytes_per_row_intermediate/1024:.1f}KB/row)")
     _log(f"  Negative reservoir: {min(negative_posts_sample, raw_posts_rows):,} posts ({posts_bytes_per_row_expanded/1024:.1f}KB/post)")
     _log(f"  Memory phases: likes={result['phase_1_likes_gb']:.2f}GB, posts={result['phase_2_posts_gb']:.2f}GB, final={result['phase_3_final_gb']:.2f}GB")
     _log(f"  Estimated peak: {result['estimated_peak_gb']:.2f} GB")
@@ -863,12 +932,16 @@ def load_likes_core_polars(
     Load and filter likes data using memory-efficient incremental processing.
     
     Instead of loading all files at once, this processes files incrementally:
-    1. First pass: scan files to collect unique user DIDs (minimal memory)
-    2. Sample users if cap is set
-    3. Second pass: scan files again, only keeping likes from sampled users
-    4. Apply per-user caps and min-likes filters
+    1. First pass: scan files to count likes per user
+    2. Pre-filter users who don't meet min_likes_per_user threshold
+    3. Sample users from eligible pool (if cap is set)
+    4. Second pass: scan files again, only keeping likes from sampled users
+    5. Apply per-user random caps (NOT recency-based)
+    6. Verify min-likes threshold (handles edge cases from per-user caps)
     
-    This approach keeps memory usage bounded regardless of total data size.
+    This approach keeps memory usage bounded regardless of total data size,
+    and ensures sampled users actually meet the minimum likes requirement,
+    avoiding wasteful sampling of users who will be filtered out later.
     
     Returns:
         Tuple of (likes_df: pl.DataFrame, stats: Dict with filtering statistics)
@@ -931,9 +1004,9 @@ def load_likes_core_polars(
         
         return lf
     
-    # ===== PASS 1: Collect unique users and counts (batch processing) =====
-    _log(f"Pass 1: Scanning files for unique users (batch size: {BATCH_SIZE})...")
-    all_users: Set[str] = set()
+    # ===== PASS 1: Collect unique users with like counts (batch processing) =====
+    _log(f"Pass 1: Scanning files for user like counts (batch size: {BATCH_SIZE})...")
+    user_counts: Dict[str, int] = {}
     n_likes_initial = 0
     
     for batch_start in range(0, len(paths), BATCH_SIZE):
@@ -941,15 +1014,19 @@ def load_likes_core_polars(
         batch_paths = paths[batch_start:batch_end]
         
         lf = _prepare_batch_lf(batch_paths)
-        # Only collect the 'did' column - minimal memory
+        # Collect user DIDs to count likes per user
         batch_users = lf.select('did').collect()
-        all_users.update(batch_users['did'].to_list())
+        
+        # Count likes per user in this batch
+        for user in batch_users['did'].to_list():
+            user_counts[user] = user_counts.get(user, 0) + 1
+        
         n_likes_initial += len(batch_users)
         
-        _log(f"  Scanned {batch_end}/{len(paths)} files: {n_likes_initial:,} likes, {len(all_users):,} unique users")
+        _log(f"  Scanned {batch_end}/{len(paths)} files: {n_likes_initial:,} likes, {len(user_counts):,} unique users")
         log_memory_checkpoint(f"likes_pass1_batch_{batch_end}", logger)
     
-    n_users_initial = len(all_users)
+    n_users_initial = len(user_counts)
     _log(f"Pass 1 complete: {n_likes_initial:,} likes from {n_users_initial:,} users")
     log_memory_checkpoint("likes_after_pass1", logger)
     
@@ -958,21 +1035,37 @@ def load_likes_core_polars(
         'n_users_initial': n_users_initial,
     }
     
+    # ===== Pre-filter users by min_likes_per_user before sampling =====
+    if min_likes_per_user > 0:
+        eligible_users = {user for user, count in user_counts.items() if count >= min_likes_per_user}
+        n_users_eligible = len(eligible_users)
+        n_users_filtered = n_users_initial - n_users_eligible
+        _log(f"Pre-filtering: {n_users_eligible:,} users meet min-likes threshold ({min_likes_per_user}), "
+             f"excluded {n_users_filtered:,} users with too few likes")
+        stats['n_users_eligible_for_sampling'] = n_users_eligible
+        stats['n_users_excluded_min_likes'] = n_users_filtered
+    else:
+        eligible_users = set(user_counts.keys())
+        stats['n_users_eligible_for_sampling'] = n_users_initial
+    
+    # Free the user_counts dict - no longer needed
+    del user_counts
+    
     # ===== Sample users if cap is set =====
     rng = np.random.RandomState(random_seed)
     
-    if max_liking_users > 0 and n_users_initial > max_liking_users:
-        user_list = list(all_users)
+    if max_liking_users > 0 and len(eligible_users) > max_liking_users:
+        user_list = list(eligible_users)
         sampled_indices = rng.choice(len(user_list), size=max_liking_users, replace=False)
         sampled_user_set = {user_list[i] for i in sampled_indices}
-        _log(f"Sampled {max_liking_users:,} liking users ({100*max_liking_users/n_users_initial:.1f}% of total)")
+        _log(f"Sampled {max_liking_users:,} liking users ({100*max_liking_users/len(eligible_users):.1f}% of eligible)")
         stats['n_users_sampled'] = max_liking_users
     else:
-        sampled_user_set = all_users
-        stats['n_users_sampled'] = n_users_initial
+        sampled_user_set = eligible_users
+        stats['n_users_sampled'] = len(eligible_users)
     
-    # Free the full user set
-    del all_users
+    # Free the eligible user set
+    del eligible_users
     log_memory_checkpoint("likes_after_user_sample", logger)
     
     # ===== PASS 2: Collect likes only for sampled users (batch processing) =====
@@ -1028,7 +1121,9 @@ def load_likes_core_polars(
     else:
         stats['n_likes_after_per_user_cap'] = len(likes_df)
     
-    # ===== Filter users with fewer than min_likes_per_user =====
+    # ===== Verify min-likes filter (should be mostly satisfied already) =====
+    # Since we pre-filtered users before sampling, this step mainly handles edge cases
+    # where the per-user cap might have reduced some users below the threshold
     if min_likes_per_user > 0 and len(likes_df) > 0:
         n_before_min = len(likes_df)
         user_counts = likes_df.group_by('did').agg(pl.len().alias('count'))
@@ -1037,8 +1132,14 @@ def load_likes_core_polars(
         
         n_after_min = len(likes_df)
         n_users_final = likes_df['did'].n_unique() if len(likes_df) > 0 else 0
-        pct_retained = 100.0 * n_after_min / n_before_min if n_before_min > 0 else 0
-        _log(f"After min-likes filter ({min_likes_per_user}): {n_after_min:,} likes ({pct_retained:.1f}% retained)")
+        
+        # This should typically remove few or no users since we pre-filtered
+        n_removed = n_before_min - n_after_min
+        if n_removed > 0:
+            pct_removed = 100.0 * n_removed / n_before_min
+            _log(f"Min-likes verification removed {n_removed:,} likes ({pct_removed:.1f}%) from users "
+                 f"who fell below threshold after per-user cap")
+        
         _log(f"Final: {n_users_final:,} users with {n_after_min:,} likes")
         stats['n_likes_final'] = n_after_min
         stats['n_users_final'] = n_users_final

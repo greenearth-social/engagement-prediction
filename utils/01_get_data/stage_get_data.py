@@ -199,6 +199,7 @@ def _run_greenearth_pipeline(
     embedding_model = getattr(args, 'embedding_model', 'all_MiniLM_L6_v2')
     max_memory_gb = float(getattr(args, 'max_memory_gb', 0))
     max_memory_pct = float(getattr(args, 'max_memory_pct', 0.75))
+    skip_memory_check = bool(getattr(args, 'skip_memory_check', False))
     
     all_stats = {}
     
@@ -229,20 +230,27 @@ def _run_greenearth_pipeline(
     )
     
     # Smart memory check that accounts for filtering parameters
-    memory_estimate = check_data_load_safe(
-        likes_paths=likes_paths,
-        posts_paths=posts_paths,
-        embedding_dim=384,  # Standard MiniLM dimension
-        max_memory_gb=max_memory_gb,
-        max_memory_pct=max_memory_pct,
-        max_liking_users=max_liking_users,
-        max_likes_per_user=max_likes_per_user,
-        min_likes_per_user=min_likes_per_user,
-        negative_posts_sample=negative_posts_sample,
-        logger=logger,
-    )
+    if skip_memory_check:
+        logger.warning("=" * 60)
+        logger.warning("SKIPPING MEMORY CHECK (--skip-memory-check flag set)")
+        logger.warning("Monitor memory usage carefully - OOM may occur!")
+        logger.warning("=" * 60)
+        memory_estimate = {'skipped': True, 'reason': 'skip_memory_check flag set'}
+    else:
+        memory_estimate = check_data_load_safe(
+            likes_paths=likes_paths,
+            posts_paths=posts_paths,
+            embedding_dim=384,  # Standard MiniLM dimension
+            max_memory_gb=max_memory_gb,
+            max_memory_pct=max_memory_pct,
+            max_liking_users=max_liking_users,
+            max_likes_per_user=max_likes_per_user,
+            min_likes_per_user=min_likes_per_user,
+            negative_posts_sample=negative_posts_sample,
+            logger=logger,
+        )
+        logger.info("Memory check passed, proceeding with data load")
     all_stats['memory_estimate'] = memory_estimate
-    logger.info("Memory check passed, proceeding with data load")
     
     mem_tracker.checkpoint("after_memory_check")
     
