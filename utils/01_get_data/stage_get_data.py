@@ -1,27 +1,102 @@
 #!/usr/bin/env python3
 
 """
-Stage 1: Get and filter data using Polars-based lazy evaluation.
+Stage 1: Get and filter data using memory-efficient incremental processing.
 
-This stage implements efficient filtering to produce core datasets:
+This stage implements a two-pass filtering pipeline to produce core datasets:
 - likes_core.parquet: filtered likes (user sampling, per-user caps, min-likes)
-- posts_core.parquet: liked posts + random sample for negatives, with expanded embeddings
+- posts_core.parquet: liked posts + random negative sample, with expanded embeddings
 
-Filtering Sequence:
-1. Scan likes parquets for liking user DIDs
-2. Sample liking users if --max-liking-users cap is set
-3. Filter likes to sampled users
-4. Random cap likes per user (NOT recency-based, to avoid model learning spurious time patterns)
-5. Filter users with fewer than --min-likes-per-user
-6. Extract liked post URIs
-7. Load liked posts from posts parquets
-8. Sample random posts for negative cases
-9. Expand pre-computed embeddings into columns
+================================================================================
+FILTERING SEQUENCE
+================================================================================
 
-Outputs under <run_dir>/01_get_data/<timestamp>/:
-- likes_core.parquet: did, subject_uri, record_created_at
-- posts_core.parquet: all post columns + post_emb_* + is_liked flag
-- summary.json: filtering statistics and parameters
+PHASE 1: Likes Processing (load_likes_core_polars in helpers.py)
+-------------------------------------------------------------------------
+Pass 1 - Count likes per user:
+  - Scan all likes parquet files in batches (20 files at a time)
+  - Build a Dict[user_did, like_count] to track likes per user
+  - Apply time-range filter (--likes-start / --likes-end)
+
+Pre-filter for minimum likes:
+  - Exclude users with fewer than --min-likes-per-user from the eligible pool
+  - This happens BEFORE sampling, ensuring we don't waste sample slots on users
+    who would later be filtered out
+
+Sample users (if --max-liking-users is set):
+  - Randomly sample from the eligible user pool (not all users)
+  - Uses --cap-random-seed for reproducibility
+
+Pass 2 - Collect likes for sampled users:
+  - Scan files again, keeping only likes from sampled users
+  - Accumulates likes incrementally to bound memory usage
+
+Per-user random cap (--max-likes-per-user):
+  - For each user, randomly select up to the cap limit
+  - IMPORTANT: Random selection, NOT recency-based, to avoid the model learning
+    spurious time patterns (e.g., "recent likes predict engagement")
+
+Final min-likes verification:
+  - Re-check that users still meet --min-likes-per-user after the per-user cap
+  - Handles edge cases where capping reduced a user below the threshold
+
+PHASE 2: Posts Processing (load_posts_core_polars in helpers.py)
+-------------------------------------------------------------------------
+Extract liked post URIs:
+  - Get unique subject_uri values from the filtered likes
+
+Process posts in batches with early embedding expansion:
+  - Scan posts parquet files in batches (20 files at a time)
+  - Apply time-range filter (--posts-start / --posts-end)
+  - For each batch:
+    a) Filter to liked posts (matching the URIs from Phase 1)
+    b) Expand embeddings immediately (float list -> individual columns)
+    c) Drop the raw embedding blob to free memory
+    d) Accumulate only the slim expanded data
+
+Reservoir sampling for negatives (--negative-posts-sample):
+  - Maintain a reservoir of non-liked posts across all batches
+  - Early embedding expansion for negatives too
+  - Ensures random distribution across the full time range
+
+Combine outputs:
+  - Concatenate liked posts + negative sample
+  - Add 'is_liked' flag (True for liked, False for negative sample)
+
+================================================================================
+DESIGN RATIONALE
+================================================================================
+
+Two-pass processing:
+  Memory usage is bounded regardless of total data size. Pass 1 only stores
+  user DIDs and counts; Pass 2 only stores likes for sampled users.
+
+Pre-filtering before sampling:
+  Without this, sampling 100k users might yield only 67k after min-likes filter.
+  Pre-filtering ensures the full sample budget is used on valid users.
+
+Random capping (not recency-based):
+  If we kept only the N most recent likes per user, the model could learn that
+  "recency = engagement" rather than content-based patterns. Random selection
+  prevents this temporal leakage.
+
+Early embedding expansion:
+  Raw embeddings are ~150KB/post (serialized float lists). Expanded columns are
+  ~2KB/post. Expanding per-batch reduces peak memory by ~98%.
+
+Reservoir sampling for negatives:
+  Ensures the negative sample is representative of the full time range, not
+  biased toward early or late files in the scan order.
+
+================================================================================
+OUTPUTS
+================================================================================
+
+Under <run_dir>/01_get_data/<timestamp>/:
+  - likes_core.parquet: did, subject_uri, record_created_at
+  - posts_core.parquet: post columns + post_emb_0..N + is_liked flag
+  - summary.json: full filtering statistics and parameters
+  - stage.log: detailed execution log with memory checkpoints
 """
 
 from __future__ import annotations
