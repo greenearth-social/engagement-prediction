@@ -55,6 +55,14 @@ Process posts in batches with early embedding expansion:
     d) Drop the raw embedding blob to free memory
     e) Accumulate only the slim expanded data
 
+POST-JOIN MIN-LIKES VERIFICATION:
+  - After Phase 2, re-check min-likes threshold based on likes that have matching posts
+  - Since like-post joining isn't perfect (some posts may be missing, deleted, or outside
+    time range), users who met the threshold in Phase 1 may drop below it after the join
+  - Filter out likes for posts that don't exist in posts_core
+  - Remove users who no longer meet --min-likes-per-user after the join filter
+  - This ensures all users in the final dataset have at least min-likes with valid posts
+
 Reservoir sampling for random sample (--negative-posts-sample):
   - Maintain a reservoir of posts sampled from ALL posts (not filtered by like status)
   - This ensures the random sample is STATISTICALLY INDEPENDENT of like status
@@ -393,6 +401,64 @@ def _run_greenearth_pipeline(
     all_stats['embedding_dim'] = embed_dim
     
     mem_tracker.checkpoint("after_posts_load_and_expansion")
+    
+    # Step 4: Re-verify min-likes after like-post join
+    # Since like-post joining isn't perfect (some posts may be missing, deleted, or outside time range),
+    # we need to re-check that users still meet min-likes threshold based on likes that have matching posts.
+    log_operation_start('Re-verify min-likes after like-post join', 'STAGE_01_GET_DATA', logger)
+    
+    # Get set of post URIs that actually exist in posts_core
+    existing_post_uris = set(posts_core_df['at_uri'].unique().to_list())
+    logger.info(f"Found {len(existing_post_uris):,} unique post URIs in posts_core")
+    
+    # Filter likes to only those with matching posts
+    n_likes_before_join_filter = len(likes_core_df)
+    likes_core_df = likes_core_df.filter(
+        pl.col('subject_uri').is_in(existing_post_uris)
+    )
+    n_likes_after_join_filter = len(likes_core_df)
+    n_likes_removed_by_join = n_likes_before_join_filter - n_likes_after_join_filter
+    logger.info(f"After join filter: {n_likes_before_join_filter:,} -> {n_likes_after_join_filter:,} likes ({n_likes_removed_by_join:,} removed)")
+    
+    # Re-verify min-likes per user
+    n_users_removed_by_join_verify = 0
+    if min_likes_per_user > 0:
+        user_like_counts = (
+            likes_core_df.group_by('did')
+            .agg(pl.count().alias('like_count'))
+        )
+        
+        n_users_before_join_verify = len(user_like_counts)
+        users_meeting_threshold = user_like_counts.filter(
+            pl.col('like_count') >= min_likes_per_user
+        )
+        n_users_after_join_verify = len(users_meeting_threshold)
+        n_users_removed_by_join_verify = n_users_before_join_verify - n_users_after_join_verify
+        
+        if n_users_removed_by_join_verify > 0:
+            logger.warning(
+                f"Min-likes verification after join: {n_users_before_join_verify:,} -> {n_users_after_join_verify:,} users "
+                f"({n_users_removed_by_join_verify:,} removed due to insufficient likes after join)"
+            )
+            
+            # Filter likes to only users who still meet threshold
+            valid_user_dids = set(users_meeting_threshold['did'].to_list())
+            likes_core_df = likes_core_df.filter(
+                pl.col('did').is_in(valid_user_dids)
+            )
+            n_likes_after_final_filter = len(likes_core_df)
+            logger.info(f"Final likes after user filter: {n_likes_after_final_filter:,} likes")
+        else:
+            logger.info(f"All {n_users_before_join_verify:,} users still meet min-likes threshold after join")
+    
+    # Update stats with join verification results
+    if 'likes' in all_stats:
+        all_stats['likes']['n_likes_removed_by_join'] = n_likes_removed_by_join
+        all_stats['likes']['n_users_removed_by_join_verify'] = n_users_removed_by_join_verify
+        all_stats['likes']['n_users_final_after_join'] = likes_core_df['did'].n_unique() if len(likes_core_df) > 0 else 0
+        all_stats['likes']['n_likes_final_after_join'] = len(likes_core_df)
+    
+    mem_tracker.checkpoint("after_join_verification")
     
     # Memory summary: compare actual vs estimated
     memory_summary = mem_tracker.summary()
