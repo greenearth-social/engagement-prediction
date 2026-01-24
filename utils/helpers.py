@@ -453,6 +453,127 @@ def estimate_parquet_memory(
     }
 
 
+def sample_bytes_per_row(
+    file_paths: List[str],
+    n_sample_files: int = 2,
+    expand_embeddings: bool = False,
+    embedding_dim: int = 384,
+    logger: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Empirically measure bytes-per-row by loading a small random sample of files.
+    
+    This provides accurate memory estimates that adapt to the actual data schema
+    and content, rather than relying on hard-coded constants.
+    
+    Files are sampled RANDOMLY from the middle of the list to avoid temporal bias
+    (files at start/end of time windows may have different characteristics).
+    
+    Args:
+        file_paths: List of parquet file paths to sample from
+        n_sample_files: Number of files to sample (default: 2)
+        expand_embeddings: Whether to expand embedding column (for posts)
+        embedding_dim: Embedding dimension if expanding
+        logger: Optional logger
+        
+    Returns:
+        Dict with 'bytes_per_row', 'rows_sampled', 'files_sampled', 'memory_bytes'
+    """
+    import gc
+    
+    if not file_paths or n_sample_files <= 0:
+        return {'bytes_per_row': None, 'rows_sampled': 0, 'files_sampled': 0}
+    
+    if psutil is None:
+        if logger:
+            logger.warning("psutil not available - cannot sample bytes per row empirically")
+        return {'bytes_per_row': None, 'rows_sampled': 0, 'files_sampled': 0, 'error': 'psutil not available'}
+    
+    # Sample files RANDOMLY from the list (avoiding temporal bias at start/end)
+    # Exclude first and last 10% of files to avoid edge effects
+    n_files = len(file_paths)
+    if n_files <= 5:
+        # Too few files - just sample what we can
+        sample_indices = random.sample(range(n_files), min(n_sample_files, n_files))
+    else:
+        # Exclude first/last 10% to avoid temporal edge effects
+        margin = max(1, n_files // 10)
+        middle_range = range(margin, n_files - margin)
+        sample_indices = random.sample(list(middle_range), min(n_sample_files, len(middle_range)))
+    
+    sample_paths = [file_paths[i] for i in sample_indices]
+    
+    # Force garbage collection before measurement
+    gc.collect()
+    process = psutil.Process()
+    mem_before = process.memory_info().rss
+    
+    total_rows = 0
+    dfs = []
+    
+    try:
+        for path in sample_paths:
+            df = pl.read_parquet(path)
+            
+            if expand_embeddings and 'embeddings' in df.columns:
+                # Expand embedding column to match actual processing
+                # This mirrors what happens in the actual data loading
+                df = df.with_columns([
+                    pl.col('embeddings').list.get(i).alias(f'emb_{i}')
+                    for i in range(embedding_dim)
+                ]).drop('embeddings')
+            
+            total_rows += len(df)
+            dfs.append(df)
+        
+        # Force memory allocation by concatenating (mirrors actual processing)
+        if dfs:
+            combined = pl.concat(dfs)
+            # Trigger actual memory allocation
+            _ = combined.shape
+        
+        gc.collect()
+        mem_after = process.memory_info().rss
+        
+        bytes_used = max(mem_after - mem_before, 0)
+        bytes_per_row = bytes_used / max(total_rows, 1) if total_rows > 0 else None
+        
+        result = {
+            'bytes_per_row': bytes_per_row,
+            'rows_sampled': total_rows,
+            'files_sampled': len(sample_paths),
+            'memory_bytes': bytes_used,
+        }
+        
+        if logger and bytes_per_row:
+            logger.debug(f"  Sampled {len(sample_paths)} files, {total_rows:,} rows: {bytes_per_row/1024:.1f} KB/row")
+        
+        return result
+        
+    except Exception as e:
+        if logger:
+            logger.warning(f"Error sampling bytes per row: {e}")
+        return {'bytes_per_row': None, 'rows_sampled': 0, 'files_sampled': 0, 'error': str(e)}
+    
+    finally:
+        # Clean up to minimize impact on subsequent measurements
+        del dfs
+        if 'combined' in dir():
+            del combined
+        gc.collect()
+
+
+# Empirically-derived constants for unique post overlap modeling
+# Based on observed data from runs with 72K-136K users:
+#   72K users  -> 1.32M unique liked URIs
+#   104K users -> 1.64M unique liked URIs  
+#   136K users -> 1.94M unique liked URIs
+# Power law fit: unique_posts = BASE_UNIQUE_POSTS * (users / BASE_USERS)^OVERLAP_EXPONENT
+OVERLAP_EXPONENT = 0.61  # Derived from log-log regression on observed data
+OVERLAP_BASE_USERS = 72_000
+OVERLAP_BASE_UNIQUE_POSTS = 1_320_000
+
+
 def estimate_filtered_data_memory(
     likes_paths: List[str],
     posts_paths: List[str],
@@ -598,9 +719,27 @@ def estimate_filtered_data_memory(
         # No cap - use intermediate likes as estimate
         estimated_likes = intermediate_likes
     
-    # Estimate liked posts for final output
-    unique_liked_uris_estimate = int(estimated_likes * 0.5)
-    liked_post_match_rate = 0.75
+    # Estimate unique liked posts using power-law overlap model
+    # As more users are sampled, they increasingly share liked posts (popular content).
+    # Empirical observation: unique_posts grows as users^0.61, not linearly.
+    #
+    # Model: unique_posts = BASE_UNIQUE_POSTS * (users / BASE_USERS)^OVERLAP_EXPONENT
+    # Calibrated from observed data:
+    #   72K users  -> 1.32M unique URIs (18.3 per user)
+    #   104K users -> 1.64M unique URIs (15.8 per user)
+    #   136K users -> 1.94M unique URIs (14.3 per user)
+    
+    if estimated_users > 0:
+        # Apply power-law scaling for overlap effect
+        unique_liked_uris_estimate = int(
+            OVERLAP_BASE_UNIQUE_POSTS * (estimated_users / OVERLAP_BASE_USERS) ** OVERLAP_EXPONENT
+        )
+        # Ensure we don't exceed total likes (sanity check)
+        unique_liked_uris_estimate = min(unique_liked_uris_estimate, estimated_likes)
+    else:
+        unique_liked_uris_estimate = 0
+    
+    liked_post_match_rate = 0.70  # ~70% of liked URIs have matching posts (observed)
     estimated_liked_posts = min(int(unique_liked_uris_estimate * liked_post_match_rate), raw_posts_rows)
     
     # Total posts = liked posts + negative sample (this is final output)
@@ -608,27 +747,55 @@ def estimate_filtered_data_memory(
     
     # === Memory estimation with incremental processing ===
     
-    # Bytes per row estimates (in-memory representation)
-    # IMPORTANT: These are calibrated from observed actual memory usage across multiple runs
-    # 
-    # Observations from 2026-01-23 runs:
-    # - 10k users: 743,983 likes, ~25 GB memory → ~34 KB/row
-    # - 30k users: 2,284,802 likes, ~25 GB memory → ~11 KB/row
-    # - 50k users: 3,677,782 likes, ~30 GB memory → ~8 KB/row
-    # - Per-row overhead decreases with larger datasets (Polars consolidation)
-    #
-    # Using estimates calibrated for larger scales (more common use case):
+    # Empirically sample bytes-per-row from actual data files
+    # This adapts to schema changes and provides accurate estimates for the specific data.
+    # Files are sampled randomly from the middle of the time window to avoid temporal bias.
     
-    # Likes during chunk accumulation: 8-10 KB/row for larger datasets
-    likes_bytes_per_row_intermediate = 9_000  # During Pass 2 chunk accumulation
-    likes_bytes_per_row_final = 200  # After combining into single DataFrame
+    _log("  Sampling files to measure bytes-per-row empirically...")
     
-    # Posts: use parquet metadata to estimate, with 4x expansion for in-memory
+    # Sample likes files (no embedding expansion needed)
+    likes_sample = sample_bytes_per_row(
+        likes_paths, 
+        n_sample_files=2, 
+        expand_embeddings=False,
+        logger=logger
+    )
+    
+    # Sample posts files (with embedding expansion to match actual processing)
+    posts_sample = sample_bytes_per_row(
+        posts_paths, 
+        n_sample_files=2, 
+        expand_embeddings=True, 
+        embedding_dim=embedding_dim,
+        logger=logger
+    )
+    
+    # Use empirical values with conservative fallback defaults
+    # Fallback defaults are calibrated from observed runs (2026-01-24):
+    #   Likes: ~2 KB/row observed at scale
+    #   Posts: ~22 KB/row with expanded embeddings
+    
+    if likes_sample.get('bytes_per_row'):
+        # Add 20% safety margin to empirical measurement
+        likes_bytes_per_row_intermediate = int(likes_sample['bytes_per_row'] * 1.2)
+        _log(f"  Likes: {likes_sample['bytes_per_row']/1024:.1f} KB/row (sampled), using {likes_bytes_per_row_intermediate/1024:.1f} KB/row with margin")
+    else:
+        likes_bytes_per_row_intermediate = 2_500  # Conservative fallback
+        _log(f"  Likes: using fallback {likes_bytes_per_row_intermediate/1024:.1f} KB/row")
+    
+    if posts_sample.get('bytes_per_row'):
+        # Add 10% safety margin to empirical measurement
+        posts_bytes_per_row_expanded = int(posts_sample['bytes_per_row'] * 1.1)
+        _log(f"  Posts: {posts_sample['bytes_per_row']/1024:.1f} KB/row (sampled), using {posts_bytes_per_row_expanded/1024:.1f} KB/row with margin")
+    else:
+        posts_bytes_per_row_expanded = 25_000  # Conservative fallback
+        _log(f"  Posts: using fallback {posts_bytes_per_row_expanded/1024:.1f} KB/row")
+    
+    likes_bytes_per_row_final = 200  # After combining into single DataFrame (small)
+    
+    # Posts batch processing uses raw (unexpanded) size
     posts_bytes_per_row_parquet = posts_raw['estimated_bytes'] / max(raw_posts_rows, 1)
     posts_bytes_per_row_raw = int(posts_bytes_per_row_parquet * 4)
-    
-    # Expanded posts: ~40KB per post observed (text, author, embeddings as float32s, metadata)
-    posts_bytes_per_row_expanded = 40_000
     
     # Component 1: User counts dict during Pass 1 (DID strings + int counts)
     # Using dict instead of set adds ~8 bytes per entry for the int value
@@ -670,13 +837,24 @@ def estimate_filtered_data_memory(
     phase_1_likes = user_set_bytes + likes_intermediate_bytes
     
     # Phase 2: Posts loading with early expansion
-    # After likes processing, the final likes_df is in memory (smaller than intermediate)
+    # After likes processing, the likes data is consolidated into a smaller final DataFrame.
+    # The intermediate chunks are freed, though some memory fragmentation remains.
+    # 
+    # Observed behavior (from 2026-01-24 runs):
+    #   - after_likes_load memory is typically ~30-32 GB regardless of user count
+    #   - This is much less than the intermediate peak during Pass 2
+    #   - Memory retained is roughly proportional to final likes count, not intermediate
+    #
     # During posts loading, we accumulate:
+    # - Retained likes data (consolidated, much smaller than intermediate)
     # - Liked posts with expanded embeddings (grows during processing)
     # - Negative reservoir with expanded embeddings (capped at sample size)
     # - Current batch being processed
-    # Memory from likes phase is largely retained due to Python/Polars memory management
-    phase_2_posts = (likes_intermediate_bytes +       # Likes memory still held (fragmentation)
+    
+    # Likes memory retained after consolidation: ~2x final output size for fragmentation overhead
+    likes_retained_bytes = int(likes_output_bytes * 2.0)
+    
+    phase_2_posts = (likes_retained_bytes +           # Likes memory retained (consolidated)
                      liked_posts_accumulated_bytes +  # Accumulated liked posts (expanded)
                      negative_reservoir_bytes +       # Negative sample (expanded)
                      posts_batch_bytes)               # Current batch being processed
@@ -689,9 +867,9 @@ def estimate_filtered_data_memory(
     
     # Add Python/Polars baseline overhead
     # Observed: ~2 GB fixed overhead for Polars/Python runtime, chunk management, etc.
-    # Use 15% buffer for GC timing and estimation variance
+    # Use 10% buffer for safety margin (empirical sampling provides accurate estimates)
     baseline_overhead_bytes = int(2.0 * (1024**3))
-    peak_bytes = int(peak_bytes * 1.15) + baseline_overhead_bytes  # 15% buffer
+    peak_bytes = int(peak_bytes * 1.10) + baseline_overhead_bytes  # 10% buffer
     
     result = {
         # Raw data stats
@@ -701,9 +879,11 @@ def estimate_filtered_data_memory(
         'raw_posts_gb': posts_raw['estimated_gb'],
         'n_likes_files': n_likes_files,
         'n_posts_files': n_posts_files,
-        # Per-row estimates (KB)
+        # Per-row estimates (KB) - empirically sampled or fallback
         'likes_bytes_per_row_intermediate_kb': likes_bytes_per_row_intermediate / 1024,
         'posts_bytes_per_row_expanded_kb': posts_bytes_per_row_expanded / 1024,
+        'likes_bytes_sampled': likes_sample.get('bytes_per_row') is not None,
+        'posts_bytes_sampled': posts_sample.get('bytes_per_row') is not None,
         # Estimated users (with pre-filtering for min_likes_per_user)
         'estimated_raw_users': estimated_raw_users,
         'estimated_eligible_users': estimated_eligible_users,  # Users meeting min_likes threshold
@@ -715,12 +895,18 @@ def estimate_filtered_data_memory(
         # Estimated data sizes
         'intermediate_likes': intermediate_likes,  # Before per-user cap/min-likes filter
         'estimated_likes_rows': estimated_likes,   # After filtering (final output)
+        'unique_liked_uris_estimate': unique_liked_uris_estimate,  # Sublinear overlap model
         'estimated_liked_posts': estimated_liked_posts,
         'estimated_negative_posts': min(negative_posts_sample, raw_posts_rows),
         'estimated_total_posts': estimated_posts,
+        # Overlap model parameters (for transparency)
+        'overlap_exponent': OVERLAP_EXPONENT,
+        'overlap_base_users': OVERLAP_BASE_USERS,
+        'overlap_base_unique_posts': OVERLAP_BASE_UNIQUE_POSTS,
         # Memory breakdown (GB)
         'mem_user_set_gb': user_set_bytes / (1024**3),
         'mem_likes_intermediate_gb': likes_intermediate_bytes / (1024**3),
+        'mem_likes_retained_gb': likes_retained_bytes / (1024**3),
         'mem_posts_batch_gb': posts_batch_bytes / (1024**3),
         'mem_negative_reservoir_gb': negative_reservoir_bytes / (1024**3),
         'mem_liked_posts_accumulated_gb': liked_posts_accumulated_bytes / (1024**3),
@@ -745,15 +931,18 @@ def estimate_filtered_data_memory(
         },
     }
     
-    _log("Memory estimation (batch processing with early embedding expansion):")
+    _log("Memory estimation (with empirical sampling and overlap model):")
     _log(f"  Raw data: {raw_likes_rows:,} likes ({n_likes_files} files), {raw_posts_rows:,} posts ({n_posts_files} files)")
     _log(f"  Users: {estimated_raw_users:,} total, ~{estimated_eligible_users:,} eligible (>={min_likes_per_user} likes)")
     _log(f"  User sampling: {estimated_users:,} from {estimated_eligible_users:,} eligible ({user_sampling_ratio*100:.1f}%)")
     _log(f"  Avg likes/eligible user: {avg_likes_per_eligible_user:.1f}")
-    _log(f"  Intermediate likes (before cap): {intermediate_likes:,} ({likes_bytes_per_row_intermediate/1024:.1f}KB/row)")
-    _log(f"  Negative reservoir: {min(negative_posts_sample, raw_posts_rows):,} posts ({posts_bytes_per_row_expanded/1024:.1f}KB/post)")
+    _log(f"  Intermediate likes (before cap): {intermediate_likes:,} ({likes_bytes_per_row_intermediate/1024:.1f}KB/row{'*' if likes_sample.get('bytes_per_row') else ''})")
+    _log(f"  Unique liked posts (overlap model): {unique_liked_uris_estimate:,} (users^{OVERLAP_EXPONENT} scaling)")
+    _log(f"  Negative reservoir: {min(negative_posts_sample, raw_posts_rows):,} posts ({posts_bytes_per_row_expanded/1024:.1f}KB/post{'*' if posts_sample.get('bytes_per_row') else ''})")
     _log(f"  Memory phases: likes={result['phase_1_likes_gb']:.2f}GB, posts={result['phase_2_posts_gb']:.2f}GB, final={result['phase_3_final_gb']:.2f}GB")
     _log(f"  Estimated peak: {result['estimated_peak_gb']:.2f} GB")
+    if likes_sample.get('bytes_per_row') or posts_sample.get('bytes_per_row'):
+        _log(f"  (* = empirically sampled from data)")
     
     return result
 
@@ -2451,8 +2640,9 @@ __all__ = [
     'load_raw_data_ingex',
     # Stage 1: Memory safety checks and tracking
     'get_current_memory_usage', 'log_memory_checkpoint', 'MemoryTracker',
-    'estimate_parquet_memory', 'estimate_filtered_data_memory',
+    'estimate_parquet_memory', 'sample_bytes_per_row', 'estimate_filtered_data_memory',
     'check_memory_available', 'check_data_load_safe',
+    'OVERLAP_EXPONENT', 'OVERLAP_BASE_USERS', 'OVERLAP_BASE_UNIQUE_POSTS',
     # Stage 1: Polars-based filtering for core datasets
     'load_likes_core_polars', 'load_posts_core_polars', 'expand_embeddings_polars',
     # Data IO Digital Ocean
