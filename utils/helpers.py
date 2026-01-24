@@ -772,6 +772,190 @@ def create_pairs_dataset(
 # ----------------------------------------
 # Data integrity validation (shared)
 # ----------------------------------------
+def validate_dataframe_schema(
+    df: pd.DataFrame | pl.DataFrame | pl.LazyFrame,
+    expected_schema: Dict[str, Any],
+    *,
+    allow_extra_columns: bool = True,
+) -> None:
+    """Validate a DataFrame against an expected schema of column names and dtypes.
+
+    Supports pandas DataFrame and polars DataFrame/LazyFrame. expected_schema maps
+    column name -> dtype spec, where dtype spec can be a Python type (e.g., int,
+    float, str), a pandas/numpy dtype, a dtype string, or an iterable of specs.
+    """
+    if not isinstance(expected_schema, dict) or not expected_schema:
+        raise ValueError("expected_schema must be a non-empty dict")
+
+    if isinstance(df, (pl.DataFrame, pl.LazyFrame)):
+        schema = dict(df.collect_schema() if isinstance(df, pl.LazyFrame) else df.schema)
+
+        polars_integer = {pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64}
+        polars_float = {pl.Float32, pl.Float64}
+        polars_string = {pl.String, pl.Utf8}
+
+        def _matches_expected_dtype_polars(dtype: pl.DataType, expected: Any) -> bool:
+            if isinstance(expected, (list, tuple, set)):
+                return any(_matches_expected_dtype_polars(dtype, e) for e in expected)
+
+            if isinstance(expected, pl.DataType) or type(expected).__name__ == "DataTypeClass":
+                return dtype == expected
+
+            if isinstance(expected, str):
+                key = expected.strip().lower()
+                if key in ("int", "int64", "integer"):
+                    return dtype in polars_integer
+                if key in ("float", "float64", "double"):
+                    return dtype in polars_float
+                if key in ("bool", "boolean"):
+                    return dtype == pl.Boolean
+                if key in ("string", "str", "utf8"):
+                    return dtype in polars_string
+                if key in ("object", "obj"):
+                    return dtype == pl.Object
+                if key in ("category", "categorical"):
+                    return dtype == pl.Categorical
+                if key in ("datetime", "datetime64", "datetime64[ns]", "datetime64[ns, tz]"):
+                    return dtype == pl.Datetime
+                if key in ("date",):
+                    return dtype == pl.Date
+                if key in ("time", "time64"):
+                    return dtype == pl.Time
+                if key in ("timedelta", "timedelta64", "timedelta64[ns]", "duration"):
+                    return dtype == pl.Duration
+                try:
+                    return _matches_expected_dtype_polars(dtype, np.dtype(expected))
+                except Exception:
+                    return False
+
+            if isinstance(expected, np.dtype):
+                if expected.kind in ("i", "u"):
+                    return dtype in polars_integer
+                if expected.kind == "f":
+                    return dtype in polars_float
+                if expected.kind == "b":
+                    return dtype == pl.Boolean
+                if expected.kind == "M":
+                    return dtype in (pl.Datetime, pl.Date)
+                if expected.kind == "m":
+                    return dtype == pl.Duration
+                if expected.kind in ("U", "S", "O"):
+                    return dtype in polars_string or dtype == pl.Object
+
+            if isinstance(expected, type):
+                if issubclass(expected, (int, np.integer)):
+                    return dtype in polars_integer
+                if issubclass(expected, (float, np.floating)):
+                    return dtype in polars_float
+                if issubclass(expected, (bool, np.bool_)):
+                    return dtype == pl.Boolean
+                if issubclass(expected, str):
+                    return dtype in polars_string
+                if issubclass(expected, (np.datetime64, datetime)):
+                    return dtype in (pl.Datetime, pl.Date)
+                if issubclass(expected, (np.timedelta64, timedelta)):
+                    return dtype == pl.Duration
+
+            return dtype == expected
+
+        missing_cols = [col for col in expected_schema if col not in schema]
+        extra_cols = [col for col in schema if col not in expected_schema] if not allow_extra_columns else []
+
+        mismatches = []
+        for col, expected in expected_schema.items():
+            if col not in schema:
+                continue
+            if not _matches_expected_dtype_polars(schema[col], expected):
+                mismatches.append((col, expected, schema[col]))
+
+        errors = []
+        if missing_cols:
+            errors.append(f"Missing columns: {missing_cols}")
+        if extra_cols:
+            errors.append(f"Unexpected columns: {extra_cols}")
+        if mismatches:
+            formatted = ", ".join([f"{col} (expected {exp!r}, got {actual})" for col, exp, actual in mismatches])
+            errors.append(f"Dtype mismatches: {formatted}")
+
+        if errors:
+            raise ValueError("Schema validation failed: " + "; ".join(errors))
+        return
+
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError(f"df must be a pandas DataFrame or polars DataFrame/LazyFrame, got {type(df)!r}")
+
+    def _matches_expected_dtype_pandas(series: pd.Series, expected: Any) -> bool:
+        if isinstance(expected, (list, tuple, set)):
+            return any(_matches_expected_dtype_pandas(series, e) for e in expected)
+
+        dtype = series.dtype
+
+        if isinstance(expected, str):
+            key = expected.strip().lower()
+            if key in ("int", "int64", "integer"):
+                return pd.api.types.is_integer_dtype(dtype)
+            if key in ("float", "float64", "double"):
+                return pd.api.types.is_float_dtype(dtype)
+            if key in ("bool", "boolean"):
+                return pd.api.types.is_bool_dtype(dtype)
+            if key in ("string", "str"):
+                return pd.api.types.is_string_dtype(dtype)
+            if key in ("object", "obj"):
+                return pd.api.types.is_object_dtype(dtype)
+            if key in ("datetime", "datetime64", "datetime64[ns]", "datetime64[ns, tz]"):
+                return pd.api.types.is_datetime64_any_dtype(dtype)
+            if key in ("timedelta", "timedelta64", "timedelta64[ns]"):
+                return pd.api.types.is_timedelta64_dtype(dtype)
+            try:
+                return pd.api.types.is_dtype_equal(dtype, np.dtype(expected))
+            except Exception:
+                return False
+
+        if isinstance(expected, np.dtype):
+            return pd.api.types.is_dtype_equal(dtype, expected)
+
+        if isinstance(expected, type):
+            if issubclass(expected, (int, np.integer)):
+                return pd.api.types.is_integer_dtype(dtype)
+            if issubclass(expected, (float, np.floating)):
+                return pd.api.types.is_float_dtype(dtype)
+            if issubclass(expected, (bool, np.bool_)):
+                return pd.api.types.is_bool_dtype(dtype)
+            if issubclass(expected, str):
+                return pd.api.types.is_string_dtype(dtype)
+            if issubclass(expected, (np.datetime64, datetime)):
+                return pd.api.types.is_datetime64_any_dtype(dtype)
+            if issubclass(expected, (np.timedelta64, timedelta)):
+                return pd.api.types.is_timedelta64_dtype(dtype)
+
+        try:
+            return pd.api.types.is_dtype_equal(dtype, expected)
+        except Exception:
+            return False
+
+    missing_cols = [col for col in expected_schema if col not in df.columns]
+    extra_cols = [col for col in df.columns if col not in expected_schema] if not allow_extra_columns else []
+
+    mismatches = []
+    for col, expected in expected_schema.items():
+        if col not in df.columns:
+            continue
+        if not _matches_expected_dtype_pandas(df[col], expected):
+            mismatches.append((col, expected, df[col].dtype))
+
+    errors = []
+    if missing_cols:
+        errors.append(f"Missing columns: {missing_cols}")
+    if extra_cols:
+        errors.append(f"Unexpected columns: {extra_cols}")
+    if mismatches:
+        formatted = ", ".join([f"{col} (expected {exp!r}, got {actual})" for col, exp, actual in mismatches])
+        errors.append(f"Dtype mismatches: {formatted}")
+
+    if errors:
+        raise ValueError("Schema validation failed: " + "; ".join(errors))
+
+
 def validate_data_integrity(data_dict: Dict) -> bool:
     required_keys = ['train_df', 'embedding_dim', 'join_post', 'join_like']
     for key in required_keys:
@@ -910,7 +1094,7 @@ __all__ = [
     # Dataset construction
     'create_pairs_dataset',
     # Validation
-    'validate_data_integrity',
+    'validate_dataframe_schema', 'validate_data_integrity',
     # Viz
     'plot_training_history', 'plot_model_performance', 'create_user_visualization',
 ]
