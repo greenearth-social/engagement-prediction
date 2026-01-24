@@ -194,24 +194,24 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     validate_dataframe_schema(likes_core_df, likes_schema, allow_extra_columns=False)
     logger.info("✓ likes_core schema validated")
     
-    # Validate posts_core schema (dynamic embedding columns)
+    # Validate posts_core schema (dynamic embedding columns + all extra columns)
     posts_schema = {
         'at_uri': str,
         'in_random_sample': bool,
+        # Extra columns from source data
+        'did': str,
+        'embed_quote_uri': str,
+        'inserted_at': str,
+        'record_created_at': 'datetime',
+        'record_text': str,
+        'reply_parent_uri': str,
+        'reply_root_uri': str,
     }
     # Add embedding columns dynamically
     for i in range(embed_dim):
         posts_schema[f'post_emb_{i}'] = float
-    validate_dataframe_schema(posts_core_df, posts_schema, allow_extra_columns=True)
+    validate_dataframe_schema(posts_core_df, posts_schema, allow_extra_columns=False)
     
-    # Log extra columns in posts_core for future schema refinement
-    expected_posts_cols = set(posts_schema.keys())
-    actual_posts_cols = set(posts_core_df.columns)
-    extra_posts_cols = sorted(actual_posts_cols - expected_posts_cols)
-    if extra_posts_cols:
-        logger.info(f"posts_core extra columns (not yet validated): {extra_posts_cols}")
-    else:
-        logger.info("posts_core has no extra columns")
     logger.info(f"✓ posts_core schema validated (embed_dim={embed_dim})")
 
     # Save outputs as parquet

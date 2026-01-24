@@ -1288,8 +1288,12 @@ def load_likes_core_polars(
     if likes_chunks:
         likes_df = pl.concat(likes_chunks)
     else:
-        # Empty result
-        likes_df = pl.DataFrame({'did': [], 'subject_uri': [], 'record_created_at': []})
+        # Empty result - create with correct schema
+        likes_df = pl.DataFrame({
+            'did': pl.Series([], dtype=pl.String),
+            'subject_uri': pl.Series([], dtype=pl.String),
+            'record_created_at': pl.Series([], dtype=pl.Datetime),
+        })
     
     del likes_chunks
     
@@ -1348,6 +1352,20 @@ def load_likes_core_polars(
     available_cols = [c for c in output_cols if c in likes_df.columns]
     if available_cols:
         likes_df = likes_df.select(available_cols)
+    
+    # Convert record_created_at to datetime if it exists and is not already datetime
+    if 'record_created_at' in likes_df.columns:
+        if likes_df['record_created_at'].dtype != pl.Datetime:
+            # Convert from string to datetime
+            if len(likes_df) > 0:
+                likes_df = likes_df.with_columns(
+                    pl.col('record_created_at').str.to_datetime(time_zone="UTC").alias('record_created_at')
+                )
+            else:
+                # Empty DataFrame - cast the column type
+                likes_df = likes_df.with_columns(
+                    pl.col('record_created_at').cast(pl.Datetime).alias('record_created_at')
+                )
     
     log_memory_checkpoint("likes_final", logger)
     
@@ -1594,6 +1612,20 @@ def load_posts_core_polars(
     n_combined = len(posts_combined)
     _log(f"posts_core: {n_combined:,} rows ({n_liked_only:,} liked-only + {n_random_sample:,} random sample)")
     _log(f"Embeddings already expanded during loading (dim={embed_dim})")
+    
+    # Clean up temporary columns and normalize types
+    if len(posts_combined) > 0:
+        # Drop inserted_at_dt (only needed for filtering, not in final output)
+        if 'inserted_at_dt' in posts_combined.columns:
+            posts_combined = posts_combined.drop('inserted_at_dt')
+        
+        # Convert record_created_at to datetime if it exists and is not already datetime
+        if 'record_created_at' in posts_combined.columns:
+            if posts_combined['record_created_at'].dtype != pl.Datetime:
+                posts_combined = posts_combined.with_columns(
+                    pl.col('record_created_at').str.to_datetime(time_zone="UTC").alias('record_created_at')
+                )
+    
     stats['n_posts_core'] = n_combined
     stats['embedding_dim'] = embed_dim
     log_memory_checkpoint("posts_after_combine", logger)
@@ -2400,12 +2432,13 @@ def validate_dataframe_schema(
                     return dtype in polars_string or dtype == pl.Object
 
             if isinstance(expected, type):
+                # Handle bool explicitly (bool is a special case - it's not a subclass of itself in the traditional sense)
+                if expected is bool or expected is np.bool_:
+                    return dtype == pl.Boolean
                 if issubclass(expected, (int, np.integer)):
                     return dtype in polars_integer
                 if issubclass(expected, (float, np.floating)):
                     return dtype in polars_float
-                if issubclass(expected, (bool, np.bool_)):
-                    return dtype == pl.Boolean
                 if issubclass(expected, str):
                     return dtype in polars_string
                 if issubclass(expected, (np.datetime64, datetime)):
