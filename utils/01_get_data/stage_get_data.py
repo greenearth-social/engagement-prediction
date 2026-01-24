@@ -509,7 +509,234 @@ def _run_greenearth_pipeline(
             accuracy_pct = 100.0 * actual_peak / estimated_peak
             logger.info(f"Memory estimation accuracy: actual peak {actual_peak:.3f} GB vs estimated {estimated_peak:.2f} GB ({accuracy_pct:.1f}%)")
     
+    # Log comprehensive attrition report
+    _log_data_attrition_report(all_stats, memory_estimate, args, logger)
+    
     return likes_core_df, posts_core_df, embed_dim, all_stats
+
+
+def _log_data_attrition_report(
+    all_stats: Dict[str, Any],
+    memory_estimate: Dict[str, Any],
+    args: argparse.Namespace,
+    logger,
+) -> None:
+    """
+    Log a comprehensive data attrition report showing case counts and memory
+    usage at each filtering stage.
+    
+    This consolidates the scattered statistics into a single, easy-to-read
+    summary at the end of the data-getting process.
+    """
+    likes_stats = all_stats.get('likes', {})
+    posts_stats = all_stats.get('posts', {})
+    memory_actual = all_stats.get('memory_actual', {})
+    
+    # Helper for safe percentage calculation
+    def pct(part, whole):
+        return 100.0 * part / whole if whole > 0 else 0.0
+    
+    # Helper for formatting numbers with commas
+    def fmt(n):
+        if n is None:
+            return '-'
+        return f"{n:,}"
+    
+    # Get parameters for display
+    min_likes = int(getattr(args, 'min_likes_per_user', 2))
+    max_likes = int(getattr(args, 'max_likes_per_user', 100))
+    max_users = int(getattr(args, 'max_liking_users', 0))
+    neg_sample = int(getattr(args, 'negative_posts_sample', 100000))
+    
+    # Build memory checkpoint lookup
+    mem_checkpoints = {}
+    for cp in memory_actual.get('checkpoints', []):
+        mem_checkpoints[cp['name']] = cp
+    
+    # Extract likes pipeline stats
+    n_likes_initial = likes_stats.get('n_likes_initial', 0)
+    n_users_initial = likes_stats.get('n_users_initial', 0)
+    n_users_eligible = likes_stats.get('n_users_eligible_for_sampling', 0)
+    n_users_excluded_min = likes_stats.get('n_users_excluded_min_likes', 0)
+    n_users_sampled = likes_stats.get('n_users_sampled', 0)
+    n_likes_after_user_sample = likes_stats.get('n_likes_after_user_sample', 0)
+    n_likes_after_cap = likes_stats.get('n_likes_after_per_user_cap', 0)
+    n_likes_final = likes_stats.get('n_likes_final', 0)
+    n_users_final = likes_stats.get('n_users_final', 0)
+    n_likes_removed_join = likes_stats.get('n_likes_removed_by_join', 0)
+    n_users_removed_join = likes_stats.get('n_users_removed_by_join_verify', 0)
+    n_users_final_join = likes_stats.get('n_users_final_after_join', 0)
+    n_likes_final_join = likes_stats.get('n_likes_final_after_join', 0)
+    
+    # Extract posts pipeline stats
+    n_posts_total = posts_stats.get('n_posts_total', 0)
+    n_liked_posts = posts_stats.get('n_liked_posts', 0)
+    n_liked_only = posts_stats.get('n_liked_only', 0)
+    n_liked_in_random = posts_stats.get('n_liked_in_random_sample', 0)
+    n_random_sample = posts_stats.get('n_random_sample', 0)
+    n_posts_core = posts_stats.get('n_posts_core', 0)
+    match_rate = posts_stats.get('liked_post_match_rate', 0)
+    
+    # Calculate derived stats
+    n_likes_after_join = n_likes_final - n_likes_removed_join if n_likes_removed_join else n_likes_final
+    n_users_before_join_verify = n_users_final
+    
+    # Memory stats
+    peak_actual = memory_actual.get('peak_process_gb', 0)
+    peak_estimated = memory_estimate.get('estimated_peak_gb', 0) if memory_estimate else 0
+    mem_after_likes = mem_checkpoints.get('after_likes_load', {}).get('process_gb', 0)
+    mem_after_posts = mem_checkpoints.get('after_posts_load_and_expansion', {}).get('process_gb', 0)
+    
+    # Build the report
+    sep = "=" * 80
+    sep2 = "-" * 80
+    
+    logger.info("")
+    logger.info(sep)
+    logger.info("DATA ATTRITION REPORT")
+    logger.info(sep)
+    
+    # === LIKES PIPELINE ===
+    logger.info("")
+    logger.info("LIKES PIPELINE")
+    logger.info(sep2)
+    logger.info(f"{'Stage':<45} {'Users':>12} {'Likes':>15} {'Mem(GB)':>10}")
+    logger.info(sep2)
+    
+    # 1. Initial scan
+    logger.info(f"{'1. Initial scan (time-filtered)':<45} {fmt(n_users_initial):>12} {fmt(n_likes_initial):>15} {'':>10}")
+    
+    # 2. Min-likes pre-filter
+    if n_users_excluded_min > 0:
+        excluded_pct = pct(n_users_excluded_min, n_users_initial)
+        logger.info(f"{'2. Min-likes pre-filter (>=' + str(min_likes) + ')':<45} {fmt(n_users_eligible):>12} {'(n/a)':>15} {'':>10}")
+        logger.info(f"{'   - Excluded users':<45} {'-' + fmt(n_users_excluded_min):>12} {f'({excluded_pct:.1f}%)':>15} {'':>10}")
+    else:
+        logger.info(f"{'2. Min-likes pre-filter (>=' + str(min_likes) + ')':<45} {fmt(n_users_eligible):>12} {'(n/a)':>15} {'':>10}")
+    
+    # 3. User sampling
+    if max_users > 0 and n_users_eligible > 0:
+        sample_pct = pct(n_users_sampled, n_users_eligible)
+        logger.info(f"{'3. User sampling (' + fmt(max_users) + ')':<45} {fmt(n_users_sampled):>12} {'(n/a)':>15} {'':>10}")
+        logger.info(f"{'   - Retained':<45} {f'{sample_pct:.1f}%':>12} {'':>15} {'':>10}")
+    else:
+        logger.info(f"{'3. User sampling (no cap)':<45} {fmt(n_users_sampled):>12} {'(n/a)':>15} {'':>10}")
+    
+    # 4. Collect sampled user likes
+    if n_likes_initial > 0:
+        likes_sample_pct = pct(n_likes_after_user_sample, n_likes_initial)
+        logger.info(f"{'4. Collect sampled user likes':<45} {'(n/a)':>12} {fmt(n_likes_after_user_sample):>15} {f'{mem_after_likes:.2f}':>10}")
+        logger.info(f"{'   - Retained from initial':<45} {'':>12} {f'({likes_sample_pct:.1f}%)':>15} {'':>10}")
+    
+    # 5. Per-user cap
+    if n_likes_after_user_sample > 0:
+        cap_pct = pct(n_likes_after_cap, n_likes_after_user_sample)
+        logger.info(f"{'5. Per-user cap (' + str(max_likes) + ')':<45} {'(n/a)':>12} {fmt(n_likes_after_cap):>15} {'':>10}")
+        logger.info(f"{'   - Retained':<45} {'':>12} {f'({cap_pct:.1f}%)':>15} {'':>10}")
+    
+    # 6. Min-likes verification
+    n_likes_removed_verify = n_likes_after_cap - n_likes_final if n_likes_after_cap > n_likes_final else 0
+    n_users_removed_verify = n_users_sampled - n_users_final if n_users_sampled > n_users_final else 0
+    logger.info(f"{'6. Min-likes verification':<45} {fmt(n_users_final):>12} {fmt(n_likes_final):>15} {'':>10}")
+    if n_users_removed_verify > 0 or n_likes_removed_verify > 0:
+        logger.info(f"{'   - Removed (edge cases)':<45} {'-' + fmt(n_users_removed_verify):>12} {'-' + fmt(n_likes_removed_verify):>15} {'':>10}")
+    
+    logger.info(sep2)
+    
+    # === POSTS PIPELINE ===
+    logger.info("")
+    logger.info("POSTS PIPELINE")
+    logger.info(sep2)
+    logger.info(f"{'Stage':<45} {'Posts':>15} {'Mem(GB)':>10}")
+    logger.info(sep2)
+    
+    logger.info(f"{'1. Time-filtered scan':<45} {fmt(n_posts_total):>15} {'':>10}")
+    logger.info(f"{'2. Liked posts extracted':<45} {fmt(n_liked_posts):>15} {f'{mem_after_posts:.2f}':>10}")
+    logger.info(f"{'   - Match rate vs liked URIs':<45} {f'{match_rate:.1f}%':>15} {'':>10}")
+    logger.info(f"{'3. Random sample (reservoir)':<45} {fmt(n_random_sample):>15} {'':>10}")
+    if n_liked_in_random > 0:
+        logger.info(f"{'   - Overlap with liked posts':<45} {fmt(n_liked_in_random):>15} {'':>10}")
+    logger.info(f"{'4. Combined output':<45} {fmt(n_posts_core):>15} {'':>10}")
+    logger.info(f"   ({fmt(n_liked_only)} liked-only + {fmt(n_random_sample)} random)")
+    
+    logger.info(sep2)
+    
+    # === POST-JOIN VERIFICATION ===
+    logger.info("")
+    logger.info("POST-JOIN VERIFICATION")
+    logger.info(sep2)
+    logger.info(f"{'Stage':<45} {'Users':>12} {'Likes':>15}")
+    logger.info(sep2)
+    
+    logger.info(f"{'Before join filter':<45} {fmt(n_users_final):>12} {fmt(n_likes_final):>15}")
+    
+    if n_likes_removed_join > 0:
+        join_filter_likes_pct = pct(n_likes_removed_join, n_likes_final)
+        n_users_after_join_filter = n_users_final - n_users_removed_join if n_users_removed_join else n_users_final
+        n_likes_after_join_filter = n_likes_final - n_likes_removed_join
+        logger.info(f"{'After join filter':<45} {fmt(n_users_before_join_verify):>12} {fmt(n_likes_after_join_filter):>15}")
+        logger.info(f"{'  - Likes removed (no matching post)':<45} {'':>12} {'-' + fmt(n_likes_removed_join) + f' ({join_filter_likes_pct:.1f}%)':>15}")
+    
+    if n_users_removed_join > 0:
+        join_users_pct = pct(n_users_removed_join, n_users_before_join_verify)
+        logger.info(f"{'After min-likes re-verify':<45} {fmt(n_users_final_join):>12} {fmt(n_likes_final_join):>15}")
+        logger.info(f"{'  - Users removed (<' + str(min_likes) + ' joinable)':<45} {'-' + fmt(n_users_removed_join) + f' ({join_users_pct:.1f}%)':>12} {'':>15}")
+    
+    logger.info(sep2)
+    
+    # === FINAL OUTPUT ===
+    logger.info("")
+    logger.info("FINAL OUTPUT")
+    logger.info(sep2)
+    logger.info(f"likes_core.parquet:  {fmt(n_users_final_join)} users, {fmt(n_likes_final_join)} likes")
+    logger.info(f"posts_core.parquet:  {fmt(n_posts_core)} posts ({fmt(n_liked_only)} liked + {fmt(n_random_sample)} random)")
+    logger.info(sep2)
+    
+    # === OVERALL ATTRITION SUMMARY ===
+    logger.info("")
+    logger.info("OVERALL ATTRITION SUMMARY")
+    logger.info(sep2)
+    
+    if n_users_initial > 0 and n_users_final_join > 0:
+        users_retained_pct = pct(n_users_final_join, n_users_initial)
+        logger.info(f"Users: {fmt(n_users_initial)} -> {fmt(n_users_final_join)} ({users_retained_pct:.2f}% retained)")
+    
+    if n_likes_initial > 0 and n_likes_final_join > 0:
+        likes_retained_pct = pct(n_likes_final_join, n_likes_initial)
+        logger.info(f"Likes: {fmt(n_likes_initial)} -> {fmt(n_likes_final_join)} ({likes_retained_pct:.2f}% retained)")
+    
+    if n_posts_total > 0 and n_posts_core > 0:
+        posts_retained_pct = pct(n_posts_core, n_posts_total)
+        logger.info(f"Posts: {fmt(n_posts_total)} -> {fmt(n_posts_core)} ({posts_retained_pct:.2f}% retained)")
+    
+    logger.info(sep2)
+    
+    # === MEMORY SUMMARY ===
+    logger.info("")
+    logger.info("MEMORY SUMMARY")
+    logger.info(sep2)
+    logger.info(f"{'Phase':<40} {'Memory (GB)':>12} {'Elapsed (s)':>12}")
+    logger.info(sep2)
+    
+    for cp in memory_actual.get('checkpoints', []):
+        name = cp.get('name', 'unknown')
+        mem_gb = cp.get('process_gb', 0)
+        elapsed = cp.get('elapsed_sec', 0)
+        # Make checkpoint names more readable
+        display_name = name.replace('_', ' ').title()
+        logger.info(f"{display_name:<40} {mem_gb:>12.2f} {elapsed:>12.1f}")
+    
+    logger.info(sep2)
+    
+    # Peak memory comparison
+    if peak_estimated > 0:
+        accuracy = pct(peak_actual, peak_estimated)
+        logger.info(f"Peak process memory: {peak_actual:.2f} GB (estimated: {peak_estimated:.2f} GB, accuracy: {accuracy:.1f}%)")
+    else:
+        logger.info(f"Peak process memory: {peak_actual:.2f} GB")
+    
+    logger.info(sep)
+    logger.info("")
 
 
 def _run_digitalocean_legacy(
