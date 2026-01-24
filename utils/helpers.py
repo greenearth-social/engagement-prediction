@@ -821,6 +821,7 @@ def check_data_load_safe(
     max_likes_per_user: int = 100,
     min_likes_per_user: int = 2,
     negative_posts_sample: int = 100_000,
+    skip_safety_check: bool = False,
     logger: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
@@ -839,13 +840,14 @@ def check_data_load_safe(
         max_likes_per_user: Max likes to keep per user
         min_likes_per_user: Min likes required per user
         negative_posts_sample: Number of negative posts to sample
+        skip_safety_check: If True, perform estimation but don't raise error
         logger: Optional logger
     
     Returns:
         Dict with memory estimation details
     
     Raises:
-        MemoryError: If estimated memory exceeds limits
+        MemoryError: If estimated memory exceeds limits (unless skip_safety_check=True)
     """
     if psutil is None:
         if logger:
@@ -900,16 +902,21 @@ def check_data_load_safe(
         logger.info("=" * 60)
     
     if not is_safe:
-        raise MemoryError(
-            f"Data load would exceed memory limits. {msg}\n"
-            f"Estimated peak memory: {estimation['estimated_peak_gb']:.2f} GB\n"
-            f"Options to reduce memory:\n"
-            f"  - Use a shorter time window (--posts-start/--posts-end)\n"
-            f"  - Reduce --max-liking-users (current: {max_liking_users})\n"
-            f"  - Reduce --max-likes-per-user (current: {max_likes_per_user})\n"
-            f"  - Reduce --negative-posts-sample (current: {negative_posts_sample})\n"
-            f"  - Increase --max-memory-gb if you have more RAM available"
-        )
+        if skip_safety_check:
+            if logger:
+                logger.warning("Memory limit would be exceeded, but proceeding due to --skip-memory-check")
+        else:
+            raise MemoryError(
+                f"Data load would exceed memory limits. {msg}\n"
+                f"Estimated peak memory: {estimation['estimated_peak_gb']:.2f} GB\n"
+                f"Options to reduce memory:\n"
+                f"  - Use a shorter time window (--posts-start/--posts-end)\n"
+                f"  - Reduce --max-liking-users (current: {max_liking_users})\n"
+                f"  - Reduce --max-likes-per-user (current: {max_likes_per_user})\n"
+                f"  - Reduce --negative-posts-sample (current: {negative_posts_sample})\n"
+                f"  - Increase --max-memory-gb if you have more RAM available\n"
+                f"  - Use --skip-memory-check to proceed anyway (at your own risk)"
+            )
     
     return estimation
 

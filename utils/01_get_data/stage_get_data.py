@@ -336,27 +336,30 @@ def _run_greenearth_pipeline(
     )
     
     # Smart memory check that accounts for filtering parameters
+    memory_estimate = check_data_load_safe(
+        likes_paths=likes_paths,
+        posts_paths=posts_paths,
+        embedding_dim=384,  # Standard MiniLM dimension
+        max_memory_gb=max_memory_gb,
+        max_memory_pct=max_memory_pct,
+        max_liking_users=max_liking_users,
+        max_likes_per_user=max_likes_per_user,
+        min_likes_per_user=min_likes_per_user,
+        negative_posts_sample=negative_posts_sample,
+        skip_safety_check=skip_memory_check,
+        logger=logger,
+    )
+    all_stats['memory_estimate'] = memory_estimate
+    
+    # Log additional warning if skip_memory_check is set
     if skip_memory_check:
         logger.warning("=" * 60)
-        logger.warning("SKIPPING MEMORY CHECK (--skip-memory-check flag set)")
-        logger.warning("Monitor memory usage carefully - OOM may occur!")
+        logger.warning("SKIPPING MEMORY SAFETY CHECK (--skip-memory-check flag set)")
+        logger.warning(f"Estimated peak: {memory_estimate.get('estimated_peak_gb', 0):.2f} GB")
+        logger.warning("Proceeding anyway - monitor memory usage carefully, OOM may occur!")
         logger.warning("=" * 60)
-        memory_estimate = {'skipped': True, 'reason': 'skip_memory_check flag set'}
     else:
-        memory_estimate = check_data_load_safe(
-            likes_paths=likes_paths,
-            posts_paths=posts_paths,
-            embedding_dim=384,  # Standard MiniLM dimension
-            max_memory_gb=max_memory_gb,
-            max_memory_pct=max_memory_pct,
-            max_liking_users=max_liking_users,
-            max_likes_per_user=max_likes_per_user,
-            min_likes_per_user=min_likes_per_user,
-            negative_posts_sample=negative_posts_sample,
-            logger=logger,
-        )
         logger.info("Memory check passed, proceeding with data load")
-    all_stats['memory_estimate'] = memory_estimate
     
     mem_tracker.checkpoint("after_memory_check")
     
