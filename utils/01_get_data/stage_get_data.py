@@ -152,6 +152,8 @@ from utils.helpers import (
     parse_one_ts,
     # Legacy imports for DigitalOcean fallback
     load_most_recent_raw_data_digital_ocean,
+    # Data validation
+    validate_dataframe_schema,
 )
 
 
@@ -179,6 +181,38 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         )
     else:
         raise ValueError(f"Unknown data_source: {data_source}")
+
+    # Validate output schemas before saving
+    log_operation_start('Validate output schemas', 'STAGE_01_GET_DATA', logger)
+    
+    # Validate likes_core schema
+    likes_schema = {
+        'did': str,
+        'subject_uri': str,
+        'record_created_at': 'datetime',
+    }
+    validate_dataframe_schema(likes_core_df, likes_schema, allow_extra_columns=False)
+    logger.info("✓ likes_core schema validated")
+    
+    # Validate posts_core schema (dynamic embedding columns)
+    posts_schema = {
+        'at_uri': str,
+        'in_random_sample': bool,
+    }
+    # Add embedding columns dynamically
+    for i in range(embed_dim):
+        posts_schema[f'post_emb_{i}'] = float
+    validate_dataframe_schema(posts_core_df, posts_schema, allow_extra_columns=True)
+    
+    # Log extra columns in posts_core for future schema refinement
+    expected_posts_cols = set(posts_schema.keys())
+    actual_posts_cols = set(posts_core_df.columns)
+    extra_posts_cols = sorted(actual_posts_cols - expected_posts_cols)
+    if extra_posts_cols:
+        logger.info(f"posts_core extra columns (not yet validated): {extra_posts_cols}")
+    else:
+        logger.info("posts_core has no extra columns")
+    logger.info(f"✓ posts_core schema validated (embed_dim={embed_dim})")
 
     # Save outputs as parquet
     log_operation_start('Save core datasets as parquet', 'STAGE_01_GET_DATA', logger)
