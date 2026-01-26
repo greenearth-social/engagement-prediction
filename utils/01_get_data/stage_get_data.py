@@ -269,13 +269,14 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         json.dump(summary, f, indent=2)
 
     # Log to experiment tracker - comprehensive metrics for sweep analysis
+    # Metric names use readable format: "Category - Metric Name" for better CSV exports
     n_likes = len(likes_core_df)
     n_posts = len(posts_core_df)
     
     # Primary outputs
-    context.tracker.log_single_value(name="get_data/n_likes_core", value=n_likes)
-    context.tracker.log_single_value(name="get_data/n_posts_core", value=n_posts)
-    context.tracker.log_single_value(name="get_data/embedding_dim", value=embed_dim)
+    context.tracker.log_single_value(name="Output - Likes (final)", value=n_likes)
+    context.tracker.log_single_value(name="Output - Posts (final)", value=n_posts)
+    context.tracker.log_single_value(name="Output - Embedding Dim", value=embed_dim)
     
     # Likes pipeline attrition metrics
     if 'likes' in all_stats:
@@ -283,47 +284,47 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         
         # Initial counts
         context.tracker.log_single_value(
-            name="get_data/n_users_initial", 
+            name="Likes - 1 Initial Users", 
             value=likes_stats.get('n_users_initial', 0)
         )
         context.tracker.log_single_value(
-            name="get_data/n_likes_initial", 
+            name="Likes - 1 Initial Likes", 
             value=likes_stats.get('n_likes_initial', 0)
         )
         
         # After each filtering stage
         context.tracker.log_single_value(
-            name="get_data/n_users_eligible",
+            name="Likes - 2 Eligible Users (min-likes)",
             value=likes_stats.get('n_users_eligible_for_sampling', 0)
         )
         context.tracker.log_single_value(
-            name="get_data/n_users_sampled",
+            name="Likes - 3 Sampled Users",
             value=likes_stats.get('n_users_sampled', 0)
         )
         context.tracker.log_single_value(
-            name="get_data/n_likes_after_user_sample",
+            name="Likes - 4 Likes After User Sample",
             value=likes_stats.get('n_likes_after_user_sample', 0)
         )
         context.tracker.log_single_value(
-            name="get_data/n_likes_after_cap",
+            name="Likes - 5 Likes After Per-User Cap",
             value=likes_stats.get('n_likes_after_per_user_cap', 0)
         )
         
         # Final counts (before and after join)
         context.tracker.log_single_value(
-            name="get_data/n_users_final", 
+            name="Likes - 6 Final Users (pre-join)", 
             value=likes_stats.get('n_users_final', 0)
         )
         context.tracker.log_single_value(
-            name="get_data/n_likes_final",
+            name="Likes - 6 Final Likes (pre-join)",
             value=likes_stats.get('n_likes_final', 0)
         )
         context.tracker.log_single_value(
-            name="get_data/n_users_final_after_join",
+            name="Likes - 7 Final Users (post-join)",
             value=likes_stats.get('n_users_final_after_join', 0)
         )
         context.tracker.log_single_value(
-            name="get_data/n_likes_final_after_join",
+            name="Likes - 7 Final Likes (post-join)",
             value=likes_stats.get('n_likes_final_after_join', 0)
         )
         
@@ -335,32 +336,64 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         
         if n_users_initial > 0:
             context.tracker.log_single_value(
-                name="get_data/user_retention_pct",
+                name="Retention - Users %",
                 value=100.0 * n_users_final / n_users_initial
             )
         if n_likes_initial > 0:
             context.tracker.log_single_value(
-                name="get_data/likes_retention_pct",
+                name="Retention - Likes %",
                 value=100.0 * n_likes_final / n_likes_initial
+            )
+        
+        # Like count distribution stats (for understanding cap impact)
+        if 'likes_per_user_mean' in likes_stats:
+            context.tracker.log_single_value(
+                name="Distribution - Likes/User Mean",
+                value=likes_stats.get('likes_per_user_mean', 0)
+            )
+            context.tracker.log_single_value(
+                name="Distribution - Likes/User Median",
+                value=likes_stats.get('likes_per_user_median', 0)
+            )
+            context.tracker.log_single_value(
+                name="Distribution - Likes/User Max",
+                value=likes_stats.get('likes_per_user_max', 0)
+            )
+            context.tracker.log_single_value(
+                name="Distribution - Likes/User P90",
+                value=likes_stats.get('likes_per_user_p90', 0)
+            )
+            context.tracker.log_single_value(
+                name="Distribution - Likes/User P99",
+                value=likes_stats.get('likes_per_user_p99', 0)
+            )
+        
+        # Plot histogram of likes per user (with cap line)
+        if 'likes_per_user_distribution' in likes_stats:
+            _log_likes_distribution_plot(
+                context.tracker, 
+                likes_stats['likes_per_user_distribution'],
+                max_likes_per_user,
+                logger
             )
     
     # Posts pipeline metrics
     if 'posts' in all_stats:
         posts_stats = all_stats['posts']
         context.tracker.log_single_value(
-            name="get_data/n_posts_total",
+            name="Posts - 1 Total (time-filtered)",
             value=posts_stats.get('n_posts_total', 0)
         )
         context.tracker.log_single_value(
-            name="get_data/n_liked_posts",
+            name="Posts - 2 Liked Posts Found",
             value=posts_stats.get('n_liked_posts', 0)
         )
         context.tracker.log_single_value(
-            name="get_data/n_random_sample",
+            name="Posts - 3 Random Sample",
             value=posts_stats.get('n_random_sample', 0)
         )
         context.tracker.log_single_value(
-            name="get_data/liked_post_match_rate",
+            name="Posts - Match Rate %",
             value=posts_stats.get('liked_post_match_rate', 0)
         )
     
@@ -368,19 +401,19 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     if 'memory_actual' in all_stats:
         mem_stats = all_stats['memory_actual']
         context.tracker.log_single_value(
-            name="get_data/memory_peak_gb",
+            name="Memory - Peak GB",
             value=mem_stats.get('peak_process_gb', 0)
         )
         context.tracker.log_single_value(
-            name="get_data/memory_start_gb",
+            name="Memory - Start GB",
             value=mem_stats.get('start_process_gb', 0)
         )
         context.tracker.log_single_value(
-            name="get_data/memory_end_gb",
+            name="Memory - End GB",
             value=mem_stats.get('end_process_gb', 0)
         )
         context.tracker.log_single_value(
-            name="get_data/memory_growth_gb",
+            name="Memory - Growth GB",
             value=mem_stats.get('growth_gb', 0)
         )
     
@@ -388,7 +421,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     if 'memory_estimate' in all_stats:
         est_stats = all_stats['memory_estimate']
         context.tracker.log_single_value(
-            name="get_data/memory_estimated_peak_gb",
+            name="Memory - Estimated Peak GB",
             value=est_stats.get('estimated_peak_gb', 0)
         )
         
@@ -397,7 +430,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         estimated_peak = est_stats.get('estimated_peak_gb', 0)
         if estimated_peak > 0:
             context.tracker.log_single_value(
-                name="get_data/memory_estimate_accuracy_pct",
+                name="Memory - Estimate Accuracy %",
                 value=100.0 * actual_peak / estimated_peak
             )
 
@@ -853,6 +886,98 @@ def _log_data_attrition_report(
     
     logger.info(sep)
     logger.info("")
+
+
+def _log_likes_distribution_plot(
+    tracker,
+    likes_per_user: list,
+    cap_value: int,
+    logger,
+) -> None:
+    """
+    Log a histogram of likes per user to the experiment tracker.
+    Shows the distribution with a vertical line at the per-user cap.
+    
+    This helps visualize how many users are affected by the cap.
+    """
+    try:
+        import matplotlib
+        matplotlib.use('Agg')  # Non-interactive backend
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        # Create histogram
+        likes_arr = np.array(likes_per_user)
+        
+        # Determine bin edges - use log scale if distribution is very skewed
+        max_val = likes_arr.max()
+        if max_val > 10 * np.median(likes_arr):
+            # Log-spaced bins for skewed distribution
+            bins = np.logspace(0, np.log10(max_val + 1), 50)
+            ax.set_xscale('log')
+        else:
+            bins = 50
+        
+        # Plot histogram
+        counts, bin_edges, patches = ax.hist(
+            likes_arr, 
+            bins=bins, 
+            alpha=0.7, 
+            color='steelblue',
+            edgecolor='white',
+            linewidth=0.5,
+        )
+        
+        # Add vertical line at cap value
+        ax.axvline(
+            x=cap_value, 
+            color='red', 
+            linestyle='--', 
+            linewidth=2,
+            label=f'Per-user cap = {cap_value}'
+        )
+        
+        # Calculate stats
+        n_above_cap = np.sum(likes_arr > cap_value)
+        pct_above_cap = 100.0 * n_above_cap / len(likes_arr)
+        
+        # Add annotations
+        ax.set_xlabel('Likes per User (before cap)')
+        ax.set_ylabel('Number of Users')
+        ax.set_title(f'Likes Distribution for Sampled Users\n'
+                     f'({n_above_cap:,} users ({pct_above_cap:.1f}%) exceed cap)')
+        ax.legend()
+        
+        # Add text box with stats
+        stats_text = (f'N users: {len(likes_arr):,}\n'
+                     f'Mean: {np.mean(likes_arr):.1f}\n'
+                     f'Median: {np.median(likes_arr):.0f}\n'
+                     f'P90: {np.percentile(likes_arr, 90):.0f}\n'
+                     f'Max: {max_val:,}')
+        ax.text(0.98, 0.98, stats_text, transform=ax.transAxes,
+                fontsize=9, verticalalignment='top', horizontalalignment='right',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        
+        plt.tight_layout()
+        
+        # Log to ClearML
+        tracker.log_plot(
+            title="Likes Distribution",
+            series="Sampled Users",
+            figure=fig,
+        )
+        
+        plt.close(fig)
+        
+        if logger:
+            logger.info(f"Logged likes distribution plot to experiment tracker "
+                       f"({pct_above_cap:.1f}% of users exceed cap)")
+    
+    except Exception as e:
+        if logger:
+            logger.warning(f"Failed to create likes distribution plot: {e}")
 
 
 def _run_digitalocean_legacy(

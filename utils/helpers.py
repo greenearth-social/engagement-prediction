@@ -1320,6 +1320,25 @@ def load_likes_core_polars(
     stats['n_likes_after_user_sample'] = n_after_user_sample
     log_memory_checkpoint("likes_after_pass2", logger)
     
+    # ===== Capture like count distribution BEFORE cap (for analysis/plotting) =====
+    # This shows how many likes each sampled user has before we apply the per-user cap
+    if len(likes_df) > 0:
+        likes_per_user_before_cap = (
+            likes_df.group_by('did')
+            .agg(pl.len().alias('like_count'))
+            ['like_count']
+            .to_list()
+        )
+        stats['likes_per_user_distribution'] = likes_per_user_before_cap
+        stats['likes_per_user_mean'] = float(np.mean(likes_per_user_before_cap))
+        stats['likes_per_user_median'] = float(np.median(likes_per_user_before_cap))
+        stats['likes_per_user_max'] = int(max(likes_per_user_before_cap))
+        stats['likes_per_user_p90'] = float(np.percentile(likes_per_user_before_cap, 90))
+        stats['likes_per_user_p99'] = float(np.percentile(likes_per_user_before_cap, 99))
+        _log(f"Likes per sampled user: mean={stats['likes_per_user_mean']:.1f}, "
+             f"median={stats['likes_per_user_median']:.0f}, max={stats['likes_per_user_max']}, "
+             f"p90={stats['likes_per_user_p90']:.0f}, p99={stats['likes_per_user_p99']:.0f}")
+    
     # ===== Apply per-user random cap (NOT recency-based) =====
     if max_likes_per_user > 0 and len(likes_df) > 0:
         n_before_cap = len(likes_df)
