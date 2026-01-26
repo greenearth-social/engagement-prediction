@@ -453,139 +453,17 @@ def estimate_parquet_memory(
     }
 
 
-def sample_bytes_per_row(
-    file_paths: List[str],
-    n_sample_files: int = 2,
-    expand_embeddings: bool = False,
-    embedding_dim: int = 384,
-    logger: Optional[Any] = None,
-) -> Dict[str, Any]:
-    """
-    Empirically measure bytes-per-row by loading a small random sample of files.
-    
-    This provides accurate memory estimates that adapt to the actual data schema
-    and content, rather than relying on hard-coded constants.
-    
-    Files are sampled RANDOMLY from the middle of the list to avoid temporal bias
-    (files at start/end of time windows may have different characteristics).
-    
-    Args:
-        file_paths: List of parquet file paths to sample from
-        n_sample_files: Number of files to sample (default: 2)
-        expand_embeddings: Whether to expand embedding column (for posts)
-        embedding_dim: Embedding dimension if expanding
-        logger: Optional logger
-        
-    Returns:
-        Dict with 'bytes_per_row', 'rows_sampled', 'files_sampled', 'memory_bytes'
-    """
-    import gc
-    
-    if not file_paths or n_sample_files <= 0:
-        return {'bytes_per_row': None, 'rows_sampled': 0, 'files_sampled': 0}
-    
-    if psutil is None:
-        if logger:
-            logger.warning("psutil not available - cannot sample bytes per row empirically")
-        return {'bytes_per_row': None, 'rows_sampled': 0, 'files_sampled': 0, 'error': 'psutil not available'}
-    
-    # Sample files RANDOMLY from the list (avoiding temporal bias at start/end)
-    # Exclude first and last 10% of files to avoid edge effects
-    n_files = len(file_paths)
-    if n_files <= 5:
-        # Too few files - just sample what we can
-        sample_indices = random.sample(range(n_files), min(n_sample_files, n_files))
-    else:
-        # Exclude first/last 10% to avoid temporal edge effects
-        margin = max(1, n_files // 10)
-        middle_range = range(margin, n_files - margin)
-        sample_indices = random.sample(list(middle_range), min(n_sample_files, len(middle_range)))
-    
-    sample_paths = [file_paths[i] for i in sample_indices]
-    
-    # Force garbage collection before measurement
-    gc.collect()
-    process = psutil.Process()
-    mem_before = process.memory_info().rss
-    
-    total_rows = 0
-    dfs = []
-    
-    try:
-        for path in sample_paths:
-            df = pl.read_parquet(path)
-            
-            if expand_embeddings and 'embeddings' in df.columns and len(df) > 0:
-                # Expand embedding column to match actual processing
-                # First, detect the actual embedding dimension from the data
-                # (don't assume embedding_dim - it might differ from actual data)
-                try:
-                    # Get the first non-null embedding to determine actual dimension
-                    first_embedding = df.filter(pl.col('embeddings').is_not_null()).select('embeddings').head(1)
-                    if len(first_embedding) > 0:
-                        actual_dim = len(first_embedding['embeddings'][0])
-                        # Use the smaller of actual_dim and embedding_dim to avoid out-of-bounds
-                        dim_to_use = min(actual_dim, embedding_dim) if actual_dim > 0 else 0
-                        
-                        if dim_to_use > 0:
-                            df = df.with_columns([
-                                pl.col('embeddings').list.get(i).alias(f'emb_{i}')
-                                for i in range(dim_to_use)
-                            ]).drop('embeddings')
-                except Exception as embed_err:
-                    # If embedding expansion fails, just drop the column and continue
-                    # The memory estimate will be slightly off but still useful
-                    if logger:
-                        logger.debug(f"Could not expand embeddings during sampling: {embed_err}")
-                    if 'embeddings' in df.columns:
-                        df = df.drop('embeddings')
-            
-            total_rows += len(df)
-            dfs.append(df)
-        
-        # Force memory allocation by concatenating (mirrors actual processing)
-        if dfs:
-            combined = pl.concat(dfs)
-            # Trigger actual memory allocation
-            _ = combined.shape
-        
-        gc.collect()
-        mem_after = process.memory_info().rss
-        
-        bytes_used = max(mem_after - mem_before, 0)
-        bytes_per_row = bytes_used / max(total_rows, 1) if total_rows > 0 else None
-        
-        result = {
-            'bytes_per_row': bytes_per_row,
-            'rows_sampled': total_rows,
-            'files_sampled': len(sample_paths),
-            'memory_bytes': bytes_used,
-        }
-        
-        if logger and bytes_per_row:
-            logger.debug(f"  Sampled {len(sample_paths)} files, {total_rows:,} rows: {bytes_per_row/1024:.1f} KB/row")
-        
-        return result
-        
-    except Exception as e:
-        if logger:
-            logger.warning(f"Error sampling bytes per row: {e}")
-        return {'bytes_per_row': None, 'rows_sampled': 0, 'files_sampled': 0, 'error': str(e)}
-    
-    finally:
-        # Clean up to minimize impact on subsequent measurements
-        del dfs
-        if 'combined' in dir():
-            del combined
-        gc.collect()
-
-
 # ============================================================================
 # MEMORY ESTIMATION MODEL
 # ============================================================================
 # Fitted regression model for predicting peak memory usage.
-# Trained on sweep_results.csv using scripts/fit_memory_model.py
-# R-squared: 0.9440, Mean % error: 6.7% (10x better than old heuristics)
+#
+# Model performance: R-squared = 0.9440, Mean % error = 6.7%
+#
+# To re-fit after collecting new sweep data:
+#   python scripts/fit_memory_model.py --input sweep_results.csv
+# This will output new coefficients to paste here.
+# ============================================================================
 
 MEMORY_MODEL_COEFFICIENTS = {
     'intercept': 32.1569093112,
@@ -666,12 +544,6 @@ def predict_memory_gb(
     return max(result, 1.0)
 
 
-# Legacy constants kept for backward compatibility (may be used in logging/reports)
-OVERLAP_EXPONENT = 0.61
-OVERLAP_BASE_USERS = 72_000
-OVERLAP_BASE_UNIQUE_POSTS = 1_320_000
-
-
 def estimate_filtered_data_memory(
     likes_paths: List[str],
     posts_paths: List[str],
@@ -687,9 +559,8 @@ def estimate_filtered_data_memory(
     """
     Estimate memory required for data loading using a fitted regression model.
     
-    This function uses a regression model trained on sweep results to predict
-    peak memory usage, providing ~10x better accuracy than the previous
-    heuristic-based approach.
+    Uses a regression model trained on sweep_results.csv to predict peak memory
+    usage based on configuration parameters (users, likes/user, window size, etc.).
     
     Args:
         likes_paths: Paths to likes parquet files
@@ -2539,11 +2410,10 @@ __all__ = [
     'load_raw_data_ingex',
     # Stage 1: Memory safety checks and tracking
     'get_current_memory_usage', 'log_memory_checkpoint', 'MemoryTracker',
-    'estimate_parquet_memory', 'sample_bytes_per_row', 'estimate_filtered_data_memory',
+    'estimate_parquet_memory', 'estimate_filtered_data_memory',
     'compute_memory_model_features', 'predict_memory_gb',
     'MEMORY_MODEL_COEFFICIENTS', 'MEMORY_MODEL_FEATURE_NAMES',
     'check_memory_available', 'check_data_load_safe',
-    'OVERLAP_EXPONENT', 'OVERLAP_BASE_USERS', 'OVERLAP_BASE_UNIQUE_POSTS',
     # Stage 1: Polars-based filtering for core datasets
     'load_likes_core_polars', 'load_posts_core_polars', 'expand_embeddings_polars',
     # Data IO Digital Ocean
