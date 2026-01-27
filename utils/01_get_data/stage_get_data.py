@@ -150,8 +150,6 @@ from utils.helpers import (
     log_memory_checkpoint,
     list_files_in_range_ingex_gcs,
     parse_one_ts,
-    # Legacy imports for DigitalOcean fallback
-    load_most_recent_raw_data_digital_ocean,
     # Data validation
     validate_dataframe_schema,
 )
@@ -164,23 +162,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # Initialize logger
     logger = get_stage_logger('STAGE_01_GET_DATA', log_file=out_dir / 'stage.log')
 
-    # Parameters (defaults are set in cli.py)
-    data_source = args.data_source
-
     t0 = time.time()
 
-    if data_source == 'greenearth':
-        # Use new Polars-based filtering pipeline
-        likes_core_df, posts_core_df, embed_dim, all_stats = _run_greenearth_pipeline(
-            args, logger, context
-        )
-    elif data_source == 'digitalocean':
-        # Legacy path: DigitalOcean Spaces (kept for backwards compatibility)
-        likes_core_df, posts_core_df, embed_dim, all_stats = _run_digitalocean_legacy(
-            args, logger, context
-        )
-    else:
-        raise ValueError(f"Unknown data_source: {data_source}")
+    # Use Polars-based filtering pipeline for GreenEarth Ingex data
+    likes_core_df, posts_core_df, embed_dim, all_stats = _run_greenearth_pipeline(
+        args, logger, context
+    )
 
     # Validate output schemas before saving
     log_operation_start('Validate output schemas', 'STAGE_01_GET_DATA', logger)
@@ -246,7 +233,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     embedding_model = getattr(args, 'embedding_model', 'all_MiniLM_L6_v2')
     
     summary = {
-        'data_source': data_source,
         'gcs_bucket': gcs_bucket,
         'posts_start': posts_start,
         'posts_end': posts_end,
@@ -442,7 +428,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     info_lines = [
         f"stage: get_data",
         f"runtime_seconds: {runtime:.2f}",
-        f"data_source: {data_source}",
         f"settings: max_liking_users={max_liking_users}, max_likes_per_user={max_likes_per_user}, "
         f"min_likes_per_user={min_likes_per_user}, negative_posts_sample={negative_posts_sample}",
         f"inputs: GCS bucket={gcs_bucket}",
@@ -986,69 +971,3 @@ def _log_likes_distribution_plot(
             logger.warning(f"Failed to create likes distribution plot: {e}")
 
 
-def _run_digitalocean_legacy(
-    args: argparse.Namespace,
-    logger,
-    context: Context,
-):
-    """
-    Legacy path for DigitalOcean Spaces data.
-    Converts to the new output format for compatibility.
-    
-    Returns:
-        Tuple of (likes_core_df, posts_core_df, embed_dim, stats_dict)
-    """
-    import polars as pl
-    import pandas as pd
-    import numpy as np
-    
-    max_files = int(args.max_files_per_table)
-    max_liking_users = int(getattr(args, 'max_liking_users', 0))
-    cap_random_seed = int(getattr(args, 'cap_random_seed', 42))
-    
-    log_operation_start('Load data from DigitalOcean Spaces (legacy)', 'STAGE_01_GET_DATA', logger)
-    posts_pdf, likes_pdf, metadata_df = load_most_recent_raw_data_digital_ocean(max_files)
-    
-    all_stats = {
-        'legacy_mode': True,
-        'max_files_per_table': max_files,
-    }
-    
-    n_users_before = 0
-    n_users_after = 0
-    
-    # User-level downsampling
-    if 'did' in likes_pdf.columns:
-        unique_users = likes_pdf['did'].unique()
-        n_users_before = len(unique_users)
-        
-        if max_liking_users is not None and n_users_before > max_liking_users:
-            log_operation_start(f'Downsample liking users: {n_users_before} -> {max_liking_users}', 'STAGE_01_GET_DATA', logger)
-            rng = np.random.RandomState(cap_random_seed)
-            sampled_users = set(rng.choice(unique_users, size=max_liking_users, replace=False))
-            likes_pdf = likes_pdf[likes_pdf['did'].isin(sampled_users)]
-            n_users_after = max_liking_users
-        else:
-            n_users_after = n_users_before
-    
-    all_stats['likes'] = {
-        'n_users_initial': n_users_before,
-        'n_users_final': n_users_after,
-        'n_likes_final': len(likes_pdf),
-    }
-    all_stats['posts'] = {
-        'n_posts_total': len(posts_pdf),
-        'n_posts_core': len(posts_pdf),
-    }
-    
-    # Convert to polars
-    likes_core_df = pl.from_pandas(likes_pdf)
-    posts_core_df = pl.from_pandas(posts_pdf)
-    
-    # Add in_random_sample flag (all false for legacy mode - no random sampling done)
-    posts_core_df = posts_core_df.with_columns(pl.lit(False).alias('in_random_sample'))
-    
-    # No embeddings in DO data by default
-    embed_dim = 0
-    
-    return likes_core_df, posts_core_df, embed_dim, all_stats
