@@ -138,6 +138,8 @@ import time
 from pathlib import Path
 from typing import Dict, Any
 
+import polars as pl
+
 from utils.pipeline.core import new_stage_timestamp_dir, Context
 from utils.helpers import (
     get_stage_logger,
@@ -165,7 +167,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     t0 = time.time()
 
     # Use Polars-based filtering pipeline for GreenEarth Ingex data
-    likes_core_df, posts_core_df, embed_dim, all_stats = _run_greenearth_pipeline(
+    likes_core_lf, posts_core_df, embed_dim, all_stats = _run_greenearth_pipeline(
         args, logger, context
     )
 
@@ -178,7 +180,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'subject_uri': str,
         'record_created_at': 'datetime',
     }
-    validate_dataframe_schema(likes_core_df, likes_schema, allow_extra_columns=False)
+    validate_dataframe_schema(likes_core_lf, likes_schema, allow_extra_columns=False)
     logger.info("✓ likes_core schema validated")
     
     # Validate posts_core schema (dynamic embedding columns + all extra columns)
@@ -208,11 +210,17 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     likes_core_path = out_dir / f"likes_core_{ts_name}.parquet"
     posts_core_path = out_dir / f"posts_core_{ts_name}.parquet"
     
-    likes_core_df.write_parquet(likes_core_path)
+    likes_core_lf.sink_parquet(likes_core_path)
     posts_core_df.write_parquet(posts_core_path)
     
-    logger.info(f"Saved likes_core: {likes_core_path} ({len(likes_core_df):,} rows)")
-    logger.info(f"Saved posts_core: {posts_core_path} ({len(posts_core_df):,} rows)")
+    likes_stats = all_stats.get('likes', {})
+    n_likes = likes_stats.get('n_likes_final_after_join')
+    if n_likes is None:
+        n_likes = int(pl.scan_parquet(likes_core_path).select(pl.len()).collect(streaming=True).item())
+    n_posts = len(posts_core_df)
+    
+    logger.info(f"Saved likes_core: {likes_core_path} ({n_likes:,} rows)")
+    logger.info(f"Saved posts_core: {posts_core_path} ({n_posts:,} rows)")
 
     # Summary
     log_operation_start('Write summary files', 'STAGE_01_GET_DATA', logger)
@@ -247,8 +255,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             'embedding_model': embedding_model,
         },
         'outputs': {
-            'likes_core_rows': len(likes_core_df),
-            'posts_core_rows': len(posts_core_df),
+            'likes_core_rows': n_likes,
+            'posts_core_rows': n_posts,
             'embedding_dim': embed_dim,
         },
         'filtering_stats': all_stats,
@@ -258,8 +266,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # Log to experiment tracker - comprehensive metrics for sweep analysis
     # Metric names use readable format: "Category - Metric Name" for better CSV exports
-    n_likes = len(likes_core_df)
-    n_posts = len(posts_core_df)
+    # n_likes/n_posts already computed above for saved outputs
     
     # Primary outputs
     context.tracker.log_single_value(name="Output - Likes (final)", value=n_likes)
@@ -457,7 +464,7 @@ def _run_greenearth_pipeline(
     Run the new Polars-based filtering pipeline for GreenEarth Ingex data.
     
     Returns:
-        Tuple of (likes_core_df, posts_core_df, embed_dim, stats_dict)
+        Tuple of (likes_core_lf, posts_core_df, embed_dim, stats_dict)
     """
     import polars as pl
     
@@ -539,7 +546,7 @@ def _run_greenearth_pipeline(
     
     # Step 1: Load and filter likes
     log_operation_start('Load and filter likes data', 'STAGE_01_GET_DATA', logger)
-    likes_core_df, likes_stats = load_likes_core_polars(
+    likes_core_lf, likes_stats = load_likes_core_polars(
         gcs_bucket=gcs_bucket,
         start_str=likes_start,
         end_str=likes_end,
@@ -555,7 +562,10 @@ def _run_greenearth_pipeline(
     
     # Step 2: Extract liked post URIs
     log_operation_start('Extract liked post URIs', 'STAGE_01_GET_DATA', logger)
-    liked_post_uris = set(likes_core_df['subject_uri'].unique().to_list())
+    liked_post_uris = (
+        likes_core_lf.select(pl.col('subject_uri').unique())
+        .collect(streaming=True)['subject_uri']
+    )
     logger.info(f"Extracted {len(liked_post_uris):,} unique liked post URIs")
     
     mem_tracker.checkpoint("after_uri_extraction")
@@ -585,32 +595,40 @@ def _run_greenearth_pipeline(
     log_operation_start('Re-verify min-likes after like-post join', 'STAGE_01_GET_DATA', logger)
     
     # Get set of post URIs that actually exist in posts_core
-    existing_post_uris = set(posts_core_df['at_uri'].unique().to_list())
+    existing_post_uris = posts_core_df['at_uri'].unique()
     logger.info(f"Found {len(existing_post_uris):,} unique post URIs in posts_core")
     
     # Filter likes to only those with matching posts
-    n_likes_before_join_filter = len(likes_core_df)
-    likes_core_df = likes_core_df.filter(
+    n_likes_before_join_filter = likes_stats.get('n_likes_final', 0)
+    likes_core_lf = likes_core_lf.filter(
         pl.col('subject_uri').is_in(existing_post_uris)
     )
-    n_likes_after_join_filter = len(likes_core_df)
+    counts_after_join_df = (
+        likes_core_lf.group_by('did')
+        .agg(pl.len().alias('like_count'))
+        .collect(streaming=True)
+    )
+    n_likes_after_join_filter = int(counts_after_join_df['like_count'].sum()) if counts_after_join_df.height > 0 else 0
     n_likes_removed_by_join = n_likes_before_join_filter - n_likes_after_join_filter
-    logger.info(f"After join filter: {n_likes_before_join_filter:,} -> {n_likes_after_join_filter:,} likes ({n_likes_removed_by_join:,} removed)")
+    logger.info(
+        f"After join filter: {n_likes_before_join_filter:,} -> {n_likes_after_join_filter:,} likes "
+        f"({n_likes_removed_by_join:,} removed)"
+    )
     
     # Re-verify min-likes per user
     n_users_removed_by_join_verify = 0
+    n_users_before_join_verify = counts_after_join_df.height
+    n_users_after_join_verify = n_users_before_join_verify
+    n_likes_after_final_filter = n_likes_after_join_filter
     if min_likes_per_user > 0:
-        user_like_counts = (
-            likes_core_df.group_by('did')
-            .agg(pl.count().alias('like_count'))
-        )
-        
-        n_users_before_join_verify = len(user_like_counts)
-        users_meeting_threshold = user_like_counts.filter(
+        users_meeting_threshold = counts_after_join_df.filter(
             pl.col('like_count') >= min_likes_per_user
         )
-        n_users_after_join_verify = len(users_meeting_threshold)
+        n_users_after_join_verify = users_meeting_threshold.height
         n_users_removed_by_join_verify = n_users_before_join_verify - n_users_after_join_verify
+        n_likes_after_final_filter = (
+            int(users_meeting_threshold['like_count'].sum()) if users_meeting_threshold.height > 0 else 0
+        )
         
         if n_users_removed_by_join_verify > 0:
             logger.warning(
@@ -619,11 +637,11 @@ def _run_greenearth_pipeline(
             )
             
             # Filter likes to only users who still meet threshold
-            valid_user_dids = set(users_meeting_threshold['did'].to_list())
-            likes_core_df = likes_core_df.filter(
-                pl.col('did').is_in(valid_user_dids)
+            likes_core_lf = likes_core_lf.join(
+                users_meeting_threshold.select('did').lazy(),
+                on='did',
+                how='semi',
             )
-            n_likes_after_final_filter = len(likes_core_df)
             logger.info(f"Final likes after user filter: {n_likes_after_final_filter:,} likes")
         else:
             logger.info(f"All {n_users_before_join_verify:,} users still meet min-likes threshold after join")
@@ -632,8 +650,8 @@ def _run_greenearth_pipeline(
     if 'likes' in all_stats:
         all_stats['likes']['n_likes_removed_by_join'] = n_likes_removed_by_join
         all_stats['likes']['n_users_removed_by_join_verify'] = n_users_removed_by_join_verify
-        all_stats['likes']['n_users_final_after_join'] = likes_core_df['did'].n_unique() if len(likes_core_df) > 0 else 0
-        all_stats['likes']['n_likes_final_after_join'] = len(likes_core_df)
+        all_stats['likes']['n_users_final_after_join'] = n_users_after_join_verify
+        all_stats['likes']['n_likes_final_after_join'] = n_likes_after_final_filter
     
     mem_tracker.checkpoint("after_join_verification")
     
@@ -652,7 +670,7 @@ def _run_greenearth_pipeline(
     # Log comprehensive attrition report
     _log_data_attrition_report(all_stats, memory_estimate, args, logger)
     
-    return likes_core_df, posts_core_df, embed_dim, all_stats
+    return likes_core_lf, posts_core_df, embed_dim, all_stats
 
 
 def _log_data_attrition_report(
@@ -969,5 +987,3 @@ def _log_likes_distribution_plot(
     except Exception as e:
         if logger:
             logger.warning(f"Failed to create likes distribution plot: {e}")
-
-

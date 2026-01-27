@@ -801,24 +801,23 @@ def load_likes_core_polars(
     min_likes_per_user: int = 2,
     random_seed: int = 42,
     logger: Optional[Any] = None,
-) -> Tuple[pl.DataFrame, Dict[str, Any]]:
+) -> Tuple[pl.LazyFrame, Dict[str, Any]]:
     """
-    Load and filter likes data using memory-efficient incremental processing.
+    Load and filter likes data using a streaming Polars pipeline.
     
-    Instead of loading all files at once, this processes files incrementally:
-    1. First pass: scan files to count likes per user
-    2. Pre-filter users who don't meet min_likes_per_user threshold
+    High-level flow:
+    1. Streamed pass: count likes per user
+    2. Pre-filter users who don't meet min_likes_per_user
     3. Sample users from eligible pool (if cap is set)
-    4. Second pass: scan files again, only keeping likes from sampled users
+    4. Streamed pass: keep only likes from sampled users
     5. Apply per-user random caps (NOT recency-based)
     6. Verify min-likes threshold (handles edge cases from per-user caps)
     
-    This approach keeps memory usage bounded regardless of total data size,
-    and ensures sampled users actually meet the minimum likes requirement,
-    avoiding wasteful sampling of users who will be filtered out later.
+    This avoids materializing the full likes table in memory and returns a
+    LazyFrame suitable for streaming writes (sink_parquet).
     
     Returns:
-        Tuple of (likes_df: pl.DataFrame, stats: Dict with filtering statistics)
+        Tuple of (likes_lf: pl.LazyFrame, stats: Dict with filtering statistics)
     """
     def _log(msg: str):
         if logger:
@@ -843,64 +842,59 @@ def load_likes_core_polars(
     _log(f"Found {len(paths)} likes parquet files")
     log_memory_checkpoint("likes_before_scan", logger)
     
-    # Batch size for processing multiple files at once
-    BATCH_SIZE = 20
-    
-    # Helper to normalize column names and apply time filter for batch of files
-    def _prepare_batch_lf(batch_paths: List[str]) -> pl.LazyFrame:
-        lf = pl.scan_parquet(batch_paths)
+    # Helper to normalize column names and apply time filter
+    def _prepare_lf(all_paths: List[str]) -> pl.LazyFrame:
+        lf = pl.scan_parquet(all_paths)
         schema = lf.collect_schema()
         
         # Normalize column names
         col_mapping = {}
         for col in schema.names():
-            if col.lower() == 'did':
+            lower = col.lower()
+            if lower == 'did':
                 col_mapping[col] = 'did'
-            elif col.lower() == 'subjecturi':
+            elif lower == 'subjecturi':
                 col_mapping[col] = 'subject_uri'
-            elif col.lower() == 'recordcreatedat':
+            elif lower == 'recordcreatedat':
                 col_mapping[col] = 'record_created_at'
-            elif col.lower() == 'insertedat':
+            elif lower == 'insertedat':
                 col_mapping[col] = 'inserted_at'
         
         if col_mapping:
             lf = lf.rename(col_mapping)
         
+        schema = lf.collect_schema()
+        wanted = ['did', 'subject_uri', 'record_created_at', 'inserted_at']
+        existing = [c for c in wanted if c in schema.names()]
+        if existing:
+            lf = lf.select(existing)
+        
         # Apply time filter
         if 'inserted_at' in lf.collect_schema().names():
             lf = lf.with_columns(
-                pl.col("inserted_at").str.to_datetime(time_zone="UTC").alias("inserted_at_dt")
+                pl.col("inserted_at").str.to_datetime(time_zone="UTC").alias("_inserted_at_dt")
             )
             if start_dt is not None:
-                lf = lf.filter(pl.col("inserted_at_dt") >= start_dt)
+                lf = lf.filter(pl.col("_inserted_at_dt") >= start_dt)
             if end_dt is not None:
-                lf = lf.filter(pl.col("inserted_at_dt") < end_dt)
+                lf = lf.filter(pl.col("_inserted_at_dt") < end_dt)
+            lf = lf.drop("_inserted_at_dt")
         
         return lf
     
-    # ===== PASS 1: Collect unique users with like counts (batch processing) =====
-    _log(f"Pass 1: Scanning files for user like counts (batch size: {BATCH_SIZE})...")
-    user_counts: Dict[str, int] = {}
-    n_likes_initial = 0
+    base_lf = _prepare_lf(paths)
     
-    for batch_start in range(0, len(paths), BATCH_SIZE):
-        batch_end = min(batch_start + BATCH_SIZE, len(paths))
-        batch_paths = paths[batch_start:batch_end]
-        
-        lf = _prepare_batch_lf(batch_paths)
-        # Collect user DIDs to count likes per user
-        batch_users = lf.select('did').collect()
-        
-        # Count likes per user in this batch
-        for user in batch_users['did'].to_list():
-            user_counts[user] = user_counts.get(user, 0) + 1
-        
-        n_likes_initial += len(batch_users)
-        
-        _log(f"  Scanned {batch_end}/{len(paths)} files: {n_likes_initial:,} likes, {len(user_counts):,} unique users")
-        log_memory_checkpoint(f"likes_pass1_batch_{batch_end}", logger)
+    # ===== PASS 1: Count likes per user (streaming) =====
+    _log("Pass 1: Counting likes per user (streaming)...")
+    user_counts_df = (
+        base_lf.select('did')
+        .group_by('did')
+        .agg(pl.len().alias('like_count'))
+        .collect(streaming=True)
+    )
     
-    n_users_initial = len(user_counts)
+    n_users_initial = user_counts_df.height
+    n_likes_initial = int(user_counts_df['like_count'].sum()) if n_users_initial > 0 else 0
     _log(f"Pass 1 complete: {n_likes_initial:,} likes from {n_users_initial:,} users")
     log_memory_checkpoint("likes_after_pass1", logger)
     
@@ -911,71 +905,48 @@ def load_likes_core_polars(
     
     # ===== Pre-filter users by min_likes_per_user before sampling =====
     if min_likes_per_user > 0:
-        eligible_users = {user for user, count in user_counts.items() if count >= min_likes_per_user}
-        n_users_eligible = len(eligible_users)
+        eligible_users_df = user_counts_df.filter(pl.col('like_count') >= min_likes_per_user)
+        n_users_eligible = eligible_users_df.height
         n_users_filtered = n_users_initial - n_users_eligible
-        _log(f"Pre-filtering: {n_users_eligible:,} users meet min-likes threshold ({min_likes_per_user}), "
-             f"excluded {n_users_filtered:,} users with too few likes")
+        _log(
+            f"Pre-filtering: {n_users_eligible:,} users meet min-likes threshold ({min_likes_per_user}), "
+            f"excluded {n_users_filtered:,} users with too few likes"
+        )
         stats['n_users_eligible_for_sampling'] = n_users_eligible
         stats['n_users_excluded_min_likes'] = n_users_filtered
     else:
-        eligible_users = set(user_counts.keys())
+        eligible_users_df = user_counts_df.select('did')
         stats['n_users_eligible_for_sampling'] = n_users_initial
     
-    # Free the user_counts dict - no longer needed
-    del user_counts
-    
     # ===== Sample users if cap is set =====
-    rng = np.random.RandomState(random_seed)
-    
-    if max_liking_users is not None and len(eligible_users) > max_liking_users:
-        user_list = list(eligible_users)
-        sampled_indices = rng.choice(len(user_list), size=max_liking_users, replace=False)
-        sampled_user_set = {user_list[i] for i in sampled_indices}
-        _log(f"Sampled {max_liking_users:,} liking users ({100*max_liking_users/len(eligible_users):.1f}% of eligible)")
+    if max_liking_users is not None and eligible_users_df.height > max_liking_users:
+        sampled_users_df = (
+            eligible_users_df.select('did')
+            .sample(n=max_liking_users, with_replacement=False, seed=random_seed)
+        )
+        _log(
+            f"Sampled {max_liking_users:,} liking users "
+            f"({100*max_liking_users/eligible_users_df.height:.1f}% of eligible)"
+        )
         stats['n_users_sampled'] = max_liking_users
     else:
-        sampled_user_set = eligible_users
-        stats['n_users_sampled'] = len(eligible_users)
+        sampled_users_df = eligible_users_df.select('did')
+        stats['n_users_sampled'] = sampled_users_df.height
     
-    # Free the eligible user set
-    del eligible_users
     log_memory_checkpoint("likes_after_user_sample", logger)
     
-    # ===== PASS 2: Collect likes only for sampled users (batch processing) =====
-    _log(f"Pass 2: Collecting likes for sampled users (batch size: {BATCH_SIZE})...")
-    likes_chunks: List[pl.DataFrame] = []
-    n_likes_collected = 0
+    # ===== PASS 2: Filter likes to sampled users (lazy) =====
+    _log("Pass 2: Filtering likes for sampled users (streaming)...")
+    likes_lf = base_lf.join(sampled_users_df.lazy(), on='did', how='semi')
     
-    for batch_start in range(0, len(paths), BATCH_SIZE):
-        batch_end = min(batch_start + BATCH_SIZE, len(paths))
-        batch_paths = paths[batch_start:batch_end]
-        
-        lf = _prepare_batch_lf(batch_paths)
-        # Filter to sampled users before collecting
-        batch_df = lf.filter(pl.col('did').is_in(sampled_user_set)).collect()
-        
-        if len(batch_df) > 0:
-            likes_chunks.append(batch_df)
-            n_likes_collected += len(batch_df)
-        
-        _log(f"  Processed {batch_end}/{len(paths)} files: {n_likes_collected:,} likes collected")
-        log_memory_checkpoint(f"likes_pass2_batch_{batch_end}", logger)
+    # Compute counts per user before per-user cap
+    counts_pre_cap_df = (
+        likes_lf.group_by('did')
+        .agg(pl.len().alias('like_count'))
+        .collect(streaming=True)
+    )
     
-    # Combine chunks
-    if likes_chunks:
-        likes_df = pl.concat(likes_chunks)
-    else:
-        # Empty result - create with correct schema
-        likes_df = pl.DataFrame({
-            'did': pl.Series([], dtype=pl.String),
-            'subject_uri': pl.Series([], dtype=pl.String),
-            'record_created_at': pl.Series([], dtype=pl.Datetime),
-        })
-    
-    del likes_chunks
-    
-    n_after_user_sample = len(likes_df)
+    n_after_user_sample = int(counts_pre_cap_df['like_count'].sum()) if counts_pre_cap_df.height > 0 else 0
     pct_retained = 100.0 * n_after_user_sample / n_likes_initial if n_likes_initial > 0 else 0
     _log(f"Pass 2 complete: {n_after_user_sample:,} likes ({pct_retained:.1f}% retained)")
     stats['n_likes_after_user_sample'] = n_after_user_sample
@@ -983,13 +954,8 @@ def load_likes_core_polars(
     
     # ===== Capture like count distribution BEFORE cap (for analysis/plotting) =====
     # This shows how many likes each sampled user has before we apply the per-user cap
-    if len(likes_df) > 0:
-        likes_per_user_before_cap = (
-            likes_df.group_by('did')
-            .agg(pl.len().alias('like_count'))
-            ['like_count']
-            .to_list()
-        )
+    if counts_pre_cap_df.height > 0:
+        likes_per_user_before_cap = counts_pre_cap_df['like_count'].to_list()
         stats['likes_per_user_distribution'] = likes_per_user_before_cap
         stats['likes_per_user_mean'] = float(np.mean(likes_per_user_before_cap))
         stats['likes_per_user_median'] = float(np.median(likes_per_user_before_cap))
@@ -1001,79 +967,85 @@ def load_likes_core_polars(
              f"p90={stats['likes_per_user_p90']:.0f}, p99={stats['likes_per_user_p99']:.0f}")
     
     # ===== Apply per-user random cap (NOT recency-based) =====
-    if max_likes_per_user > 0 and len(likes_df) > 0:
-        n_before_cap = len(likes_df)
+    counts_after_cap_df = counts_pre_cap_df
+    if max_likes_per_user > 0 and n_after_user_sample > 0:
+        n_before_cap = n_after_user_sample
         
-        # Add random ordering within each user's likes
-        likes_df = likes_df.with_columns(
+        # Add random order per user, then keep top-K
+        likes_lf = likes_lf.with_columns(
             pl.lit(1).cum_count().over('did').shuffle(seed=random_seed).alias('_rand_order')
         )
-        likes_df = likes_df.filter(pl.col('_rand_order') <= max_likes_per_user)
-        likes_df = likes_df.drop('_rand_order')
+        likes_lf = likes_lf.filter(pl.col('_rand_order') <= max_likes_per_user)
+        likes_lf = likes_lf.drop('_rand_order')
         
-        n_after_cap = len(likes_df)
+        counts_after_cap_df = (
+            likes_lf.group_by('did')
+            .agg(pl.len().alias('count'))
+            .collect(streaming=True)
+        )
+        n_after_cap = int(counts_after_cap_df['count'].sum()) if counts_after_cap_df.height > 0 else 0
         pct_retained = 100.0 * n_after_cap / n_before_cap if n_before_cap > 0 else 0
         _log(f"After per-user cap ({max_likes_per_user}): {n_after_cap:,} likes ({pct_retained:.1f}% retained)")
         stats['n_likes_after_per_user_cap'] = n_after_cap
     else:
-        stats['n_likes_after_per_user_cap'] = len(likes_df)
+        counts_after_cap_df = counts_pre_cap_df.rename({'like_count': 'count'})
+        stats['n_likes_after_per_user_cap'] = n_after_user_sample
     
     # ===== Verify min-likes filter (should be mostly satisfied already) =====
     # Since we pre-filtered users before sampling, this step mainly handles edge cases
     # where the per-user cap might have reduced some users below the threshold
-    if min_likes_per_user > 0 and len(likes_df) > 0:
-        n_before_min = len(likes_df)
-        user_counts = likes_df.group_by('did').agg(pl.len().alias('count'))
-        eligible_users = user_counts.filter(pl.col('count') >= min_likes_per_user)['did']
-        likes_df = likes_df.filter(pl.col('did').is_in(eligible_users))
-        
-        n_after_min = len(likes_df)
-        n_users_final = likes_df['did'].n_unique() if len(likes_df) > 0 else 0
+    if min_likes_per_user > 0 and counts_after_cap_df.height > 0:
+        n_before_min = int(counts_after_cap_df['count'].sum())
+        eligible_users_df = counts_after_cap_df.filter(pl.col('count') >= min_likes_per_user)
+        n_after_min = int(eligible_users_df['count'].sum()) if eligible_users_df.height > 0 else 0
+        n_users_final = eligible_users_df.height
         
         # This should typically remove few or no users since we pre-filtered
         n_removed = n_before_min - n_after_min
         if n_removed > 0:
-            pct_removed = 100.0 * n_removed / n_before_min
-            _log(f"Min-likes verification removed {n_removed:,} likes ({pct_removed:.1f}%) from users "
-                 f"who fell below threshold after per-user cap")
+            pct_removed = 100.0 * n_removed / n_before_min if n_before_min > 0 else 0
+            _log(
+                f"Min-likes verification removed {n_removed:,} likes ({pct_removed:.1f}%) from users "
+                f"who fell below threshold after per-user cap"
+            )
         
         _log(f"Final: {n_users_final:,} users with {n_after_min:,} likes")
         stats['n_likes_final'] = n_after_min
         stats['n_users_final'] = n_users_final
+        
+        likes_lf = likes_lf.join(eligible_users_df.select('did').lazy(), on='did', how='semi')
     else:
-        stats['n_likes_final'] = len(likes_df)
-        stats['n_users_final'] = likes_df['did'].n_unique() if len(likes_df) > 0 else 0
+        stats['n_likes_final'] = int(counts_after_cap_df['count'].sum()) if counts_after_cap_df.height > 0 else 0
+        stats['n_users_final'] = counts_after_cap_df.height
     
     # Select output columns
     output_cols = ['did', 'subject_uri', 'record_created_at']
-    available_cols = [c for c in output_cols if c in likes_df.columns]
+    available_cols = [c for c in output_cols if c in likes_lf.collect_schema().names()]
     if available_cols:
-        likes_df = likes_df.select(available_cols)
+        likes_lf = likes_lf.select(available_cols)
     
     # Convert record_created_at to datetime if it exists and is not already datetime
-    if 'record_created_at' in likes_df.columns:
-        if likes_df['record_created_at'].dtype != pl.Datetime:
-            # Convert from string to datetime
-            if len(likes_df) > 0:
-                likes_df = likes_df.with_columns(
-                    pl.col('record_created_at').str.to_datetime(time_zone="UTC").alias('record_created_at')
-                )
-            else:
-                # Empty DataFrame - cast the column type
-                likes_df = likes_df.with_columns(
-                    pl.col('record_created_at').cast(pl.Datetime).alias('record_created_at')
-                )
+    schema = likes_lf.collect_schema()
+    if 'record_created_at' in schema and schema['record_created_at'] != pl.Datetime:
+        if schema['record_created_at'] in (pl.String, pl.Utf8):
+            likes_lf = likes_lf.with_columns(
+                pl.col('record_created_at').str.to_datetime(time_zone="UTC").alias('record_created_at')
+            )
+        else:
+            likes_lf = likes_lf.with_columns(
+                pl.col('record_created_at').cast(pl.Datetime).alias('record_created_at')
+            )
     
     log_memory_checkpoint("likes_final", logger)
     
-    return likes_df, stats
+    return likes_lf, stats
 
 
 def load_posts_core_polars(
     gcs_bucket: str,
     start_str: Optional[str],
     end_str: Optional[str],
-    liked_post_uris: Set[str],
+    liked_post_uris: Set[str] | pl.Series,
     *,
     negative_posts_sample: int = 100000,
     embedding_model: str = 'all_MiniLM_L6_v2',
@@ -1284,7 +1256,7 @@ def load_posts_core_polars(
     
     # Total liked posts = those only in liked set + those also in random sample
     n_total_liked_posts = n_liked_only + n_liked_in_random
-    liked_post_match_rate = 100.0 * n_total_liked_posts / len(liked_post_uris) if liked_post_uris else 0
+    liked_post_match_rate = 100.0 * n_total_liked_posts / len(liked_post_uris) if len(liked_post_uris) > 0 else 0
     _log(f"Loaded {n_total_liked_posts:,} liked posts ({liked_post_match_rate:.1f}% match rate)")
     
     stats = {
