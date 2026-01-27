@@ -218,19 +218,19 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     log_operation_start('Write summary files', 'STAGE_01_GET_DATA', logger)
     
     # Get parameters for summary
-    gcs_bucket = getattr(args, 'gcs_bucket', None)
-    posts_start = getattr(args, 'posts_start', None)
-    posts_end = getattr(args, 'posts_end', None)
-    likes_start = getattr(args, 'likes_start', None)
-    likes_end = getattr(args, 'likes_end', None)
-    max_liking_users = getattr(args, 'max_liking_users', None)
+    gcs_bucket = args.gcs_bucket
+    posts_start = args.posts_start
+    posts_end = args.posts_end
+    likes_start = args.likes_start
+    likes_end = args.likes_end
+    max_liking_users = args.max_liking_users
     if max_liking_users is not None:
         max_liking_users = int(max_liking_users)
-    max_likes_per_user = int(getattr(args, 'max_likes_per_user', 100))
-    min_likes_per_user = int(getattr(args, 'min_likes_per_user', 2))
-    negative_posts_sample = int(getattr(args, 'negative_posts_sample', 100000))
-    cap_random_seed = int(getattr(args, 'cap_random_seed', 42))
-    embedding_model = getattr(args, 'embedding_model', 'all_MiniLM_L6_v2')
+    max_likes_per_user = int(args.max_likes_per_user)
+    min_likes_per_user = int(args.min_likes_per_user)
+    negative_posts_sample = int(args.negative_posts_sample)
+    cap_random_seed = int(args.cap_random_seed)
+    embedding_model = args.embedding_model
     
     summary = {
         'gcs_bucket': gcs_bucket,
@@ -467,19 +467,19 @@ def _run_greenearth_pipeline(
     likes_start = args.likes_start
     likes_end = args.likes_end
     
-    max_liking_users = getattr(args, 'max_liking_users', None)
+    max_liking_users = args.max_liking_users
     if max_liking_users is not None:
         max_liking_users = int(max_liking_users)
-    max_likes_per_user = int(getattr(args, 'max_likes_per_user', 100))
-    min_likes_per_user = int(getattr(args, 'min_likes_per_user', 2))
-    negative_posts_sample = int(getattr(args, 'negative_posts_sample', 100000))
-    cap_random_seed = int(getattr(args, 'cap_random_seed', 42))
-    embedding_model = getattr(args, 'embedding_model', 'all_MiniLM_L6_v2')
-    max_memory_gb = getattr(args, 'max_memory_gb', None)
+    max_likes_per_user = int(args.max_likes_per_user)
+    min_likes_per_user = int(args.min_likes_per_user)
+    negative_posts_sample = int(args.negative_posts_sample)
+    cap_random_seed = int(args.cap_random_seed)
+    embedding_model = args.embedding_model
+    max_memory_gb = args.max_memory_gb
     if max_memory_gb is not None:
         max_memory_gb = float(max_memory_gb)
-    max_memory_pct = float(getattr(args, 'max_memory_pct', 0.75))
-    skip_memory_check = bool(getattr(args, 'skip_memory_check', False))
+    max_memory_pct = float(args.max_memory_pct)
+    skip_memory_check = bool(args.skip_memory_check)
     
     all_stats = {}
     
@@ -683,10 +683,10 @@ def _log_data_attrition_report(
         return f"{n:,}"
     
     # Get parameters for display
-    min_likes = int(getattr(args, 'min_likes_per_user', 2))
-    max_likes = int(getattr(args, 'max_likes_per_user', 100))
-    max_users = int(getattr(args, 'max_liking_users', 0))
-    neg_sample = int(getattr(args, 'negative_posts_sample', 100000))
+    min_likes = int(args.min_likes_per_user)
+    max_likes = int(args.max_likes_per_user)
+    max_users = int(args.max_liking_users) if args.max_liking_users is not None else 0
+    neg_sample = int(args.negative_posts_sample)
     
     # Build memory checkpoint lookup
     mem_checkpoints = {}
