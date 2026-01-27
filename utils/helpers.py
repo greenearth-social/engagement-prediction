@@ -890,7 +890,7 @@ def load_likes_core_polars(
         base_lf.select('did')
         .group_by('did')
         .agg(pl.len().alias('like_count'))
-        .collect(streaming=True)
+        .collect(engine="streaming")
     )
     
     n_users_initial = user_counts_df.height
@@ -902,7 +902,7 @@ def load_likes_core_polars(
         'n_likes_initial': n_likes_initial,
         'n_users_initial': n_users_initial,
     }
-    
+
     # ===== Pre-filter users by min_likes_per_user before sampling =====
     if min_likes_per_user > 0:
         eligible_users_df = user_counts_df.filter(pl.col('like_count') >= min_likes_per_user)
