@@ -143,13 +143,13 @@ def load_raw_data_ingex(
         pl
         .scan_parquet(paths)
         .with_columns(
-            pl.col("inserted_at").str.to_datetime(time_zone="UTC").alias("inserted_at_dt")
+            pl.col("record_created_at").str.to_datetime(time_zone="UTC").alias("record_created_at_dt")
         )
     )
     if start_dt is not None:
-        lf = lf.filter(pl.col("inserted_at_dt") >= start_dt)
+        lf = lf.filter(pl.col("record_created_at_dt") >= start_dt)
     if end_dt is not None:
-        lf = lf.filter(pl.col("inserted_at_dt") < end_dt)
+        lf = lf.filter(pl.col("record_created_at_dt") < end_dt)
     pandas_df = lf.collect().to_pandas()
 
     return pandas_df
@@ -850,15 +850,15 @@ def load_likes_core_polars(
         if col_mapping:
             lf = lf.rename(col_mapping)
         
-        # Apply time filter
-        if 'inserted_at' in lf.collect_schema().names():
+        # Apply time filter based on record_created_at (when the event occurred)
+        if 'record_created_at' in lf.collect_schema().names():
             lf = lf.with_columns(
-                pl.col("inserted_at").str.to_datetime(time_zone="UTC").alias("inserted_at_dt")
+                pl.col("record_created_at").str.to_datetime(time_zone="UTC").alias("record_created_at_dt")
             )
             if start_dt is not None:
-                lf = lf.filter(pl.col("inserted_at_dt") >= start_dt)
+                lf = lf.filter(pl.col("record_created_at_dt") >= start_dt)
             if end_dt is not None:
-                lf = lf.filter(pl.col("inserted_at_dt") < end_dt)
+                lf = lf.filter(pl.col("record_created_at_dt") < end_dt)
         
         return lf
     
@@ -1104,18 +1104,18 @@ def load_posts_core_polars(
     # Batch size for processing
     BATCH_SIZE = 20
     
-    # Helper to prepare batch with time filter
+    # Helper to prepare batch with time filter based on record_created_at (when the event occurred)
     def _prepare_batch_lf(batch_paths: List[str]) -> pl.LazyFrame:
         lf = pl.scan_parquet(batch_paths)
         
-        if 'inserted_at' in lf.collect_schema().names():
+        if 'record_created_at' in lf.collect_schema().names():
             lf = lf.with_columns(
-                pl.col("inserted_at").str.to_datetime(time_zone="UTC").alias("inserted_at_dt")
+                pl.col("record_created_at").str.to_datetime(time_zone="UTC").alias("record_created_at_dt")
             )
             if start_dt is not None:
-                lf = lf.filter(pl.col("inserted_at_dt") >= start_dt)
+                lf = lf.filter(pl.col("record_created_at_dt") >= start_dt)
             if end_dt is not None:
-                lf = lf.filter(pl.col("inserted_at_dt") < end_dt)
+                lf = lf.filter(pl.col("record_created_at_dt") < end_dt)
         
         return lf
     
@@ -1283,9 +1283,9 @@ def load_posts_core_polars(
     
     # Clean up temporary columns and normalize types
     if len(posts_combined) > 0:
-        # Drop inserted_at_dt (only needed for filtering, not in final output)
-        if 'inserted_at_dt' in posts_combined.columns:
-            posts_combined = posts_combined.drop('inserted_at_dt')
+        # Drop record_created_at_dt (only needed for filtering, not in final output)
+        if 'record_created_at_dt' in posts_combined.columns:
+            posts_combined = posts_combined.drop('record_created_at_dt')
         
         # Convert record_created_at to datetime if it exists and is not already datetime
         if 'record_created_at' in posts_combined.columns:
