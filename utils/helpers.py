@@ -143,13 +143,13 @@ def load_raw_data_ingex(
         pl
         .scan_parquet(paths)
         .with_columns(
-            pl.col("inserted_at").str.to_datetime(time_zone="UTC").alias("inserted_at_dt")
+            pl.col("record_created_at").str.to_datetime(time_zone="UTC").alias("record_created_at_dt")
         )
     )
     if start_dt is not None:
-        lf = lf.filter(pl.col("inserted_at_dt") >= start_dt)
+        lf = lf.filter(pl.col("record_created_at_dt") >= start_dt)
     if end_dt is not None:
-        lf = lf.filter(pl.col("inserted_at_dt") < end_dt)
+        lf = lf.filter(pl.col("record_created_at_dt") < end_dt)
     pandas_df = lf.collect().to_pandas()
 
     return pandas_df
@@ -513,7 +513,7 @@ def estimate_filtered_data_memory(
     min_likes_per_user: int = 2,
     negative_posts_sample: int = 100_000,
     embedding_dim: int = 384,
-    logger: Optional[Any] = None,
+    logger: logging.Logger,
     data_window_days: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
@@ -530,15 +530,12 @@ def estimate_filtered_data_memory(
         min_likes_per_user: Min likes required per user (not used by model, kept for compatibility)
         negative_posts_sample: Number of negative posts to sample
         embedding_dim: Embedding dimension (not used by model, kept for compatibility)
-        logger: Optional logger
+        logger: Logger instance for output
         data_window_days: Number of days in the data window (auto-detected from file count if not provided)
         
     Returns:
         Dict with memory estimates and metadata
     """
-    def _log(msg: str):
-        if logger:
-            logger.info(msg)
     
     # Get raw stats from parquet metadata (no data loading)
     likes_raw = estimate_parquet_memory(likes_paths, embedding_expansion_dim=0)
@@ -616,11 +613,11 @@ def estimate_filtered_data_memory(
         },
     }
     
-    _log("Memory estimation (fitted regression model):")
-    _log(f"  Raw data: {raw_likes_rows:,} likes ({n_likes_files} files), {raw_posts_rows:,} posts ({n_posts_files} files)")
-    _log(f"  Window: {data_window_days} days, Users: {effective_max_users:,}, Likes/user cap: {max_likes_per_user}")
-    _log(f"  Model prediction: {estimated_peak_gb:.2f} GB (with 10% margin: {estimated_peak_gb_with_margin:.2f} GB)")
-    _log(f"  Model R-squared: 0.9440 (mean error: 6.7%)")
+    logger.info("Memory estimation (fitted regression model):")
+    logger.info(f"  Raw data: {raw_likes_rows:,} likes ({n_likes_files} files), {raw_posts_rows:,} posts ({n_posts_files} files)")
+    logger.info(f"  Window: {data_window_days} days, Users: {effective_max_users:,}, Likes/user cap: {max_likes_per_user}")
+    logger.info(f"  Model prediction: {estimated_peak_gb:.2f} GB (with 10% margin: {estimated_peak_gb_with_margin:.2f} GB)")
+    logger.info(f"  Model R-squared: 0.9440 (mean error: 6.7%)")
     
     return result
 
@@ -795,13 +792,14 @@ def load_likes_core_polars(
     gcs_bucket: str,
     start_str: Optional[str],
     end_str: Optional[str],
+    paths: List[str],
     *,
     max_liking_users: Optional[int] = None,
     max_likes_per_user: int = 100,
     min_likes_per_user: int = 2,
     random_seed: int = 42,
-    logger: Optional[Any] = None,
-) -> Tuple[pl.LazyFrame, Dict[str, Any]]:
+    logger: logging.Logger,
+) -> Tuple[pl.DataFrame, Dict[str, Any]]:
     """
     Load and filter likes data using a streaming Polars pipeline.
     
@@ -819,27 +817,13 @@ def load_likes_core_polars(
     Returns:
         Tuple of (likes_lf: pl.LazyFrame, stats: Dict with filtering statistics)
     """
-    def _log(msg: str):
-        if logger:
-            logger.info(msg)
-        else:
-            print(f"  {msg}")
-    
     start_dt = parse_one_ts(start_str)
     end_dt = parse_one_ts(end_str)
-    
-    # Get file paths for likes
-    paths = list_files_in_range_ingex_gcs(
-        gcs_bucket=gcs_bucket,
-        blob_prefix='bsky_likes',
-        start=start_dt,
-        end=end_dt,
-    )
     
     if not paths:
         raise ValueError(f"No likes parquet files found for time range {start_str} to {end_str}")
     
-    _log(f"Found {len(paths)} likes parquet files")
+    logger.info(f"Found {len(paths)} likes parquet files")
     log_memory_checkpoint("likes_before_scan", logger)
     
     # Helper to normalize column names and apply time filter
@@ -863,29 +847,22 @@ def load_likes_core_polars(
         if col_mapping:
             lf = lf.rename(col_mapping)
         
-        schema = lf.collect_schema()
-        wanted = ['did', 'subject_uri', 'record_created_at', 'inserted_at']
-        existing = [c for c in wanted if c in schema.names()]
-        if existing:
-            lf = lf.select(existing)
-        
-        # Apply time filter
-        if 'inserted_at' in lf.collect_schema().names():
+        # Apply time filter based on record_created_at (when the event occurred)
+        if 'record_created_at' in lf.collect_schema().names():
             lf = lf.with_columns(
-                pl.col("inserted_at").str.to_datetime(time_zone="UTC").alias("_inserted_at_dt")
+                pl.col("record_created_at").str.to_datetime(time_zone="UTC").alias("record_created_at_dt")
             )
             if start_dt is not None:
-                lf = lf.filter(pl.col("_inserted_at_dt") >= start_dt)
+                lf = lf.filter(pl.col("record_created_at_dt") >= start_dt)
             if end_dt is not None:
-                lf = lf.filter(pl.col("_inserted_at_dt") < end_dt)
-            lf = lf.drop("_inserted_at_dt")
+                lf = lf.filter(pl.col("record_created_at_dt") < end_dt)
         
         return lf
     
     base_lf = _prepare_lf(paths)
     
     # ===== PASS 1: Count likes per user (streaming) =====
-    _log("Pass 1: Counting likes per user (streaming)...")
+    logger.info("Pass 1: Counting likes per user (streaming)...")
     user_counts_df = (
         base_lf.group_by('did')
         .agg(pl.len().alias('like_count'))
@@ -894,7 +871,7 @@ def load_likes_core_polars(
     
     n_users_initial = user_counts_df.height
     n_likes_initial = int(user_counts_df['like_count'].sum()) if n_users_initial > 0 else 0
-    _log(f"Pass 1 complete: {n_likes_initial:,} likes from {n_users_initial:,} users")
+    logger.info(f"Pass 1 complete: {n_likes_initial:,} likes from {n_users_initial:,} users")
     log_memory_checkpoint("likes_after_pass1", logger)
     
     stats = {
@@ -907,10 +884,8 @@ def load_likes_core_polars(
         eligible_users_df = user_counts_df.filter(pl.col('like_count') >= min_likes_per_user)
         n_users_eligible = eligible_users_df.height
         n_users_filtered = n_users_initial - n_users_eligible
-        _log(
-            f"Pre-filtering: {n_users_eligible:,} users meet min-likes threshold ({min_likes_per_user}), "
-            f"excluded {n_users_filtered:,} users with too few likes"
-        )
+        logger.info(f"Pre-filtering: {n_users_eligible:,} users meet min-likes threshold ({min_likes_per_user}), "
+             f"excluded {n_users_filtered:,} users with too few likes")
         stats['n_users_eligible_for_sampling'] = n_users_eligible
         stats['n_users_excluded_min_likes'] = n_users_filtered
     else:
@@ -924,7 +899,7 @@ def load_likes_core_polars(
                 pl.col('did').hash(seed=random_seed).alias('_rand_key')
             ).sort('_rand_key').head(max_liking_users).select('did')
         )
-        _log(
+        logger.info(
             f"Sampled {max_liking_users:,} liking users "
             f"({100*max_liking_users/eligible_users_df.height:.1f}% of eligible)"
         )
@@ -936,7 +911,7 @@ def load_likes_core_polars(
     log_memory_checkpoint("likes_after_user_sample", logger)
     
     # ===== PASS 2: Filter likes to sampled users (lazy) =====
-    _log("Pass 2: Filtering likes for sampled users (streaming)...")
+    logger.info("Pass 2: Filtering likes for sampled users (streaming)...")
     likes_lf = base_lf.join(sampled_users_df.lazy(), on='did', how='semi')
     
     # Compute counts per user before per-user cap
@@ -948,7 +923,7 @@ def load_likes_core_polars(
     
     n_after_user_sample = int(counts_pre_cap_df['like_count'].sum()) if counts_pre_cap_df.height > 0 else 0
     pct_retained = 100.0 * n_after_user_sample / n_likes_initial if n_likes_initial > 0 else 0
-    _log(f"Pass 2 complete: {n_after_user_sample:,} likes ({pct_retained:.1f}% retained)")
+    logger.info(f"Pass 2 complete: {n_after_user_sample:,} likes ({pct_retained:.1f}% retained)")
     stats['n_likes_after_user_sample'] = n_after_user_sample
     log_memory_checkpoint("likes_after_pass2", logger)
     
@@ -962,7 +937,7 @@ def load_likes_core_polars(
         stats['likes_per_user_max'] = int(max(likes_per_user_before_cap))
         stats['likes_per_user_p90'] = float(np.percentile(likes_per_user_before_cap, 90))
         stats['likes_per_user_p99'] = float(np.percentile(likes_per_user_before_cap, 99))
-        _log(f"Likes per sampled user: mean={stats['likes_per_user_mean']:.1f}, "
+        logger.info(f"Likes per sampled user: mean={stats['likes_per_user_mean']:.1f}, "
              f"median={stats['likes_per_user_median']:.0f}, max={stats['likes_per_user_max']}, "
              f"p90={stats['likes_per_user_p90']:.0f}, p99={stats['likes_per_user_p99']:.0f}")
     
@@ -988,7 +963,7 @@ def load_likes_core_polars(
         )
         n_after_cap = int(counts_after_cap_df['count'].sum()) if counts_after_cap_df.height > 0 else 0
         pct_retained = 100.0 * n_after_cap / n_before_cap if n_before_cap > 0 else 0
-        _log(f"After per-user cap ({max_likes_per_user}): {n_after_cap:,} likes ({pct_retained:.1f}% retained)")
+        logger.info(f"After per-user cap ({max_likes_per_user}): {n_after_cap:,} likes ({pct_retained:.1f}% retained)")
         stats['n_likes_after_per_user_cap'] = n_after_cap
     else:
         counts_after_cap_df = counts_pre_cap_df.rename({'like_count': 'count'})
@@ -1006,13 +981,11 @@ def load_likes_core_polars(
         # This should typically remove few or no users since we pre-filtered
         n_removed = n_before_min - n_after_min
         if n_removed > 0:
-            pct_removed = 100.0 * n_removed / n_before_min if n_before_min > 0 else 0
-            _log(
-                f"Min-likes verification removed {n_removed:,} likes ({pct_removed:.1f}%) from users "
-                f"who fell below threshold after per-user cap"
-            )
+            pct_removed = 100.0 * n_removed / n_before_min
+            logger.info(f"Min-likes verification removed {n_removed:,} likes ({pct_removed:.1f}%) from users "
+                 f"who fell below threshold after per-user cap")
         
-        _log(f"Final: {n_users_final:,} users with {n_after_min:,} likes")
+        logger.info(f"Final: {n_users_final:,} users with {n_after_min:,} likes")
         stats['n_likes_final'] = n_after_min
         stats['n_users_final'] = n_users_final
         
@@ -1048,12 +1021,13 @@ def load_posts_core_polars(
     gcs_bucket: str,
     start_str: Optional[str],
     end_str: Optional[str],
-    liked_post_uris: Set[str] | pl.Series,
+    liked_post_uris: Set[str],
+    paths: List[str],
     *,
     negative_posts_sample: int = 100000,
     embedding_model: str = 'all_MiniLM_L6_v2',
     random_seed: int = 42,
-    logger: Optional[Any] = None,
+    logger: logging.Logger,
 ) -> Tuple[pl.DataFrame, Dict[str, Any], int]:
     """
     Load posts data using batch processing with early embedding expansion.
@@ -1082,44 +1056,30 @@ def load_posts_core_polars(
     Returns:
         Tuple of (posts_df: pl.DataFrame, stats: Dict, embedding_dim: int)
     """
-    def _log(msg: str):
-        if logger:
-            logger.info(msg)
-        else:
-            print(f"  {msg}")
-    
     start_dt = parse_one_ts(start_str)
     end_dt = parse_one_ts(end_str)
-    
-    # Get file paths for posts
-    paths = list_files_in_range_ingex_gcs(
-        gcs_bucket=gcs_bucket,
-        blob_prefix='bsky_posts',
-        start=start_dt,
-        end=end_dt,
-    )
     
     if not paths:
         raise ValueError(f"No posts parquet files found for time range {start_str} to {end_str}")
     
-    _log(f"Found {len(paths)} posts parquet files")
+    logger.info(f"Found {len(paths)} posts parquet files")
     log_memory_checkpoint("posts_before_scan", logger)
     
     # Batch size for processing
     BATCH_SIZE = 20
     
-    # Helper to prepare batch with time filter
+    # Helper to prepare batch with time filter based on record_created_at (when the event occurred)
     def _prepare_batch_lf(batch_paths: List[str]) -> pl.LazyFrame:
         lf = pl.scan_parquet(batch_paths)
         
-        if 'inserted_at' in lf.collect_schema().names():
+        if 'record_created_at' in lf.collect_schema().names():
             lf = lf.with_columns(
-                pl.col("inserted_at").str.to_datetime(time_zone="UTC").alias("inserted_at_dt")
+                pl.col("record_created_at").str.to_datetime(time_zone="UTC").alias("record_created_at_dt")
             )
             if start_dt is not None:
-                lf = lf.filter(pl.col("inserted_at_dt") >= start_dt)
+                lf = lf.filter(pl.col("record_created_at_dt") >= start_dt)
             if end_dt is not None:
-                lf = lf.filter(pl.col("inserted_at_dt") < end_dt)
+                lf = lf.filter(pl.col("record_created_at_dt") < end_dt)
         
         return lf
     
@@ -1135,7 +1095,7 @@ def load_posts_core_polars(
     n_liked_posts = 0
     embed_dim = 0  # Will be set on first successful expansion
     
-    _log(f"Processing {len(paths)} files in batches of {BATCH_SIZE} with early embedding expansion...")
+    logger.info(f"Processing {len(paths)} files in batches of {BATCH_SIZE} with early embedding expansion...")
     
     for batch_start in range(0, len(paths), BATCH_SIZE):
         batch_end = min(batch_start + BATCH_SIZE, len(paths))
@@ -1151,7 +1111,7 @@ def load_posts_core_polars(
         
         # Check for at_uri column
         if 'at_uri' not in batch_df.columns:
-            _log(f"  Warning: Batch {batch_end} missing 'at_uri' column, skipping")
+            logger.info(f"  Warning: Batch {batch_end} missing 'at_uri' column, skipping")
             continue
         
         # === Reservoir sampling for random sample (INDEPENDENT of like status) ===
@@ -1223,10 +1183,10 @@ def load_posts_core_polars(
         del batch_df
         
         n_random_current = sum(len(r) for r in random_sample_expanded)
-        _log(f"  Processed {batch_end}/{len(paths)} files: {n_posts_total:,} posts, {n_liked_posts:,} liked (expanded), {n_random_current:,} random sample reservoir")
+        logger.info(f"  Processed {batch_end}/{len(paths)} files: {n_posts_total:,} posts, {n_liked_posts:,} liked (expanded), {n_random_current:,} random sample reservoir")
         log_memory_checkpoint(f"posts_batch_{batch_end}", logger)
     
-    _log(f"Extracted {len(liked_post_uris):,} unique liked post IDs")
+    logger.info(f"Extracted {len(liked_post_uris):,} unique liked post IDs")
     
     # Combine random sample (already expanded)
     if random_sample_expanded:
@@ -1239,7 +1199,7 @@ def load_posts_core_polars(
         n_random_sample = len(random_sample_df)
         # Count how many liked posts happen to be in the random sample
         n_liked_in_random = random_sample_df.filter(pl.col('at_uri').is_in(liked_post_uris)).height
-        _log(f"Random sample: {n_random_sample:,} posts ({n_liked_in_random:,} are also liked)")
+        logger.info(f"Random sample: {n_random_sample:,} posts ({n_liked_in_random:,} are also liked)")
     else:
         random_sample_df = None
         n_random_sample = 0
@@ -1259,8 +1219,8 @@ def load_posts_core_polars(
     
     # Total liked posts = those only in liked set + those also in random sample
     n_total_liked_posts = n_liked_only + n_liked_in_random
-    liked_post_match_rate = 100.0 * n_total_liked_posts / len(liked_post_uris) if len(liked_post_uris) > 0 else 0
-    _log(f"Loaded {n_total_liked_posts:,} liked posts ({liked_post_match_rate:.1f}% match rate)")
+    liked_post_match_rate = 100.0 * n_total_liked_posts / len(liked_post_uris) if liked_post_uris else 0
+    logger.info(f"Loaded {n_total_liked_posts:,} liked posts ({liked_post_match_rate:.1f}% match rate)")
     
     stats = {
         'n_posts_total': n_posts_total,
@@ -1282,14 +1242,14 @@ def load_posts_core_polars(
         posts_combined = pl.DataFrame()
     
     n_combined = len(posts_combined)
-    _log(f"posts_core: {n_combined:,} rows ({n_liked_only:,} liked-only + {n_random_sample:,} random sample)")
-    _log(f"Embeddings already expanded during loading (dim={embed_dim})")
+    logger.info(f"posts_core: {n_combined:,} rows ({n_liked_only:,} liked-only + {n_random_sample:,} random sample)")
+    logger.info(f"Embeddings already expanded during loading (dim={embed_dim})")
     
     # Clean up temporary columns and normalize types
     if len(posts_combined) > 0:
-        # Drop inserted_at_dt (only needed for filtering, not in final output)
-        if 'inserted_at_dt' in posts_combined.columns:
-            posts_combined = posts_combined.drop('inserted_at_dt')
+        # Drop record_created_at_dt (only needed for filtering, not in final output)
+        if 'record_created_at_dt' in posts_combined.columns:
+            posts_combined = posts_combined.drop('record_created_at_dt')
         
         # Convert record_created_at to datetime if it exists and is not already datetime
         if 'record_created_at' in posts_combined.columns:
@@ -1375,7 +1335,8 @@ def _expand_embeddings_chunk(
 def expand_embeddings_polars(
     posts_df: pl.DataFrame,
     embedding_model: str = 'all_MiniLM_L6_v2',
-    logger: Optional[Any] = None,
+    *,
+    logger: logging.Logger,
 ) -> Tuple[pl.DataFrame, int]:
     """
     Expand the 'embeddings' column into separate post_emb_* columns.
@@ -1386,18 +1347,12 @@ def expand_embeddings_polars(
     Returns:
         Tuple of (posts_df with expanded embeddings, embedding_dim)
     """
-    def _log(msg: str):
-        if logger:
-            logger.info(msg)
-        else:
-            print(f"  {msg}")
-    
     if 'embeddings' not in posts_df.columns:
-        _log("No 'embeddings' column found, skipping expansion")
+        logger.info("No 'embeddings' column found, skipping expansion")
         return posts_df, 0
     
     # Convert to pandas for embedding extraction (complex nested structure)
-    _log("Expanding embeddings column...")
+    logger.info("Expanding embeddings column...")
     log_memory_checkpoint("embeddings_before_expand", logger)
     pdf = posts_df.to_pandas()
     
@@ -1416,10 +1371,10 @@ def expand_embeddings_polars(
                 continue
     
     if embed_dim is None:
-        _log(f"No valid embeddings found for model {embedding_model}")
+        logger.info(f"No valid embeddings found for model {embedding_model}")
         return posts_df, 0
     
-    _log(f"Embedding dimension: {embed_dim}")
+    logger.info(f"Embedding dimension: {embed_dim}")
     
     # Extract embeddings for all rows
     n_rows = len(pdf)
@@ -1437,7 +1392,7 @@ def expand_embeddings_polars(
             except Exception:
                 continue
     
-    _log(f"Expanded {n_valid:,}/{n_rows:,} embeddings ({100*n_valid/n_rows:.1f}%)")
+    logger.info(f"Expanded {n_valid:,}/{n_rows:,} embeddings ({100*n_valid/n_rows:.1f}%)")
     
     # Create embedding column names
     emb_col_names = [f'post_emb_{i}' for i in range(embed_dim)]
@@ -1830,8 +1785,7 @@ def validate_dataframe_schema(
                     return dtype in polars_string or dtype == pl.Object
 
             if isinstance(expected, type):
-                # Handle bool explicitly (bool is a special case - it's not a subclass of itself in the traditional sense)
-                if expected is bool or expected is np.bool_:
+                if issubclass(expected, (bool, np.bool_)):
                     return dtype == pl.Boolean
                 if issubclass(expected, (int, np.integer)):
                     return dtype in polars_integer
