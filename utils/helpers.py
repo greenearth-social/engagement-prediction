@@ -942,7 +942,6 @@ def load_likes_core_polars(
              f"p90={stats['likes_per_user_p90']:.0f}, p99={stats['likes_per_user_p99']:.0f}")
     
     # ===== Apply per-user random cap (NOT recency-based) =====
-    counts_after_cap_df = counts_pre_cap_df
     if max_likes_per_user > 0 and n_after_user_sample > 0:
         n_before_cap = n_after_user_sample
         
@@ -956,43 +955,17 @@ def load_likes_core_polars(
         likes_lf = likes_lf.filter(pl.col('_rand_order') <= max_likes_per_user)
         likes_lf = likes_lf.drop(['_rand_key', '_rand_order'])
         
-        counts_after_cap_df = (
-            likes_lf.group_by('did')
-            .agg(pl.len().alias('count'))
-            .collect(engine="streaming")
+        # Compute post-cap counts from pre-cap per-user counts to avoid materializing likes_lf.
+        n_after_cap = int(
+            counts_pre_cap_df
+            .select(pl.col('like_count').clip(upper_bound=max_likes_per_user).sum())
+            .item()
         )
-        n_after_cap = int(counts_after_cap_df['count'].sum()) if counts_after_cap_df.height > 0 else 0
         pct_retained = 100.0 * n_after_cap / n_before_cap if n_before_cap > 0 else 0
         logger.info(f"After per-user cap ({max_likes_per_user}): {n_after_cap:,} likes ({pct_retained:.1f}% retained)")
         stats['n_likes_after_per_user_cap'] = n_after_cap
     else:
-        counts_after_cap_df = counts_pre_cap_df.rename({'like_count': 'count'})
         stats['n_likes_after_per_user_cap'] = n_after_user_sample
-    
-    # ===== Verify min-likes filter (should be mostly satisfied already) =====
-    # Since we pre-filtered users before sampling, this step mainly handles edge cases
-    # where the per-user cap might have reduced some users below the threshold
-    if min_likes_per_user > 0 and counts_after_cap_df.height > 0:
-        n_before_min = int(counts_after_cap_df['count'].sum())
-        eligible_users_df = counts_after_cap_df.filter(pl.col('count') >= min_likes_per_user)
-        n_after_min = int(eligible_users_df['count'].sum()) if eligible_users_df.height > 0 else 0
-        n_users_final = eligible_users_df.height
-        
-        # This should typically remove few or no users since we pre-filtered
-        n_removed = n_before_min - n_after_min
-        if n_removed > 0:
-            pct_removed = 100.0 * n_removed / n_before_min
-            logger.info(f"Min-likes verification removed {n_removed:,} likes ({pct_removed:.1f}%) from users "
-                 f"who fell below threshold after per-user cap")
-        
-        logger.info(f"Final: {n_users_final:,} users with {n_after_min:,} likes")
-        stats['n_likes_final'] = n_after_min
-        stats['n_users_final'] = n_users_final
-        
-        likes_lf = likes_lf.join(eligible_users_df.select('did').lazy(), on='did', how='semi')
-    else:
-        stats['n_likes_final'] = int(counts_after_cap_df['count'].sum()) if counts_after_cap_df.height > 0 else 0
-        stats['n_users_final'] = counts_after_cap_df.height
     
     # Select output columns
     output_cols = ['did', 'subject_uri', 'record_created_at']
