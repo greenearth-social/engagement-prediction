@@ -792,6 +792,7 @@ def load_likes_core_polars(
     gcs_bucket: str,
     start_str: Optional[str],
     end_str: Optional[str],
+    paths: List[str],
     *,
     max_liking_users: Optional[int] = None,
     max_likes_per_user: int = 100,
@@ -819,14 +820,6 @@ def load_likes_core_polars(
     """
     start_dt = parse_one_ts(start_str)
     end_dt = parse_one_ts(end_str)
-    
-    # Get file paths for likes
-    paths = list_files_in_range_ingex_gcs(
-        gcs_bucket=gcs_bucket,
-        blob_prefix='bsky_likes',
-        start=start_dt,
-        end=end_dt,
-    )
     
     if not paths:
         raise ValueError(f"No likes parquet files found for time range {start_str} to {end_str}")
@@ -1065,6 +1058,7 @@ def load_posts_core_polars(
     start_str: Optional[str],
     end_str: Optional[str],
     liked_post_uris: Set[str],
+    paths: List[str],
     *,
     negative_posts_sample: int = 100000,
     embedding_model: str = 'all_MiniLM_L6_v2',
@@ -1100,14 +1094,6 @@ def load_posts_core_polars(
     """
     start_dt = parse_one_ts(start_str)
     end_dt = parse_one_ts(end_str)
-    
-    # Get file paths for posts
-    paths = list_files_in_range_ingex_gcs(
-        gcs_bucket=gcs_bucket,
-        blob_prefix='bsky_posts',
-        start=start_dt,
-        end=end_dt,
-    )
     
     if not paths:
         raise ValueError(f"No posts parquet files found for time range {start_str} to {end_str}")
