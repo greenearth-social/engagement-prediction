@@ -213,7 +213,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     posts_core_path = out_dir / f"posts_core_{ts_name}.parquet"
     
     likes_core_lf.sink_parquet(likes_core_path)
-    return {}
+    return {"output_dir": out_dir}
     posts_core_df.write_parquet(posts_core_path)
     
     likes_stats = all_stats.get('likes', {})

@@ -799,7 +799,7 @@ def load_likes_core_polars(
     min_likes_per_user: int = 2,
     random_seed: int = 42,
     logger: logging.Logger,
-) -> Tuple[pl.DataFrame, Dict[str, Any]]:
+) -> Tuple[pl.LazyFrame, Dict[str, Any]]:
     """
     Load and filter likes data using a streaming Polars pipeline.
     
