@@ -38,27 +38,27 @@ def _generate_user_history_from_likes(
     # repeat likes num_buckets_lookback times
     if bucket_duration == 'daily':
         user_history_lf = likes_core_lf.with_columns(
-            (pl.col("inserted_at").dt.truncate("1d") + pl.duration(days=1)).alias("inserted_at_ceil")
+            (pl.col("record_created_at").dt.truncate("1d") + pl.duration(days=1)).alias("record_created_at_ceil")
         ).with_columns(
             pl.int_ranges(0, num_buckets_lookback).alias("bucket_offset")
         ).explode("bucket_offset").with_columns(
-            (pl.col("inserted_at_ceil") + pl.duration(days=pl.col("bucket_offset"))).alias("inserted_at_bucket")
+            (pl.col("record_created_at_ceil") + pl.duration(days=pl.col("bucket_offset"))).alias("record_created_at_bucket")
         )
     elif bucket_duration == 'hourly':
         user_history_lf = likes_core_lf.with_columns(
-            (pl.col("inserted_at").dt.truncate("1h") + pl.duration(hours=1)).alias("inserted_at_ceil")
+            (pl.col("record_created_at").dt.truncate("1h") + pl.duration(hours=1)).alias("record_created_at_ceil")
         ).with_columns(
             pl.int_ranges(0, num_buckets_lookback).alias("bucket_offset")
         ).explode("bucket_offset").with_columns(
-            (pl.col("inserted_at_ceil") + pl.duration(hours=pl.col("bucket_offset"))).alias("inserted_at_bucket")
+            (pl.col("record_created_at_ceil") + pl.duration(hours=pl.col("bucket_offset"))).alias("record_created_at_bucket")
         )
     else:
         raise ValueError(f"Unsupported bucket_duration: {bucket_duration}")
     
     # get unique likes per bucket, and count them
     user_history_lf = user_history_lf.drop(
-        "bucket_offset", "inserted_at_ceil", "inserted_at"
-    ).group_by(["did", "inserted_at_bucket"]).agg(
+        "bucket_offset", "record_created_at_ceil", "record_created_at"
+    ).group_by(["did", "record_created_at_bucket"]).agg(
         pl.col("subject_uri").unique().alias("subject_uri")
     ).with_columns(
         pl.col("subject_uri").list.len().alias("num_likes_in_bucket")
@@ -102,11 +102,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     log_operation_start('Load raw data from prior stage', 'STAGE_02_FEATURIZE', logger)
     t0 = time.time()
     likes_core_lf: pl.LazyFrame = load_parquet_from_prior(prior_path, "likes_core_")
-    validate_dataframe_schema(likes_core_lf, {"did": str, "inserted_at": pl.Datetime, "subject_uri": str})
+    validate_dataframe_schema(likes_core_lf, {"did": str, "record_created_at": pl.Datetime, "subject_uri": str})
 
     log_operation_start('Aggregate likes into user history store', 'STAGE_02_FEATURIZE', logger)
     user_history_lf: pl.LazyFrame = _generate_user_history_from_likes(likes_core_lf, bucket_duration, num_buckets_lookback, max_likes_per_bucket, random_seed)
-    validate_dataframe_schema(user_history_lf, {"did": str, "subject_uri": str, "inserted_at_bucket": pl.Datetime})
+    validate_dataframe_schema(user_history_lf, {"did": str, "subject_uri": str, "record_created_at_bucket": pl.Datetime})
 
     # Write out result
     user_history_output_path = out_dir / f"user_history_{out_dir.name}.parquet"

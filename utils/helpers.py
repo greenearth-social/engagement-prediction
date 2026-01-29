@@ -183,13 +183,13 @@ def load_raw_data_ingex(
         pl
         .scan_parquet(paths)
         .with_columns(
-            pl.col("inserted_at").str.to_datetime(time_zone="UTC").alias("inserted_at_dt")
+            pl.col("record_created_at").str.to_datetime(time_zone="UTC").alias("record_created_at_dt")
         )
     )
     if start_dt is not None:
-        lf = lf.filter(pl.col("inserted_at_dt") >= start_dt)
+        lf = lf.filter(pl.col("record_created_at_dt") >= start_dt)
     if end_dt is not None:
-        lf = lf.filter(pl.col("inserted_at_dt") < end_dt)
+        lf = lf.filter(pl.col("record_created_at_dt") < end_dt)
     pandas_df = lf.collect().to_pandas()
 
     return pandas_df
