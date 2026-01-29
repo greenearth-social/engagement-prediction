@@ -166,7 +166,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # Use Polars-based filtering pipeline for GreenEarth Ingex data
     likes_core_df, posts_core_df, embed_dim, all_stats = _run_greenearth_pipeline(
-        args, logger, context
+        args, logger, context, out_dir
     )
 
     # Validate output schemas before saving
@@ -180,31 +180,15 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     }
     validate_dataframe_schema(likes_core_df, likes_schema, allow_extra_columns=False)
     logger.info("✓ likes_core schema validated")
-    
-    # Validate posts_core schema
-    posts_schema = {
-        'at_uri': str,
-        'in_random_sample': bool,
-        'did': str,
-        'record_created_at': 'str',
-        'record_text': str,
-        'is_liked': bool,
-    }
-    validate_dataframe_schema(posts_core_df, posts_schema, allow_extra_columns=False)
-    logger.info(f"✓ posts_core schema validated (embed_dim={embed_dim})")
 
-    # Save outputs as parquet
-    log_operation_start('Save core datasets as parquet', 'STAGE_01_GET_DATA', logger)
+    # Save likes as parquet
+    log_operation_start('Save likes core dataset as parquet', 'STAGE_01_GET_DATA', logger)
     ts_name = out_dir.name
     
     likes_core_path = out_dir / f"likes_core_{ts_name}.parquet"
-    posts_core_path = out_dir / f"posts_core_{ts_name}.parquet"
-    
     likes_core_df.write_parquet(likes_core_path)
-    posts_core_df.write_parquet(posts_core_path)
-    
     logger.info(f"Saved likes_core: {likes_core_path} ({len(likes_core_df):,} rows)")
-    logger.info(f"Saved posts_core: {posts_core_path} ({len(posts_core_df):,} rows)")
+    posts_core_path = out_dir / f"posts_core_{ts_name}.parquet"
 
     # Summary
     log_operation_start('Write summary files', 'STAGE_01_GET_DATA', logger)
@@ -444,6 +428,7 @@ def _run_greenearth_pipeline(
     args: argparse.Namespace,
     logger,
     context: Context,
+    out_dir: Path,
 ):
     """
     Run the new Polars-based filtering pipeline for GreenEarth Ingex data.
@@ -566,6 +551,7 @@ def _run_greenearth_pipeline(
         embedding_model=embedding_model,
         random_seed=cap_random_seed,
         logger=logger,
+        out_dir=out_dir,
     )
     all_stats['posts'] = posts_stats
     all_stats['embedding_dim'] = embed_dim

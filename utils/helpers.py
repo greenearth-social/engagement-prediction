@@ -995,6 +995,7 @@ def load_posts_core_polars(
     embedding_model: str,
     random_seed: int,
     logger: logging.Logger,
+    out_dir: Path,
 ) -> Tuple[pl.DataFrame, Dict[str, Any], int]:
     """
     Load posts data using batch processing with early embedding expansion.
@@ -1067,27 +1068,60 @@ def load_posts_core_polars(
     logger.info(f"Detected embedding dimension: {embed_dim}")
 
     # expand embeddings into columns
-    negs_and_likes_lf = expand_embeddings_polars(negs_and_likes_lf, embedding_model, embed_dim)
+    posts_core_lf = expand_embeddings_polars(negs_and_likes_lf, embedding_model, embed_dim)
+    
+    # Validate posts_core_lf schema
+    posts_schema_with_embs = {
+        'at_uri': str,
+        'in_random_sample': bool,
+        'did': str,
+        'record_created_at': 'str',
+        'record_text': str,
+        'is_liked': bool,
+    }
+    for i in range(embed_dim):
+        posts_schema_with_embs[f'post_emb_{i}'] = float
+    validate_dataframe_schema(posts_core_lf, posts_schema_with_embs, allow_extra_columns=False)
 
     # write out
-    negs_and_likes_lf.sink_parquet("negs_and_likes.parquet", compression="zstd", engine="streaming", row_group_size=128)
+    logger.info(f"✓ posts_core schema validated (embed_dim={embed_dim})")
+
+    # Save outputs as parquet
+    log_operation_start('Save likes core dataset as parquet', 'STAGE_01_GET_DATA', logger)
+    ts_name = out_dir.name
+    posts_core_path = out_dir / f"posts_core_{ts_name}.parquet"
+    
+    # low row_group_size because embeddings are very large. keeps memory low
+    posts_core_lf.sink_parquet(posts_core_path, compression="zstd", engine="streaming", row_group_size=128)
     log_memory_checkpoint("posts_after_sink_parquet", logger)
 
-    negs_and_likes_df = (
+    # read back from the parquet file, withOUT embeddings
+    posts_core_df = (
         pl
-        .scan_parquet("negs_and_likes.parquet")
+        .scan_parquet(posts_core_path)
         .select(cols_no_emb + ['is_liked', 'in_random_sample'])
         .collect(engine="streaming")
     )
 
-    # calculate metrics
-    n_posts_core = negs_and_likes_df.height
-    n_liked_only = negs_and_likes_df.filter(pl.col("is_liked") & ~pl.col("in_random_sample")).height
-    n_liked_in_random = negs_and_likes_df.filter(pl.col("is_liked") & pl.col("in_random_sample")).height
-    n_random_sample = negs_and_likes_df.filter(pl.col("in_random_sample")).height
+    # Validate posts_core_lf schema
+    posts_schema_no_embs = {
+        'at_uri': str,
+        'in_random_sample': bool,
+        'did': str,
+        'record_created_at': 'str',
+        'record_text': str,
+        'is_liked': bool,
+    }
+    validate_dataframe_schema(posts_core_df, posts_schema_no_embs, allow_extra_columns=False)
 
+    # calculate metrics
+    n_posts_core = posts_core_df.height
+    n_liked_only = posts_core_df.filter(pl.col("is_liked") & ~pl.col("in_random_sample")).height
+    n_liked_in_random = posts_core_df.filter(pl.col("is_liked") & pl.col("in_random_sample")).height
+    n_random_sample = posts_core_df.filter(pl.col("in_random_sample")).height
+
+    logger.info(f"Saved posts_core: {posts_core_path} ({n_posts_core:,} rows)")
     logger.info(f"All posts in raw data: {n_posts_total:,}")
-    logger.info(f"All negatives and likes: {n_posts_core:,}")
     logger.info(f"Liked only: {n_liked_only:,}")
     logger.info(f"Liked in random sample: {n_liked_in_random:,}")
     logger.info(f"Random sample total: {n_random_sample:,}")
@@ -1113,7 +1147,7 @@ def load_posts_core_polars(
     stats['embedding_dim'] = embed_dim
     log_memory_checkpoint("posts_after_combine", logger)
     
-    return negs_and_likes_df, stats, embed_dim
+    return posts_core_df, stats, embed_dim
 
 
 # ----------------------------------------
