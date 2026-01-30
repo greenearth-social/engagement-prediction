@@ -334,7 +334,7 @@ def _load_likes_core_polars(
     if max_likes_per_user > 0 and n_after_user_sample > 0:
         likes_lf = _apply_per_user_random_cap(likes_lf, max_likes_per_user, random_seed)
     
-    likes_df = likes_lf.select(['did', 'subject_uri', 'record_created_at']).collect(engine="streaming")
+    likes_df = likes_lf.select(['did', 'subject_uri', 'record_created_at']).unique().collect(engine="streaming")
 
     # Compute post-cap counts from pre-cap per-user counts to avoid materializing likes_lf.
     n_after_cap = likes_df.height
