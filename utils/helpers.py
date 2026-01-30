@@ -994,7 +994,7 @@ def load_posts_core_polars(
     random_seed: int,
     logger: logging.Logger,
     out_dir: Path,
-) -> Tuple[pl.DataFrame, Dict[str, Any], int]:
+) -> Tuple[pl.DataFrame, Dict[str, Any], int, Path]:
     """
     Load posts data using batch processing with early embedding expansion.
     
@@ -1146,7 +1146,7 @@ def load_posts_core_polars(
     stats['embedding_dim'] = embed_dim
     log_memory_checkpoint("posts_after_combine", logger)
     
-    return posts_core_df, stats, embed_dim
+    return posts_core_df, stats, embed_dim, posts_core_path
 
 
 # ----------------------------------------
