@@ -909,14 +909,15 @@ def load_likes_core_polars(
 
     # record stats and log stuff
     n_users_filtered = n_users_initial - n_users_eligible
+    n_users_sampled = sampled_users_df.height
     logger.info(f"Pre-filtering: {n_users_eligible:,} users meet min-likes threshold ({min_likes_per_user}), "
             f"excluded {n_users_filtered:,} users with too few likes")
     stats['n_users_eligible_for_sampling'] = n_users_eligible
     stats['n_users_excluded_min_likes'] = n_users_filtered
-    stats['n_users_sampled'] = sampled_users_df.height
+    stats['n_users_sampled'] = n_users_sampled
     logger.info(
-        f"Sampled {n_users_filtered:,} liking users "
-        f"({100*n_users_filtered/n_users_eligible:.1f}% of eligible)"
+        f"Sampled {n_users_sampled:,} liking users "
+        f"({100*n_users_sampled/n_users_initial:.1f}% of eligible)"
     )
     log_memory_checkpoint("likes_after_user_sample", logger)
     
@@ -1999,7 +2000,7 @@ def get_stage_logger(stage_name: str, log_file: Optional[Path] = None) -> loggin
     
     # Create formatter with timestamp
     formatter = logging.Formatter(
-        '[%(asctime)s.%(msecs)03d] [%(name)s] %(message)s',
+        '[%(asctime)s] [%(name)s] %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     

@@ -162,7 +162,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     out_dir = new_stage_timestamp_dir(run_dir, '01_get_data')
 
     # Initialize logger
-    logger = get_stage_logger('STAGE_01_GET_DATA', log_file=out_dir / 'stage.log')
+    logger = get_stage_logger('01_GET_DATA', log_file=out_dir / 'stage.log')
 
     t0 = time.time()
 
@@ -207,7 +207,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     )
 
     # Validate likes_core schema
-    log_operation_start('Validate likes core output schema', 'STAGE_01_GET_DATA', logger)
+    log_operation_start('Validate likes core output schema', '01_GET_DATA', logger)
     likes_schema = {
         'did': str,
         'subject_uri': str,
@@ -220,14 +220,14 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     n_posts = len(posts_core_df)
 
     # Save likes as parquet (posts are saved in load_posts_core_polars() in helpers.py)
-    log_operation_start('Save likes core dataset as parquet', 'STAGE_01_GET_DATA', logger)
+    log_operation_start('Save likes core dataset as parquet', '01_GET_DATA', logger)
     ts_name = out_dir.name
     likes_core_path = out_dir / f"likes_core_{ts_name}.parquet"
     likes_core_df.write_parquet(likes_core_path)
     logger.info(f"Saved likes_core: {likes_core_path} ({n_likes:,} rows)")
 
     # Summary
-    log_operation_start('Write summary files', 'STAGE_01_GET_DATA', logger)
+    log_operation_start('Write summary files', '01_GET_DATA', logger)
     
     summary = {
         'gcs_bucket': gcs_bucket,
@@ -319,7 +319,7 @@ def _run_greenearth_pipeline(
     mem_tracker.checkpoint("pipeline_start")
     
     # Pre-flight memory safety check
-    log_operation_start('Pre-flight memory safety check', 'STAGE_01_GET_DATA', logger)
+    log_operation_start('Pre-flight memory safety check', '01_GET_DATA', logger)
     
     # Get file paths for memory estimation
     likes_start_dt = parse_one_ts(likes_start)
@@ -368,7 +368,7 @@ def _run_greenearth_pipeline(
     mem_tracker.checkpoint("after_memory_check")
     
     # Step 1: Load and filter likes
-    log_operation_start('Load and filter likes data', 'STAGE_01_GET_DATA', logger)
+    log_operation_start('Load and filter likes data', '01_GET_DATA', logger)
     likes_core_df, likes_stats = load_likes_core_polars(
         start_str=likes_start,
         end_str=likes_end,
@@ -383,14 +383,14 @@ def _run_greenearth_pipeline(
     mem_tracker.checkpoint("after_likes_load")
     
     # Step 2: Extract liked post URIs
-    log_operation_start('Extract liked post URIs', 'STAGE_01_GET_DATA', logger)
+    log_operation_start('Extract liked post URIs', '01_GET_DATA', logger)
     liked_post_uris_df: pl.DataFrame = likes_core_df.select(pl.col('subject_uri').unique())
     logger.info(f"Extracted {len(liked_post_uris_df):,} unique liked post URIs")
     mem_tracker.checkpoint("after_uri_extraction")
     
     # Step 3: Load posts with early embedding expansion
     # This loads posts, filters to liked + negative sample, and expands embeddings
-    log_operation_start('Load posts with early embedding expansion', 'STAGE_01_GET_DATA', logger)
+    log_operation_start('Load posts with early embedding expansion', '01_GET_DATA', logger)
     posts_core_df, posts_stats, embed_dim, posts_core_path = load_posts_core_polars(
         start_str=posts_start,
         end_str=posts_end,
@@ -409,7 +409,7 @@ def _run_greenearth_pipeline(
     # Step 4: Re-verify min-likes after like-post join
     # Since like-post joining isn't perfect (some posts may be missing, deleted, or outside time range),
     # we need to re-check that users still meet min-likes threshold based on likes that have matching posts.
-    log_operation_start('Re-verify min-likes after like-post join', 'STAGE_01_GET_DATA', logger)
+    log_operation_start('Re-verify min-likes after like-post join', '01_GET_DATA', logger)
     
     # Get set of post URIs that actually exist in posts_core
     existing_post_uris = set(posts_core_df['at_uri'].unique().to_list())
