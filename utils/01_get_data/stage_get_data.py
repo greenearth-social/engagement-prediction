@@ -136,25 +136,438 @@ import json
 import argparse
 import time
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 import polars as pl
 import logging
+from datetime import datetime, timezone
+import re
+from google.cloud import storage
+import numpy as np
 
 from utils.pipeline.core import new_stage_timestamp_dir, Context
 from utils.helpers import (
     get_stage_logger,
     log_operation_start,
-    load_likes_core_polars,
-    load_posts_core_polars,
-    # Memory safety checks and tracking
+    parse_one_ts,
+    validate_dataframe_schema,
+    apply_time_filter,
+    get_embed_dim,
+    expand_embeddings_polars,
+)
+from utils.memory_helpers import (
+    log_memory_checkpoint,
     check_data_load_safe,
     MemoryTracker,
-    list_files_in_range_ingex_gcs,
-    parse_one_ts,
-    # Data validation
-    validate_dataframe_schema,
-    get_sampled_users_with_min_likes,
 )
+
+# ----------------------------------------
+# Data IO helpers (Green Earth Ingex + GCS)
+# ----------------------------------------
+# For parsing GCS Ingex filenames
+TIMESTAMP_SUFFIX_GCS = "_(\\d{8})_(\\d{6})\\.parquet$"
+
+def _parse_ts_from_name_ingex_gcs(
+        blob_name: str, 
+        blob_prefix: str
+    ) -> Optional[datetime]:
+    """Parse timestamp from GCS blob name based on Ingex naming convention."""
+    pattern = re.compile(blob_prefix + TIMESTAMP_SUFFIX_GCS)
+    m = pattern.match(blob_name)
+    if not m:
+        return None
+    ymd, hms = m.group(1), m.group(2)
+    return datetime.strptime(ymd + hms, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+
+
+def _list_files_in_range_ingex_gcs(
+        gcs_bucket: str, 
+        blob_prefix: str, 
+        start: Optional[datetime], 
+        end: Optional[datetime],
+        ) -> list[str]:
+    """List GCS blob URIs within specified time range based on Ingex naming convention."""
+    client = storage.Client()
+    blobs = client.list_blobs(gcs_bucket)
+    out = []
+    for b in blobs:
+        ts = _parse_ts_from_name_ingex_gcs(blob_name=b.name, blob_prefix=blob_prefix)
+        if ts is None:
+            continue
+        if start is not None and ts < start:
+            continue
+        if end is not None and ts >= end:
+            continue
+        out.append(f"gs://{gcs_bucket}/{b.name}")
+    return out
+
+
+def _get_sampled_users_with_min_likes(
+    likes_lf: pl.LazyFrame,
+    min_likes_per_user: int,
+    max_liking_users: Optional[int],
+    random_seed: int
+) -> Tuple[pl.DataFrame, int, int, int]:
+    
+    # ===== Count likes per user =====
+    likes_summary_df = likes_lf.select(
+        pl.col('did').n_unique().alias('user_count'),
+        pl.len().alias('like_count')
+    ).collect(engine="streaming")
+
+    n_users_initial = likes_summary_df["user_count"][0]
+    n_likes_initial = likes_summary_df["like_count"][0]
+
+    user_counts_lf = (
+        likes_lf.group_by('did')
+        .agg(pl.len().alias('like_count'))
+    )
+    # ===== Pre-filter users by min_likes_per_user before sampling =====
+    if min_likes_per_user > 0:
+        user_counts_lf = user_counts_lf.filter(
+            pl.col('like_count') >= min_likes_per_user
+        )
+
+    n_users_eligible = (
+        user_counts_lf
+        .select(pl.len().alias('n'))
+        .collect(engine="streaming")
+        .item()
+    )
+
+    # ===== Sample users if cap is set =====
+    if max_liking_users is not None and n_users_eligible > max_liking_users:
+        fraction_to_sample = max_liking_users / n_users_eligible
+        threshold_hash = int(fraction_to_sample * (2**64 - 1))
+        
+        user_counts_lf = (
+            user_counts_lf.with_columns(
+                pl.col("did").hash(seed=random_seed).alias("_hash_key"),
+            ).filter(
+                pl.col("_hash_key") <= threshold_hash
+            ).select("did")
+        )
+
+    return user_counts_lf.collect(engine="streaming"), n_users_initial, n_likes_initial, n_users_eligible
+
+
+def _load_likes_core_polars(
+    start_str: Optional[str],
+    end_str: Optional[str],
+    paths: List[str],
+    *,
+    max_liking_users: Optional[int],
+    max_likes_per_user: int,
+    min_likes_per_user: int,
+    random_seed: int,
+    logger: logging.Logger,
+) -> Tuple[pl.DataFrame, Dict[str, Any]]:
+    """
+    Load and filter likes data using a streaming Polars pipeline.
+    
+    High-level flow:
+    1. Streamed pass: count likes per user
+    2. Pre-filter users who don't meet min_likes_per_user
+    3. Sample users from eligible pool (if cap is set)
+    4. Streamed pass: keep only likes from sampled users
+    5. Apply per-user random caps (NOT recency-based)
+    6. Verify min-likes threshold (handles edge cases from per-user caps)
+    
+    This avoids materializing the full likes table in memory and returns a
+    LazyFrame suitable for streaming writes (sink_parquet).
+    
+    Returns:
+        Tuple of (likes_lf: pl.LazyFrame, stats: Dict with filtering statistics)
+    """
+    if not paths:
+        raise ValueError(f"No likes parquet files found for time range {start_str} to {end_str}")
+    
+    logger.info(f"Found {len(paths)} likes parquet files")
+    log_memory_checkpoint("likes_before_scan", logger)
+    
+    raw_lf = pl.scan_parquet(paths)
+    base_lf = apply_time_filter(raw_lf, start_str, end_str)
+
+    # ===== PASS 1: Filter users =====
+    logger.info("Pass 1: Counting likes per user (streaming)...")
+
+    # Filter users by min likes and then sample down to max liking users
+    sampled_users_df, n_users_initial, n_likes_initial, n_users_eligible = _get_sampled_users_with_min_likes(
+        base_lf, 
+        min_likes_per_user,
+        max_liking_users,
+        random_seed
+    )
+    logger.info(f"Pass 1 complete: {n_likes_initial:,} likes from {n_users_initial:,} users")
+    log_memory_checkpoint("likes_after_pass1", logger)
+    
+    stats = {
+        'n_likes_initial': n_likes_initial,
+        'n_users_initial': n_users_initial,
+    }
+
+    # record stats and log stuff
+    n_users_filtered = n_users_initial - n_users_eligible
+    n_users_sampled = sampled_users_df.height
+    logger.info(f"Pre-filtering: {n_users_eligible:,} users meet min-likes threshold ({min_likes_per_user}), "
+            f"excluded {n_users_filtered:,} users with too few likes")
+    stats['n_users_eligible_for_sampling'] = n_users_eligible
+    stats['n_users_excluded_min_likes'] = n_users_filtered
+    stats['n_users_sampled'] = n_users_sampled
+    logger.info(
+        f"Sampled {n_users_sampled:,} liking users "
+        f"({100*n_users_sampled/n_users_initial:.1f}% of eligible)"
+    )
+    log_memory_checkpoint("likes_after_user_sample", logger)
+    
+    # ===== PASS 2: Filter likes to sampled users (lazy) =====
+    logger.info("Pass 2: Filtering likes for sampled users (streaming)...")
+    likes_lf = base_lf.join(sampled_users_df.lazy(), on='did', how='semi')
+    
+    # Compute counts per user before per-user cap
+    counts_pre_cap_df = (
+        likes_lf.group_by('did')
+        .agg(pl.len().alias('like_count'))
+        .collect(engine='streaming')
+    )
+    
+    n_after_user_sample = int(counts_pre_cap_df['like_count'].sum()) if counts_pre_cap_df.height > 0 else 0
+    pct_retained = 100.0 * n_after_user_sample / n_likes_initial if n_likes_initial > 0 else 0
+    logger.info(f"Pass 2 complete: {n_after_user_sample:,} likes ({pct_retained:.1f}% retained)")
+    stats['n_likes_after_user_sample'] = n_after_user_sample
+    log_memory_checkpoint("likes_after_pass2", logger)
+    
+    # ===== Capture like count distribution BEFORE cap (for analysis/plotting) =====
+    # This shows how many likes each sampled user has before we apply the per-user cap
+    if counts_pre_cap_df.height > 0:
+        likes_per_user_before_cap = counts_pre_cap_df['like_count'].to_list()
+        stats['likes_per_user_distribution'] = likes_per_user_before_cap
+        stats['likes_per_user_mean'] = float(np.mean(likes_per_user_before_cap))
+        stats['likes_per_user_median'] = float(np.median(likes_per_user_before_cap))
+        stats['likes_per_user_max'] = int(max(likes_per_user_before_cap))
+        stats['likes_per_user_p90'] = float(np.percentile(likes_per_user_before_cap, 90))
+        stats['likes_per_user_p99'] = float(np.percentile(likes_per_user_before_cap, 99))
+        logger.info(f"Likes per sampled user: mean={stats['likes_per_user_mean']:.1f}, "
+             f"median={stats['likes_per_user_median']:.0f}, max={stats['likes_per_user_max']}, "
+             f"p90={stats['likes_per_user_p90']:.0f}, p99={stats['likes_per_user_p99']:.0f}")
+    
+    # ===== Apply per-user random cap (NOT recency-based) =====
+    if max_likes_per_user > 0 and n_after_user_sample > 0:
+        n_before_cap = n_after_user_sample
+        
+        # Add deterministic pseudo-random order per user, then keep top-K
+        likes_lf = likes_lf.with_columns(
+            pl.col('subject_uri').hash(seed=random_seed).alias('_rand_key')
+        )
+        likes_lf = likes_lf.with_columns(
+            pl.col('_rand_key').rank('ordinal').over('did').alias('_rand_order')
+        )
+        likes_lf = likes_lf.filter(pl.col('_rand_order') <= max_likes_per_user)
+        likes_lf = likes_lf.drop(['_rand_key', '_rand_order'])
+        
+        # Compute post-cap counts from pre-cap per-user counts to avoid materializing likes_lf.
+        n_after_cap = int(
+            counts_pre_cap_df
+            .select(pl.col('like_count').clip(upper_bound=max_likes_per_user).sum())
+            .item()
+        )
+        pct_retained = 100.0 * n_after_cap / n_before_cap if n_before_cap > 0 else 0
+        logger.info(f"After per-user cap ({max_likes_per_user}): {n_after_cap:,} likes ({pct_retained:.1f}% retained)")
+        stats['n_likes_after_per_user_cap'] = n_after_cap
+    else:
+        stats['n_likes_after_per_user_cap'] = n_after_user_sample
+    
+    # Select output columns
+    output_cols = ['did', 'subject_uri', 'record_created_at']
+    available_cols = [c for c in output_cols if c in likes_lf.collect_schema().names()]
+    if available_cols:
+        likes_lf = likes_lf.select(available_cols)
+    
+    # Convert record_created_at to datetime if it exists and is not already datetime
+    schema = likes_lf.collect_schema()
+    if 'record_created_at' in schema and schema['record_created_at'] != pl.Datetime:
+        if schema['record_created_at'] in (pl.String, pl.Utf8):
+            likes_lf = likes_lf.with_columns(
+                pl.col('record_created_at').str.to_datetime(time_zone="UTC").alias('record_created_at')
+            )
+        else:
+            likes_lf = likes_lf.with_columns(
+                pl.col('record_created_at').cast(pl.Datetime).alias('record_created_at')
+            )
+    
+    likes_df = likes_lf.collect(engine="streaming")
+
+    stats['n_likes_final'] = len(likes_df)
+    stats['n_users_final'] = likes_df['did'].n_unique() if len(likes_df) > 0 else 0
+
+    log_memory_checkpoint("likes_final", logger)
+    
+    return likes_df, stats
+
+
+def _load_posts_core_polars(
+    start_str: Optional[str],
+    end_str: Optional[str],
+    liked_post_uris_df: pl.DataFrame,
+    paths: List[str],
+    *,
+    negative_posts_sample: int,
+    embedding_model: str,
+    random_seed: int,
+    logger: logging.Logger,
+    out_dir: Path,
+) -> Tuple[pl.DataFrame, Dict[str, Any], int, Path]:
+    """
+    Load posts data using batch processing with early embedding expansion.
+    
+    Key optimization: expand embeddings per-batch BEFORE accumulating.
+    This reduces memory by ~98% (150KB/post raw -> 2KB/post expanded).
+    
+    Processing flow:
+    1. Process files in batches (20 files at a time)
+    2. For each batch:
+       a) Reservoir sample from ALL posts (independent of like status)
+       b) Collect liked posts NOT already in the random sample
+       c) Expand embeddings and DROP the raw blob
+    3. Accumulate only the slim expanded data
+    
+    Statistical independence:
+    The random sample is drawn from ALL posts, not filtered by like status.
+    Posts that are both liked AND randomly sampled appear once with in_random_sample=True.
+    This ensures the random sample can be used for unbiased population statistics.
+    
+    Output columns:
+    - in_random_sample: True if post was collected via reservoir sampling,
+                        False if collected only because it was liked
+    - To identify liked posts: join with likes_core on subject_uri = at_uri
+    
+    Returns:
+        Tuple of (posts_df: pl.DataFrame, stats: Dict, embedding_dim: int)
+    """
+    if not paths:
+        raise ValueError(f"No posts parquet files found for time range {start_str} to {end_str}")
+    
+    logger.info(f"Found {len(paths)} posts parquet files")
+    log_memory_checkpoint("posts_before_scan", logger)
+
+    posts_lf = pl.scan_parquet(paths)
+    posts_lf = apply_time_filter(posts_lf, start_str, end_str)
+
+    # get the total number of posts and calc threshold
+    n_posts_total = posts_lf.select(pl.count()).collect().item()
+    logger.info(f"n_posts_total: {n_posts_total:,}")
+    fraction_to_sample = negative_posts_sample / n_posts_total
+    threshold_hash = int(fraction_to_sample * (2**64 - 1))
+
+    cols_with_emb = ["at_uri", "embeddings", "record_created_at", "did", "record_text"]
+    cols_no_emb = cols_with_emb.copy()
+    cols_no_emb.remove("embeddings")
+    
+    # get posts: sampled via hash, or in liked_post_uris:
+    negs_and_likes_lf = (
+        posts_lf
+        .select(cols_with_emb)
+        .with_columns(
+            pl.col("at_uri").hash(seed=random_seed).alias("_hash_key"),
+        )
+        .join(
+            liked_post_uris_df.with_columns(pl.lit(True).alias("_is_liked")).lazy(),
+            left_on="at_uri",
+            right_on="subject_uri",
+            how="left",
+        )
+        .with_columns(
+            (pl.col("_hash_key") <= threshold_hash).alias("in_random_sample"),
+            pl.col("_is_liked").fill_null(False).alias("is_liked"),
+        )
+        .filter(pl.col("in_random_sample") | pl.col("is_liked"))
+        .drop(["_is_liked", "_hash_key"])
+    )
+
+    # get embedding dim
+    embed_dim = get_embed_dim(posts_lf, embedding_model)
+    logger.info(f"Detected embedding dimension: {embed_dim}")
+
+    # expand embeddings into columns
+    posts_core_lf = expand_embeddings_polars(negs_and_likes_lf, embedding_model, embed_dim)
+    
+    # Validate posts_core_lf schema
+    posts_schema_with_embs = {
+        'at_uri': str,
+        'in_random_sample': bool,
+        'did': str,
+        'record_created_at': str,
+        'record_text': str,
+        'is_liked': bool,
+    }
+    for i in range(embed_dim):
+        posts_schema_with_embs[f'post_emb_{i}'] = float
+    validate_dataframe_schema(posts_core_lf, posts_schema_with_embs, allow_extra_columns=False)
+
+    # write out
+    logger.info(f"✓ posts_core schema validated (embed_dim={embed_dim})")
+
+    # Save outputs as parquet
+    log_operation_start('Save likes core dataset as parquet', 'STAGE_01_GET_DATA', logger)
+    ts_name = out_dir.name
+    posts_core_path = out_dir / f"posts_core_{ts_name}.parquet"
+    
+    # low row_group_size because embeddings are very large. keeps memory low
+    posts_core_lf.sink_parquet(posts_core_path, compression="zstd", engine="streaming", row_group_size=128)
+    log_memory_checkpoint("posts_after_sink_parquet", logger)
+
+    # read back from the parquet file, withOUT embeddings
+    posts_core_df = (
+        pl
+        .scan_parquet(posts_core_path)
+        .select(cols_no_emb + ['is_liked', 'in_random_sample'])
+        .collect(engine="streaming")
+    )
+
+    # Validate posts_core_lf schema
+    posts_schema_no_embs = {
+        'at_uri': str,
+        'in_random_sample': bool,
+        'did': str,
+        'record_created_at': str,
+        'record_text': str,
+        'is_liked': bool,
+    }
+    validate_dataframe_schema(posts_core_df, posts_schema_no_embs, allow_extra_columns=False)
+
+    # calculate metrics
+    n_posts_core = posts_core_df.height
+    n_liked_only = posts_core_df.filter(pl.col("is_liked") & ~pl.col("in_random_sample")).height
+    n_liked_in_random = posts_core_df.filter(pl.col("is_liked") & pl.col("in_random_sample")).height
+    n_random_sample = posts_core_df.filter(pl.col("in_random_sample")).height
+
+    logger.info(f"Saved posts_core: {posts_core_path} ({n_posts_core:,} rows)")
+    logger.info(f"All posts in raw data: {n_posts_total:,}")
+    logger.info(f"Liked only: {n_liked_only:,}")
+    logger.info(f"Liked in random sample: {n_liked_in_random:,}")
+    logger.info(f"Random sample total: {n_random_sample:,}")
+
+    # Total liked posts = those only in liked set + those also in random sample
+    n_total_liked_posts = n_liked_only + n_liked_in_random
+    liked_post_match_rate = 100.0 * n_total_liked_posts / liked_post_uris_df.height
+    logger.info(f"Loaded {n_total_liked_posts:,} liked posts ({liked_post_match_rate:.1f}% match rate)")
+    
+    stats = {
+        'n_posts_total': n_posts_total,
+        'n_liked_posts': n_total_liked_posts,
+        'n_liked_only': n_liked_only,  # Liked posts not in random sample
+        'n_liked_in_random_sample': n_liked_in_random,  # Liked posts that are also in random sample
+        'liked_post_match_rate': liked_post_match_rate,
+        'n_random_sample': n_random_sample,
+    }
+    
+    logger.info(f"posts_core: {n_posts_core:,} rows ({n_liked_only:,} liked-only + {n_random_sample:,} random sample)")
+    logger.info(f"Embeddings already expanded during loading (dim={embed_dim})")
+    
+    stats['n_posts_core'] = n_posts_core
+    stats['embedding_dim'] = embed_dim
+    log_memory_checkpoint("posts_after_combine", logger)
+    
+    return posts_core_df, stats, embed_dim, posts_core_path
 
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
@@ -327,13 +740,13 @@ def _run_greenearth_pipeline(
     posts_start_dt = parse_one_ts(posts_start)
     posts_end_dt = parse_one_ts(posts_end)
     
-    likes_paths = list_files_in_range_ingex_gcs(
+    likes_paths = _list_files_in_range_ingex_gcs(
         gcs_bucket=gcs_bucket,
         blob_prefix='bsky_likes',
         start=likes_start_dt,
         end=likes_end_dt,
     )
-    posts_paths = list_files_in_range_ingex_gcs(
+    posts_paths = _list_files_in_range_ingex_gcs(
         gcs_bucket=gcs_bucket,
         blob_prefix='bsky_posts',
         start=posts_start_dt,
@@ -369,7 +782,7 @@ def _run_greenearth_pipeline(
     
     # Step 1: Load and filter likes
     log_operation_start('Load and filter likes data', '01_GET_DATA', logger)
-    likes_core_df, likes_stats = load_likes_core_polars(
+    likes_core_df, likes_stats = _load_likes_core_polars(
         start_str=likes_start,
         end_str=likes_end,
         paths=likes_paths,
@@ -391,7 +804,7 @@ def _run_greenearth_pipeline(
     # Step 3: Load posts with early embedding expansion
     # This loads posts, filters to liked + negative sample, and expands embeddings
     log_operation_start('Load posts with early embedding expansion', '01_GET_DATA', logger)
-    posts_core_df, posts_stats, embed_dim, posts_core_path = load_posts_core_polars(
+    posts_core_df, posts_stats, embed_dim, posts_core_path = _load_posts_core_polars(
         start_str=posts_start,
         end_str=posts_end,
         liked_post_uris_df=liked_post_uris_df,
@@ -440,7 +853,7 @@ def _run_greenearth_pipeline(
         n_users_removed_by_join_verify = n_users_before_join_verify - n_users_after_join_verify
 
         # Filter users by min likes
-        sampled_users_df, _, _, _ = get_sampled_users_with_min_likes(
+        sampled_users_df, _, _, _ = _get_sampled_users_with_min_likes(
             likes_lf=likes_core_df.lazy(),
             min_likes_per_user=min_likes_per_user,
             max_liking_users=None,
