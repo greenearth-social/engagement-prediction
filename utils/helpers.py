@@ -47,7 +47,7 @@ os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
 
 
 # ----------------------------------------
-# Datetime helpers
+# Data loading helpers
 # ----------------------------------------
 # For parsing CLI arg strings
 KNOWN_TS_FORMATS = [
@@ -77,6 +77,11 @@ def apply_time_filter(
     start_str: Optional[str], 
     end_str: Optional[str]
 ) -> pl.LazyFrame:
+    """
+    Apply a time filter to a polars lazyframe. 
+    Note that applying the filter using strings instead of converting to datetimes allows for 
+    streaming rather than loading everything into memory.
+    """
     if 'record_created_at' not in lf.collect_schema().names():
         raise ValueError("Input LazyFrame does not contain 'record_created_at' column for time filtering")
     if start_str is not None:

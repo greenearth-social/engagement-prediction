@@ -300,7 +300,7 @@ def _load_likes_core_polars(
     logger.info(f"Pass 1 complete: {n_likes_initial:,} likes from {n_users_initial:,} users")
     log_memory_checkpoint("likes_after_pass1", logger)
     
-    stats = {
+    stats: Dict[str, Any] = {
         'n_likes_initial': n_likes_initial,
         'n_users_initial': n_users_initial,
     }
@@ -320,7 +320,7 @@ def _load_likes_core_polars(
     log_memory_checkpoint("likes_after_user_sample", logger)
     
     # ===== PASS 2: Filter likes to sampled users (lazy) =====
-    logger.info("Pass 2: Filtering likes for sampled users (streaming)...")
+    logger.info("Pass 2: Filtering likes to sampled users")
     likes_lf = base_lf.join(sampled_users_df.lazy(), on='did', how='semi')
     
     # Compute counts per user before per-user cap
@@ -378,21 +378,14 @@ def _load_likes_core_polars(
     
     # Select output columns
     output_cols = ['did', 'subject_uri', 'record_created_at']
-    available_cols = [c for c in output_cols if c in likes_lf.collect_schema().names()]
-    if available_cols:
-        likes_lf = likes_lf.select(available_cols)
+    likes_lf = likes_lf.select(output_cols)
     
     # Convert record_created_at to datetime if it exists and is not already datetime
     schema = likes_lf.collect_schema()
     if 'record_created_at' in schema and schema['record_created_at'] != pl.Datetime:
-        if schema['record_created_at'] in (pl.String, pl.Utf8):
-            likes_lf = likes_lf.with_columns(
-                pl.col('record_created_at').str.to_datetime(time_zone="UTC").alias('record_created_at')
-            )
-        else:
-            likes_lf = likes_lf.with_columns(
-                pl.col('record_created_at').cast(pl.Datetime).alias('record_created_at')
-            )
+        likes_lf = likes_lf.with_columns(
+            pl.col('record_created_at').str.to_datetime(time_zone="UTC").alias('record_created_at')
+        )
     
     likes_df = likes_lf.collect(engine="streaming")
 
@@ -417,29 +410,27 @@ def _load_posts_core_polars(
     out_dir: Path,
 ) -> Tuple[pl.DataFrame, Dict[str, Any], int, Path]:
     """
-    Load posts data using batch processing with early embedding expansion.
-    
-    Key optimization: expand embeddings per-batch BEFORE accumulating.
-    This reduces memory by ~98% (150KB/post raw -> 2KB/post expanded).
-    
+    Load posts data with a single Polars scan (no batching) and expand embeddings early.
+
     Processing flow:
-    1. Process files in batches (20 files at a time)
-    2. For each batch:
-       a) Reservoir sample from ALL posts (independent of like status)
-       b) Collect liked posts NOT already in the random sample
-       c) Expand embeddings and DROP the raw blob
-    3. Accumulate only the slim expanded data
-    
+    1. Scan all parquet files and apply the time filter.
+    2. Count total posts to set a hash-sampling threshold.
+    3. Hash-sample posts (random_seed) and left-join liked_post_uris.
+    4. Keep posts that are either in the random sample or liked.
+    5. Expand embeddings into columns and drop the raw embeddings blob.
+    6. Write posts_core parquet (with embeddings), then read back a slim version
+       (without embeddings) for downstream use.
+
     Statistical independence:
     The random sample is drawn from ALL posts, not filtered by like status.
     Posts that are both liked AND randomly sampled appear once with in_random_sample=True.
-    This ensures the random sample can be used for unbiased population statistics.
-    
+    This keeps the random sample usable for unbiased population statistics.
+
     Output columns:
-    - in_random_sample: True if post was collected via reservoir sampling,
-                        False if collected only because it was liked
-    - To identify liked posts: join with likes_core on subject_uri = at_uri
-    
+    - in_random_sample: True if post was selected by hash-sampling,
+                        False if included only because it was liked
+    - is_liked: True if post is in likes core dataset, False otherwise
+
     Returns:
         Tuple of (posts_df: pl.DataFrame, stats: Dict, embedding_dim: int)
     """
@@ -803,6 +794,7 @@ def _run_greenearth_pipeline(
     
     # Step 3: Load posts with early embedding expansion
     # This loads posts, filters to liked + negative sample, and expands embeddings
+    # Returned dataframe does *not* include embeddings. Those are written to parquet though.
     log_operation_start('Load posts with early embedding expansion', '01_GET_DATA', logger)
     posts_core_df, posts_stats, embed_dim, posts_core_path = _load_posts_core_polars(
         start_str=posts_start,
@@ -840,20 +832,8 @@ def _run_greenearth_pipeline(
     # Re-verify min-likes per user
     n_users_removed_by_join_verify = 0
     if min_likes_per_user > 0:
-        user_like_counts = (
-            likes_core_df.group_by('did')
-            .agg(pl.count().alias('like_count'))
-        )
-        
-        n_users_before_join_verify = len(user_like_counts)
-        users_meeting_threshold = user_like_counts.filter(
-            pl.col('like_count') >= min_likes_per_user
-        )
-        n_users_after_join_verify = len(users_meeting_threshold)
-        n_users_removed_by_join_verify = n_users_before_join_verify - n_users_after_join_verify
-
         # Filter users by min likes
-        sampled_users_df, _, _, _ = _get_sampled_users_with_min_likes(
+        sampled_users_df, n_users_before_join_verify, _, n_users_after_join_verify = _get_sampled_users_with_min_likes(
             likes_lf=likes_core_df.lazy(),
             min_likes_per_user=min_likes_per_user,
             max_liking_users=None,
