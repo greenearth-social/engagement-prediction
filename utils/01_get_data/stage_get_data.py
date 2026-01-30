@@ -149,11 +149,11 @@ from utils.helpers import (
     # Memory safety checks and tracking
     check_data_load_safe,
     MemoryTracker,
-    log_memory_checkpoint,
     list_files_in_range_ingex_gcs,
     parse_one_ts,
     # Data validation
     validate_dataframe_schema,
+    get_sampled_users_with_min_likes,
 )
 
 
@@ -216,8 +216,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     validate_dataframe_schema(likes_core_df, likes_schema, allow_extra_columns=False)
     logger.info("✓ likes_core schema validated")
 
-    # Log to experiment tracker - comprehensive metrics for sweep analysis
-    # Metric names use readable format: "Category - Metric Name" for better CSV exports
     n_likes = len(likes_core_df)
     n_posts = len(posts_core_df)
 
@@ -260,7 +258,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     context.tracker.log_single_value(name="Output - Posts (final)", value=n_posts)
     context.tracker.log_single_value(name="Output - Embedding Dim", value=embed_dim)
 
-    # All other metrics for experiment tracker:
+    # Log to experiment tracker - comprehensive metrics for sweep analysis
+    # Metric names use readable format: "Category - Metric Name" for better CSV exports
     _attrition_stats_to_experiment_tracker(all_stats, context, max_likes_per_user, logger)
 
     runtime = time.time() - t0
@@ -290,7 +289,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def _run_greenearth_pipeline(
-    logger,
+    logger: logging.Logger,
     out_dir: Path,
     gcs_bucket: str,
     likes_start: str,
@@ -366,7 +365,6 @@ def _run_greenearth_pipeline(
         logger.warning("Proceeding anyway - monitor memory usage carefully, OOM may occur!")
         logger.warning("=" * 60)
         
-    
     mem_tracker.checkpoint("after_memory_check")
     
     # Step 1: Load and filter likes
@@ -382,20 +380,16 @@ def _run_greenearth_pipeline(
         logger=logger,
     )
     all_stats['likes'] = likes_stats
-    
     mem_tracker.checkpoint("after_likes_load")
     
     # Step 2: Extract liked post URIs
     log_operation_start('Extract liked post URIs', 'STAGE_01_GET_DATA', logger)
-    # liked_post_uris = set(likes_core_df['subject_uri'].unique().to_list())
     liked_post_uris_df: pl.DataFrame = likes_core_df.select(pl.col('subject_uri').unique())
-    # logger.info(f"Extracted {len(liked_post_uris_df):,} unique liked post URIs")
-    
+    logger.info(f"Extracted {len(liked_post_uris_df):,} unique liked post URIs")
     mem_tracker.checkpoint("after_uri_extraction")
     
     # Step 3: Load posts with early embedding expansion
-    # This loads posts, filters to liked + negative sample, and expands embeddings per-batch
-    # Early expansion dramatically reduces memory by dropping raw embedding blobs immediately
+    # This loads posts, filters to liked + negative sample, and expands embeddings
     log_operation_start('Load posts with early embedding expansion', 'STAGE_01_GET_DATA', logger)
     posts_core_df, posts_stats, embed_dim, posts_core_path = load_posts_core_polars(
         start_str=posts_start,
@@ -410,9 +404,8 @@ def _run_greenearth_pipeline(
     )
     all_stats['posts'] = posts_stats
     all_stats['embedding_dim'] = embed_dim
-    
     mem_tracker.checkpoint("after_posts_load_and_expansion")
-    
+
     # Step 4: Re-verify min-likes after like-post join
     # Since like-post joining isn't perfect (some posts may be missing, deleted, or outside time range),
     # we need to re-check that users still meet min-likes threshold based on likes that have matching posts.
@@ -445,15 +438,26 @@ def _run_greenearth_pipeline(
         )
         n_users_after_join_verify = len(users_meeting_threshold)
         n_users_removed_by_join_verify = n_users_before_join_verify - n_users_after_join_verify
-        
+
+        # Filter users by min likes
+        sampled_users_df, _, _, _ = get_sampled_users_with_min_likes(
+            likes_lf=likes_core_df.lazy(),
+            min_likes_per_user=min_likes_per_user,
+            max_liking_users=None,
+            random_seed=cap_random_seed
+        )
+
+        n_users_before_join_verify = all_stats['likes']['n_users_final']
+        n_users_after_join_verify = sampled_users_df.height
+        n_users_removed_by_join_verify = n_users_before_join_verify - n_users_after_join_verify
+
         if n_users_removed_by_join_verify > 0:
-            logger.warning(
+            logger.info(
                 f"Min-likes verification after join: {n_users_before_join_verify:,} -> {n_users_after_join_verify:,} users "
                 f"({n_users_removed_by_join_verify:,} removed due to insufficient likes after join)"
             )
-            
             # Filter likes to only users who still meet threshold
-            valid_user_dids = set(users_meeting_threshold['did'].to_list())
+            valid_user_dids = set(sampled_users_df['did'].to_list())
             likes_core_df = likes_core_df.filter(
                 pl.col('did').is_in(valid_user_dids)
             )
