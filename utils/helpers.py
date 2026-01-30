@@ -971,9 +971,14 @@ def load_likes_core_polars(
                 pl.col('record_created_at').cast(pl.Datetime).alias('record_created_at')
             )
     
+    likes_df = likes_lf.collect(engine="streaming")
+
+    stats['n_likes_final'] = len(likes_df)
+    stats['n_users_final'] = likes_df['did'].n_unique() if len(likes_df) > 0 else 0
+
     log_memory_checkpoint("likes_final", logger)
     
-    return likes_lf.collect(engine="streaming"), stats
+    return likes_df, stats
 
 
 def save_polars_physical_plan_image(lf: pl.LazyFrame, out_path: str):
