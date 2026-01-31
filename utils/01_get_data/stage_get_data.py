@@ -89,7 +89,7 @@ Under <run_dir>/01_get_data/<timestamp>/:
 
 Using the outputs:
   - Random sample (for population stats): filter posts_core where in_random_sample=True
-  - Liked posts: join likes_core.subject_uri with posts_core.at_uri
+  - Liked posts: join likes_core.subject_uri with posts_core.at_uri. is_liked is also set
   - Negative examples for training: sample from random sample excluding user's likes
 """
 
@@ -107,7 +107,10 @@ import re
 from google.cloud import storage
 import numpy as np
 
-from utils.pipeline.core import new_stage_timestamp_dir, Context
+from utils.pipeline.core import (
+    new_stage_timestamp_dir, 
+    Context,
+)
 from utils.helpers import (
     get_stage_logger,
     log_operation_start,
@@ -171,7 +174,7 @@ def _get_sampled_users_with_min_likes(
     max_liking_users: Optional[int],
     random_seed: int
 ) -> Tuple[pl.DataFrame, int, int, int]:
-    # get totals
+    # get total user and like count
     likes_summary_df = likes_lf.select(
         pl.col('did').n_unique().alias('user_count'),
         pl.len().alias('like_count')
@@ -198,9 +201,7 @@ def _get_sampled_users_with_min_likes(
     )
     # ===== Sample users if cap is set =====
     if max_liking_users is not None and n_users_eligible > max_liking_users:
-        fraction_to_sample = max_liking_users / n_users_eligible
-        threshold_hash = int(fraction_to_sample * (2**64 - 1))
-        
+        threshold_hash = _compute_random_sample_threshold(n_users_eligible, max_liking_users)
         user_counts_lf = (
             user_counts_lf.with_columns(
                 pl.col("did").hash(seed=random_seed).alias("_hash_key"),
@@ -271,6 +272,7 @@ def _load_likes_core_polars(
     logger.info("Pass 1: Counting likes per user (streaming)...")
 
     # Filter users by min likes and then sample down to max liking users
+    # n_users_eligible is the number of users that had the minimum number of likes, before we randomly sample
     sampled_users_df, n_users_initial, n_likes_initial, n_users_eligible = _get_sampled_users_with_min_likes(
         base_lf, 
         min_likes_per_user,
@@ -336,7 +338,7 @@ def _load_likes_core_polars(
     
     likes_df = likes_lf.select(['did', 'subject_uri', 'record_created_at']).unique().collect(engine="streaming")
 
-    # Compute post-cap counts from pre-cap per-user counts to avoid materializing likes_lf.
+    # Compute post-cap counts
     n_after_cap = likes_df.height
     pct_retained = 100.0 * n_after_cap / n_after_user_sample if n_after_user_sample > 0 else 0
     logger.info(f"After per-user cap ({max_likes_per_user}): {n_after_cap:,} likes ({pct_retained:.1f}% retained)")
@@ -350,8 +352,6 @@ def _load_likes_core_polars(
         )
 
     stats['n_likes_final'] = n_after_cap
-    stats['n_users_final'] = likes_df['did'].n_unique() if n_after_cap > 0 else 0
-
     log_memory_checkpoint("likes_final", logger)
     
     return likes_df, stats
@@ -368,6 +368,7 @@ def _load_posts_core_polars(
     random_seed: int,
     logger: logging.Logger,
     out_dir: Path,
+    # the below inputs are for testing: they allow this function to be called without expanding real embeddings
     expand_embeddings_fn: Optional[Callable[[pl.LazyFrame, str, int], pl.LazyFrame]] = expand_embeddings_polars,
     get_embed_dim_fn: Callable[[pl.LazyFrame, str], int] = get_embed_dim,
     embed_dim_override: Optional[int] = None,
@@ -412,9 +413,8 @@ def _load_posts_core_polars(
     logger.info(f"n_posts_total: {n_posts_total:,}")
     threshold_hash = _compute_random_sample_threshold(n_posts_total, negative_posts_sample)
 
-    cols_with_emb = ["at_uri", "embeddings", "record_created_at", "did", "record_text"]
-    cols_no_emb = cols_with_emb.copy()
-    cols_no_emb.remove("embeddings")
+    cols_no_emb = ["at_uri", "record_created_at", "did", "record_text"]
+    cols_with_emb = cols_no_emb + ["embeddings"]
     
     # get posts: sampled via hash, or in liked_post_uris:
     negs_and_likes_lf = _build_posts_candidate_lf(
@@ -466,7 +466,12 @@ def _load_posts_core_polars(
     posts_core_path = out_dir / f"posts_core_{ts_name}.parquet"
     
     # low row_group_size because embeddings are very large. keeps memory low
-    _write_posts_core_parquet(posts_core_lf, posts_core_path)
+    posts_core_lf.sink_parquet(
+        posts_core_path,
+        compression="zstd",
+        engine="streaming",
+        row_group_size=128
+    )
     log_memory_checkpoint("posts_after_sink_parquet", logger)
 
     # read back from the parquet file, withOUT embeddings
@@ -524,16 +529,16 @@ def _load_posts_core_polars(
     return posts_core_df, stats, embed_dim, posts_core_path
 
 
-def _compute_random_sample_threshold(n_posts_total: int, negative_posts_sample: int) -> int:
-    if n_posts_total <= 0:
+def _compute_random_sample_threshold(n_rows_total: int, n_sample: int) -> int:
+    if n_rows_total <= 0:
         return 0
     max_hash = 2**64 - 1
-    if negative_posts_sample >= n_posts_total:
+    if n_sample >= n_rows_total:
         return max_hash
-    if negative_posts_sample <= 0:
+    if n_sample <= 0:
         return 0
     # Use integer math to avoid float rounding issues at large ranges.
-    return (negative_posts_sample * max_hash) // n_posts_total
+    return (n_sample * max_hash) // n_rows_total
 
 
 def _build_posts_candidate_lf(
@@ -543,6 +548,7 @@ def _build_posts_candidate_lf(
     random_seed: int,
     cols_with_emb: List[str],
 ) -> pl.LazyFrame:
+    """Samples random posts (liked or not) and also includes posts from liked_post_uris_df"""
     return (
         posts_lf
         .select(cols_with_emb)
@@ -576,15 +582,6 @@ def _expand_posts_embeddings(
     if expand_embeddings_fn is None:
         return posts_lf
     return expand_embeddings_fn(posts_lf, embedding_model, embed_dim)
-
-
-def _write_posts_core_parquet(posts_core_lf: pl.LazyFrame, posts_core_path: Path) -> None:
-    posts_core_lf.sink_parquet(
-        posts_core_path,
-        compression="zstd",
-        engine="streaming",
-        row_group_size=128
-    )
 
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
@@ -735,12 +732,12 @@ def _run_greenearth_pipeline(
     negative_posts_sample: int,
     cap_random_seed: int,
     embedding_model: str
-):
+) -> Tuple[pl.DataFrame, pl.DataFrame, Path, int, Dict[str, Any]]:
     """
     Run the new Polars-based filtering pipeline for GreenEarth Ingex data.
     
     Returns:
-        Tuple of (likes_core_df, posts_core_df, embed_dim, stats_dict)
+        Tuple of (likes_core_df, posts_core_df, posts_core_path, embed_dim, stats_dict)
     """
     all_stats = {}
     
@@ -810,6 +807,8 @@ def _run_greenearth_pipeline(
         logger=logger,
     )
     all_stats['likes'] = likes_stats
+    n_users_final = likes_core_df['did'].n_unique()
+    all_stats['likes']['n_users_final'] = n_users_final
     mem_tracker.checkpoint("after_likes_load")
     
     # Step 2: Extract liked post URIs
@@ -820,7 +819,7 @@ def _run_greenearth_pipeline(
     
     # Step 3: Load posts with early embedding expansion
     # This loads posts, filters to liked + negative sample, and expands embeddings
-    # Returned dataframe does *not* include embeddings. Those are written to parquet though.
+    # Returned dataframe does *NOT* include embeddings. Those are written to parquet though.
     log_operation_start('Load posts with early embedding expansion', '01_GET_DATA', logger)
     posts_core_df, posts_stats, embed_dim, posts_core_path = _load_posts_core_polars(
         start_str=posts_start,
@@ -847,7 +846,7 @@ def _run_greenearth_pipeline(
         min_likes_per_user=min_likes_per_user,
         random_seed=cap_random_seed,
         logger=logger,
-        n_users_final_before_join=all_stats.get('likes', {}).get('n_users_final', 0),
+        n_users_before_join_verify=n_users_final,
     )
     
     # Update stats with join verification results
@@ -882,8 +881,9 @@ def _filter_likes_after_post_join(
     min_likes_per_user: int,
     random_seed: int,
     logger: logging.Logger,
-    n_users_final_before_join: Optional[int] = None,
+    n_users_before_join_verify: int,
 ) -> Tuple[pl.DataFrame, Dict[str, int]]:
+    """Once we've filtered posts, now filter likes to only those that have matching posts in the dataset"""
     # Get set of post URIs that actually exist in posts_core
     existing_post_uris = set(posts_core_df['at_uri'].unique().to_list())
     logger.info(f"Found {len(existing_post_uris):,} unique post URIs in posts_core")
@@ -901,6 +901,7 @@ def _filter_likes_after_post_join(
     n_users_removed_by_join_verify = 0
     if min_likes_per_user > 0:
         # Filter users by min likes
+        # (no need to use the max_liking_users functionality)
         sampled_users_df, n_users_before_join_verify, _, n_users_after_join_verify = _get_sampled_users_with_min_likes(
             likes_lf=likes_core_df.lazy(),
             min_likes_per_user=min_likes_per_user,
@@ -908,8 +909,6 @@ def _filter_likes_after_post_join(
             random_seed=random_seed
         )
 
-        if n_users_final_before_join is not None:
-            n_users_before_join_verify = n_users_final_before_join
         n_users_after_join_verify = sampled_users_df.height
         n_users_removed_by_join_verify = n_users_before_join_verify - n_users_after_join_verify
 
