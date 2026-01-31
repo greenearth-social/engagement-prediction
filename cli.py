@@ -5,7 +5,7 @@ Unified CLI for Engagement Prediction Pipeline
 =============================================
 
 Subcommands:
-- run-all: Run the 6-stage pipeline end-to-end (ingest → featurize → relevel → split → train → evaluate)
+- run-all: Run the 7-stage pipeline end-to-end (ingest → featurize → user_summary → relevel → split → train → evaluate)
 
 Usage examples:
     python cli.py run-all --epochs 150 --embedding-model all_MiniLM_L12_v2
@@ -94,6 +94,7 @@ DEFAULTS: Dict[str, Any] = {
     "stop_after": None,
     "prior_get_data": None,
     "prior_featurize": None,
+    "prior_user_summary": None,
     "prior_relevel": None,
     "prior_split": None,
     "prior_train": None,
@@ -279,7 +280,7 @@ def _generate_run_name(args: argparse.Namespace) -> str:
 
 
 def cmd_run_all(args: argparse.Namespace) -> int:
-    """Run the 4-stage pipeline.
+    """Run the 7-stage pipeline.
 
     Creates a run directory up front and backgrounds itself with nohup unless --foreground.
     """
@@ -372,7 +373,7 @@ def cmd_run_all(args: argparse.Namespace) -> int:
 
 
 def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
-    """Execute the 6-stage modular pipeline in the foreground sequentially."""
+    """Execute the 7-stage modular pipeline in the foreground sequentially."""
     # Build Context and invoke stages via registry
     from utils.pipeline import registry as reg
 
@@ -400,7 +401,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
     
-    stage_order = ['get_data', 'user_history', relevel_key, 'split', train_key, 'evaluate']
+    stage_order = ['get_data', 'user_history', 'user_summary', relevel_key, 'split', train_key, 'evaluate']
     stage_folder = {}
     for key in stage_order:
         _mp, _folder = reg.get_stage_spec(key)
@@ -435,10 +436,11 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
                 ctx.prior_outputs[stage_folder[stage_key]] = p
 
     _pin_prior('prior_get_data', 'get_data')
-    _pin_prior('prior_featurize', 'featurize')
+    _pin_prior('prior_featurize', 'user_history')  # Both use 02_featurize folder
+    _pin_prior('prior_user_summary', 'user_summary')
     _pin_prior('prior_relevel', relevel_key)  # Use the selected relevel key
     _pin_prior('prior_split', 'split')
-    _pin_prior('prior_train', 'train')
+    _pin_prior('prior_train', train_key)  # Use the selected train key
 
     # Optional interactive chooser (foreground only)
     def _maybe_choose_prior(stage_key: str):
@@ -481,16 +483,17 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
                 'get_data': "Stage 1: Get data…",
                 # 'featurize': "Stage 2: Featurize…",
                 'user_history': "Stage 2: Generate user history...",
-                'relevel': "Stage 3: Relevel (uniform mixture)…",
-                'relevel_gini': "Stage 3: Relevel (Gini-optimized)…",
-                'relevel_simple': "Stage 3: Relevel (simple)…",
-                'split': "Stage 4: Split users…",
-                'train': "Stage 5: Train model (MLP)…",
-                'train_two_tower': "Stage 5: Train model (Two-Tower)…",
-                'evaluate': "Stage 6: Evaluate model…",
+                'user_summary': "Stage 3: Generate user summary...",
+                'relevel': "Stage 4: Relevel (uniform mixture)…",
+                'relevel_gini': "Stage 4: Relevel (Gini-optimized)…",
+                'relevel_simple': "Stage 4: Relevel (simple)…",
+                'split': "Stage 5: Split users…",
+                'train': "Stage 6: Train model (MLP)…",
+                'train_two_tower': "Stage 6: Train model (Two-Tower)…",
+                'evaluate': "Stage 7: Evaluate model…",
             }
             label = label_map.get(key, f"Stage {idx+1}: {key}…")
-            print(f"\n[{idx+1}/6] ▶️  {label}")
+            print(f"\n[{idx+1}/7] ▶️  {label}")
             reg.run_stage(key, ctx, args)
     finally:
         ctx.tracker.close()
@@ -511,8 +514,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # run-all (modular 6-stage end-to-end)
-    p_all = subparsers.add_parser("run-all", help="Run all 6 stages end-to-end. Defaults to background with nohup.")
+    # run-all (modular 7-stage end-to-end)
+    p_all = subparsers.add_parser("run-all", help="Run all 7 stages end-to-end. Defaults to background with nohup.")
     # Stage 1 options
     _add_arg_with_default(p_all, "--data-source", type=str, choices=["greenearth", "digitalocean"],
                           default=argparse.SUPPRESS, help_text="Source for raw input data - posts and likes")
@@ -624,15 +627,17 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="(Deprecated) Always enabled during sequential run-all")
     # Selective reruns and prior pinning
     _add_arg_with_default(p_all, "--start-from", type=str,
-                          choices=["get_data", "user_history", "relevel", "split", "train", "evaluate"],
+                          choices=["get_data", "user_history", "user_summary", "relevel", "split", "train", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Begin execution at this stage")
     _add_arg_with_default(p_all, "--stop-after", type=str,
-                          choices=["get_data", "user_history", "relevel", "split", "train", "evaluate"],
+                          choices=["get_data", "user_history", "user_summary", "relevel", "split", "train", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Stop after this stage completes")
     _add_arg_with_default(p_all, "--prior-get-data", type=str, default=argparse.SUPPRESS,
                           help_text="Path to a specific 01_get_data/<ts> directory")
     _add_arg_with_default(p_all, "--prior-featurize", type=str, default=argparse.SUPPRESS,
                           help_text="Path to a specific 02_featurize/<ts> directory")
+    _add_arg_with_default(p_all, "--prior-user-summary", type=str, default=argparse.SUPPRESS,
+                          help_text="Path to a specific 03_user_summary/<ts> directory")
     _add_arg_with_default(p_all, "--prior-relevel", type=str, default=argparse.SUPPRESS,
                           help_text="Path to a specific 03_relevel/<ts> directory")
     _add_arg_with_default(p_all, "--prior-split", type=str, default=argparse.SUPPRESS,
