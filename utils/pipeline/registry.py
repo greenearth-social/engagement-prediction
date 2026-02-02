@@ -25,6 +25,8 @@ STAGE_SPECS: Dict[str, Tuple[str, str]] = {
     # Alternative two-tower training module
     'train_two_tower': ("utils/05_train/stage_train_two_tower.py", "05_train"),
     'evaluate':      ("utils/06_evaluate/stage_evaluate.py", "06_evaluate"),
+    # Optional retrieval stage with ANN + cross-encoder reranking
+    'retrieval':     ("utils/07_retrieval/stage_retrieval.py", "07_retrieval"),
 }
 
 

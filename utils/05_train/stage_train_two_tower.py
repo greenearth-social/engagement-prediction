@@ -871,6 +871,22 @@ def evaluate_model(
     y_true = np.array(all_labels)
     y_pred = np.array(all_preds)
     
+    # Handle empty evaluation set
+    if len(y_true) == 0:
+        return {
+            'metrics': {
+                'total_samples': 0,
+                'positive_samples': 0,
+                'negative_samples': 0,
+            },
+            'predictions': {
+                'user_ids': [],
+                'post_ids': [],
+                'y_true': y_true,
+                'y_pred': y_pred,
+            },
+        }
+    
     metrics = {
         'total_samples': len(y_true),
         'positive_samples': int(y_true.sum()),

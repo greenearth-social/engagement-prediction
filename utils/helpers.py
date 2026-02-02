@@ -435,7 +435,7 @@ def load_embeddings_ingex(posts_df: pd.DataFrame, model_name: str) -> Tuple[pd.D
     n = len(posts_df)
     arr = np.zeros((n, embed_dim), dtype=float)
     for i, x in enumerate(posts_df[embed_str_col].to_numpy()):
-        if x is not None:
+        if x is not None and isinstance(x, str):
             arr[i] = embedding_loads(x, True)
 
     emb_cols = get_embed_col_names(embed_dim)
@@ -1300,8 +1300,11 @@ def discover_topics(
     X = joined[feat_cols].values.astype(np.float32, copy=False)
     pca = None
     if X.shape[1] > 256:
-        pca = PCA(n_components=256, random_state=int(random_seed))
-        X = pca.fit_transform(X)
+        # PCA components must be <= min(n_samples, n_features)
+        max_components = min(256, X.shape[0], X.shape[1])
+        if max_components > global_topic_k:  # Only use PCA if it's useful
+            pca = PCA(n_components=max_components, random_state=int(random_seed))
+            X = pca.fit_transform(X)
     kmeans = MiniBatchKMeans(n_clusters=int(global_topic_k), random_state=int(random_seed), batch_size=min(2048, max(64, len(X))))
     kmeans.fit(X)
     return TopicArtifacts(kmeans, pca, int(global_topic_k))
