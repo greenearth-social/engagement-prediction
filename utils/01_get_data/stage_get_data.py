@@ -106,7 +106,7 @@ Using the outputs:
   - Random sample (for population stats): filter posts_core where in_random_sample=True
   - Liked posts: join likes_core.subject_uri with posts_core.at_uri. is_liked is also set
   - Embedding lookup: mmap = np.memmap(embeddings_path, ...); emb = mmap[emb_idx]
-  - Negative examples for training: sample from random sample excluding user's likes
+  - Negative examples for training: sample from random sample, but make sure to exclude each given user's likes, since this is a true random sample that can (with low probability) contain liked posts.
 """
 
 from __future__ import annotations
@@ -391,10 +391,12 @@ def _apply_per_user_random_cap(
     if max_likes_per_user <= 0:
         return likes_lf
     # Add deterministic pseudo-random order per user, then keep top-K
+    # Hash (did, subject_uri) together to get independent randomization per user
+    # (hashing subject_uri alone would create correlation across users)
     return (
         likes_lf
         .with_columns(
-            pl.col('subject_uri').hash(seed=random_seed).alias('_rand_key')
+            pl.concat_str([pl.col('did'), pl.col('subject_uri')]).hash(seed=random_seed).alias('_rand_key')
         ).with_columns(
             pl.col('_rand_key').rank('ordinal').over('did').alias('_rand_order')
         ).filter(
