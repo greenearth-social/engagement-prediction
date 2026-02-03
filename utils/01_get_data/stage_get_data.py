@@ -546,10 +546,13 @@ def _load_posts_core_polars(
     3. Hash-sample posts (random_seed) and left-join liked_post_uris.
     4. Keep posts that are either in the random sample or liked.
     5. Collect metadata-only DataFrame (no embeddings).
-    6. Assign emb_idx as row number for later memmap lookup.
 
-    Embeddings are written to a separate memmap file at the end of the pipeline,
-    after all filtering is complete and emb_idx values are finalized.
+    NOTE: emb_idx is NOT assigned here. It is assigned after embedding validation
+    to ensure only posts with valid embeddings get indices. This prevents gaps
+    in the memmap file and ensures data integrity.
+
+    Embeddings are validated and written to a separate memmap file later in the pipeline.
+    The emb_idx column is added after embedding validation is complete.
 
     Statistical independence:
     The random sample is drawn from ALL posts, not filtered by like status.
@@ -560,7 +563,6 @@ def _load_posts_core_polars(
     - in_random_sample: True if post was selected by hash-sampling,
                         False if included only because it was liked
     - is_liked: True if post is in likes core dataset, False otherwise
-    - emb_idx: Row index for memmap embedding lookup (0-indexed)
 
     Returns:
         Tuple of (posts_df: pl.DataFrame, stats: Dict, embedding_dim: int)
@@ -600,10 +602,10 @@ def _load_posts_core_polars(
     # Collect metadata (small - no embeddings)
     posts_core_df = negs_and_likes_lf.collect(engine="streaming")
     
-    # Assign emb_idx as row number (0-indexed) for memmap lookup
-    posts_core_df = posts_core_df.with_row_index("emb_idx")
+    # NOTE: emb_idx is NOT assigned here - it's added later after embedding validation
+    # This ensures only posts with valid embeddings get indices (no gaps in memmap)
     
-    # Validate posts_core_df schema
+    # Validate posts_core_df schema (no emb_idx yet)
     posts_schema = {
         'at_uri': str,
         'in_random_sample': bool,
@@ -611,10 +613,9 @@ def _load_posts_core_polars(
         'record_created_at': str,
         'record_text': str,
         'is_liked': bool,
-        'emb_idx': int,
     }
     validate_dataframe_schema(posts_core_df, posts_schema, allow_extra_columns=False)
-    logger.info(f"✓ posts_core schema validated (embed_dim={embed_dim}, emb_idx assigned)")
+    logger.info(f"✓ posts_core schema validated (embed_dim={embed_dim}, emb_idx will be assigned after embedding validation)")
 
     # calculate metrics
     n_posts_core = posts_core_df.height
@@ -854,85 +855,105 @@ def _write_embeddings_memmap(
     embed_dim: int,
     embedding_model: str,
     logger: logging.Logger,
-) -> None:
+) -> Tuple[Dict[str, int], Dict[str, Any]]:
     """
-    Stream posts from GCS, filter to posts_core, decode embeddings, write to memmap.
+    Stream posts from GCS, validate embeddings, and write valid ones to memmap.
     
-    This is the ONLY place embeddings are handled - completely decoupled from filtering.
-    The function re-scans GCS posts data, filters to posts in posts_core, and writes
-    embeddings to a numpy memmap file indexed by emb_idx.
+    This function writes embeddings SEQUENTIALLY (not to pre-assigned indices).
+    It builds and returns the uri_to_idx mapping based on actual write positions.
+    This approach ensures:
+    - No gaps in the memmap (every index has valid data)
+    - emb_idx values are assigned based on what was actually written
+    - Posts with missing/invalid embeddings are excluded
     
     Args:
         posts_paths: List of GCS paths to posts parquet files
         posts_start: Start timestamp for time filtering
         posts_end: End timestamp for time filtering
-        posts_core_df: DataFrame with at_uri and emb_idx columns
+        posts_core_df: DataFrame with at_uri column (NO emb_idx - that's assigned after)
         embeddings_path: Path to write the memmap file
         embed_dim: Embedding dimension (e.g., 384)
         embedding_model: Name of embedding model to extract (e.g., "all_MiniLM_L12_v2")
         logger: Logger instance
+        
+    Returns:
+        Tuple of:
+        - uri_to_idx: Dict mapping at_uri -> emb_idx for posts with valid embeddings
+        - stats: Dict with write statistics (n_written, n_skipped, etc.)
     """
-    n_posts = len(posts_core_df)
-    logger.info(f"Writing {n_posts:,} embeddings to memmap: {embeddings_path}")
+    n_posts_candidate = len(posts_core_df)
+    logger.info(f"Validating embeddings for {n_posts_candidate:,} candidate posts...")
     
-    # Build at_uri -> emb_idx lookup
-    uri_to_idx = dict(zip(
-        posts_core_df["at_uri"].to_list(),
-        posts_core_df["emb_idx"].to_list()
-    ))
-    uri_set = set(uri_to_idx.keys())
-    logger.info(f"Built URI lookup with {len(uri_set):,} unique URIs")
+    # Build set of candidate URIs (posts we want embeddings for)
+    candidate_uris = set(posts_core_df["at_uri"].to_list())
+    logger.info(f"Built candidate URI set with {len(candidate_uris):,} unique URIs")
     
-    # Pre-allocate memmap
-    mmap = np.memmap(embeddings_path, dtype=np.float32, mode='w+', shape=(n_posts, embed_dim))
-    logger.info(f"Pre-allocated memmap: shape={mmap.shape}, dtype={mmap.dtype}")
-    
-    # Stream through GCS posts, filter, decode, write
+    # Stream through GCS posts, filter, decode embeddings
     posts_lf = pl.scan_parquet(posts_paths)
     posts_lf = apply_time_filter(posts_lf, posts_start, posts_end)
     
-    # Select only at_uri and embeddings columns, filter to posts in our set
+    # Select only at_uri and embeddings columns, filter to posts in our candidate set
     posts_lf = posts_lf.select(["at_uri", "embeddings"]).filter(
-        pl.col("at_uri").is_in(uri_set)
+        pl.col("at_uri").is_in(candidate_uris)
     )
     
-    # Process with streaming - decode embeddings and write to memmap
+    # Process with streaming - decode embeddings
     # Use _get_embeddings_list_col to extract the correct embedding model
     posts_lf = _get_embeddings_list_col(posts_lf, embedding_model)
     
-    # Collect in streaming mode and process
-    n_written = 0
-    n_skipped = 0
-    
-    # Collect the filtered data - this should be manageable since we've filtered to posts_core
+    # Collect the filtered data - this should be manageable since we've filtered to candidates
     filtered_df = posts_lf.select(["at_uri", "_emb_vec"]).collect(engine="streaming")
+    logger.info(f"Collected {len(filtered_df):,} posts with embeddings column")
+    
+    # First pass: count valid embeddings to pre-allocate memmap with exact size
+    valid_uris = []
+    valid_embeddings = []
+    n_null = 0
+    n_wrong_dim = 0
+    n_not_in_candidates = 0
     
     for row in filtered_df.iter_rows(named=True):
         uri = row["at_uri"]
         emb_vec = row["_emb_vec"]
         
-        if uri not in uri_to_idx:
-            n_skipped += 1
+        if uri not in candidate_uris:
+            n_not_in_candidates += 1
             continue
             
         if emb_vec is None:
-            n_skipped += 1
+            n_null += 1
             continue
         
-        idx = uri_to_idx[uri]
-        
-        # Convert list to numpy array and write to memmap
+        # Convert list to numpy array and validate dimension
         emb_array = np.array(emb_vec, dtype=np.float32)
         if len(emb_array) != embed_dim:
-            logger.warning(f"Embedding dim mismatch for {uri}: expected {embed_dim}, got {len(emb_array)}")
-            n_skipped += 1
+            n_wrong_dim += 1
             continue
-            
-        mmap[idx] = emb_array
-        n_written += 1
         
-        if n_written % 100_000 == 0:
-            logger.info(f"Written {n_written:,} embeddings...")
+        valid_uris.append(uri)
+        valid_embeddings.append(emb_array)
+    
+    n_valid = len(valid_uris)
+    n_skipped = n_null + n_wrong_dim + n_not_in_candidates
+    
+    logger.info(f"Validated embeddings: {n_valid:,} valid, {n_skipped:,} skipped "
+                f"(null={n_null:,}, wrong_dim={n_wrong_dim:,}, not_in_candidates={n_not_in_candidates:,})")
+    
+    if n_valid == 0:
+        raise ValueError("No valid embeddings found - cannot create memmap")
+    
+    # Pre-allocate memmap with exact size (no gaps)
+    mmap = np.memmap(embeddings_path, dtype=np.float32, mode='w+', shape=(n_valid, embed_dim))
+    logger.info(f"Pre-allocated memmap: shape={mmap.shape}, dtype={mmap.dtype}")
+    
+    # Write embeddings sequentially and build uri_to_idx mapping
+    uri_to_idx: Dict[str, int] = {}
+    for idx, (uri, emb_array) in enumerate(zip(valid_uris, valid_embeddings)):
+        mmap[idx] = emb_array
+        uri_to_idx[uri] = idx
+        
+        if (idx + 1) % 100_000 == 0:
+            logger.info(f"Written {idx + 1:,} embeddings...")
     
     # Flush to disk
     mmap.flush()
@@ -940,13 +961,24 @@ def _write_embeddings_memmap(
     
     # Log summary
     file_size_mb = embeddings_path.stat().st_size / (1024 * 1024)
-    logger.info(f"✓ Wrote {n_written:,} embeddings to memmap ({file_size_mb:.1f} MB)")
-    if n_skipped > 0:
-        logger.warning(f"Skipped {n_skipped:,} posts (missing/invalid embeddings)")
+    logger.info(f"✓ Wrote {n_valid:,} embeddings to memmap ({file_size_mb:.1f} MB)")
     
-    # Verify we wrote all expected embeddings
-    if n_written != n_posts:
-        logger.warning(f"WARNING: Expected {n_posts:,} embeddings but wrote {n_written:,}")
+    # Calculate how many candidate posts were dropped
+    n_candidates_without_valid_emb = n_posts_candidate - n_valid
+    if n_candidates_without_valid_emb > 0:
+        drop_pct = 100.0 * n_candidates_without_valid_emb / n_posts_candidate
+        logger.info(f"Dropped {n_candidates_without_valid_emb:,} posts ({drop_pct:.1f}%) due to missing/invalid embeddings")
+    
+    stats = {
+        'n_posts_candidate': n_posts_candidate,
+        'n_embeddings_valid': n_valid,
+        'n_embeddings_null': n_null,
+        'n_embeddings_wrong_dim': n_wrong_dim,
+        'n_posts_dropped_no_embedding': n_candidates_without_valid_emb,
+        'memmap_size_mb': file_size_mb,
+    }
+    
+    return uri_to_idx, stats
 
 
 def _run_greenearth_pipeline(
@@ -1087,9 +1119,73 @@ def _run_greenearth_pipeline(
     mem_tracker.checkpoint("after_posts_load", quiet=True)
 
     # ========================================================================
-    # PHASE 3: Post-join verification and join emb_idx to likes
+    # PHASE 3: Write embeddings to memmap FIRST (determines which posts are valid)
     # ========================================================================
-    log_operation_start('Re-verify min-likes after like-post join', '01_GET_DATA', logger)
+    # This is done BEFORE filtering/saving parquets to ensure only posts with
+    # valid embeddings are included. The memmap write returns uri_to_idx mapping.
+    log_operation_start('Write embeddings to memmap (validates embeddings)', '01_GET_DATA', logger)
+    ts_name = out_dir.name
+    embeddings_path = out_dir / f"embeddings_{ts_name}.npy"
+    
+    uri_to_idx, embedding_stats = _write_embeddings_memmap(
+        posts_paths=posts_paths,
+        posts_start=posts_start,
+        posts_end=posts_end,
+        posts_core_df=posts_core_df,
+        embeddings_path=embeddings_path,
+        embed_dim=embed_dim,
+        embedding_model=embedding_model,
+        logger=logger,
+    )
+    all_stats['embeddings'] = embedding_stats
+    
+    mem_tracker.checkpoint("after_embeddings_write", quiet=True)
+    
+    # ========================================================================
+    # PHASE 4: Filter posts to only those with valid embeddings, add emb_idx
+    # ========================================================================
+    log_operation_start('Filter posts to valid embeddings', '01_GET_DATA', logger)
+    n_posts_before_emb_filter = len(posts_core_df)
+    valid_uris = set(uri_to_idx.keys())
+    
+    # Filter posts_core to only those with valid embeddings
+    posts_core_df = posts_core_df.filter(pl.col("at_uri").is_in(valid_uris))
+    n_posts_after_emb_filter = len(posts_core_df)
+    n_posts_dropped = n_posts_before_emb_filter - n_posts_after_emb_filter
+    
+    if n_posts_dropped > 0:
+        logger.info(f"Filtered posts: {n_posts_before_emb_filter:,} -> {n_posts_after_emb_filter:,} "
+                   f"({n_posts_dropped:,} dropped due to missing/invalid embeddings)")
+    else:
+        logger.info(f"All {n_posts_after_emb_filter:,} posts have valid embeddings")
+    
+    # Add emb_idx column from uri_to_idx mapping
+    # Convert to DataFrame for joining
+    uri_idx_df = pl.DataFrame({
+        "at_uri": list(uri_to_idx.keys()),
+        "emb_idx": list(uri_to_idx.values()),
+    })
+    posts_core_df = posts_core_df.join(uri_idx_df, on="at_uri", how="left")
+    
+    # Verify no nulls in emb_idx
+    n_null_post_idx = posts_core_df.filter(pl.col("emb_idx").is_null()).height
+    if n_null_post_idx > 0:
+        raise ValueError(f"CRITICAL: {n_null_post_idx:,} posts have null emb_idx after join - this should not happen")
+    logger.info(f"✓ Added emb_idx to {len(posts_core_df):,} posts")
+    
+    # Update posts stats with embedding filter results
+    all_stats['posts']['n_posts_dropped_no_embedding'] = n_posts_dropped
+    all_stats['posts']['n_posts_core'] = n_posts_after_emb_filter
+    
+    mem_tracker.checkpoint("after_posts_emb_filter", quiet=True)
+    
+    # ========================================================================
+    # PHASE 5: Re-filter likes after embedding validation
+    # ========================================================================
+    # Some posts may have been dropped due to missing embeddings, so we need to:
+    # 1. Filter likes to only those with matching posts (that have valid embeddings)
+    # 2. Re-verify min_likes_per_user (some users may now have too few likes)
+    log_operation_start('Re-verify min-likes after embedding filter', '01_GET_DATA', logger)
     likes_core_df, join_stats = _filter_likes_after_post_join(
         likes_core_df=likes_core_df,
         posts_core_df=posts_core_df,
@@ -1103,7 +1199,11 @@ def _run_greenearth_pipeline(
     if 'likes' in all_stats:
         all_stats['likes'].update(join_stats)
     
-    # Join emb_idx from posts to likes for fast embedding lookup
+    mem_tracker.checkpoint("after_join_verification", quiet=True)
+    
+    # ========================================================================
+    # PHASE 6: Join emb_idx to likes
+    # ========================================================================
     log_operation_start('Join emb_idx to likes', '01_GET_DATA', logger)
     posts_uri_to_idx = posts_core_df.select(["at_uri", "emb_idx"])
     likes_core_df = likes_core_df.join(
@@ -1119,13 +1219,12 @@ def _run_greenearth_pipeline(
     else:
         logger.info(f"✓ All {len(likes_core_df):,} likes have valid emb_idx")
     
-    mem_tracker.checkpoint("after_join_verification", quiet=True)
+    mem_tracker.checkpoint("after_emb_idx_join", quiet=True)
     
     # ========================================================================
-    # PHASE 4: Save parquets (no embeddings)
+    # PHASE 7: Save parquets (FINAL - after all filtering complete)
     # ========================================================================
     log_operation_start('Save parquet files', '01_GET_DATA', logger)
-    ts_name = out_dir.name
     
     posts_core_path = out_dir / f"posts_core_{ts_name}.parquet"
     likes_core_path = out_dir / f"likes_core_{ts_name}.parquet"
@@ -1137,25 +1236,6 @@ def _run_greenearth_pipeline(
     logger.info(f"Saved likes_core: {likes_core_path} ({len(likes_core_df):,} rows)")
     
     mem_tracker.checkpoint("after_parquet_save", quiet=True)
-    
-    # ========================================================================
-    # PHASE 5: Write embeddings to memmap (FINAL STEP)
-    # ========================================================================
-    log_operation_start('Write embeddings to memmap', '01_GET_DATA', logger)
-    embeddings_path = out_dir / f"embeddings_{ts_name}.npy"
-    
-    _write_embeddings_memmap(
-        posts_paths=posts_paths,
-        posts_start=posts_start,
-        posts_end=posts_end,
-        posts_core_df=posts_core_df,
-        embeddings_path=embeddings_path,
-        embed_dim=embed_dim,
-        embedding_model=embedding_model,
-        logger=logger,
-    )
-    
-    mem_tracker.checkpoint("after_embeddings_write", quiet=True)
     
     # Memory summary: compare actual vs estimated
     memory_summary = mem_tracker.summary()
@@ -1254,6 +1334,7 @@ def _log_data_attrition_report(
     """
     likes_stats = all_stats.get('likes', {})
     posts_stats = all_stats.get('posts', {})
+    embeddings_stats = all_stats.get('embeddings', {})
     memory_actual = all_stats.get('memory_actual', {})
     
     # Helper for safe percentage calculation
@@ -1293,7 +1374,14 @@ def _log_data_attrition_report(
     n_liked_in_random = posts_stats.get('n_liked_in_random_sample', 0)
     n_random_sample = posts_stats.get('n_random_sample', 0)
     n_posts_core = posts_stats.get('n_posts_core', 0)
+    n_posts_dropped_no_emb = posts_stats.get('n_posts_dropped_no_embedding', 0)
     match_rate = posts_stats.get('liked_post_match_rate', 0)
+    
+    # Extract embedding stats
+    n_emb_valid = embeddings_stats.get('n_embeddings_valid', 0)
+    n_emb_null = embeddings_stats.get('n_embeddings_null', 0)
+    n_emb_wrong_dim = embeddings_stats.get('n_embeddings_wrong_dim', 0)
+    memmap_size_mb = embeddings_stats.get('memmap_size_mb', 0)
     
     # Calculate derived stats
     n_likes_after_join = n_likes_final - n_likes_removed_join if n_likes_removed_join else n_likes_final
@@ -1373,8 +1461,24 @@ def _log_data_attrition_report(
     logger.info(f"{'3. Random sample (reservoir)':<45} {fmt(n_random_sample):>15} {'':>10}")
     if n_liked_in_random > 0:
         logger.info(f"{'   - Overlap with liked posts':<45} {fmt(n_liked_in_random):>15} {'':>10}")
-    logger.info(f"{'4. Combined output':<45} {fmt(n_posts_core):>15} {'':>10}")
-    logger.info(f"   ({fmt(n_liked_only)} liked-only + {fmt(n_random_sample)} random)")
+    
+    # Show pre-embedding filter count
+    n_posts_pre_emb = n_posts_core + n_posts_dropped_no_emb
+    logger.info(f"{'4. Combined candidates':<45} {fmt(n_posts_pre_emb):>15} {'':>10}")
+    logger.info(f"   ({fmt(n_liked_only + n_posts_dropped_no_emb)} liked-only + {fmt(n_random_sample)} random)")
+    
+    # Embedding validation step
+    if n_posts_dropped_no_emb > 0:
+        emb_drop_pct = pct(n_posts_dropped_no_emb, n_posts_pre_emb)
+        logger.info(f"{'5. Embedding validation':<45} {fmt(n_posts_core):>15} {'':>10}")
+        logger.info(f"{'   - Dropped (null/invalid)':<45} {'-' + fmt(n_posts_dropped_no_emb) + f' ({emb_drop_pct:.1f}%)':>15} {'':>10}")
+        if n_emb_null > 0:
+            logger.info(f"{'     - Null embeddings':<45} {fmt(n_emb_null):>15} {'':>10}")
+        if n_emb_wrong_dim > 0:
+            logger.info(f"{'     - Wrong dimension':<45} {fmt(n_emb_wrong_dim):>15} {'':>10}")
+    else:
+        logger.info(f"{'5. Embedding validation':<45} {fmt(n_posts_core):>15} {'':>10}")
+        logger.info(f"{'   - All posts have valid embeddings':<45} {'':>15} {'':>10}")
     
     logger.info(sep2)
     
@@ -1407,6 +1511,7 @@ def _log_data_attrition_report(
     logger.info(sep2)
     logger.info(f"likes_core.parquet:  {fmt(n_users_final_join)} users, {fmt(n_likes_final_join)} likes")
     logger.info(f"posts_core.parquet:  {fmt(n_posts_core)} posts ({fmt(n_liked_only)} liked + {fmt(n_random_sample)} random)")
+    logger.info(f"embeddings.npy:      {fmt(n_emb_valid)} embeddings ({memmap_size_mb:.1f} MB)")
     logger.info(sep2)
     
     # === OVERALL ATTRITION SUMMARY ===
@@ -1672,6 +1777,34 @@ def _attrition_stats_to_experiment_tracker(
         context.tracker.log_single_value(
             name="Posts - Match Rate %",
             value=posts_stats.get('liked_post_match_rate', 0)
+        )
+        context.tracker.log_single_value(
+            name="Posts - 4 Final (valid embeddings)",
+            value=posts_stats.get('n_posts_core', 0)
+        )
+        context.tracker.log_single_value(
+            name="Posts - Dropped (no embedding)",
+            value=posts_stats.get('n_posts_dropped_no_embedding', 0)
+        )
+    
+    # Embedding metrics
+    if 'embeddings' in all_stats:
+        emb_stats = all_stats['embeddings']
+        context.tracker.log_single_value(
+            name="Embeddings - Valid",
+            value=emb_stats.get('n_embeddings_valid', 0)
+        )
+        context.tracker.log_single_value(
+            name="Embeddings - Null",
+            value=emb_stats.get('n_embeddings_null', 0)
+        )
+        context.tracker.log_single_value(
+            name="Embeddings - Wrong Dim",
+            value=emb_stats.get('n_embeddings_wrong_dim', 0)
+        )
+        context.tracker.log_single_value(
+            name="Embeddings - Memmap Size MB",
+            value=emb_stats.get('memmap_size_mb', 0)
         )
     
     # Memory metrics (critical for sweep analysis)
