@@ -13,25 +13,16 @@ from __future__ import annotations
 import os
 import sys
 import json
-import time
 import random
-import hashlib
-import tempfile
 import base64
 import struct
 import zlib
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Set, Any
 from datetime import datetime, timedelta, timezone
-from collections import defaultdict
-from functools import partial
-import warnings
-from io import BytesIO
 import multiprocessing as mp
-from google.cloud import storage
-import re
 import polars as pl
-
+import subprocess
 import numpy as np
 import pandas as pd
 
@@ -56,11 +47,8 @@ os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
 
 
 # ----------------------------------------
-# Datetime helpers
+# Data loading helpers
 # ----------------------------------------
-# For parsing GCS Ingex filenames
-TIMESTAMP_SUFFIX_GCS = "_(\\d{8})_(\\d{6})\\.parquet$"
-
 # For parsing CLI arg strings
 KNOWN_TS_FORMATS = [
     "%Y-%m-%dT%H:%M:%S%z",     # 2024-02-10T13:45:00+0000
@@ -84,1177 +72,86 @@ def parse_one_ts(raw_ts: Optional[str]) -> Optional[datetime]:
     raise ValueError(f"Unrecognized datetime format: {raw_ts!r}")
 
 
-# ----------------------------------------
-# Data IO helpers (Green Earth Ingex + GCS)
-# ----------------------------------------
-def parse_ts_from_name_ingex_gcs(
-        blob_name: str, 
-        blob_prefix: str
-    ) -> Optional[datetime]:
-    """Parse timestamp from GCS blob name based on Ingex naming convention."""
-    pattern = re.compile(blob_prefix + TIMESTAMP_SUFFIX_GCS)
-    m = pattern.match(blob_name)
-    if not m:
-        return None
-    ymd, hms = m.group(1), m.group(2)
-    return datetime.strptime(ymd + hms, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
-
-def list_files_in_range_ingex_gcs(
-        gcs_bucket: str, 
-        blob_prefix: str, 
-        start: Optional[datetime], 
-        end: Optional[datetime],
-        ) -> list[str]:
-    """List GCS blob URIs within specified time range based on Ingex naming convention."""
-    client = storage.Client()
-    blobs = client.list_blobs(gcs_bucket)
-    out = []
-    for b in blobs:
-        ts = parse_ts_from_name_ingex_gcs(blob_name=b.name, blob_prefix=blob_prefix)
-        if ts is None:
-            continue
-        if start is not None and ts < start:
-            continue
-        if end is not None and ts >= end:
-            continue
-        out.append(f"gs://{gcs_bucket}/{b.name}")
-    return out
-
-def load_raw_data_ingex(
-        gcs_bucket: str, 
-        blob_prefix: str,
-        start_str: Optional[str], 
-        end_str: Optional[str], 
-    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Load raw data from GreenEarth Ingex on GCS within specified time ranges."""
-    
-    start_dt: Optional[datetime] = parse_one_ts(start_str)
-    end_dt: Optional[datetime] = parse_one_ts(end_str)
-    
-    paths = list_files_in_range_ingex_gcs(
-        gcs_bucket = gcs_bucket,
-        blob_prefix = blob_prefix,
-        start = start_dt,
-        end = end_dt,
-    )
-
-    # LazyFrame (from polars)
-    lf = (
-        pl
-        .scan_parquet(paths)
-        .with_columns(
-            pl.col("record_created_at").str.to_datetime(time_zone="UTC").alias("record_created_at_dt")
-        )
-    )
-    if start_dt is not None:
-        lf = lf.filter(pl.col("record_created_at_dt") >= start_dt)
-    if end_dt is not None:
-        lf = lf.filter(pl.col("record_created_at_dt") < end_dt)
-    pandas_df = lf.collect().to_pandas()
-
-    return pandas_df
-
-
-# ----------------------------------------
-# Stage 1: Memory estimation and safety checks
-# ----------------------------------------
-try:
-    import psutil  # type: ignore
-except ImportError:
-    psutil = None  # type: ignore
-
-# Memory estimation constants (bytes per value after Polars/pandas expansion)
-DTYPE_MEMORY_MAP = {
-    'String': 50,      # Average string length estimate
-    'Utf8': 50,
-    'Int64': 8,
-    'Int32': 4,
-    'Float64': 8,
-    'Float32': 4,
-    'Boolean': 1,
-    'Date': 8,
-    'Datetime': 8,
-    'List': 200,       # For embeddings column (nested structure)
-}
-
-
-def get_current_memory_usage() -> Dict[str, Any]:
-    """
-    Get current memory usage for both the process and system.
-    
-    Returns:
-        Dict with memory stats:
-        - process_rss_gb: Process resident set size in GB
-        - process_vms_gb: Process virtual memory size in GB
-        - system_used_gb: System used memory in GB
-        - system_available_gb: System available memory in GB
-        - system_total_gb: System total memory in GB
-        - system_percent: System memory usage percentage
-    """
-    if psutil is None:
-        return {'error': 'psutil not available'}
-    
-    process = psutil.Process()
-    mem_info = process.memory_info()
-    sys_mem = psutil.virtual_memory()
-    
-    return {
-        'process_rss_gb': mem_info.rss / (1024**3),
-        'process_vms_gb': mem_info.vms / (1024**3),
-        'system_used_gb': sys_mem.used / (1024**3),
-        'system_available_gb': sys_mem.available / (1024**3),
-        'system_total_gb': sys_mem.total / (1024**3),
-        'system_percent': sys_mem.percent,
-    }
-
-
-def log_memory_checkpoint(
-    checkpoint_name: str,
-    logger: Optional[Any] = None,
-    *,
-    include_system: bool = True,
-) -> Dict[str, Any]:
-    """
-    Log a memory checkpoint with current usage stats.
-    
-    This function is designed to be called at key points in the pipeline
-    to track actual memory consumption vs. estimates.
-    
-    Args:
-        checkpoint_name: Descriptive name for this checkpoint (e.g., "after_likes_load")
-        logger: Logger instance to use for output
-        include_system: Whether to include system-wide memory stats
-        
-    Returns:
-        Dict with memory stats (same as get_current_memory_usage)
-    """
-    stats = get_current_memory_usage()
-    
-    if 'error' in stats:
-        if logger:
-            logger.warning(f"[MEMORY] {checkpoint_name}: {stats['error']}")
-        return stats
-    
-    if include_system:
-        msg = (
-            f"[MEMORY] {checkpoint_name}: "
-            f"process={stats['process_rss_gb']:.3f}GB, "
-            f"system={stats['system_used_gb']:.1f}/{stats['system_total_gb']:.1f}GB "
-            f"({stats['system_percent']:.1f}% used), "
-            f"available={stats['system_available_gb']:.1f}GB"
-        )
-    else:
-        msg = f"[MEMORY] {checkpoint_name}: process={stats['process_rss_gb']:.3f}GB"
-    
-    if logger:
-        logger.info(msg)
-    else:
-        print(msg)
-    
-    return stats
-
-
-class MemoryTracker:
-    """
-    Track memory usage throughout a pipeline run for comparison with estimates.
-    
-    Usage:
-        tracker = MemoryTracker(logger=logger)
-        tracker.checkpoint("start")
-        # ... do work ...
-        tracker.checkpoint("after_load_likes")
-        # ... more work ...
-        tracker.checkpoint("end")
-        tracker.summary()  # logs all checkpoints and deltas
-    """
-    
-    def __init__(self, logger: Optional[Any] = None):
-        self.logger = logger
-        self.checkpoints: List[Tuple[str, float, Dict[str, Any]]] = []
-        self.start_time = time.time()
-    
-    def checkpoint(self, name: str) -> Dict[str, Any]:
-        """Record a memory checkpoint."""
-        elapsed = time.time() - self.start_time
-        stats = log_memory_checkpoint(name, self.logger)
-        self.checkpoints.append((name, elapsed, stats))
-        return stats
-    
-    def get_peak_process_memory_gb(self) -> float:
-        """Get the peak process memory observed across all checkpoints."""
-        if not self.checkpoints:
-            return 0.0
-        return max(
-            cp[2].get('process_rss_gb', 0) 
-            for cp in self.checkpoints 
-            if 'process_rss_gb' in cp[2]
-        )
-    
-    def summary(self) -> Dict[str, Any]:
-        """
-        Log a summary of all memory checkpoints and return the data.
-        """
-        if not self.checkpoints:
-            if self.logger:
-                self.logger.info("[MEMORY SUMMARY] No checkpoints recorded")
-            return {}
-        
-        peak_gb = self.get_peak_process_memory_gb()
-        start_gb = self.checkpoints[0][2].get('process_rss_gb', 0) if self.checkpoints else 0
-        end_gb = self.checkpoints[-1][2].get('process_rss_gb', 0) if self.checkpoints else 0
-        
-        summary_data = {
-            'n_checkpoints': len(self.checkpoints),
-            'peak_process_gb': peak_gb,
-            'start_process_gb': start_gb,
-            'end_process_gb': end_gb,
-            'growth_gb': end_gb - start_gb,
-            'checkpoints': [
-                {
-                    'name': name,
-                    'elapsed_sec': elapsed,
-                    'process_gb': stats.get('process_rss_gb', 0),
-                }
-                for name, elapsed, stats in self.checkpoints
-            ]
-        }
-        
-        if self.logger:
-            self.logger.info("=" * 60)
-            self.logger.info("[MEMORY SUMMARY]")
-            self.logger.info(f"  Peak process memory: {peak_gb:.3f} GB")
-            self.logger.info(f"  Memory growth: {start_gb:.3f} GB -> {end_gb:.3f} GB (+{summary_data['growth_gb']:.3f} GB)")
-            self.logger.info("  Checkpoints:")
-            for name, elapsed, stats in self.checkpoints:
-                self.logger.info(f"    {elapsed:6.1f}s  {name}: {stats.get('process_rss_gb', 0):.3f} GB")
-            self.logger.info("=" * 60)
-        
-        return summary_data
-
-
-def estimate_parquet_memory(
-    paths: List[str],
-    *,
-    embedding_expansion_dim: int = 384,
-) -> Dict[str, Any]:
-    """
-    Estimate memory required to load parquet files WITHOUT loading them.
-    
-    Uses parquet metadata (row counts, schema) to estimate in-memory size.
-    
-    Args:
-        paths: List of parquet file paths (gs:// or local)
-        embedding_expansion_dim: Number of embedding dimensions to expand (0 to skip)
-    
-    Returns:
-        Dict with estimated_bytes, estimated_gb, total_rows, etc.
-    """
-    if not paths:
-        return {'estimated_bytes': 0, 'estimated_gb': 0.0, 'total_rows': 0}
-    
-    total_rows = 0
-    schema = None
-    
-    for path in paths:
-        # Read just the metadata (no data loaded)
-        try:
-            lf = pl.scan_parquet(path)
-            meta = lf.collect_schema()
-            if schema is None:
-                schema = meta
-            
-            # Get row count from parquet metadata
-            row_count = lf.select(pl.len()).collect().item()
-            total_rows += row_count
-        except Exception:
-            continue
-    
-    if schema is None or total_rows == 0:
-        return {'estimated_bytes': 0, 'estimated_gb': 0.0, 'total_rows': 0}
-    
-    # Estimate memory per row based on schema
-    bytes_per_row = 0
-    has_embeddings = False
-    
-    for col_name, dtype in schema.items():
-        dtype_str = str(dtype)
-        
-        if col_name == 'embeddings':
-            has_embeddings = True
-            # Embeddings column will be dropped after expansion
-            continue
-        
-        # Get estimated bytes for this dtype
-        matched = False
-        for known_dtype, size in DTYPE_MEMORY_MAP.items():
-            if known_dtype.lower() in dtype_str.lower():
-                bytes_per_row += size
-                matched = True
-                break
-        if not matched:
-            bytes_per_row += 50  # Default estimate for unknown types
-    
-    # Add embedding expansion overhead
-    if has_embeddings and embedding_expansion_dim > 0:
-        # Each embedding dimension becomes a Float32 column
-        bytes_per_row += embedding_expansion_dim * 4
-    
-    # Add polars/pandas overhead (typically 1.5-2x raw data)
-    overhead_factor = 1.8
-    estimated_bytes = int(total_rows * bytes_per_row * overhead_factor)
-    
-    return {
-        'estimated_bytes': estimated_bytes,
-        'estimated_gb': estimated_bytes / (1024**3),
-        'total_rows': total_rows,
-        'bytes_per_row': bytes_per_row,
-        'n_columns': len(schema),
-        'has_embeddings': has_embeddings,
-    }
-
-
-# ============================================================================
-# MEMORY ESTIMATION MODEL
-# ============================================================================
-# Fitted regression model for predicting peak memory usage.
-#
-# Model performance: R-squared = 0.9440, Mean % error = 6.7%
-#
-# To re-fit after collecting new sweep data:
-#   python scripts/fit_memory_model.py --input sweep_results.csv
-# This will output new coefficients to paste here.
-# ============================================================================
-
-MEMORY_MODEL_COEFFICIENTS = {
-    'intercept': 32.1569093112,
-    'data_window_days': -0.3731594051,
-    'max_liking_users_10k': 5.3712117159,
-    'max_likes_per_user_100': 0.0586046975,
-    'negative_posts_sample_10k': -0.0297902646,
-    'log_max_liking_users': -8.7875844850,
-    'sqrt_likes_initial_1e6': 4.4282688972,
-    'days_x_users_10k': 0.0362670731,
-    'users_x_log_users': -0.8738069443,
-}
-
-MEMORY_MODEL_FEATURE_NAMES = [
-    'data_window_days',
-    'max_liking_users_10k',
-    'max_likes_per_user_100',
-    'negative_posts_sample_10k',
-    'log_max_liking_users',
-    'sqrt_likes_initial_1e6',
-    'days_x_users_10k',
-    'users_x_log_users',
-]
-
-
-def compute_memory_model_features(
-    data_window_days: float,
-    max_liking_users: float,
-    max_likes_per_user: float,
-    negative_posts_sample: float,
-    likes_initial: float,
-) -> Dict[str, float]:
-    """Compute feature values for the memory prediction model.
-    
-    Args:
-        data_window_days: Number of days in the data window (e.g., 7, 14, 21)
-        max_liking_users: Maximum number of liking users to sample
-        max_likes_per_user: Cap on likes per user
-        negative_posts_sample: Number of negative posts to sample
-        likes_initial: Total raw likes count (from parquet metadata)
-    
-    Returns:
-        Dict mapping feature names to values
-    """
-    return {
-        'data_window_days': data_window_days,
-        'max_liking_users_10k': max_liking_users / 10000,
-        'max_likes_per_user_100': max_likes_per_user / 100,
-        'negative_posts_sample_10k': negative_posts_sample / 10000,
-        'log_max_liking_users': np.log10(max(max_liking_users, 1)),
-        'sqrt_likes_initial_1e6': np.sqrt(likes_initial) / 1000,
-        'days_x_users_10k': data_window_days * max_liking_users / 10000,
-        'users_x_log_users': (max_liking_users / 10000) * np.log10(max(max_liking_users, 1)),
-    }
-
-
-def predict_memory_gb(
-    features: Dict[str, float],
-    coefficients: Optional[Dict[str, float]] = None,
-) -> float:
-    """Predict peak memory usage in GB using the fitted model.
-    
-    Args:
-        features: Feature dict from compute_memory_model_features()
-        coefficients: Model coefficients (defaults to MEMORY_MODEL_COEFFICIENTS)
-    
-    Returns:
-        Estimated peak memory in GB
-    """
-    if coefficients is None:
-        coefficients = MEMORY_MODEL_COEFFICIENTS
-    
-    result = coefficients['intercept']
-    for name in MEMORY_MODEL_FEATURE_NAMES:
-        result += coefficients[name] * features[name]
-    
-    # Ensure non-negative (model could predict negative for extreme edge cases)
-    return max(result, 1.0)
-
-
-def estimate_filtered_data_memory(
-    likes_paths: List[str],
-    posts_paths: List[str],
-    *,
-    max_liking_users: Optional[int] = None,
-    max_likes_per_user: int = 100,
-    min_likes_per_user: int = 2,
-    negative_posts_sample: int = 100_000,
-    embedding_dim: int = 384,
-    logger: logging.Logger,
-    data_window_days: Optional[int] = None,
-) -> Dict[str, Any]:
-    """
-    Estimate memory required for data loading using a fitted regression model.
-    
-    Uses a regression model trained on sweep_results.csv to predict peak memory
-    usage based on configuration parameters (users, likes/user, window size, etc.).
-    
-    Args:
-        likes_paths: Paths to likes parquet files
-        posts_paths: Paths to posts parquet files
-        max_liking_users: Cap on number of liking users (None = no cap, uses 10000 for estimation)
-        max_likes_per_user: Max likes to keep per user
-        min_likes_per_user: Min likes required per user (not used by model, kept for compatibility)
-        negative_posts_sample: Number of negative posts to sample
-        embedding_dim: Embedding dimension (not used by model, kept for compatibility)
-        logger: Logger instance for output
-        data_window_days: Number of days in the data window (auto-detected from file count if not provided)
-        
-    Returns:
-        Dict with memory estimates and metadata
-    """
-    
-    # Get raw stats from parquet metadata (no data loading)
-    likes_raw = estimate_parquet_memory(likes_paths, embedding_expansion_dim=0)
-    posts_raw = estimate_parquet_memory(posts_paths, embedding_expansion_dim=0)
-    
-    raw_likes_rows = likes_raw['total_rows']
-    raw_posts_rows = posts_raw['total_rows']
-    n_likes_files = len(likes_paths)
-    n_posts_files = len(posts_paths)
-    
-    if raw_likes_rows == 0:
-        return {
-            'estimated_peak_gb': 0,
-            'estimated_total_gb': 0,
-            'error': 'No likes data found',
-            'model_version': 'v1.0',
-        }
-    
-    # Auto-detect data window days from file count if not provided
-    # Each day typically has ~24 files (hourly), so divide by 24
-    if data_window_days is None:
-        data_window_days = max(1, n_likes_files // 24)
-        if data_window_days < 1:
-            data_window_days = 7  # Default fallback
-    
-    # Use default max_liking_users if not specified (None means no cap)
-    effective_max_users = max_liking_users if max_liking_users is not None else 10000
-    
-    # Compute features for the model
-    features = compute_memory_model_features(
-        data_window_days=data_window_days,
-        max_liking_users=effective_max_users,
-        max_likes_per_user=max_likes_per_user,
-        negative_posts_sample=negative_posts_sample,
-        likes_initial=raw_likes_rows,
-    )
-    
-    # Predict memory using fitted model
-    estimated_peak_gb = predict_memory_gb(features)
-    
-    # Add 10% safety margin for unknown variations
-    estimated_peak_gb_with_margin = estimated_peak_gb * 1.10
-    
-    # Build result dict (maintaining backward compatibility with key fields)
-    result = {
-        # Primary estimates
-        'estimated_peak_gb': estimated_peak_gb_with_margin,
-        'estimated_total_gb': estimated_peak_gb_with_margin,
-        'estimated_peak_gb_raw': estimated_peak_gb,  # Without safety margin
-        
-        # Model metadata
-        'model_version': 'v1.0',
-        'model_r_squared': 0.9440,
-        
-        # Raw data stats
-        'raw_likes_rows': raw_likes_rows,
-        'raw_posts_rows': raw_posts_rows,
-        'raw_likes_gb': likes_raw['estimated_gb'],
-        'raw_posts_gb': posts_raw['estimated_gb'],
-        'n_likes_files': n_likes_files,
-        'n_posts_files': n_posts_files,
-        
-        # Model inputs (for debugging/transparency)
-        'model_features': features,
-        
-        # Parameters used
-        'params': {
-            'max_liking_users': max_liking_users,
-            'effective_max_users': effective_max_users,
-            'max_likes_per_user': max_likes_per_user,
-            'min_likes_per_user': min_likes_per_user,
-            'negative_posts_sample': negative_posts_sample,
-            'embedding_dim': embedding_dim,
-            'data_window_days': data_window_days,
-        },
-    }
-    
-    logger.info("Memory estimation (fitted regression model):")
-    logger.info(f"  Raw data: {raw_likes_rows:,} likes ({n_likes_files} files), {raw_posts_rows:,} posts ({n_posts_files} files)")
-    logger.info(f"  Window: {data_window_days} days, Users: {effective_max_users:,}, Likes/user cap: {max_likes_per_user}")
-    logger.info(f"  Model prediction: {estimated_peak_gb:.2f} GB (with 10% margin: {estimated_peak_gb_with_margin:.2f} GB)")
-    logger.info(f"  Model R-squared: 0.9440 (mean error: 6.7%)")
-    
-    return result
-
-
-def check_memory_available(
-    estimated_bytes: int,
-    *,
-    max_memory_gb: Optional[float] = None,  # None = use percentage of available
-    max_memory_pct: float = 0.75,  # Use at most 75% of available RAM
-    logger: Optional[Any] = None,
-) -> Tuple[bool, str]:
-    """
-    Check if estimated memory usage is safe given available system memory.
-    
-    Args:
-        estimated_bytes: Estimated memory required
-        max_memory_gb: Maximum memory in GB (None = auto based on percentage)
-        max_memory_pct: Maximum percentage of available RAM to use
-        logger: Optional logger for output
-    
-    Returns:
-        Tuple of (is_safe: bool, message: str)
-    """
-    if psutil is None:
-        return True, "psutil not available, skipping memory check"
-    
-    mem = psutil.virtual_memory()
-    available_bytes = mem.available
-    total_bytes = mem.total
-    
-    # Determine threshold
-    if max_memory_gb is not None:
-        threshold_bytes = int(max_memory_gb * (1024**3))
-    else:
-        threshold_bytes = int(available_bytes * max_memory_pct)
-    
-    is_safe = estimated_bytes <= threshold_bytes
-    
-    msg = (
-        f"Memory check: estimated {estimated_bytes/(1024**3):.2f} GB, "
-        f"threshold {threshold_bytes/(1024**3):.2f} GB, "
-        f"available {available_bytes/(1024**3):.2f} GB / {total_bytes/(1024**3):.2f} GB total"
-    )
-    
-    if not is_safe:
-        msg = f"MEMORY LIMIT EXCEEDED: {msg}"
-    
-    if logger:
-        if is_safe:
-            logger.info(msg)
-        else:
-            logger.error(msg)
-    
-    return is_safe, msg
-
-
-def check_data_load_safe(
-    likes_paths: List[str],
-    posts_paths: List[str],
-    *,
-    embedding_dim: int = 384,
-    max_memory_gb: Optional[float] = None,
-    max_memory_pct: float = 0.75,
-    max_liking_users: Optional[int] = None,
-    max_likes_per_user: int = 100,
-    min_likes_per_user: int = 2,
-    negative_posts_sample: int = 100_000,
-    skip_safety_check: bool = False,
-    logger: Optional[Any] = None,
-) -> Dict[str, Any]:
-    """
-    Pre-flight check before loading data. Raises MemoryError if unsafe.
-    
-    This function uses smart estimation that accounts for filtering parameters
-    to provide more accurate memory predictions.
-    
-    Args:
-        likes_paths: List of likes parquet paths
-        posts_paths: List of posts parquet paths
-        embedding_dim: Embedding dimension for memory estimation
-        max_memory_gb: Maximum memory in GB (None = auto based on percentage)
-        max_memory_pct: Maximum percentage of available RAM
-        max_liking_users: Cap on number of liking users
-        max_likes_per_user: Max likes to keep per user
-        min_likes_per_user: Min likes required per user
-        negative_posts_sample: Number of negative posts to sample
-        skip_safety_check: If True, perform estimation but don't raise error
-        logger: Optional logger
-    
-    Returns:
-        Dict with memory estimation details
-    
-    Raises:
-        MemoryError: If estimated memory exceeds limits (unless skip_safety_check=True)
-    """
-    if psutil is None:
-        if logger:
-            logger.warning("psutil not available, skipping memory safety check")
-        return {'skipped': True, 'reason': 'psutil not available'}
-    
-    if logger:
-        logger.info("=" * 60)
-        logger.info("PRE-FLIGHT MEMORY CHECK")
-        logger.info("=" * 60)
-    
-    # Use smart estimation that accounts for filtering
-    estimation = estimate_filtered_data_memory(
-        likes_paths=likes_paths,
-        posts_paths=posts_paths,
-        max_liking_users=max_liking_users,
-        max_likes_per_user=max_likes_per_user,
-        min_likes_per_user=min_likes_per_user,
-        negative_posts_sample=negative_posts_sample,
-        embedding_dim=embedding_dim,
-        logger=logger,
-    )
-    
-    if 'error' in estimation:
-        if logger:
-            logger.warning(f"Memory estimation warning: {estimation['error']}")
-        return estimation
-    
-    # Also show raw (unfiltered) estimate for comparison
-    raw_likes = estimate_parquet_memory(likes_paths, embedding_expansion_dim=0)
-    raw_posts = estimate_parquet_memory(posts_paths, embedding_expansion_dim=embedding_dim)
-    raw_total_gb = raw_likes['estimated_gb'] + raw_posts['estimated_gb']
-    
-    if logger:
-        logger.info(f"  Raw data (unfiltered): ~{raw_total_gb:.2f} GB")
-        logger.info(f"  Estimated peak (incremental): ~{estimation['estimated_peak_gb']:.2f} GB")
-    
-    # Use the peak estimate for safety check
-    estimated_bytes = int(estimation['estimated_peak_gb'] * (1024**3))
-    
-    is_safe, msg = check_memory_available(
-        estimated_bytes,
-        max_memory_gb=max_memory_gb,
-        max_memory_pct=max_memory_pct,
-        logger=logger,
-    )
-    
-    estimation['is_safe'] = is_safe
-    estimation['memory_check_message'] = msg
-    
-    if logger:
-        logger.info("=" * 60)
-    
-    if not is_safe:
-        if skip_safety_check:
-            if logger:
-                logger.warning("Memory limit would be exceeded, but proceeding due to --skip-memory-check")
-        else:
-            raise MemoryError(
-                f"Data load would exceed memory limits. {msg}\n"
-                f"Estimated peak memory: {estimation['estimated_peak_gb']:.2f} GB\n"
-                f"Options to reduce memory:\n"
-                f"  - Use a shorter time window (--posts-start/--posts-end)\n"
-                f"  - Reduce --max-liking-users (current: {max_liking_users})\n"
-                f"  - Reduce --max-likes-per-user (current: {max_likes_per_user})\n"
-                f"  - Reduce --negative-posts-sample (current: {negative_posts_sample})\n"
-                f"  - Increase --max-memory-gb if you have more RAM available\n"
-                f"  - Use --skip-memory-check to proceed anyway (at your own risk)"
-            )
-    
-    return estimation
-
-
-def _apply_time_filter(
+def apply_time_filter(
     lf: pl.LazyFrame, 
     start_str: Optional[str], 
     end_str: Optional[str]
 ) -> pl.LazyFrame:
-    start_dt = parse_one_ts(start_str)
-    end_dt = parse_one_ts(end_str)
-
-    # Apply time filter based on record_created_at (when the event occurred)
-    if 'record_created_at' in lf.collect_schema().names():
-        lf = lf.with_columns(
-            pl.col("record_created_at").str.to_datetime(time_zone="UTC").alias("record_created_at_dt")
-        )
-        if start_dt is not None:
-            lf = lf.filter(pl.col("record_created_at_dt") >= start_dt)
-        if end_dt is not None:
-            lf = lf.filter(pl.col("record_created_at_dt") < end_dt)
-    
+    """
+    Apply a time filter to a polars lazyframe. 
+    Note that applying the filter using strings instead of converting to datetimes allows for 
+    streaming rather than loading everything into memory.
+    """
+    if 'record_created_at' not in lf.collect_schema().names():
+        raise ValueError("Input LazyFrame does not contain 'record_created_at' column for time filtering")
+    if start_str is not None:
+        lf = lf.filter(pl.col("record_created_at") >= start_str)
+    if end_str is not None:
+        lf = lf.filter(pl.col("record_created_at") < end_str)
     return lf
 
 
-# ----------------------------------------
-# Stage 1: Polars-based filtering for core datasets
-# ----------------------------------------
-def load_likes_core_polars(
-    start_str: Optional[str],
-    end_str: Optional[str],
-    paths: List[str],
-    *,
-    max_liking_users: Optional[int] = None,
-    max_likes_per_user: int,
-    min_likes_per_user: int,
-    random_seed: int,
-    logger: logging.Logger,
-) -> Tuple[pl.DataFrame, Dict[str, Any]]:
-    """
-    Load and filter likes data using a streaming Polars pipeline.
-    
-    High-level flow:
-    1. Streamed pass: count likes per user
-    2. Pre-filter users who don't meet min_likes_per_user
-    3. Sample users from eligible pool (if cap is set)
-    4. Streamed pass: keep only likes from sampled users
-    5. Apply per-user random caps (NOT recency-based)
-    6. Verify min-likes threshold (handles edge cases from per-user caps)
-    
-    This avoids materializing the full likes table in memory and returns a
-    LazyFrame suitable for streaming writes (sink_parquet).
-    
-    Returns:
-        Tuple of (likes_lf: pl.LazyFrame, stats: Dict with filtering statistics)
-    """
-    if not paths:
-        raise ValueError(f"No likes parquet files found for time range {start_str} to {end_str}")
-    
-    logger.info(f"Found {len(paths)} likes parquet files")
-    log_memory_checkpoint("likes_before_scan", logger)
-    
-    raw_lf = pl.scan_parquet(paths)
-    base_lf = _apply_time_filter(raw_lf, start_str, end_str)
-
-    # ===== PASS 1: Count likes per user (streaming) =====
-    logger.info("Pass 1: Counting likes per user (streaming)...")
-    user_counts_df = (
-        base_lf.group_by('did')
-        .agg(pl.len().alias('like_count'))
-        .collect(engine="streaming")
-    )
-    
-    n_users_initial = user_counts_df.height
-    n_likes_initial = int(user_counts_df['like_count'].sum()) if n_users_initial > 0 else 0
-    logger.info(f"Pass 1 complete: {n_likes_initial:,} likes from {n_users_initial:,} users")
-    log_memory_checkpoint("likes_after_pass1", logger)
-    
-    stats = {
-        'n_likes_initial': n_likes_initial,
-        'n_users_initial': n_users_initial,
-    }
-
-    # ===== Pre-filter users by min_likes_per_user before sampling =====
-    if min_likes_per_user > 0:
-        eligible_users_df = user_counts_df.filter(pl.col('like_count') >= min_likes_per_user)
-        n_users_eligible = eligible_users_df.height
-        n_users_filtered = n_users_initial - n_users_eligible
-        logger.info(f"Pre-filtering: {n_users_eligible:,} users meet min-likes threshold ({min_likes_per_user}), "
-             f"excluded {n_users_filtered:,} users with too few likes")
-        stats['n_users_eligible_for_sampling'] = n_users_eligible
-        stats['n_users_excluded_min_likes'] = n_users_filtered
+def save_polars_physical_plan_image(lf: pl.LazyFrame, out_path: str):
+    dot = lf.show_graph(plan_stage='physical', engine='streaming', raw_output=True)
+    if dot is not None:
+        Path("plan.dot").write_text(dot)
     else:
-        eligible_users_df = user_counts_df.select('did')
-        stats['n_users_eligible_for_sampling'] = n_users_initial
-
-    # ===== Sample users if cap is set =====
-    if max_liking_users is not None and eligible_users_df.height > max_liking_users:
-        sampled_users_df = (
-            eligible_users_df.with_columns(
-                pl.col('did').hash(seed=random_seed).alias('_rand_key')
-            ).sort('_rand_key').head(max_liking_users).select('did')
-        )
-        logger.info(
-            f"Sampled {max_liking_users:,} liking users "
-            f"({100*max_liking_users/eligible_users_df.height:.1f}% of eligible)"
-        )
-        stats['n_users_sampled'] = max_liking_users
-    else:
-        sampled_users_df = eligible_users_df.select('did')
-        stats['n_users_sampled'] = sampled_users_df.height
-    
-    log_memory_checkpoint("likes_after_user_sample", logger)
-    
-    # ===== PASS 2: Filter likes to sampled users (lazy) =====
-    logger.info("Pass 2: Filtering likes for sampled users (streaming)...")
-    likes_lf = base_lf.join(sampled_users_df.lazy(), on='did', how='semi')
-    
-    # Compute counts per user before per-user cap
-    counts_pre_cap_df = (
-        likes_lf.group_by('did')
-        .agg(pl.len().alias('like_count'))
-        .collect(engine='streaming')
-    )
-    
-    n_after_user_sample = int(counts_pre_cap_df['like_count'].sum()) if counts_pre_cap_df.height > 0 else 0
-    pct_retained = 100.0 * n_after_user_sample / n_likes_initial if n_likes_initial > 0 else 0
-    logger.info(f"Pass 2 complete: {n_after_user_sample:,} likes ({pct_retained:.1f}% retained)")
-    stats['n_likes_after_user_sample'] = n_after_user_sample
-    log_memory_checkpoint("likes_after_pass2", logger)
-    
-    # ===== Capture like count distribution BEFORE cap (for analysis/plotting) =====
-    # This shows how many likes each sampled user has before we apply the per-user cap
-    if counts_pre_cap_df.height > 0:
-        likes_per_user_before_cap = counts_pre_cap_df['like_count'].to_list()
-        stats['likes_per_user_distribution'] = likes_per_user_before_cap
-        stats['likes_per_user_mean'] = float(np.mean(likes_per_user_before_cap))
-        stats['likes_per_user_median'] = float(np.median(likes_per_user_before_cap))
-        stats['likes_per_user_max'] = int(max(likes_per_user_before_cap))
-        stats['likes_per_user_p90'] = float(np.percentile(likes_per_user_before_cap, 90))
-        stats['likes_per_user_p99'] = float(np.percentile(likes_per_user_before_cap, 99))
-        logger.info(f"Likes per sampled user: mean={stats['likes_per_user_mean']:.1f}, "
-             f"median={stats['likes_per_user_median']:.0f}, max={stats['likes_per_user_max']}, "
-             f"p90={stats['likes_per_user_p90']:.0f}, p99={stats['likes_per_user_p99']:.0f}")
-    
-    # ===== Apply per-user random cap (NOT recency-based) =====
-    if max_likes_per_user > 0 and n_after_user_sample > 0:
-        n_before_cap = n_after_user_sample
-        
-        # Add deterministic pseudo-random order per user, then keep top-K
-        likes_lf = likes_lf.with_columns(
-            pl.col('subject_uri').hash(seed=random_seed).alias('_rand_key')
-        )
-        likes_lf = likes_lf.with_columns(
-            pl.col('_rand_key').rank('ordinal').over('did').alias('_rand_order')
-        )
-        likes_lf = likes_lf.filter(pl.col('_rand_order') <= max_likes_per_user)
-        likes_lf = likes_lf.drop(['_rand_key', '_rand_order'])
-        
-        # Compute post-cap counts from pre-cap per-user counts to avoid materializing likes_lf.
-        n_after_cap = int(
-            counts_pre_cap_df
-            .select(pl.col('like_count').clip(upper_bound=max_likes_per_user).sum())
-            .item()
-        )
-        pct_retained = 100.0 * n_after_cap / n_before_cap if n_before_cap > 0 else 0
-        logger.info(f"After per-user cap ({max_likes_per_user}): {n_after_cap:,} likes ({pct_retained:.1f}% retained)")
-        stats['n_likes_after_per_user_cap'] = n_after_cap
-    else:
-        stats['n_likes_after_per_user_cap'] = n_after_user_sample
-    
-    # Select output columns
-    output_cols = ['did', 'subject_uri', 'record_created_at']
-    available_cols = [c for c in output_cols if c in likes_lf.collect_schema().names()]
-    if available_cols:
-        likes_lf = likes_lf.select(available_cols)
-    
-    # Convert record_created_at to datetime if it exists and is not already datetime
-    schema = likes_lf.collect_schema()
-    if 'record_created_at' in schema and schema['record_created_at'] != pl.Datetime:
-        if schema['record_created_at'] in (pl.String, pl.Utf8):
-            likes_lf = likes_lf.with_columns(
-                pl.col('record_created_at').str.to_datetime(time_zone="UTC").alias('record_created_at')
-            )
-        else:
-            likes_lf = likes_lf.with_columns(
-                pl.col('record_created_at').cast(pl.Datetime).alias('record_created_at')
-            )
-    
-    log_memory_checkpoint("likes_final", logger)
-    
-    return likes_lf.collect(), stats
-
-
-def load_posts_core_polars(
-    start_str: Optional[str],
-    end_str: Optional[str],
-    liked_post_uris_df: pl.DataFrame,
-    paths: List[str],
-    *,
-    negative_posts_sample: int,
-    embedding_model: str,
-    random_seed: int,
-    logger: logging.Logger,
-) -> Tuple[pl.DataFrame, Dict[str, Any], int]:
-    """
-    Load posts data using batch processing with early embedding expansion.
-    
-    Key optimization: expand embeddings per-batch BEFORE accumulating.
-    This reduces memory by ~98% (150KB/post raw -> 2KB/post expanded).
-    
-    Processing flow:
-    1. Process files in batches (20 files at a time)
-    2. For each batch:
-       a) Reservoir sample from ALL posts (independent of like status)
-       b) Collect liked posts NOT already in the random sample
-       c) Expand embeddings and DROP the raw blob
-    3. Accumulate only the slim expanded data
-    
-    Statistical independence:
-    The random sample is drawn from ALL posts, not filtered by like status.
-    Posts that are both liked AND randomly sampled appear once with in_random_sample=True.
-    This ensures the random sample can be used for unbiased population statistics.
-    
-    Output columns:
-    - in_random_sample: True if post was collected via reservoir sampling,
-                        False if collected only because it was liked
-    - To identify liked posts: join with likes_core on subject_uri = at_uri
-    
-    Returns:
-        Tuple of (posts_df: pl.DataFrame, stats: Dict, embedding_dim: int)
-    """
-    if not paths:
-        raise ValueError(f"No posts parquet files found for time range {start_str} to {end_str}")
-    
-    logger.info(f"Found {len(paths)} posts parquet files")
-    log_memory_checkpoint("posts_before_scan", logger)
-
-    raw_lf = pl.scan_parquet(paths)
-    posts_lf = raw_lf
-    # posts_lf = _apply_time_filter(raw_lf, start_str, end_str)
-
-    # get the total number of posts and calc threshold
-    n_posts_total = posts_lf.select(pl.count()).collect().item()
-    fraction_to_sample = negative_posts_sample / n_posts_total
-    threshold_hash = int(fraction_to_sample * (2**64 - 1))
-    
-    # get posts: sampled via hash, or in liked_post_uris:
-    negs_and_likes_df = (
-        posts_lf
-        .with_columns(
-            pl.col("at_uri").hash(seed=random_seed).alias("_hash_key"),
-        )
-        .join(
-            liked_post_uris_df.with_columns(pl.lit(True).alias("_is_liked")).lazy(),
-            left_on="at_uri",
-            right_on="subject_uri",
-            how="left",
-        )
-        .with_columns(
-            (pl.col("_hash_key") <= threshold_hash).alias("in_random_sample"),
-            pl.col("_is_liked").fill_null(False).alias("is_liked"),
-        )
-        .filter(pl.col("in_random_sample") | pl.col("is_liked"))
-        .drop(["_is_liked", "_hash_key"])
-        .collect(engine="streaming")
-    )
-
-    # calculate metrics
-    n_posts_core = negs_and_likes_df.height
-    n_liked_only = negs_and_likes_df.filter(pl.col("is_liked") & ~pl.col("in_random_sample")).height
-    n_liked_in_random = negs_and_likes_df.filter(pl.col("is_liked") & pl.col("in_random_sample")).height
-    n_random_sample = negs_and_likes_df.filter(pl.col("in_random_sample")).height
-
-    logger.info(f"All posts in raw data: {n_posts_total:,}")
-    logger.info(f"All negatives and likes: {n_posts_core:,}")
-    logger.info(f"Liked only: {n_liked_only:,}")
-    logger.info(f"Liked in random sample: {n_liked_in_random:,}")
-    logger.info(f"Random sample total: {n_random_sample:,}")
-
-    # # expand embeddings
-    final_df, embed_dim = _expand_embeddings_chunk(negs_and_likes_df, embedding_model, logger)
-
-    # Total liked posts = those only in liked set + those also in random sample
-    n_total_liked_posts = n_liked_only + n_liked_in_random
-    liked_post_match_rate = 100.0 * n_total_liked_posts / liked_post_uris_df.height
-    logger.info(f"Loaded {n_total_liked_posts:,} liked posts ({liked_post_match_rate:.1f}% match rate)")
-    
-    stats = {
-        'n_posts_total': n_posts_total,
-        'n_liked_posts': n_total_liked_posts,
-        'n_liked_only': n_liked_only,  # Liked posts not in random sample
-        'n_liked_in_random_sample': n_liked_in_random,  # Liked posts that are also in random sample
-        'liked_post_match_rate': liked_post_match_rate,
-        'n_random_sample': n_random_sample,
-    }
-    
-    logger.info(f"posts_core: {n_posts_core:,} rows ({n_liked_only:,} liked-only + {n_random_sample:,} random sample)")
-    logger.info(f"Embeddings already expanded during loading (dim={embed_dim})")
-    
-    # Clean up temporary columns and normalize types
-    # Drop record_created_at_dt (only needed for filtering, not in final output)
-    if 'record_created_at_dt' in final_df.columns:
-        final_df = final_df.drop('record_created_at_dt')
-    
-    # Convert record_created_at to datetime if it exists and is not already datetime
-    if 'record_created_at' in final_df.columns:
-        if final_df['record_created_at'].dtype != pl.Datetime:
-            final_df = final_df.with_columns(
-                pl.col('record_created_at').str.to_datetime(time_zone="UTC").alias('record_created_at')
-            )
-    
-    stats['n_posts_core'] = n_posts_core
-    stats['embedding_dim'] = embed_dim
-    log_memory_checkpoint("posts_after_combine", logger)
-    
-    return final_df, stats, embed_dim
-
-
-def _expand_embeddings_chunk(
-    posts_df: pl.DataFrame,
-    embedding_model: str,
-    logger: Optional[Any] = None,
-) -> Tuple[pl.DataFrame, int]:
-    """
-    Expand embeddings for a chunk of posts and drop the raw blob.
-    
-    This is an internal helper for early embedding expansion during batch loading.
-    Returns (expanded_df without embeddings column, embedding_dim).
-    """
-    if 'embeddings' not in posts_df.columns or len(posts_df) == 0:
-        return posts_df, 0
-    
-    # Convert to pandas for embedding extraction
-    pdf = posts_df.to_pandas()
-    
-    # Find embedding dimension from first valid example
-    embed_dim = None
-    for emb_list in pdf['embeddings']:
-        if emb_list is None:
-            continue
-        emb_str = extract_encoded_embedding_ingex(emb_list, embedding_model)
-        if emb_str is not None:
-            try:
-                sample_emb = embedding_loads(emb_str, decompress=True)
-                embed_dim = len(sample_emb)
-                break
-            except Exception:
-                continue
-    
-    if embed_dim is None:
-        # No valid embeddings - just drop the column
-        if 'embeddings' in posts_df.columns:
-            posts_df = posts_df.drop('embeddings')
-        return posts_df, 0
-    
-    # Extract embeddings for all rows
-    n_rows = len(pdf)
-    emb_array = np.zeros((n_rows, embed_dim), dtype=np.float32)
-    
-    for i, emb_list in enumerate(pdf['embeddings']):
-        if emb_list is None:
-            continue
-        emb_str = extract_encoded_embedding_ingex(emb_list, embedding_model)
-        if emb_str is not None:
-            try:
-                emb_array[i] = embedding_loads(emb_str, decompress=True)
-            except Exception:
-                continue
-    
-    # Create embedding column names
-    emb_col_names = [f'post_emb_{i}' for i in range(embed_dim)]
-    
-    # Add embedding columns to dataframe
-    emb_df = pd.DataFrame(emb_array, columns=emb_col_names)
-    pdf = pd.concat([pdf.reset_index(drop=True), emb_df], axis=1)
-    
-    # Drop the original embeddings column (the large raw blob)
-    pdf = pdf.drop(columns=['embeddings'])
-    
-    # Convert back to polars
-    result_df = pl.from_pandas(pdf)
-    
-    return result_df, embed_dim
-
-
-def expand_embeddings_polars(
-    posts_df: pl.DataFrame,
-    embedding_model: str = 'all_MiniLM_L6_v2',
-    *,
-    logger: logging.Logger,
-) -> Tuple[pl.DataFrame, int]:
-    """
-    Expand the 'embeddings' column into separate post_emb_* columns.
-    
-    The embeddings column contains a list of dicts like:
-    [{'key': 'all_MiniLM_L6_v2', 'value': '<base85-encoded>'}, ...]
-    
-    Returns:
-        Tuple of (posts_df with expanded embeddings, embedding_dim)
-    """
-    if 'embeddings' not in posts_df.columns:
-        logger.info("No 'embeddings' column found, skipping expansion")
-        return posts_df, 0
-    
-    # Convert to pandas for embedding extraction (complex nested structure)
-    logger.info("Expanding embeddings column...")
-    log_memory_checkpoint("embeddings_before_expand", logger)
-    pdf = posts_df.to_pandas()
-    
-    # Find embedding dimension from first valid example
-    embed_dim = None
-    for emb_list in pdf['embeddings']:
-        if emb_list is None:
-            continue
-        emb_str = extract_encoded_embedding_ingex(emb_list, embedding_model)
-        if emb_str is not None:
-            try:
-                sample_emb = embedding_loads(emb_str, decompress=True)
-                embed_dim = len(sample_emb)
-                break
-            except Exception:
-                continue
-    
-    if embed_dim is None:
-        logger.info(f"No valid embeddings found for model {embedding_model}")
-        return posts_df, 0
-    
-    logger.info(f"Embedding dimension: {embed_dim}")
-    
-    # Extract embeddings for all rows
-    n_rows = len(pdf)
-    emb_array = np.zeros((n_rows, embed_dim), dtype=np.float32)
-    n_valid = 0
-    
-    for i, emb_list in enumerate(pdf['embeddings']):
-        if emb_list is None:
-            continue
-        emb_str = extract_encoded_embedding_ingex(emb_list, embedding_model)
-        if emb_str is not None:
-            try:
-                emb_array[i] = embedding_loads(emb_str, decompress=True)
-                n_valid += 1
-            except Exception:
-                continue
-    
-    logger.info(f"Expanded {n_valid:,}/{n_rows:,} embeddings ({100*n_valid/n_rows:.1f}%)")
-    
-    # Create embedding column names
-    emb_col_names = [f'post_emb_{i}' for i in range(embed_dim)]
-    
-    # Add embedding columns to dataframe
-    emb_df = pd.DataFrame(emb_array, columns=emb_col_names)
-    pdf = pd.concat([pdf.reset_index(drop=True), emb_df], axis=1)
-    
-    # Drop the original embeddings column (too large for parquet)
-    pdf = pdf.drop(columns=['embeddings'])
-    
-    # Convert back to polars
-    result_df = pl.from_pandas(pdf)
-    log_memory_checkpoint("embeddings_after_expand", logger)
-    
-    return result_df, embed_dim
+        print("\n\nNo DOT output generated!!!\n\n")
+    subprocess.run(["dot", "-Tpng", "-Gdpi=220", "plan.dot", "-o", out_path], check=True) 
 
 
 # ----------------------------------------
 # Embeddings helpers
 # ----------------------------------------
+def _get_embeddings_list_col(lf: pl.LazyFrame, embedding_model: str) -> pl.LazyFrame:
+    emb_str = (
+        pl.col("embeddings")
+        .list.eval(
+            pl.when(pl.element().struct.field("key") == embedding_model)
+              .then(pl.element().struct.field("value"))
+        )
+        .list.drop_nulls()
+        .list.get(0)
+    )
+    emb_vec = emb_str.map_elements(
+        lambda s: _embedding_loads(s, decompress=True) if s is not None else None,
+        return_dtype=pl.List(pl.Float32),
+    )
+    return lf.with_columns(emb_vec.alias("_emb_vec"))
+
+
+def get_embed_dim(lf: pl.LazyFrame, embedding_model: str) -> int:
+    lf_with_emb = _get_embeddings_list_col(lf, embedding_model)
+    return (
+        lf_with_emb
+        .select(pl.col("_emb_vec").list.len().alias("dim"))
+        .filter(pl.col("dim").is_not_null())
+        .head(1)
+        .collect(engine="streaming")
+        .item()
+    )
+
+
+def expand_embeddings_polars(
+    lf: pl.LazyFrame,
+    embedding_model: str,
+    embed_dim: int
+) -> pl.LazyFrame:
+    lf = _get_embeddings_list_col(lf, embedding_model)
+    return (
+        lf
+        .with_columns(
+            [pl.col("_emb_vec").list.get(i).alias(f"post_emb_{i}") for i in range(embed_dim)]
+        ).drop(["embeddings", "_emb_vec"])
+    )
+
+
 def get_embed_col_names(dim: int) -> List[str]:
     """Generate embedding column names for given dimension."""
     return [f"post_emb_{i}" for i in range(dim)]
 
 
-def embedding_loads(s: str, decompress: Optional[bool] = None) -> list[float]:
+def _embedding_loads(s: str, decompress: Optional[bool] = None) -> list[float]:
     """
     Convert an embedding from a base85-encoded string to a list of floats.
 
@@ -1276,16 +173,6 @@ def embedding_loads(s: str, decompress: Optional[bool] = None) -> list[float]:
                 raise
 
     return list(struct.unpack(f'<{int(len(bs) / 4)}f', bs))
-
-
-def extract_encoded_embedding_ingex(emb_list: Optional[list[dict]], model_name: str) -> Optional[str]:
-    """Extract base85-encoded embedding string from Ingex embeddings list for given model name."""
-    if emb_list is None:
-        return None
-    for emb_dict in emb_list:
-        if emb_dict['key'] == model_name:
-            return emb_dict['value']
-    return None
 
 
 # ----------------------------------------
@@ -1856,18 +743,14 @@ def create_user_visualization(user_tracking_results: Dict[str, Any], timestamp: 
 __all__ = [
     # Datetime
     'parse_one_ts',
-    # Data IO Green Earth Ingex GCS
-    'load_raw_data_ingex',
     # Stage 1: Memory safety checks and tracking
     'get_current_memory_usage', 'log_memory_checkpoint', 'MemoryTracker',
     'estimate_parquet_memory', 'estimate_filtered_data_memory',
     'compute_memory_model_features', 'predict_memory_gb',
     'MEMORY_MODEL_COEFFICIENTS', 'MEMORY_MODEL_FEATURE_NAMES',
     'check_memory_available', 'check_data_load_safe',
-    # Stage 1: Polars-based filtering for core datasets
-    'load_likes_core_polars', 'load_posts_core_polars', 'expand_embeddings_polars',
     # Embeddings
-    'get_embed_col_names', 'embedding_loads', 'extract_encoded_embedding_ingex',
+    'expand_embeddings_polars', 'get_embed_col_names', 
     # Features/columns
     'get_actual_feature_columns', 'build_user_feature_frame',
     # Relevel/topic helpers
@@ -2032,7 +915,7 @@ def get_stage_logger(stage_name: str, log_file: Optional[Path] = None) -> loggin
     
     # Create formatter with timestamp
     formatter = logging.Formatter(
-        '[%(asctime)s.%(msecs)03d] [%(name)s] %(message)s',
+        '[%(asctime)s] [%(name)s] %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
