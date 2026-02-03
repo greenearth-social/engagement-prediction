@@ -134,6 +134,7 @@ from utils.helpers import (
     validate_dataframe_schema,
     apply_time_filter,
     get_embed_dim,
+    get_embedding_dim_for_model,
     _embedding_loads,
     _get_embeddings_list_col,
 )
@@ -487,11 +488,13 @@ def _load_likes_core_polars(
     logger.info(f"Pass 2 complete: {n_after_user_sample:,} likes ({pct_retained:.1f}% retained)")
     stats['n_likes_after_user_sample'] = n_after_user_sample
     
-    # ===== Capture like count distribution BEFORE cap (for analysis/plotting) =====
-    # This shows how many likes each sampled user has before we apply the per-user cap
+    # ===== Capture like count distribution BEFORE cap (for plotting) =====
+    # This shows how many likes each sampled user has before we apply the per-user cap.
+    # The full distribution is used for plotting then removed before JSON serialization.
+    # Only summary statistics (mean, median, etc.) are persisted.
     if counts_pre_cap_df.height > 0:
         likes_per_user_before_cap = counts_pre_cap_df['like_count'].to_list()
-        stats['likes_per_user_distribution'] = likes_per_user_before_cap
+        stats['likes_per_user_distribution'] = likes_per_user_before_cap  # removed before JSON save
         stats['likes_per_user_mean'] = float(np.mean(likes_per_user_before_cap))
         stats['likes_per_user_median'] = float(np.median(likes_per_user_before_cap))
         stats['likes_per_user_max'] = int(max(likes_per_user_before_cap))
@@ -795,6 +798,20 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # Summary
     log_operation_start('Write summary files', '01_GET_DATA', logger)
     
+    # Primary outputs
+    context.tracker.log_single_value(name="Output - Likes (final)", value=n_likes)
+    context.tracker.log_single_value(name="Output - Posts (final)", value=n_posts)
+    context.tracker.log_single_value(name="Output - Embedding Dim", value=embed_dim)
+
+    # Log to experiment tracker - comprehensive metrics for sweep analysis
+    # Metric names use readable format: "Category - Metric Name" for better CSV exports
+    # Note: this must happen BEFORE we remove likes_per_user_distribution (needed for plot)
+    _attrition_stats_to_experiment_tracker(all_stats, context, max_likes_per_user, logger)
+    
+    # Remove large distribution list before saving to JSON (summary stats are kept)
+    if 'likes' in all_stats and 'likes_per_user_distribution' in all_stats['likes']:
+        del all_stats['likes']['likes_per_user_distribution']
+    
     summary = {
         'gcs_bucket': gcs_bucket,
         'posts_start': posts_start,
@@ -819,15 +836,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     }
     with open(out_dir / 'summary.json', 'w') as f:
         json.dump(summary, f, indent=2)
-    
-    # Primary outputs
-    context.tracker.log_single_value(name="Output - Likes (final)", value=n_likes)
-    context.tracker.log_single_value(name="Output - Posts (final)", value=n_posts)
-    context.tracker.log_single_value(name="Output - Embedding Dim", value=embed_dim)
-
-    # Log to experiment tracker - comprehensive metrics for sweep analysis
-    # Metric names use readable format: "Category - Metric Name" for better CSV exports
-    _attrition_stats_to_experiment_tracker(all_stats, context, max_likes_per_user, logger)
 
     runtime = time.time() - t0
     
@@ -1069,7 +1077,7 @@ def _run_greenearth_pipeline(
         memory_estimate = check_data_load_safe(
             likes_paths=likes_paths,
             posts_paths=posts_paths,
-            embedding_dim=384,  # Standard MiniLM dimension
+            embedding_dim=get_embedding_dim_for_model(embedding_model),
             max_memory_gb=max_memory_gb,
             max_memory_pct=max_memory_pct,
             max_liking_users=max_liking_users,
@@ -1204,7 +1212,6 @@ def _run_greenearth_pipeline(
         min_likes_per_user=min_likes_per_user,
         random_seed=cap_random_seed,
         logger=logger,
-        n_users_before_join_verify=n_users_final,
     )
     
     # Update stats with join verification results
@@ -1274,7 +1281,6 @@ def _filter_likes_after_post_join(
     min_likes_per_user: int,
     random_seed: int,
     logger: logging.Logger,
-    n_users_before_join_verify: int,
 ) -> Tuple[pl.DataFrame, Dict[str, int]]:
     """Once we've filtered posts, now filter likes to only those that have matching posts in the dataset"""
     # Get set of post URIs that actually exist in posts_core
@@ -1295,7 +1301,8 @@ def _filter_likes_after_post_join(
     if min_likes_per_user > 0:
         # Filter users by min likes
         # (no need to use the max_liking_users functionality)
-        sampled_users_df, n_users_before_join_verify, _, n_users_after_join_verify = _get_sampled_users_with_min_likes(
+        # Returns: (sampled_users_df, n_users_total, n_likes_total, n_users_eligible)
+        sampled_users_df, n_users_before_min_likes, _, n_users_after_min_likes = _get_sampled_users_with_min_likes(
             likes_lf=likes_core_df.lazy(),
             min_likes_per_user=min_likes_per_user,
             max_liking_users=None,
@@ -1303,11 +1310,11 @@ def _filter_likes_after_post_join(
         )
 
         n_users_after_join_verify = sampled_users_df.height
-        n_users_removed_by_join_verify = n_users_before_join_verify - n_users_after_join_verify
+        n_users_removed_by_join_verify = n_users_before_min_likes - n_users_after_join_verify
 
         if n_users_removed_by_join_verify > 0:
             logger.info(
-                f"Min-likes verification after join: {n_users_before_join_verify:,} -> {n_users_after_join_verify:,} users "
+                f"Min-likes verification after join: {n_users_before_min_likes:,} -> {n_users_after_join_verify:,} users "
                 f"({n_users_removed_by_join_verify:,} removed due to insufficient likes after join)"
             )
             # Filter likes to only users who still meet threshold
@@ -1318,7 +1325,7 @@ def _filter_likes_after_post_join(
             n_likes_after_final_filter = len(likes_core_df)
             logger.info(f"Final likes after user filter: {n_likes_after_final_filter:,} likes")
         else:
-            logger.info(f"All {n_users_before_join_verify:,} users still meet min-likes threshold after join")
+            logger.info(f"All {n_users_before_min_likes:,} users still meet min-likes threshold after join")
 
     stats = {
         'n_likes_removed_by_join': n_likes_removed_by_join,

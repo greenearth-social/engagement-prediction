@@ -103,6 +103,41 @@ def save_polars_physical_plan_image(lf: pl.LazyFrame, out_path: str):
 # ----------------------------------------
 # Embeddings helpers
 # ----------------------------------------
+
+# Known embedding model dimensions
+EMBEDDING_MODEL_DIMS: Dict[str, int] = {
+    "all_MiniLM_L6_v2": 384,
+    "all_MiniLM_L12_v2": 384,
+    "all-MiniLM-L6-v2": 384,
+    "all-MiniLM-L12-v2": 384,
+    "paraphrase-MiniLM-L6-v2": 384,
+    "multi-qa-MiniLM-L6-cos-v1": 384,
+}
+
+
+def get_embedding_dim_for_model(embedding_model: str) -> int:
+    """
+    Get the embedding dimension for a known model name.
+    
+    Args:
+        embedding_model: Name of the embedding model
+        
+    Returns:
+        Embedding dimension (e.g., 384 for MiniLM models)
+        
+    Raises:
+        ValueError: If model name is not in EMBEDDING_MODEL_DIMS
+    """
+    if embedding_model not in EMBEDDING_MODEL_DIMS:
+        known_models = ", ".join(sorted(EMBEDDING_MODEL_DIMS.keys()))
+        raise ValueError(
+            f"Unknown embedding model '{embedding_model}'. "
+            f"Known models: {known_models}. "
+            f"Add new models to EMBEDDING_MODEL_DIMS in helpers.py."
+        )
+    return EMBEDDING_MODEL_DIMS[embedding_model]
+
+
 def _get_embeddings_list_col(lf: pl.LazyFrame, embedding_model: str) -> pl.LazyFrame:
     emb_str = (
         pl.col("embeddings")
