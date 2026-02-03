@@ -51,7 +51,10 @@ DEFAULTS: Dict[str, Any] = {
     "output_dir": None,
     "run_name": None,
     "debug": False,
-    # Stage 2 (relevel) / Stage 3 (split)
+    # Stage 2/3/4
+    "bucket_duration": "hourly",
+    "num_buckets_lookback": "168",  # 7 days if hourly
+    "max_likes_per_bucket": -1,
     "global_topic_k": 20,
     "relevel_method": "uniform",
     "relevel_strategy": "uniform_mixture_balanced",
@@ -157,6 +160,9 @@ def _build_tracking_params(args: argparse.Namespace, run_dir: Path) -> Dict[str,
             "likes_end": args.likes_end,
             "max_liking_users": args.max_liking_users,
             "max_likes_per_user": args.max_likes_per_user,
+            "bucket_duration": args.bucket_duration,
+            "num_buckets_lookback": args.num_buckets_lookback,
+            "max_likes_per_bucket": args.max_likes_per_bucket,
             "min_likes_per_user": args.min_likes_per_user,
             "negative_posts_sample": args.negative_posts_sample,
             "embedding_model": args.embedding_model,
@@ -391,7 +397,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
     
-    stage_order = ['get_data', relevel_key, 'split', train_key, 'evaluate']
+    stage_order = ['get_data', 'user_history', relevel_key, 'split', train_key, 'evaluate']
     stage_folder = {}
     for key in stage_order:
         _mp, _folder = reg.get_stage_spec(key)
@@ -469,6 +475,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
                     _maybe_choose_prior(prev_key)
             label_map = {
                 'get_data': "Stage 1: Get data…",
+                'user_history': "Stage 2: Generate user history...",
                 'relevel': "Stage 2: Relevel (uniform mixture)…",
                 'relevel_gini': "Stage 2: Relevel (Gini-optimized)…",
                 'relevel_simple': "Stage 2: Relevel (simple)…",
@@ -534,6 +541,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--debug", action="store_true", default=argparse.SUPPRESS,
                           help_text="Enable verbose debug logging for Stage 1")
     # Stage 2 options
+    _add_arg_with_default(p_all, "--bucket-duration", type=str, choices=['hourly', 'daily'], 
+                          default=argparse.SUPPRESS, help_text="")
+    _add_arg_with_default(p_all, "--num-buckets-lookback", type=int, default=argparse.SUPPRESS,
+                          help_text="")
+    _add_arg_with_default(p_all, "--max-likes-per-bucket", type=int, default=argparse.SUPPRESS,
+                          help_text="")
+    # bucket_duration: str,
+    # lookback_duration: str,
+    # max_likes_per_bucket: Optional[int]
     _add_arg_with_default(p_all, "--global-topic-k", type=int, default=argparse.SUPPRESS,
                           help_text="Number of global topics")
     _add_arg_with_default(p_all, "--relevel-method", type=str, choices=["uniform", "gini", "simple"],
@@ -607,10 +623,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="(Deprecated) Always enabled during sequential run-all")
     # Selective reruns and prior pinning
     _add_arg_with_default(p_all, "--start-from", type=str,
-                          choices=["get_data", "relevel", "split", "train", "evaluate"],
+                          choices=["get_data", "user_history", "relevel", "split", "train", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Begin execution at this stage")
     _add_arg_with_default(p_all, "--stop-after", type=str,
-                          choices=["get_data", "relevel", "split", "train", "evaluate"],
+                          choices=["get_data", "user_history", "relevel", "split", "train", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Stop after this stage completes")
     _add_arg_with_default(p_all, "--prior-get-data", type=str, default=argparse.SUPPRESS,
                           help_text="Path to a specific 01_get_data/<ts> directory")
