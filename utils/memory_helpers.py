@@ -263,8 +263,6 @@ def estimate_parquet_memory(
 # ============================================================================
 # Fitted regression model for predicting peak memory usage.
 #
-# Model performance: R-squared = 0.9440, Mean % error = 6.7%
-#
 # To re-fit after collecting new sweep data:
 #   python scripts/fit_memory_model.py --input sweep_results.csv
 # This will output new coefficients to paste here.
@@ -436,7 +434,6 @@ def estimate_filtered_data_memory(
         
         # Model metadata
         'model_version': 'v1.0',
-        'model_r_squared': 0.9440,
         
         # Raw data stats
         'raw_likes_rows': raw_likes_rows,
@@ -466,7 +463,6 @@ def estimate_filtered_data_memory(
     logger.info(f"  Raw data: {raw_likes_rows:,} likes ({n_likes_files} files), {raw_posts_rows:,} posts ({n_posts_files} files)")
     logger.info(f"  Window: {data_window_days} days, Users: {effective_max_users:,}, Likes/user cap: {max_likes_per_user}")
     logger.info(f"  Model prediction: {estimated_peak_gb:.2f} GB (with 10% margin: {estimated_peak_gb_with_margin:.2f} GB)")
-    logger.info(f"  Model R-squared: 0.9440 (mean error: 6.7%)")
     
     return result
 

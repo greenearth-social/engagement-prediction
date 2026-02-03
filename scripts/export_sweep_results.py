@@ -9,6 +9,12 @@ modeling.
 Usage:
     python scripts/export_sweep_results.py --output sweep_results.csv
     python scripts/export_sweep_results.py --output sweep_results.csv --project "Engagement Prediction"
+    
+    # Filter by a specific tag (e.g., from a particular sweep run)
+    python scripts/export_sweep_results.py --tag data-sweep-26-02-02 --output sweep_results.csv
+    
+    # Dry run to preview without saving
+    python scripts/export_sweep_results.py --tag data-sweep-26-02-02 --dry-run
 """
 
 import argparse
@@ -395,6 +401,12 @@ def main():
         help='ClearML project name (default: "Engagement Prediction")'
     )
     parser.add_argument(
+        '--tag',
+        type=str,
+        default=None,
+        help='Single tag to filter tasks by (e.g., "data-sweep-26-02-02"). Overrides --tags if provided.'
+    )
+    parser.add_argument(
         '--tags',
         nargs='+',
         default=['data-sweep', 'memory-analysis', 'attrition-analysis'],
@@ -407,6 +419,11 @@ def main():
         help='Optional regex pattern to filter task names (default: unified sweep pattern)'
     )
     parser.add_argument(
+        '--dry-run', '-n',
+        action='store_true',
+        help='Preview results without writing to file'
+    )
+    parser.add_argument(
         '--verbose', '-v',
         action='store_true',
         help='Print detailed progress'
@@ -414,10 +431,17 @@ def main():
     
     args = parser.parse_args()
     
+    # Determine which tags to use: --tag overrides --tags
+    if args.tag:
+        effective_tags = [args.tag]
+        print(f"Filtering by single tag: {args.tag}")
+    else:
+        effective_tags = args.tags
+    
     # Query tasks (unified sweep only by default)
     tasks = query_sweep_tasks(
         project_name=args.project,
-        tags=args.tags,
+        tags=effective_tags,
         task_name_pattern=args.task_pattern,  # If None, uses unified sweep pattern
     )
     
@@ -438,12 +462,6 @@ def main():
     if not all_data:
         print("No data extracted. Exiting.")
         return 1
-    
-    # Write to CSV
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    print(f"\nWriting {len(all_data)} records to {output_path}...")
     
     # Define column order (parameters first, then target, then features)
     fieldnames = [
@@ -469,12 +487,27 @@ def main():
         'posts_total', 'posts_liked', 'posts_random_sample', 'posts_match_rate',
     ]
     
-    with open(output_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(all_data)
-    
-    print(f"✓ Successfully exported {len(all_data)} unified sweep experiments to {output_path}")
+    # Handle dry-run mode
+    if args.dry_run:
+        print(f"\n[DRY RUN] Would write {len(all_data)} records to {args.output}")
+        print(f"\nPreview of extracted data:")
+        for d in all_data:
+            print(f"  - {d['task_name']}: peak={d['memory_peak_gb']}GB, "
+                  f"days={d['data_window_days']}, users={d['max_liking_users']}, "
+                  f"likes/user={d['max_likes_per_user']}, neg={d['negative_posts_sample']}")
+    else:
+        # Write to CSV
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        print(f"\nWriting {len(all_data)} records to {output_path}...")
+        
+        with open(output_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(all_data)
+        
+        print(f"✓ Successfully exported {len(all_data)} unified sweep experiments to {output_path}")
     print(f"\nSummary:")
     memory_peak_count = sum(1 for d in all_data if d['memory_peak_gb'] is not None)
     all_params_count = sum(1 for d in all_data if all(d.get(k) is not None for k in ['data_window_days', 'max_liking_users', 'max_likes_per_user']))
