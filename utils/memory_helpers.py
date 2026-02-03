@@ -269,16 +269,17 @@ def estimate_parquet_memory(
 # ============================================================================
 
 MEMORY_MODEL_COEFFICIENTS = {
-    'intercept': 32.1569093112,
-    'data_window_days': -0.3731594051,
-    'max_liking_users_10k': 5.3712117159,
-    'max_likes_per_user_100': 0.0586046975,
-    'negative_posts_sample_10k': -0.0297902646,
-    'log_max_liking_users': -8.7875844850,
-    'sqrt_likes_initial_1e6': 4.4282688972,
-    'days_x_users_10k': 0.0362670731,
-    'users_x_log_users': -0.8738069443,
+    'intercept': -74.5927239155,
+    'data_window_days': -0.0708091837,
+    'max_liking_users_10k': 12.0706132179,
+    'max_likes_per_user_100': 1.5620756976,
+    'negative_posts_sample_10k': 0.2271053690,
+    'log_max_liking_users': 15.4635658117,
+    'sqrt_likes_initial_1e6': 2.8735780908,
+    'days_x_users_10k': -0.0101803924,
+    'users_x_log_users': -1.9725666267,
 }
+
 
 MEMORY_MODEL_FEATURE_NAMES = [
     'data_window_days',
