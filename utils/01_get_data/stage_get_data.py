@@ -962,7 +962,7 @@ def _write_embeddings_memmap(
         raise ValueError("No valid embeddings found - cannot create memmap")
     
     # Pre-allocate memmap with exact size (no gaps)
-    mmap = np.memmap(embeddings_path, dtype=np.float32, mode='w+', shape=(n_valid, embed_dim))
+    mmap = np.lib.format.open_memmap(embeddings_path, mode="w+", dtype=np.float32, shape=(n_valid, embed_dim))
     logger.info(f"Pre-allocated memmap: shape={mmap.shape}, dtype={mmap.dtype}")
     
     # Write embeddings sequentially and build uri_to_idx mapping

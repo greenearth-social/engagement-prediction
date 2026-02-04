@@ -291,7 +291,7 @@ def test_write_embeddings_memmap(tmp_path, stage_get_data_module):
     assert stats["n_embeddings_null"] == 0
     
     # Load and verify contents using the uri_to_idx mapping
-    mmap = np.memmap(embeddings_path, dtype=np.float32, mode='r', shape=(3, embed_dim))
+    mmap = np.load(embeddings_path, mmap_mode="r")
     
     # post:1 has embedding [0.1, 0.2, 0.3]
     assert np.allclose(mmap[uri_to_idx["post:1"]], [0.1, 0.2, 0.3], atol=1e-5)
@@ -353,7 +353,7 @@ def test_write_embeddings_memmap_handles_missing_embeddings(tmp_path, stage_get_
     assert stats["n_posts_dropped_no_embedding"] == 1
     
     # Memmap should have exactly 2 rows (no gaps)
-    mmap = np.memmap(embeddings_path, dtype=np.float32, mode='r', shape=(2, embed_dim))
+    mmap = np.load(embeddings_path, mmap_mode="r")
     
     # Verify embeddings are correct using uri_to_idx
     assert np.allclose(mmap[uri_to_idx["post:1"]], [0.1, 0.2, 0.3], atol=1e-5)
