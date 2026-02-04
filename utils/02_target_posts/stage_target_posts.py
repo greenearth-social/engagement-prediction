@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 
 """
-Stage 2: 
+Stage 2: Build the target-posts dataset by pairing likes with sampled negatives and
+assigning temporal splits for train/val/holdout.
 
 Inputs:
-
+- posts_core_* (from 01_get_data)
+- likes_core_* (from 01_get_data)
 
 Outputs under <run_dir>/target_posts/<timestamp>/:
-
+- target_posts_<timestamp>.parquet
+- stage_info.txt
+- stage.log
 """
 
 from __future__ import annotations
@@ -52,6 +56,10 @@ def _get_negative_target_posts(
     posts_lf: pl.LazyFrame,
     liked_target_posts_lf: pl.LazyFrame
 ) -> pl.LazyFrame:
+    """
+    Samples one negative (unliked) post per like by bucketing posts in time and
+    selecting a deterministic index within each bucket based on the like metadata.
+    """
     random_seed = args.random_seed
     bucket = args.neg_sample_bucket
     if bucket is None:
@@ -205,7 +213,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     prior_stage_path = select_prior_output(run_dir, '01_get_data', use_latest=context.use_latest, prior_path=context.prior_outputs.get('01_get_data'))
     if prior_stage_path is None:
-        raise FileNotFoundError(f"Could not find directory {prior_stage_path}")
+        raise FileNotFoundError(f"Could not find outputs in prior 01_get_data directory!")
     
     log_operation_start('Load raw posts data from prior stage', STAGE_NAME_FOR_LOGGING, logger)
     posts_core_lf: pl.LazyFrame = load_parquet_from_prior(prior_stage_path, "posts_core_")
@@ -239,8 +247,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'was_liked': bool, 
         'split': str
     })
-
-    save_polars_physical_plan_image(target_posts_lf, 'target_posts_plan.png')
 
     # Write out result
     target_posts_output_path = out_dir / f"target_posts_{out_dir.name}.parquet"
