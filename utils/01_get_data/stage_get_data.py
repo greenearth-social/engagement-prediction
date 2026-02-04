@@ -105,7 +105,7 @@ Under <run_dir>/01_get_data/<timestamp>/:
 Using the outputs:
   - Random sample (for population stats): filter posts_core where in_random_sample=True
   - Liked posts: join likes_core.subject_uri with posts_core.at_uri. is_liked is also set
-  - Embedding lookup: mmap = np.memmap(embeddings_path, ...); emb = mmap[emb_idx]
+  - Embedding lookup: mmap = np.load(embeddings_path, mmap_mode="r"); emb = mmap[emb_idx]
   - Negative examples for training: sample from random sample, but make sure to exclude each given user's likes, since this is a true random sample that can (with low probability) contain liked posts.
 """
 
@@ -115,7 +115,7 @@ import json
 import argparse
 import time
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple, Callable
+from typing import Dict, Any, Optional, List, Tuple, Callable, Iterable
 import polars as pl
 import logging
 from datetime import datetime, timezone
@@ -884,6 +884,7 @@ def _write_embeddings_memmap(
     - No gaps in the memmap (every index has valid data)
     - emb_idx values are assigned based on what was actually written
     - Posts with missing/invalid embeddings are excluded
+    - Duplicate at_uri rows are ignored (first valid occurrence wins)
     
     Args:
         posts_paths: List of GCS paths to posts parquet files
@@ -905,58 +906,51 @@ def _write_embeddings_memmap(
     
     # Build set of candidate URIs (posts we want embeddings for)
     candidate_uris = set(posts_core_df["at_uri"].to_list())
-    logger.info(f"Built candidate URI set with {len(candidate_uris):,} unique URIs")
+    n_candidates_unique = len(candidate_uris)
+    logger.info(f"Built candidate URI set with {n_candidates_unique:,} unique URIs")
+    if n_candidates_unique < n_posts_candidate:
+        logger.info(f"Deduped {n_posts_candidate - n_candidates_unique:,} duplicate candidate URIs")
     
-    # Stream through GCS posts, filter, decode embeddings
-    posts_lf = pl.scan_parquet(posts_paths)
-    posts_lf = apply_time_filter(posts_lf, posts_start, posts_end)
-    
-    # Select only at_uri and embeddings columns, filter to posts in our candidate set
-    posts_lf = posts_lf.select(["at_uri", "embeddings"]).filter(
-        pl.col("at_uri").is_in(candidate_uris)
-    )
-    
-    # Process with streaming - decode embeddings
-    # Use get_embeddings_list_col to extract the correct embedding model
-    posts_lf = get_embeddings_list_col(posts_lf, embedding_model)
-    
-    # Collect the filtered data - this should be manageable since we've filtered to candidates
-    filtered_df = posts_lf.select(["at_uri", "_emb_vec"]).collect(engine="streaming")
-    logger.info(f"Collected {len(filtered_df):,} posts with embeddings column")
+    def _iter_candidate_embeddings() -> Iterable[Tuple[str, Optional[List[float]]]]:
+        for path in posts_paths:
+            posts_lf = pl.scan_parquet(path)
+            posts_lf = apply_time_filter(posts_lf, posts_start, posts_end)
+            posts_lf = posts_lf.select(["at_uri", "embeddings"]).filter(
+                pl.col("at_uri").is_in(candidate_uris)
+            )
+            posts_lf = get_embeddings_list_col(posts_lf, embedding_model)
+            df = posts_lf.select(["at_uri", "_emb_vec"]).collect(engine="streaming")
+            for row in df.iter_rows(named=True):
+                yield row["at_uri"], row["_emb_vec"]
     
     # First pass: count valid embeddings to pre-allocate memmap with exact size
-    valid_uris = []
-    valid_embeddings = []
     n_null = 0
     n_wrong_dim = 0
-    n_not_in_candidates = 0
+    n_duplicate_uri = 0
+    n_valid = 0
+    seen_valid_uris: set[str] = set()
     
-    for row in filtered_df.iter_rows(named=True):
-        uri = row["at_uri"]
-        emb_vec = row["_emb_vec"]
-        
-        if uri not in candidate_uris:
-            n_not_in_candidates += 1
-            continue
-            
+    for uri, emb_vec in _iter_candidate_embeddings():
         if emb_vec is None:
             n_null += 1
             continue
         
-        # Convert list to numpy array and validate dimension
-        emb_array = np.array(emb_vec, dtype=np.float32)
-        if len(emb_array) != embed_dim:
+        if len(emb_vec) != embed_dim:
             n_wrong_dim += 1
             continue
         
-        valid_uris.append(uri)
-        valid_embeddings.append(emb_array)
+        if uri in seen_valid_uris:
+            n_duplicate_uri += 1
+            continue
+        
+        seen_valid_uris.add(uri)
+        n_valid += 1
+    n_skipped = n_null + n_wrong_dim + n_duplicate_uri
     
-    n_valid = len(valid_uris)
-    n_skipped = n_null + n_wrong_dim + n_not_in_candidates
-    
-    logger.info(f"Validated embeddings: {n_valid:,} valid, {n_skipped:,} skipped "
-                f"(null={n_null:,}, wrong_dim={n_wrong_dim:,}, not_in_candidates={n_not_in_candidates:,})")
+    logger.info(
+        f"Validated embeddings: {n_valid:,} valid, {n_skipped:,} skipped "
+        f"(null={n_null:,}, wrong_dim={n_wrong_dim:,}, duplicate_uri={n_duplicate_uri:,})"
+    )
     
     if n_valid == 0:
         raise ValueError("No valid embeddings found - cannot create memmap")
@@ -967,12 +961,26 @@ def _write_embeddings_memmap(
     
     # Write embeddings sequentially and build uri_to_idx mapping
     uri_to_idx: Dict[str, int] = {}
-    for idx, (uri, emb_array) in enumerate(zip(valid_uris, valid_embeddings)):
-        mmap[idx] = emb_array
-        uri_to_idx[uri] = idx
+    idx = 0
+    seen_valid_uris = set()
+    for uri, emb_vec in _iter_candidate_embeddings():
+        if emb_vec is None:
+            continue
+        if len(emb_vec) != embed_dim:
+            continue
+        if uri in seen_valid_uris:
+            continue
+        seen_valid_uris.add(uri)
         
-        if (idx + 1) % 100_000 == 0:
-            logger.info(f"Written {idx + 1:,} embeddings...")
+        mmap[idx] = np.array(emb_vec, dtype=np.float32)
+        uri_to_idx[uri] = idx
+        idx += 1
+        
+        if idx % 100_000 == 0:
+            logger.info(f"Written {idx:,} embeddings...")
+    
+    if idx != n_valid:
+        logger.warning(f"Expected to write {n_valid:,} embeddings, but wrote {idx:,}")
     
     # Flush to disk
     mmap.flush()
@@ -983,16 +991,19 @@ def _write_embeddings_memmap(
     logger.info(f"✓ Wrote {n_valid:,} embeddings to memmap ({file_size_mb:.1f} MB)")
     
     # Calculate how many candidate posts were dropped
-    n_candidates_without_valid_emb = n_posts_candidate - n_valid
+    n_candidates_without_valid_emb = n_candidates_unique - n_valid
     if n_candidates_without_valid_emb > 0:
-        drop_pct = 100.0 * n_candidates_without_valid_emb / n_posts_candidate
+        denom = n_candidates_unique if n_candidates_unique > 0 else n_posts_candidate
+        drop_pct = 100.0 * n_candidates_without_valid_emb / denom
         logger.info(f"Dropped {n_candidates_without_valid_emb:,} posts ({drop_pct:.1f}%) due to missing/invalid embeddings")
     
     stats = {
         'n_posts_candidate': n_posts_candidate,
+        'n_posts_candidate_unique': n_candidates_unique,
         'n_embeddings_valid': n_valid,
         'n_embeddings_null': n_null,
         'n_embeddings_wrong_dim': n_wrong_dim,
+        'n_embeddings_duplicate_uri': n_duplicate_uri,
         'n_posts_dropped_no_embedding': n_candidates_without_valid_emb,
         'memmap_size_mb': file_size_mb,
     }
