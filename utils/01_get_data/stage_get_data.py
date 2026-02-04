@@ -605,6 +605,13 @@ def _load_posts_core_polars(
 
     # Collect metadata (small - no embeddings)
     posts_core_df = negs_and_likes_lf.collect(engine="streaming")
+
+    # Convert record_created_at to datetime if it exists and is not already datetime
+    schema = posts_core_df.schema
+    if 'record_created_at' in schema and schema['record_created_at'] != pl.Datetime:
+        posts_core_df = posts_core_df.with_columns(
+            pl.col('record_created_at').str.to_datetime(time_zone="UTC").alias('record_created_at')
+        )
     
     # NOTE: emb_idx is NOT assigned here - it's added later after embedding validation
     # This ensures only posts with valid embeddings get indices (no gaps in memmap)
@@ -614,7 +621,7 @@ def _load_posts_core_polars(
         'at_uri': str,
         'in_random_sample': bool,
         'did': str,
-        'record_created_at': str,
+        'record_created_at': 'datetime',
         'record_text': str,
         'is_liked': bool,
     }
@@ -783,7 +790,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'at_uri': str,
         'in_random_sample': bool,
         'did': str,
-        'record_created_at': str,
+        'record_created_at': 'datetime',
         'record_text': str,
         'is_liked': bool,
         'emb_idx': int,  # NEW: index for memmap lookup
