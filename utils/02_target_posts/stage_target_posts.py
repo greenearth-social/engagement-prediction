@@ -12,14 +12,22 @@ Outputs under <run_dir>/target_posts/<timestamp>/:
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import argparse
 import polars as pl
 import time
 from datetime import datetime
 
 from utils.pipeline.core import new_stage_timestamp_dir, select_prior_output, Context
-from utils.helpers import get_stage_logger, log_operation_start, validate_dataframe_schema, load_parquet_from_prior
+from utils.helpers import (
+    get_stage_logger, 
+    log_operation_start, 
+    validate_dataframe_schema, 
+    load_parquet_from_prior, 
+    save_polars_physical_plan_image, 
+    parse_one_ts,
+    parse_one_ts_strict
+)
 
 STAGE_NAME_FOR_LOGGING = '02_TARGET_POSTS'
 TS_COL_NAME = 'record_created_at'
@@ -34,7 +42,7 @@ def _get_liked_target_posts(
     """
     return (
         likes_lf
-        .select(['did', TS_COL_NAME, 'subject_uri'])
+        .select(['did', TS_COL_NAME, 'subject_uri', 'emb_idx'])
         .with_columns(pl.lit(True).alias("was_liked"))
     ) # 'did', 'record_created_at', 'subject_uri', 'was_liked'
 
@@ -54,7 +62,8 @@ def _get_negative_target_posts(
         posts_lf
         .select([
             pl.col('at_uri'),
-            pl.col(TS_COL_NAME).alias(post_ts_col_name)
+            pl.col(TS_COL_NAME).alias(post_ts_col_name),
+            pl.col('emb_idx'),
         ])
         .with_columns(
             pl.col(post_ts_col_name).dt.truncate(bucket).alias('bucket')
@@ -62,7 +71,7 @@ def _get_negative_target_posts(
         # stable ordering so idx assignment is deterministic
         .sort(['bucket', post_ts_col_name, 'at_uri'])
         .with_columns(
-            pl.cum_count().over('bucket').alias('idx_in_bucket'),
+            pl.col('at_uri').cum_count().over('bucket').alias('idx_in_bucket'),
             pl.count().over('bucket').alias('bucket_size'),
         )
     ) # 'at_uri', 'post_record_created_at', 'bucket', 'idx_in_bucket', 'bucket_size'
@@ -86,28 +95,31 @@ def _get_negative_target_posts(
         ])
         # join to get bucket_size for the like's bucket
         .join(bucket_sizes_lf, on="bucket", how="inner")
-        .with_columns([
+        .with_columns(
             # deterministic "random" seed per (user, liked_post, time)
             pl.struct(
                 [pl.col('did'), pl.col('subject_uri'), pl.col(like_ts_col_name)]
-            ).hash(seed=random_seed).cast(pl.Int64).abs().alias('seed'),
-            (pl.col('seed') % pl.col('bucket_size')).cast(pl.Int64).alias('neg_idx'),
-        ])
+            ).hash(seed=random_seed).cast(pl.UInt64).alias('seed'),
+        )
+        .with_columns(
+            (pl.col('seed') % pl.col('bucket_size').cast(pl.UInt64)).cast(pl.Int64).alias('neg_idx'),
+        )
     ) # 'did', 'subject_uri', 'like_record_created_at', 'bucket', 'bucket_size', 'seed', 'neg_idx'
 
     posts_keyed_lf = posts_lf.with_columns(
-        pl.struct(['bucket', 'idx_in_bucket']).alias('key')
-    ).select(['key', 'at_uri', post_ts_col_name])
+        pl.concat_str(['bucket', 'idx_in_bucket']).alias('key')
+    ).select(['key', 'at_uri', post_ts_col_name, 'emb_idx'])
     # 'key', 'at_uri', 'post_record_created_at'
 
     return (
         likes_lf
-        .with_columns(pl.struct([pl.col('bucket'), pl.col(f"neg_idx")]).alias('key'))
+        .with_columns(pl.concat_str([pl.col('bucket'), pl.col(f"neg_idx")]).alias('key'))
         .join(posts_keyed_lf, on='key', how='left')
         .select([
             pl.col('did'),
             pl.col(post_ts_col_name).alias(TS_COL_NAME),
             pl.col('at_uri').alias('subject_uri'),
+            pl.col('emb_idx'),
             pl.lit(False).alias('was_liked')
         ]) # 'did', 'record_created_at', 'subject_uri', 'was_liked'
     ) 
@@ -147,33 +159,34 @@ def _apply_temporal_splits(
     Appends a column, "split", that specifies "train", "val", or "holdout".
     If holdout_start is not specified in args, only outputs "train" or "val".
     """
-    train_start: str = _get_train_start(args)
+    train_start_str: str = _get_train_start(args)
+    train_start: datetime = parse_one_ts_strict(train_start_str)
     if args.val_start is None:
         raise ValueError("Validation window start not supplied in input arguments!")
-    val_start: str = args.val_start
+    val_start: datetime = parse_one_ts_strict(args.val_start)
     if val_start <= train_start:
         raise ValueError("Train start date is greater than or equal to val start date!")
-    holdout_start: str = args.holdout_start
+    holdout_start: Optional[datetime] = parse_one_ts(args.holdout_start)
 
-    if holdout_start is None:
-        return lf.with_columns(
-            pl.when((pl.col(TS_COL_NAME) >= pl.lit(train_start)) & (pl.col(TS_COL_NAME) < pl.lit(val_start)))
-              .then("train")
-              .when(pl.col(TS_COL_NAME) >= pl.lit(val_start))
-              .then("val")
-              .otherwise(None)
-              .alias("split")
-        )
-    else:
+    if holdout_start is not None:
         if holdout_start <= val_start:
             raise ValueError("Validation start date is greater than or equal to holdout start date!")
         return lf.with_columns(
             pl.when((pl.col(TS_COL_NAME) >= pl.lit(train_start)) & (pl.col(TS_COL_NAME) < pl.lit(val_start)))
-              .then("train")
+              .then(pl.lit("train"))
               .when((pl.col(TS_COL_NAME) >= pl.lit(val_start)) & (pl.col(TS_COL_NAME) < pl.lit(holdout_start)))
-              .then("val")
+              .then(pl.lit("val"))
               .when(pl.col(TS_COL_NAME) >= pl.lit(holdout_start))
-              .then("holdout")
+              .then(pl.lit("holdout"))
+              .otherwise(None)
+              .alias("split")
+        )
+    else:
+        return lf.with_columns(
+            pl.when((pl.col(TS_COL_NAME) >= pl.lit(train_start)) & (pl.col(TS_COL_NAME) < pl.lit(val_start)))
+              .then(pl.lit("train"))
+              .when(pl.col(TS_COL_NAME) >= pl.lit(val_start))
+              .then(pl.lit("val"))
               .otherwise(None)
               .alias("split")
         )
@@ -198,8 +211,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     validate_dataframe_schema(posts_core_lf, {
         'did': str, 
         'at_uri': str, 
-        'record_created_at': str, 
-        'embedding_id': int, 
+        'record_created_at': datetime, 
+        'emb_idx': int, 
         'record_text': str, 
         'is_liked': bool, 
         'in_random_sample': bool
@@ -211,20 +224,22 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'did': str, 
         'subject_uri': str, 
         'record_created_at': datetime, 
-        'embedding_id': int
+        'emb_idx': int
     })
 
-    log_operation_start('', STAGE_NAME_FOR_LOGGING, logger)
+    log_operation_start('Generate target posts dataset from likes and posts', STAGE_NAME_FOR_LOGGING, logger)
     target_posts_lf: pl.LazyFrame = _get_target_posts(args, posts_core_lf, likes_core_lf)
     target_posts_lf = _apply_temporal_splits(args, target_posts_lf)
     validate_dataframe_schema(target_posts_lf, {
         'did': str, 
         'subject_uri': str, 
         'record_created_at': datetime, 
-        'embedding_id': int, 
+        'emb_idx': int, 
         'was_liked': bool, 
         'split': str
     })
+
+    save_polars_physical_plan_image(target_posts_lf, 'target_posts_plan.png')
 
     # Write out result
     target_posts_output_path = out_dir / f"target_posts_{out_dir.name}.parquet"

@@ -51,6 +51,11 @@ DEFAULTS: Dict[str, Any] = {
     "output_dir": None,
     "run_name": None,
     "debug": False,
+    # Stage 2 Target posts and Split
+    "neg_sample_bucket": "1h",
+    "train_start": None,
+    "val_start": None,
+    "holdout_start": None,
     # Stage 2 (relevel) / Stage 3 (split)
     "global_topic_k": 20,
     "relevel_method": "uniform",
@@ -391,7 +396,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
     
-    stage_order = ['get_data', relevel_key, 'split', train_key, 'evaluate']
+    stage_order = ['get_data', 'target_posts', relevel_key, 'split', train_key, 'evaluate']
     stage_folder = {}
     for key in stage_order:
         _mp, _folder = reg.get_stage_spec(key)
@@ -534,6 +539,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--debug", action="store_true", default=argparse.SUPPRESS,
                           help_text="Enable verbose debug logging for Stage 1")
     # Stage 2 options
+    _add_arg_with_default(p_all, "--neg-sample-bucket", type=str, default=argparse.SUPPRESS,
+                          help_text="Duration (e.g. 1h) of time buckets for picking negative samples near positive (liked) posts")
+    _add_arg_with_default(p_all, "--train-start", type=str, default=argparse.SUPPRESS,
+                          help_text="ISO date string for start of training dataset window")
+    _add_arg_with_default(p_all, "--val-start", type=str, default=argparse.SUPPRESS,
+                          help_text="ISO date string for start of validation dataset window. Must be >= train-start")
+    _add_arg_with_default(p_all, "--holdout-start", type=str, default=argparse.SUPPRESS,
+                          help_text="ISO date string for start of holdout dataset window (if not supplied, no holdout set)")
     _add_arg_with_default(p_all, "--global-topic-k", type=int, default=argparse.SUPPRESS,
                           help_text="Number of global topics")
     _add_arg_with_default(p_all, "--relevel-method", type=str, choices=["uniform", "gini", "simple"],

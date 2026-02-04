@@ -57,10 +57,8 @@ KNOWN_TS_FORMATS = [
     "%Y-%m-%d",                # 2024-02-10
 ]
 
-def parse_one_ts(raw_ts: Optional[str]) -> Optional[datetime]:
-    """Parse a single timestamp string into a timezone-aware datetime (UTC)."""
-    if raw_ts is None:
-        return None
+
+def parse_one_ts_strict(raw_ts: str) -> datetime:
     for fmt in KNOWN_TS_FORMATS:
         try:
             dt = datetime.strptime(raw_ts, fmt)
@@ -70,6 +68,13 @@ def parse_one_ts(raw_ts: Optional[str]) -> Optional[datetime]:
         except ValueError:
             continue
     raise ValueError(f"Unrecognized datetime format: {raw_ts!r}")
+
+
+def parse_one_ts(raw_ts: Optional[str]) -> Optional[datetime]:
+    """Parse a single timestamp string into a timezone-aware datetime (UTC)."""
+    if raw_ts is None:
+        return None
+    return parse_one_ts_strict(raw_ts)
 
 
 def apply_time_filter(
