@@ -21,6 +21,7 @@ import argparse
 import polars as pl
 import time
 from datetime import datetime
+import logging
 
 from utils.pipeline.core import new_stage_timestamp_dir, select_prior_output, Context
 from utils.helpers import (
@@ -70,7 +71,9 @@ def _get_liked_target_posts(
 def _get_negative_target_posts(
     args: argparse.Namespace,
     posts_lf: pl.LazyFrame,
-    liked_target_posts_lf: pl.LazyFrame
+    liked_target_posts_lf: pl.LazyFrame,
+    logger: logging.Logger,
+    context: Context
 ) -> pl.LazyFrame:
     """
     Samples one negative (unliked) post per like by bucketing posts in time and
@@ -129,11 +132,18 @@ def _get_negative_target_posts(
         )
     ) # 'target_did', 'seen_at', 'like_uri', 'like_emb_idx', 'like_posted_at', 'like_author_did' 'bucket', 'bucket_size', 'seed', 'neg_idx'
 
+    # (Shouldn't happen but) keep track of any potential lost likes by joining to bucket sizes.
+    n_likes_orig = liked_target_posts_lf.select(pl.len()).collect(engine='streaming').item()
+    n_likes_after_bucket_join = likes_lf.select(pl.len()).collect(engine='streaming').item()
+    n_likes_lost_from_bucket_join = n_likes_orig - n_likes_after_bucket_join
+    logger.info(f"Started with {n_likes_orig:,} likes; have {n_likes_after_bucket_join:,} after joining to post buckets. (Lost {n_likes_after_bucket_join} likes).")
+    context.tracker.log_single_value('Target Posts - Dropped Likes from Bucket Join', n_likes_lost_from_bucket_join)
+
     posts_keyed_lf = posts_lf.with_columns(
         pl.concat_str(['bucket', 'idx_in_bucket']).alias('key')
     ).select(['key', 'neg_uri', 'neg_posted_at', 'neg_emb_idx', 'neg_author_did'])
 
-    return (
+    final_lf = (
         likes_lf
         .with_columns(pl.concat_str([pl.col('bucket'), pl.col(f"neg_idx")]).alias('key'))
         .join(posts_keyed_lf, on='key', how='left')
@@ -148,15 +158,60 @@ def _get_negative_target_posts(
             'neg_author_did',
         ])
     ) 
+    return final_lf
     
+
+def _log_final_metrics(
+    all_target_posts_lf: pl.LazyFrame,
+    liked_target_posts_lf: pl.LazyFrame,
+    logger: logging.Logger,
+    context: Context
+):
+    # how many negative posts were actually liked by the user??
+    final_counts = (
+        all_target_posts_lf
+        .select(['neg_uri', 'target_did'])
+        .join(
+            liked_target_posts_lf.select(['target_did', 'like_uri']).unique(), 
+            left_on=['target_did', 'neg_uri'], 
+            right_on=['target_did', 'like_uri'], 
+            how='left',
+            coalesce=False
+        )
+        .select(
+            pl.len().alias("total_rows"),
+            pl.col("like_uri").is_not_null().sum().alias("matched_rows"),
+        )
+        .collect(engine="streaming")
+    )
+    n_total_target_pairs, n_negs_liked_by_target_user = final_counts.row(0)
+    logger.info(f"Total target pairs: {n_total_target_pairs:,}.")
+    logger.info(f"(False) Negatives that were actually liked by the user: {n_negs_liked_by_target_user:,}.")
+    context.tracker.log_single_value('Target Posts - Total Target Pairs', n_total_target_pairs)
+    context.tracker.log_single_value('Target Posts - False Negatives Actually Liked By User', n_negs_liked_by_target_user)
+
+    # how many negatives were selected more than once? how many negatives were selected more than once for the same user?
+    counts_per_user_and_neg_lf = all_target_posts_lf.group_by(['target_did', 'neg_uri']).len()
+    counts_per_neg_lf = counts_per_user_and_neg_lf.group_by(['neg_uri']).agg(pl.col("len").sum().alias("len"))
+    n_same_neg_for_user = counts_per_user_and_neg_lf.filter(pl.col('len') > 1).select(pl.len()).collect(engine='streaming').item()
+    n_same_neg_overall = counts_per_neg_lf.filter(pl.col('len') > 1).select(pl.len()).collect(engine='streaming').item()
+    logger.info(f"Number of negatives that were assigned to the same target user more than once: {n_same_neg_for_user:,} ({n_same_neg_for_user/n_total_target_pairs*100:.1f}%)")
+    logger.info(f"Number of negatives that were assigned more than once, total: {n_same_neg_overall:,} ({n_same_neg_overall/n_total_target_pairs*100:.1f}%")
+    context.tracker.log_single_value('Target Posts - Negatives Assigned Multiple Times to Same User', n_same_neg_for_user)
+    context.tracker.log_single_value('Target Posts - Negatives Assigned Multiple Times', n_same_neg_overall)
+
 
 def _get_target_posts(
     args: argparse.Namespace,
     posts_lf: pl.LazyFrame,
-    likes_lf: pl.LazyFrame
+    likes_lf: pl.LazyFrame,
+    logger: logging.Logger,
+    context: Context
 ) -> pl.LazyFrame:
     liked_target_posts_lf = _get_liked_target_posts(likes_lf, posts_lf)
-    return _get_negative_target_posts(args, posts_lf, liked_target_posts_lf)
+    all_target_posts_lf = _get_negative_target_posts(args, posts_lf, liked_target_posts_lf, logger, context)
+    _log_final_metrics(all_target_posts_lf, liked_target_posts_lf, logger, context)
+    return all_target_posts_lf
 
 
 def _get_train_start(
@@ -224,7 +279,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     out_dir = new_stage_timestamp_dir(run_dir, '02_target_posts')
 
     # Initialize logger
-    logger = get_stage_logger(STAGE_NAME_FOR_LOGGING, log_file=out_dir / 'stage.log')
+    logger: logging.Logger = get_stage_logger(STAGE_NAME_FOR_LOGGING, log_file=out_dir / 'stage.log')
 
     # get args
     t0 = time.time()
@@ -233,7 +288,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     if prior_stage_path is None:
         raise FileNotFoundError(f"Could not find outputs in prior 01_get_data directory!")
     
-    log_operation_start('Load raw posts data from prior stage', STAGE_NAME_FOR_LOGGING, logger)
     posts_core_lf: pl.LazyFrame = load_parquet_from_prior(prior_stage_path, "posts_core_")
     validate_dataframe_schema(posts_core_lf, {
         'did': str, 
@@ -244,8 +298,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'is_liked': bool, 
         'in_random_sample': bool
     })
-    
-    log_operation_start('Load raw likes data from prior stage', STAGE_NAME_FOR_LOGGING, logger)
     likes_core_lf: pl.LazyFrame = load_parquet_from_prior(prior_stage_path, "likes_core_")
     validate_dataframe_schema(likes_core_lf, {
         'did': str, 
@@ -255,9 +307,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     })
 
     log_operation_start('Generate target posts dataset from likes and posts', STAGE_NAME_FOR_LOGGING, logger)
-
     # The core logic. (1) Generate target posts and (2) split into train/val/holdout
-    target_posts_lf: pl.LazyFrame = _get_target_posts(args, posts_core_lf, likes_core_lf)
+    target_posts_lf: pl.LazyFrame = _get_target_posts(args, posts_core_lf, likes_core_lf, logger, context)
     target_posts_lf = _apply_temporal_splits(args, target_posts_lf)
     validate_dataframe_schema(target_posts_lf, {
         'target_did': str,
