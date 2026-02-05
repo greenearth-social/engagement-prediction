@@ -36,17 +36,36 @@ def test_get_liked_target_posts_selects_expected_columns(stage_target_posts_modu
             }
         ]
     )
+    posts_df = pl.DataFrame(
+        [
+            {
+                "at_uri": "post:1",
+                "record_created_at": _dt(2023, 12, 31, 23),
+                "did": "author_a",
+                "emb_idx": 99,
+                "record_text": "hello",
+            }
+        ]
+    )
 
-    out = stage_target_posts_module._get_liked_target_posts(likes_df.lazy()).collect()
+    out = stage_target_posts_module._get_liked_target_posts(
+        likes_df.lazy(), posts_df.lazy()
+    ).collect()
 
     assert out.columns == [
-        "did",
-        "record_created_at",
-        "subject_uri",
-        "emb_idx",
-        "was_liked",
+        "target_did",
+        "seen_at",
+        "like_uri",
+        "like_emb_idx",
+        "like_posted_at",
+        "like_author_did",
     ]
-    assert out["was_liked"].to_list() == [True]
+    assert out["target_did"].to_list() == ["user_a"]
+    assert out["seen_at"].to_list() == [_dt(2024, 1, 1)]
+    assert out["like_uri"].to_list() == ["post:1"]
+    assert out["like_emb_idx"].to_list() == [5]
+    assert out["like_posted_at"].to_list() == [_dt(2023, 12, 31, 23)]
+    assert out["like_author_did"].to_list() == ["author_a"]
 
 
 def test_negative_target_posts_deterministic_and_bucketed(stage_target_posts_module):
@@ -54,10 +73,10 @@ def test_negative_target_posts_deterministic_and_bucketed(stage_target_posts_mod
 
     posts_df = pl.DataFrame(
         [
-            {"at_uri": "post:1", "record_created_at": _dt(2024, 1, 1, 1), "emb_idx": 1},
-            {"at_uri": "post:2", "record_created_at": _dt(2024, 1, 1, 2), "emb_idx": 2},
-            {"at_uri": "post:3", "record_created_at": _dt(2024, 1, 2, 1), "emb_idx": 3},
-            {"at_uri": "post:4", "record_created_at": _dt(2024, 1, 2, 2), "emb_idx": 4},
+            {"at_uri": "post:1", "record_created_at": _dt(2024, 1, 1, 1), "emb_idx": 1, "did": "author_1"},
+            {"at_uri": "post:2", "record_created_at": _dt(2024, 1, 1, 2), "emb_idx": 2, "did": "author_2"},
+            {"at_uri": "post:3", "record_created_at": _dt(2024, 1, 2, 1), "emb_idx": 3, "did": "author_3"},
+            {"at_uri": "post:4", "record_created_at": _dt(2024, 1, 2, 2), "emb_idx": 4, "did": "author_4"},
         ]
     )
     likes_df = pl.DataFrame(
@@ -67,41 +86,68 @@ def test_negative_target_posts_deterministic_and_bucketed(stage_target_posts_mod
         ]
     )
 
-    liked_lf = stage_target_posts_module._get_liked_target_posts(likes_df.lazy())
+    liked_lf = stage_target_posts_module._get_liked_target_posts(
+        likes_df.lazy(), posts_df.lazy()
+    )
     first = stage_target_posts_module._get_negative_target_posts(args, posts_df.lazy(), liked_lf).collect()
     second = stage_target_posts_module._get_negative_target_posts(args, posts_df.lazy(), liked_lf).collect()
 
     assert first.height == likes_df.height
-    assert first["subject_uri"].to_list() == second["subject_uri"].to_list()
+    first_sorted = first.sort(["target_did", "like_uri"])
+    second_sorted = second.sort(["target_did", "like_uri"])
+    assert first_sorted["neg_uri"].to_list() == second_sorted["neg_uri"].to_list()
 
-    expected_bucket = {
-        "user_a": datetime(2024, 1, 1, tzinfo=timezone.utc).date(),
-        "user_b": datetime(2024, 1, 2, tzinfo=timezone.utc).date(),
-    }
-    for did, ts in zip(first["did"].to_list(), first["record_created_at"].to_list()):
-        assert ts.date() == expected_bucket[did]
+    joined = (
+        first
+        .join(
+            posts_df.select(
+                [
+                    pl.col("at_uri").alias("like_uri"),
+                    pl.col("record_created_at").alias("like_posted_at"),
+                ]
+            ),
+            on="like_uri",
+            how="left",
+        )
+        .join(
+            posts_df.select(
+                [
+                    pl.col("at_uri").alias("neg_uri"),
+                    pl.col("record_created_at").alias("neg_posted_at"),
+                ]
+            ),
+            on="neg_uri",
+            how="left",
+        )
+    )
+    for like_ts, neg_ts in zip(
+        joined["like_posted_at"].to_list(), joined["neg_posted_at"].to_list()
+    ):
+        assert like_ts.date() == neg_ts.date()
 
 
 def test_negative_target_posts_requires_bucket(stage_target_posts_module):
     args = argparse.Namespace(random_seed=0, neg_sample_bucket=None)
     posts_df = pl.DataFrame(
-        [{"at_uri": "post:1", "record_created_at": _dt(2024, 1, 1), "emb_idx": 1}]
+        [{"at_uri": "post:1", "record_created_at": _dt(2024, 1, 1), "emb_idx": 1, "did": "author_1"}]
     )
     likes_df = pl.DataFrame(
         [{"did": "user_a", "subject_uri": "post:1", "record_created_at": _dt(2024, 1, 1), "emb_idx": 1}]
     )
 
-    liked_lf = stage_target_posts_module._get_liked_target_posts(likes_df.lazy())
+    liked_lf = stage_target_posts_module._get_liked_target_posts(
+        likes_df.lazy(), posts_df.lazy()
+    )
     with pytest.raises(ValueError, match="bucket size"):
         stage_target_posts_module._get_negative_target_posts(args, posts_df.lazy(), liked_lf).collect()
 
 
-def test_get_target_posts_combines_pos_and_neg(stage_target_posts_module):
+def test_get_target_posts_emits_negative_pairs(stage_target_posts_module):
     args = argparse.Namespace(random_seed=42, neg_sample_bucket="1d")
     posts_df = pl.DataFrame(
         [
-            {"at_uri": "post:1", "record_created_at": _dt(2024, 1, 1), "emb_idx": 1},
-            {"at_uri": "post:2", "record_created_at": _dt(2024, 1, 1, 1), "emb_idx": 2},
+            {"at_uri": "post:1", "record_created_at": _dt(2024, 1, 1), "emb_idx": 1, "did": "author_1"},
+            {"at_uri": "post:2", "record_created_at": _dt(2024, 1, 1, 1), "emb_idx": 2, "did": "author_2"},
         ]
     )
     likes_df = pl.DataFrame(
@@ -113,9 +159,20 @@ def test_get_target_posts_combines_pos_and_neg(stage_target_posts_module):
 
     out = stage_target_posts_module._get_target_posts(args, posts_df.lazy(), likes_df.lazy()).collect()
 
-    assert out.height == 4
-    assert out.filter(pl.col("was_liked") == True).height == 2
-    assert out.filter(pl.col("was_liked") == False).height == 2
+    assert out.height == likes_df.height
+    assert out.columns == [
+        "target_did",
+        "seen_at",
+        "like_uri",
+        "like_emb_idx",
+        "like_author_did",
+        "neg_uri",
+        "neg_emb_idx",
+        "neg_author_did",
+    ]
+    assert out["neg_uri"].null_count() == 0
+    assert out["neg_emb_idx"].null_count() == 0
+    assert out["neg_author_did"].null_count() == 0
 
 
 def test_get_train_start_fallbacks(stage_target_posts_module):
@@ -145,17 +202,20 @@ def test_apply_temporal_splits_with_holdout(stage_target_posts_module):
     )
     df = pl.DataFrame(
         {
-            "record_created_at": [
+            "seen_at": [
                 _dt(2024, 1, 1),
                 _dt(2024, 1, 2),
                 _dt(2024, 1, 4),
                 _dt(2024, 1, 6),
                 _dt(2024, 1, 7),
             ],
-            "did": ["u1"] * 5,
-            "subject_uri": ["p1", "p2", "p3", "p4", "p5"],
-            "emb_idx": [0, 1, 2, 3, 4],
-            "was_liked": [True] * 5,
+            "target_did": ["u1"] * 5,
+            "like_uri": ["p1", "p2", "p3", "p4", "p5"],
+            "like_emb_idx": [0, 1, 2, 3, 4],
+            "like_author_did": ["a1"] * 5,
+            "neg_uri": ["n1", "n2", "n3", "n4", "n5"],
+            "neg_emb_idx": [10, 11, 12, 13, 14],
+            "neg_author_did": ["a2"] * 5,
         }
     )
 
@@ -173,11 +233,14 @@ def test_apply_temporal_splits_validation_checks(stage_target_posts_module):
     )
     df = pl.DataFrame(
         {
-            "record_created_at": [_dt(2024, 1, 2)],
-            "did": ["u1"],
-            "subject_uri": ["p1"],
-            "emb_idx": [0],
-            "was_liked": [True],
+            "seen_at": [_dt(2024, 1, 2)],
+            "target_did": ["u1"],
+            "like_uri": ["p1"],
+            "like_emb_idx": [0],
+            "like_author_did": ["a1"],
+            "neg_uri": ["n1"],
+            "neg_emb_idx": [10],
+            "neg_author_did": ["a2"],
         }
     )
 

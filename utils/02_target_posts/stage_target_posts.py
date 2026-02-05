@@ -33,11 +33,12 @@ from utils.helpers import (
 )
 
 STAGE_NAME_FOR_LOGGING = '02_TARGET_POSTS'
-TS_COL_NAME = 'record_created_at'
+RAW_TS_COL_NAME = 'record_created_at'
 
 
 def _get_liked_target_posts(
-    likes_lf: pl.LazyFrame
+    likes_lf: pl.LazyFrame,
+    posts_lf: pl.LazyFrame
 ) -> pl.LazyFrame:
     """
     Get all of the liked target posts (positive examples). 
@@ -47,9 +48,23 @@ def _get_liked_target_posts(
     """
     return (
         likes_lf
-        .select(['did', TS_COL_NAME, 'subject_uri', 'emb_idx'])
-        .with_columns(pl.lit(True).alias("was_liked"))
-    ) # 'did', 'record_created_at', 'subject_uri', 'was_liked'
+        .select([
+            pl.col('did').alias('target_did'),
+            pl.col(RAW_TS_COL_NAME).alias('seen_at'),
+            pl.col('subject_uri').alias('like_uri'),
+            pl.col('emb_idx').alias('like_emb_idx')
+        ])
+        .join(
+            posts_lf.select([
+                pl.col('at_uri'),
+                pl.col(RAW_TS_COL_NAME).alias('like_posted_at'),
+                pl.col('did').alias('like_author_did')
+            ]),
+            left_on='like_uri',
+            right_on='at_uri',
+            how='inner'
+        )
+    ) # 'target_did', 'seen_at', 'like_uri', 'like_emb_idx', 'like_posted_at', 'like_author_did'
 
 
 def _get_negative_target_posts(
@@ -66,24 +81,24 @@ def _get_negative_target_posts(
     if bucket is None:
         raise ValueError("No bucket size specified for negative samples!")
     
-    post_ts_col_name = 'post_'+TS_COL_NAME
     posts_lf = (
         posts_lf
         .select([
-            pl.col('at_uri'),
-            pl.col(TS_COL_NAME).alias(post_ts_col_name),
-            pl.col('emb_idx'),
+            pl.col('at_uri').alias('neg_uri'),
+            pl.col(RAW_TS_COL_NAME).alias('neg_posted_at'),
+            pl.col('emb_idx').alias('neg_emb_idx'),
+            pl.col('did').alias('neg_author_did'),
         ])
         .with_columns(
-            pl.col(post_ts_col_name).dt.truncate(bucket).alias('bucket')
+            pl.col('neg_posted_at').dt.truncate(bucket).alias('bucket')
         )
         # stable ordering so idx assignment is deterministic
-        .sort(['bucket', post_ts_col_name, 'at_uri'])
+        .sort(['bucket', 'neg_posted_at', 'neg_uri'])
         .with_columns(
             # polars cum_count is 1-based; shift to 0-based to match neg_idx
-            (pl.col('at_uri').cum_count().over('bucket') - 1).cast(pl.Int64).alias('idx_in_bucket'),
+            (pl.col('neg_uri').cum_count().over('bucket') - 1).cast(pl.Int64).alias('idx_in_bucket'),
         )
-    ) # 'at_uri', 'post_record_created_at', 'bucket', 'idx_in_bucket'
+    ) # 'neg_uri', 'neg_posted_at', 'neg_emb_idx', 'neg_author_did', 'bucket', 'idx_in_bucket'
 
     bucket_sizes_lf = (
         posts_lf
@@ -92,23 +107,19 @@ def _get_negative_target_posts(
         .rename({'len': 'bucket_size'})
     ) # 'bucket', 'bucket_size'
 
-    like_ts_col_name = 'like_'+TS_COL_NAME
     likes_lf = (
         liked_target_posts_lf
-        .select([
-            pl.col('did'),
-            pl.col('subject_uri'),
-            pl.col(TS_COL_NAME).alias(like_ts_col_name)
-        ])
         .with_columns([
-            pl.col(like_ts_col_name).dt.truncate(bucket).alias('bucket')
+            # using posted_at time of like so that it can match up with negatives
+            # (for which we only currently have the posted_at time)
+            pl.col('like_posted_at').dt.truncate(bucket).alias('bucket')
         ])
         # join to get bucket_size for the like's bucket
         .join(bucket_sizes_lf, on="bucket", how="inner")
         .with_columns(
             # deterministic "random" seed per (user, liked_post)
             pl.struct(
-                [pl.col('did'), pl.col('subject_uri')]
+                [pl.col('target_did'), pl.col('like_uri')]
             ).hash(seed=random_seed).cast(pl.UInt64).alias('seed'),
         )
         # seed and neg_idx together effectively assign a random post in the bucket to each like
@@ -116,24 +127,26 @@ def _get_negative_target_posts(
         .with_columns(
             (pl.col('seed') % pl.col('bucket_size').cast(pl.UInt64)).cast(pl.Int64).alias('neg_idx'),
         )
-    ) # 'did', 'subject_uri', 'like_record_created_at', 'bucket', 'bucket_size', 'seed', 'neg_idx'
+    ) # 'target_did', 'seen_at', 'like_uri', 'like_emb_idx', 'like_posted_at', 'like_author_did' 'bucket', 'bucket_size', 'seed', 'neg_idx'
 
     posts_keyed_lf = posts_lf.with_columns(
         pl.concat_str(['bucket', 'idx_in_bucket']).alias('key')
-    ).select(['key', 'at_uri', post_ts_col_name, 'emb_idx'])
-    # 'key', 'at_uri', 'post_record_created_at'
+    ).select(['key', 'neg_uri', 'neg_posted_at', 'neg_emb_idx', 'neg_author_did'])
 
     return (
         likes_lf
         .with_columns(pl.concat_str([pl.col('bucket'), pl.col(f"neg_idx")]).alias('key'))
         .join(posts_keyed_lf, on='key', how='left')
         .select([
-            pl.col('did'),
-            pl.col(post_ts_col_name).alias(TS_COL_NAME),
-            pl.col('at_uri').alias('subject_uri'),
-            pl.col('emb_idx'),
-            pl.lit(False).alias('was_liked')
-        ]) # 'did', 'record_created_at', 'subject_uri', 'was_liked'
+            'target_did',
+            'seen_at',
+            'like_uri',
+            'like_emb_idx',
+            'like_author_did',
+            'neg_uri',
+            'neg_emb_idx',
+            'neg_author_did',
+        ])
     ) 
     
 
@@ -142,9 +155,8 @@ def _get_target_posts(
     posts_lf: pl.LazyFrame,
     likes_lf: pl.LazyFrame
 ) -> pl.LazyFrame:
-    liked_target_posts_lf = _get_liked_target_posts(likes_lf)
-    negative_target_posts_lf = _get_negative_target_posts(args, posts_lf, liked_target_posts_lf)
-    return pl.concat([liked_target_posts_lf, negative_target_posts_lf], how="vertical")
+    liked_target_posts_lf = _get_liked_target_posts(likes_lf, posts_lf)
+    return _get_negative_target_posts(args, posts_lf, liked_target_posts_lf)
 
 
 def _get_train_start(
@@ -171,6 +183,9 @@ def _apply_temporal_splits(
     Appends a column, "split", that specifies "train", "val", or "holdout".
     If holdout_start is not specified in args, only outputs "train" or "val".
     """
+    # note we use 
+    final_ts_col_name = 'seen_at'
+
     train_start_str: str = _get_train_start(args)
     train_start: datetime = parse_one_ts_strict(train_start_str)
     if args.val_start is None:
@@ -184,20 +199,20 @@ def _apply_temporal_splits(
         if holdout_start <= val_start:
             raise ValueError("Validation start date is greater than or equal to holdout start date!")
         return lf.with_columns(
-            pl.when((pl.col(TS_COL_NAME) >= pl.lit(train_start)) & (pl.col(TS_COL_NAME) < pl.lit(val_start)))
+            pl.when((pl.col(final_ts_col_name) >= pl.lit(train_start)) & (pl.col(final_ts_col_name) < pl.lit(val_start)))
               .then(pl.lit("train"))
-              .when((pl.col(TS_COL_NAME) >= pl.lit(val_start)) & (pl.col(TS_COL_NAME) < pl.lit(holdout_start)))
+              .when((pl.col(final_ts_col_name) >= pl.lit(val_start)) & (pl.col(final_ts_col_name) < pl.lit(holdout_start)))
               .then(pl.lit("val"))
-              .when(pl.col(TS_COL_NAME) >= pl.lit(holdout_start))
+              .when(pl.col(final_ts_col_name) >= pl.lit(holdout_start))
               .then(pl.lit("holdout"))
               .otherwise(None)
               .alias("split")
         )
     else:
         return lf.with_columns(
-            pl.when((pl.col(TS_COL_NAME) >= pl.lit(train_start)) & (pl.col(TS_COL_NAME) < pl.lit(val_start)))
+            pl.when((pl.col(final_ts_col_name) >= pl.lit(train_start)) & (pl.col(final_ts_col_name) < pl.lit(val_start)))
               .then(pl.lit("train"))
-              .when(pl.col(TS_COL_NAME) >= pl.lit(val_start))
+              .when(pl.col(final_ts_col_name) >= pl.lit(val_start))
               .then(pl.lit("val"))
               .otherwise(None)
               .alias("split")
@@ -245,12 +260,14 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     target_posts_lf: pl.LazyFrame = _get_target_posts(args, posts_core_lf, likes_core_lf)
     target_posts_lf = _apply_temporal_splits(args, target_posts_lf)
     validate_dataframe_schema(target_posts_lf, {
-        'did': str, 
-        'subject_uri': str, 
-        'record_created_at': datetime, 
-        'emb_idx': int, 
-        'was_liked': bool, 
-        'split': str
+        'target_did': str,
+        'seen_at': datetime,
+        'like_uri': str,
+        'like_emb_idx': int,
+        'like_author_did': str,
+        'neg_uri': str,
+        'neg_emb_idx': int,
+        'neg_author_did': str,
     })
 
     # Write out result
