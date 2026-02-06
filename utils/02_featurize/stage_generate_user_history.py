@@ -65,7 +65,8 @@ def _build_user_history_directory(
         logger: Logger instance
 
     Returns:
-        LazyFrame with columns [target_did, like_uri, prior_emb_indices]
+        LazyFrame with columns [target_did, like_uri, seen_at, prior_emb_indices, raw_prior_count]
+        where raw_prior_count is the uncapped number of prior likes (for distribution analysis).
     """
     logger.info("Building user history directory...")
 
@@ -116,9 +117,11 @@ def _build_user_history_directory(
     else:
         logger.info("  No cap on prior likes (using all available history)")
 
-    # Group by integer target_idx (cheap) and collect prior emb_idx as list
+    # Group by integer target_idx (cheap) and collect prior emb_idx as list.
+    # Also compute raw (uncapped) count for distribution analysis.
     directory_lf = prior_likes.group_by("target_idx").agg(
-        agg_expr.alias("prior_emb_indices")
+        agg_expr.alias("prior_emb_indices"),
+        pl.len().alias("raw_prior_count"),
     )
 
     # Left-join back to ensure every target row appears, including those with
@@ -130,7 +133,7 @@ def _build_user_history_directory(
     # though (target_did, like_uri) is the official join key.  Downstream
     # consumers should join on the key columns, but positional alignment can be
     # relied upon as an optimization if needed.
-    all_target_keys = targets_indexed.select(["target_idx", "target_did", "like_uri"])
+    all_target_keys = targets_indexed.select(["target_idx", "target_did", "like_uri", "seen_at"])
     directory_lf = all_target_keys.join(
         directory_lf,
         on="target_idx",
@@ -139,10 +142,140 @@ def _build_user_history_directory(
         pl.when(pl.col("prior_emb_indices").is_null())
         .then(pl.lit([]).cast(pl.List(pl.UInt32)))
         .otherwise(pl.col("prior_emb_indices").cast(pl.List(pl.UInt32)))
-        .alias("prior_emb_indices")
-    ).select(["target_did", "like_uri", "prior_emb_indices"])
+        .alias("prior_emb_indices"),
+        pl.col("raw_prior_count").fill_null(0),
+    ).select(["target_did", "like_uri", "seen_at", "prior_emb_indices", "raw_prior_count"])
 
     return directory_lf
+
+
+def _log_and_plot_history_distribution(
+    directory_df: pl.DataFrame,
+    max_prior_likes: Optional[int],
+    out_dir: Path,
+    logger: logging.Logger,
+) -> None:
+    """
+    Log summary statistics and save a histogram of the per-user history length
+    distribution (measured at each user's last target post) before and after
+    the max_prior_likes cap.
+
+    For each user we look at their chronologically last target post, which has
+    the maximum available history.  The distribution of these counts across
+    users reveals how many users are actually affected by the cap.
+    """
+    # For each user, find the raw prior count at their last target post
+    last_target_per_user = directory_df.group_by("target_did").agg(
+        pl.col("raw_prior_count").sort_by("seen_at").last().alias("history_len_before"),
+    )
+
+    before = last_target_per_user["history_len_before"]
+    n_users = len(before)
+
+    if n_users == 0:
+        logger.warning("No users found for history distribution analysis")
+        return
+
+    if max_prior_likes is not None:
+        last_target_per_user = last_target_per_user.with_columns(
+            pl.col("history_len_before").clip(upper_bound=max_prior_likes).alias("history_len_after")
+        )
+        after = last_target_per_user["history_len_after"]
+    else:
+        after = before
+
+    # --- Log summary statistics ---
+    logger.info("=" * 60)
+    logger.info("Per-user history distribution (at each user's last target post)")
+    logger.info(f"  Number of unique users: {n_users:,}")
+
+    for label, dist in [("Before capping", before), ("After capping", after)]:
+        logger.info(f"  {label}:")
+        logger.info(f"    mean={dist.mean():.1f}, median={dist.median():.1f}")
+        logger.info(
+            f"    p25={int(dist.quantile(0.25, 'nearest'))}, "
+            f"p75={int(dist.quantile(0.75, 'nearest'))}, "
+            f"p90={int(dist.quantile(0.90, 'nearest'))}, "
+            f"p95={int(dist.quantile(0.95, 'nearest'))}, "
+            f"p99={int(dist.quantile(0.99, 'nearest'))}"
+        )
+        logger.info(f"    min={dist.min()}, max={dist.max()}")
+
+    if max_prior_likes is not None:
+        n_capped = int((before > max_prior_likes).sum())
+        pct_capped = 100.0 * n_capped / n_users
+        logger.info(
+            f"  Users affected by cap ({max_prior_likes}): "
+            f"{n_capped:,} ({pct_capped:.1f}%)"
+        )
+        total_before = int(before.sum())
+        total_after = int(after.sum())
+        dropped = total_before - total_after
+        pct_dropped = 100.0 * dropped / max(total_before, 1)
+        logger.info(
+            f"  Total prior likes (last target): before={total_before:,}, "
+            f"after={total_after:,}, dropped={dropped:,} ({pct_dropped:.1f}%)"
+        )
+
+    logger.info("=" * 60)
+
+    # --- Plot ---
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        logger.warning("matplotlib not available, skipping distribution plot")
+        return
+
+    before_np = before.to_numpy().astype(float)
+    after_np = after.to_numpy().astype(float)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Left panel: before capping
+    ax = axes[0]
+    max_val = int(before_np.max()) if len(before_np) > 0 else 1
+    n_bins = min(100, max(max_val + 1, 2))
+    bins = np.linspace(-0.5, max_val + 0.5, n_bins)
+    ax.hist(before_np, bins=bins, alpha=0.8, color="steelblue",
+            edgecolor="white", linewidth=0.5)
+    ax.set_xlabel("Prior likes count")
+    ax.set_ylabel("Number of users")
+    ax.set_title("Before capping")
+    if before_np.max() > 0:
+        ax.set_yscale("log")
+    if max_prior_likes is not None:
+        ax.axvline(max_prior_likes, color="red", linestyle="--",
+                    linewidth=1.5, label=f"cap = {max_prior_likes}")
+        ax.legend()
+
+    # Right panel: after capping
+    ax = axes[1]
+    max_val_after = int(after_np.max()) if len(after_np) > 0 else 1
+    n_bins_after = min(100, max(max_val_after + 1, 2))
+    bins_after = np.linspace(-0.5, max_val_after + 0.5, n_bins_after)
+    ax.hist(after_np, bins=bins_after, alpha=0.8, color="darkorange",
+            edgecolor="white", linewidth=0.5)
+    ax.set_xlabel("Prior likes count")
+    ax.set_ylabel("Number of users")
+    cap_label = (f" (max_prior_likes={max_prior_likes})"
+                 if max_prior_likes is not None else " (no cap)")
+    ax.set_title(f"After capping{cap_label}")
+    if after_np.max() > 0:
+        ax.set_yscale("log")
+
+    fig.suptitle(
+        "Distribution of history length per user (last target post)",
+        fontsize=13, y=1.02,
+    )
+    fig.tight_layout()
+
+    plot_path = out_dir / "history_distribution.png"
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"✓ Saved history distribution plot to {plot_path.name}")
 
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
@@ -252,8 +385,13 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     log_operation_start('Write user history directory', 'STAGE_02_FEATURIZE', logger)
     output_path = out_dir / f"history_posts_{out_dir.name}.parquet"
 
-    # Collect and ensure column order: target_did, like_uri, prior_emb_indices
+    # Collect (includes analysis columns seen_at, raw_prior_count alongside output columns)
     directory_df = directory_lf.collect()
+
+    # Log and plot the per-user history distribution before/after capping
+    _log_and_plot_history_distribution(directory_df, max_prior_likes, out_dir, logger)
+
+    # Select only the required output columns (drop analysis columns)
     directory_df = directory_df.select(["target_did", "like_uri", "prior_emb_indices"])
 
     directory_df.write_parquet(output_path, compression="zstd")
