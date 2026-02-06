@@ -14,18 +14,12 @@ from .core import ROOT, Context, load_run_callable
 
 # Stage specs: stage_key -> (relative_file_path_from_root, stage_folder_name)
 STAGE_SPECS: Dict[str, Tuple[str, str]] = {
-    'get_data':      ("utils/01_get_data/stage_get_data.py", "01_get_data"),
-    'target_posts':  ("utils/02_target_posts/stage_target_posts.py", "02_target_posts"),
-    'user_history':  ("utils/02_featurize/stage_generate_user_history.py", "02_featurize"),
-    'relevel':       ("utils/03_relevel/stage_relevel_uniform.py", "03_relevel"),
-    # Optional alternative relevelers (caller can override file path if desired)
-    'relevel_simple':("utils/03_relevel/stage_relevel_simple.py", "03_relevel"),
-    'relevel_gini':  ("utils/03_relevel/stage_relevel_gini.py", "03_relevel"),
-    'split':         ("utils/04_split/stage_split_users.py", "04_split"),
-    'train':         ("utils/05_train/stage_train.py", "05_train"),
-    # Alternative two-tower training module
-    'train_two_tower': ("utils/05_train/stage_train_two_tower.py", "05_train"),
-    'evaluate':      ("utils/06_evaluate/stage_evaluate.py", "06_evaluate"),
+    'get_data':        ("utils/01_get_data/stage_get_data.py",                  "01_get_data"),
+    'target_posts':    ("utils/02_target_posts/stage_target_posts.py",          "02_target_posts"),
+    'user_history':    ("utils/03_user_history/stage_generate_user_history.py",  "03_user_history"),
+    'train_mlp':       ("utils/04_train/stage_train.py",                        "04_train"),
+    'train_two_tower': ("utils/04_train/stage_train_two_tower.py",              "04_train"),
+    'evaluate':        ("utils/05_evaluate/stage_evaluate.py",                  "05_evaluate"),
 }
 
 
