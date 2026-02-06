@@ -385,8 +385,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     log_operation_start('Write user history directory', 'STAGE_02_FEATURIZE', logger)
     output_path = out_dir / f"history_posts_{out_dir.name}.parquet"
 
-    # Collect (includes analysis columns seen_at, raw_prior_count alongside output columns)
-    directory_df = directory_lf.collect()
+    # Collect using the streaming engine so that the intermediate fan-out join
+    # is processed in batches rather than fully materialised in memory.
+    # Falls back to the default engine automatically if the plan can't be streamed.
+    directory_df = directory_lf.collect(streaming=True)
 
     # Log and plot the per-user history distribution before/after capping
     _log_and_plot_history_distribution(directory_df, max_prior_likes, out_dir, logger)
