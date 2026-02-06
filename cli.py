@@ -55,6 +55,7 @@ DEFAULTS: Dict[str, Any] = {
     "embedding_model": "all_MiniLM_L6_v2",
     "skip_embeddings": False,
     # Stage 2 Target posts and Split
+    "max_prior_likes": None,  # Stage 3: cap on prior likes per target for user history (None = no cap)
     "history_buffer_hours": None,  # Stage 3: buffer in hours between seen_at and prior-like cutoff (None = no buffer)
     "neg_sample_bucket": "1h",
     "train_start": None,
@@ -532,6 +533,8 @@ def build_parser() -> argparse.ArgumentParser:
     # bucket_duration: str,
     # lookback_duration: str,
     # max_likes_per_bucket: Optional[int]
+    _add_arg_with_default(p_all, "--max-prior-likes", type=int, default=argparse.SUPPRESS,
+                          help_text="Cap on prior likes per target in Stage 3 user history (None = no cap, keeps all prior likes)")
     _add_arg_with_default(p_all, "--history-buffer-hours", type=float, default=argparse.SUPPRESS,
                           help_text="Buffer in hours subtracted from seen_at when determining prior likes for user history (None = no buffer)")
     _add_arg_with_default(p_all, "--neg-sample-bucket", type=str, default=argparse.SUPPRESS,

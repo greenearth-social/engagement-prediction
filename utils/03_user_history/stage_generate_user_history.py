@@ -107,7 +107,7 @@ def _build_user_history_directory(
 
     # Filter to likes that occurred BEFORE the target timestamp (minus optional buffer).
     # This ensures we only include prior history, not future likes.
-    if history_buffer_hours and history_buffer_hours > 0:
+    if history_buffer_hours is not None and history_buffer_hours > 0:
         buffer_us = int(history_buffer_hours * 3_600_000_000)  # hours → microseconds
         cutoff = pl.col("seen_at") - pl.duration(microseconds=buffer_us)
         logger.info(f"  Applying history buffer of {history_buffer_hours}h (like_ts < seen_at - {history_buffer_hours}h)")
