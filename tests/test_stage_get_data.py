@@ -291,7 +291,7 @@ def test_write_embeddings_memmap(tmp_path, stage_get_data_module):
     assert stats["n_embeddings_null"] == 0
     
     # Load and verify contents using the uri_to_idx mapping
-    mmap = np.memmap(embeddings_path, dtype=np.float32, mode='r', shape=(3, embed_dim))
+    mmap = np.load(embeddings_path, mmap_mode="r")
     
     # post:1 has embedding [0.1, 0.2, 0.3]
     assert np.allclose(mmap[uri_to_idx["post:1"]], [0.1, 0.2, 0.3], atol=1e-5)
@@ -313,11 +313,11 @@ def test_write_embeddings_memmap_handles_missing_embeddings(tmp_path, stage_get_
     # Create posts where some have null embeddings
     posts_rows = [
         {"at_uri": "post:1", "record_created_at": "2024-01-01T10:00:00", "did": "user:a", 
-         "record_text": "text1", "embeddings": _encode_embeddings([[0.1, 0.2, 0.3]], embedding_model)},
+         "record_text": "text1", "embeddings": [{"key": embedding_model, "value": _encode_embedding([0.1, 0.2, 0.3])}]},
         {"at_uri": "post:2", "record_created_at": "2024-01-01T11:00:00", "did": "user:b", 
          "record_text": "text2", "embeddings": None},  # NULL embedding
         {"at_uri": "post:3", "record_created_at": "2024-01-02T10:00:00", "did": "user:c", 
-         "record_text": "text3", "embeddings": _encode_embeddings([[0.7, 0.8, 0.9]], embedding_model)},
+         "record_text": "text3", "embeddings": [{"key": embedding_model, "value": _encode_embedding([0.7, 0.8, 0.9])}]},
     ]
     posts_path = _write_posts_parquet(tmp_path, posts_rows)
     
@@ -353,7 +353,7 @@ def test_write_embeddings_memmap_handles_missing_embeddings(tmp_path, stage_get_
     assert stats["n_posts_dropped_no_embedding"] == 1
     
     # Memmap should have exactly 2 rows (no gaps)
-    mmap = np.memmap(embeddings_path, dtype=np.float32, mode='r', shape=(2, embed_dim))
+    mmap = np.load(embeddings_path, mmap_mode="r")
     
     # Verify embeddings are correct using uri_to_idx
     assert np.allclose(mmap[uri_to_idx["post:1"]], [0.1, 0.2, 0.3], atol=1e-5)
