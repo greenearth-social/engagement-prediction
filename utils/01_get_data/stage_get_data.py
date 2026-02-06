@@ -923,6 +923,7 @@ def _write_embeddings_memmap(
     def _iter_candidate_embeddings() -> Iterable[Tuple[str, Optional[List[float]]]]:
         for path in posts_paths:
             posts_lf = pl.scan_parquet(path)
+            posts_lf = apply_time_filter(posts_lf, posts_start, posts_end)
             posts_lf = posts_lf.select(["at_uri", "embeddings"]).filter(
                 pl.col("at_uri").is_in(candidate_uris)
             )
