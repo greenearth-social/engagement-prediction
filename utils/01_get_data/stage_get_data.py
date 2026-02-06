@@ -438,7 +438,7 @@ def _load_likes_core_polars(
     logger.info(f"Found {len(paths)} likes parquet files")
     
     raw_lf = pl.scan_parquet(paths)
-    base_lf = apply_time_filter(raw_lf, start_str, end_str).unique(subset=['did', 'subject_uri'])
+    base_lf = apply_time_filter(raw_lf, start_str, end_str)
 
     # ===== PASS 1: Filter users =====
     logger.info("Pass 1: Counting likes per user (streaming)...")
@@ -923,7 +923,6 @@ def _write_embeddings_memmap(
     def _iter_candidate_embeddings() -> Iterable[Tuple[str, Optional[List[float]]]]:
         for path in posts_paths:
             posts_lf = pl.scan_parquet(path)
-            posts_lf = apply_time_filter(posts_lf, posts_start, posts_end)
             posts_lf = posts_lf.select(["at_uri", "embeddings"]).filter(
                 pl.col("at_uri").is_in(candidate_uris)
             )
@@ -1244,11 +1243,15 @@ def _run_greenearth_pipeline(
     # ========================================================================
     log_operation_start('Join emb_idx to likes', '01_GET_DATA', logger)
     posts_uri_to_idx = posts_core_df.select(["at_uri", "emb_idx"])
-    likes_core_df = likes_core_df.join(
-        posts_uri_to_idx,
-        left_on="subject_uri",
-        right_on="at_uri",
-        how="left"
+    likes_core_df = (
+        likes_core_df
+        .join(
+            posts_uri_to_idx,
+            left_on="subject_uri",
+            right_on="at_uri",
+            how="left"
+        )
+        .unique(subset=['did', 'subject_uri'])
     )
     # Verify no nulls in emb_idx (all likes should have matching posts after join filter)
     n_null_idx = likes_core_df.filter(pl.col("emb_idx").is_null()).height
