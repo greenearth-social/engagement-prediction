@@ -53,6 +53,7 @@ DEFAULTS: Dict[str, Any] = {
     "debug": False,
     "random_seed": 42,
     "embedding_model": "all_MiniLM_L6_v2",
+    "skip_embeddings": False,
     # Stage 2 Target posts and Split
     "neg_sample_bucket": "1h",
     "train_start": None,
@@ -540,6 +541,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Random seed for splitting")
     _add_arg_with_default(p_all, "--embedding-model", type=str, choices=["all_MiniLM_L6_v2", "all_MiniLM_L12_v2"],
                           default=argparse.SUPPRESS, help_text="SentenceTransformers model for embeddings")
+    _add_arg_with_default(p_all, "--skip-embeddings", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Skip embedding validation/memmap write in Stage 1 (faster iteration; later stages that need embeddings will fail)")
     # Stage 2 options
     _add_arg_with_default(p_all, "--neg-sample-bucket", type=str, default=argparse.SUPPRESS,
                           help_text="Duration (e.g. 1h) of time buckets for picking negative samples near positive (liked) posts")
