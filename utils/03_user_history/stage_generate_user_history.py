@@ -37,6 +37,7 @@ def _build_user_history_directory(
     likes_lf: pl.LazyFrame,
     max_prior_likes: Optional[int],
     logger: logging.Logger,
+    history_buffer_hours: Optional[float] = None,
 ) -> pl.LazyFrame:
     """
     Build a directory mapping each target (user, like-event) to prior liked embedding indices.
@@ -53,7 +54,8 @@ def _build_user_history_directory(
     Uses vectorized Polars operations for efficiency:
     1. Assign integer target_idx to each target row
     2. Join with likes on user (target_did == did) carrying only target_idx
-    3. Filter to likes that occurred before the target timestamp (seen_at)
+    3. Filter to likes that occurred before the target timestamp (seen_at),
+       optionally with a buffer period subtracted from seen_at
     4. Group by target_idx and collect emb_idx values sorted by recency
     5. Left-join back to ensure every target appears (empty list for no history)
     6. Map target_idx back to (target_did, like_uri) for the final output
@@ -63,6 +65,11 @@ def _build_user_history_directory(
         likes_lf: LazyFrame with columns [did, subject_uri, record_created_at, emb_idx]
         max_prior_likes: Optional cap on prior likes per target (None = no cap)
         logger: Logger instance
+        history_buffer_hours: Optional buffer in hours to subtract from seen_at when
+            determining prior likes.  When set, a like must satisfy
+            ``like_ts < seen_at - buffer`` instead of ``like_ts < seen_at``.
+            Useful for simulating information delay or avoiding leakage near the
+            boundary.  None or 0 means no buffer (original behaviour).
 
     Returns:
         LazyFrame with columns [target_did, like_uri, seen_at, prior_emb_indices, raw_prior_count]
@@ -98,10 +105,17 @@ def _build_user_history_directory(
         how="left",
     )
 
-    # Filter to likes that occurred BEFORE the target timestamp
-    # This ensures we only include prior history, not future likes
+    # Filter to likes that occurred BEFORE the target timestamp (minus optional buffer).
+    # This ensures we only include prior history, not future likes.
+    if history_buffer_hours and history_buffer_hours > 0:
+        buffer_us = int(history_buffer_hours * 3_600_000_000)  # hours → microseconds
+        cutoff = pl.col("seen_at") - pl.duration(microseconds=buffer_us)
+        logger.info(f"  Applying history buffer of {history_buffer_hours}h (like_ts < seen_at - {history_buffer_hours}h)")
+    else:
+        cutoff = pl.col("seen_at")
+
     prior_likes = joined.filter(
-        pl.col("like_ts") < pl.col("seen_at")
+        pl.col("like_ts") < cutoff
     )
 
     # Build aggregation expression: sort by recency (descending) and optionally cap
@@ -336,6 +350,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     if max_prior_likes is not None and max_prior_likes <= 0:
         max_prior_likes = None  # Treat 0 or negative as "no cap"
 
+    history_buffer_hours: Optional[float] = getattr(args, 'history_buffer_hours', None)
+    if history_buffer_hours is not None and history_buffer_hours <= 0:
+        history_buffer_hours = None  # Treat 0 or negative as "no buffer"
+
     # === Load data ===
     log_operation_start('Load likes_core from prior stage', 'STAGE_02_FEATURIZE', logger)
     likes_lf: pl.LazyFrame = load_parquet_from_prior(prior_get_data, "likes_core_")
@@ -377,6 +395,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         likes_lf=likes_lf,
         max_prior_likes=max_prior_likes,
         logger=logger,
+        history_buffer_hours=history_buffer_hours,
     )
 
     mem_tracker.checkpoint("after_build_history", quiet=True)
@@ -436,7 +455,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     info_lines = [
         f"stage: featurize (user_history_directory)",
         f"runtime_seconds: {runtime:.2f}",
-        f"settings: max_prior_likes={max_prior_likes}",
+        f"settings: max_prior_likes={max_prior_likes}, history_buffer_hours={history_buffer_hours}",
         f"inputs: likes_core ({n_likes:,}), target_posts ({n_targets:,})",
         f"outputs: user_history_directory ({n_output:,} entries)",
         f"stats: with_history={n_with_history:,}, empty_history={n_empty_history:,}",
