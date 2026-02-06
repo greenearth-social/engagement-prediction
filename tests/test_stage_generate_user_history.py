@@ -51,19 +51,14 @@ def _build_user_history_directory(
     Local copy of the function for testing, avoiding import issues.
 
     Build a directory mapping each target (target_did, like_uri) to prior liked
-    embedding indices.
-
-    Uses vectorized Polars operations for efficiency:
-    1. Extract (target_did, like_uri, seen_at) keys from targets
-    2. Join targets with likes on user (target_did == did)
-    3. Filter to likes that occurred before the target timestamp (seen_at)
-    4. Group by (target_did, like_uri) and collect emb_idx values sorted by recency
-    5. Left-join back to ensure every target appears (empty list for no history)
+    embedding indices.  Uses integer target_idx internally for the heavy join to
+    avoid carrying expensive string columns through the fan-out.
     """
     logger.info("Building user history directory...")
 
-    # Select only the columns we need from targets for the join
-    target_keys = targets_lf.select(["target_did", "like_uri", "seen_at"])
+    # Assign integer row index for memory-efficient keying during fan-out join
+    targets_indexed = targets_lf.with_row_index("target_idx")
+    join_keys = targets_indexed.select(["target_idx", "target_did", "seen_at"])
 
     # Rename likes columns to avoid collision after join
     likes_renamed = likes_lf.select([
@@ -73,7 +68,7 @@ def _build_user_history_directory(
     ])
 
     # Join targets with likes on user identity
-    joined = target_keys.join(
+    joined = join_keys.join(
         likes_renamed,
         left_on="target_did",
         right_on="did",
@@ -97,23 +92,23 @@ def _build_user_history_directory(
     else:
         logger.info("  No cap on prior likes (using all available history)")
 
-    # Group by (target_did, like_uri) and collect prior emb_idx as list
-    directory_lf = prior_likes.group_by(["target_did", "like_uri"]).agg(
+    # Group by integer target_idx (cheap) and collect prior emb_idx as list
+    directory_lf = prior_likes.group_by("target_idx").agg(
         agg_expr.alias("prior_emb_indices")
     )
 
-    # Handle targets with no prior history: left join back to get all targets
-    all_target_keys = target_keys.select(["target_did", "like_uri"])
+    # Left-join back and map target_idx to (target_did, like_uri) for output
+    all_target_keys = targets_indexed.select(["target_idx", "target_did", "like_uri"])
     directory_lf = all_target_keys.join(
         directory_lf,
-        on=["target_did", "like_uri"],
+        on="target_idx",
         how="left",
     ).with_columns(
         pl.when(pl.col("prior_emb_indices").is_null())
         .then(pl.lit([]).cast(pl.List(pl.UInt32)))
         .otherwise(pl.col("prior_emb_indices").cast(pl.List(pl.UInt32)))
         .alias("prior_emb_indices")
-    )
+    ).select(["target_did", "like_uri", "prior_emb_indices"])
 
     return directory_lf
 

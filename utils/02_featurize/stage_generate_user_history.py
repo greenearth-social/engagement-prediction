@@ -46,12 +46,17 @@ def _build_user_history_directory(
     event timestamp (seen_at), so a single history list is produced per pair.
     The output is indexed on (target_did, like_uri).
 
+    Internally, the heavy join/filter/group_by operations use an integer target_idx
+    to avoid carrying expensive string columns (like_uri) through the fan-out join.
+    The string keys are mapped back only at the end.
+
     Uses vectorized Polars operations for efficiency:
-    1. Extract unique (target_did, like_uri, seen_at) keys from targets
-    2. Join with likes on user (target_did == did)
+    1. Assign integer target_idx to each target row
+    2. Join with likes on user (target_did == did) carrying only target_idx
     3. Filter to likes that occurred before the target timestamp (seen_at)
-    4. Group by (target_did, like_uri) and collect emb_idx values sorted by recency
+    4. Group by target_idx and collect emb_idx values sorted by recency
     5. Left-join back to ensure every target appears (empty list for no history)
+    6. Map target_idx back to (target_did, like_uri) for the final output
 
     Args:
         targets_lf: LazyFrame with at least columns [target_did, seen_at, like_uri, ...]
@@ -64,9 +69,16 @@ def _build_user_history_directory(
     """
     logger.info("Building user history directory...")
 
-    # Select only the columns we need from targets for the join.
-    # (target_did, like_uri) is a unique key for each like-event row.
-    target_keys = targets_lf.select(["target_did", "like_uri", "seen_at"])
+    # Assign an integer row index for memory-efficient keying during the
+    # expensive fan-out join.  Carrying a UInt32 target_idx through hundreds
+    # of millions of intermediate rows is far cheaper than carrying like_uri
+    # strings (~80-100 bytes each).
+    targets_indexed = targets_lf.with_row_index("target_idx")
+
+    # For the heavy join, only carry target_idx + the columns needed for
+    # joining (target_did) and filtering (seen_at).  like_uri is NOT included
+    # here to save memory during the fan-out.
+    join_keys = targets_indexed.select(["target_idx", "target_did", "seen_at"])
 
     # Rename likes columns to avoid collision after join
     # We need: did (join key), record_created_at (for filtering/sorting), emb_idx (the result)
@@ -78,7 +90,7 @@ def _build_user_history_directory(
 
     # Join targets with likes on user identity
     # This creates one row per (target, like) pair for each user
-    joined = target_keys.join(
+    joined = join_keys.join(
         likes_renamed,
         left_on="target_did",
         right_on="did",
@@ -104,31 +116,31 @@ def _build_user_history_directory(
     else:
         logger.info("  No cap on prior likes (using all available history)")
 
-    # Group by (target_did, like_uri) and collect prior emb_idx as list
-    directory_lf = prior_likes.group_by(["target_did", "like_uri"]).agg(
+    # Group by integer target_idx (cheap) and collect prior emb_idx as list
+    directory_lf = prior_likes.group_by("target_idx").agg(
         agg_expr.alias("prior_emb_indices")
     )
 
-    # Handle targets with no prior history: left join back to get all targets.
-    # Targets without prior likes (e.g. a user's first like in the dataset)
-    # will have null prior_emb_indices, which we convert to an empty list.
+    # Left-join back to ensure every target row appears, including those with
+    # no prior likes (e.g. a user's first like in the dataset).
+    # Also map back from target_idx to the meaningful (target_did, like_uri) keys.
     #
-    # NOTE: The left side (all_target_keys) preserves the original row order from
-    # the target_posts file.  This means the output rows are 1:1 aligned with
-    # target_posts, even though (target_did, like_uri) is the official join key.
-    # Downstream consumers should join on the key columns, but positional
-    # alignment can be relied upon as an optimization if needed.
-    all_target_keys = target_keys.select(["target_did", "like_uri"])
+    # NOTE: The left side preserves the original row order from the target_posts
+    # file.  This means the output rows are 1:1 aligned with target_posts, even
+    # though (target_did, like_uri) is the official join key.  Downstream
+    # consumers should join on the key columns, but positional alignment can be
+    # relied upon as an optimization if needed.
+    all_target_keys = targets_indexed.select(["target_idx", "target_did", "like_uri"])
     directory_lf = all_target_keys.join(
         directory_lf,
-        on=["target_did", "like_uri"],
+        on="target_idx",
         how="left",
     ).with_columns(
         pl.when(pl.col("prior_emb_indices").is_null())
         .then(pl.lit([]).cast(pl.List(pl.UInt32)))
         .otherwise(pl.col("prior_emb_indices").cast(pl.List(pl.UInt32)))
         .alias("prior_emb_indices")
-    )
+    ).select(["target_did", "like_uri", "prior_emb_indices"])
 
     return directory_lf
 
