@@ -791,30 +791,6 @@ def create_user_visualization(user_tracking_results: Dict[str, Any], timestamp: 
         pass
 
 
-__all__ = [
-    # Datetime
-    'parse_one_ts',
-    # Stage 1: Memory safety checks and tracking
-    'get_current_memory_usage', 'log_memory_checkpoint', 'MemoryTracker',
-    'estimate_parquet_memory', 'estimate_filtered_data_memory',
-    'compute_memory_model_features', 'predict_memory_gb',
-    'MEMORY_MODEL_COEFFICIENTS', 'MEMORY_MODEL_FEATURE_NAMES',
-    'check_memory_available', 'check_data_load_safe',
-    # Embeddings
-    'expand_embeddings_polars', 'get_embed_col_names', 
-    # Features/columns
-    'get_actual_feature_columns', 'build_user_feature_frame',
-    # Relevel/topic helpers
-    'discover_topics', 'compute_user_topic_mixtures', 'relevel_uniform_mixture',
-    # Dataset construction
-    'create_pairs_dataset',
-    # Validation
-    'validate_dataframe_schema', 'validate_data_integrity',
-    # Viz
-    'plot_training_history', 'plot_model_performance', 'create_user_visualization',
-]
-
-
 # ----------------------------------------
 # Stage 3: Topic discovery and releveling
 # ----------------------------------------
