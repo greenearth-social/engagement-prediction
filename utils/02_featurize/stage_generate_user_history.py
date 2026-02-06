@@ -29,6 +29,7 @@ import time
 
 from utils.pipeline.core import new_stage_timestamp_dir, select_prior_output, Context
 from utils.helpers import get_stage_logger, log_operation_start, validate_dataframe_schema, load_parquet_from_prior, TIMESTAMP_COL_NAME
+from utils.memory_helpers import MemoryTracker
 
 
 def _build_user_history_directory(
@@ -137,9 +138,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     run_dir = Path(context.run_dir).resolve()
     out_dir = new_stage_timestamp_dir(run_dir, '02_featurize')
 
-    # Initialize logger
+    # Initialize logger and memory tracker
     logger = get_stage_logger('STAGE_02_FEATURIZE', log_file=out_dir / 'stage.log')
     t0 = time.time()
+    mem_tracker = MemoryTracker(logger=logger)
+    mem_tracker.checkpoint("stage_start")
 
     # === Locate prior stage outputs ===
 
@@ -208,6 +211,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     validate_dataframe_schema(targets_lf, targets_schema)
     logger.info("✓ target_posts schema validated")
 
+    mem_tracker.checkpoint("after_load_inputs", quiet=True)
+
     # Log input sizes (collect counts efficiently)
     n_likes = likes_lf.select(pl.len()).collect().item()
     n_targets = targets_lf.select(pl.len()).collect().item()
@@ -222,6 +227,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         max_prior_likes=max_prior_likes,
         logger=logger,
     )
+
+    mem_tracker.checkpoint("after_build_history", quiet=True)
 
     # === Write output ===
     log_operation_start('Write user history directory', 'STAGE_02_FEATURIZE', logger)
@@ -244,10 +251,15 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     max_prior = prior_counts.max()
     min_prior = prior_counts.filter(prior_counts > 0).min() if n_with_history > 0 else 0
 
+    mem_tracker.checkpoint("after_write_output", quiet=True)
+
     logger.info(f"✓ Wrote {n_output:,} directory entries to {output_path.name}")
     logger.info(f"  With history: {n_with_history:,} ({100*n_with_history/n_output:.1f}%)")
     logger.info(f"  Empty history: {n_empty_history:,} ({100*n_empty_history/n_output:.1f}%)")
     logger.info(f"  Prior likes per target: mean={mean_prior:.1f}, min={min_prior}, max={max_prior}")
+
+    # Memory summary
+    mem_tracker.summary()
 
     runtime = time.time() - t0
 
