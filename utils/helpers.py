@@ -57,10 +57,8 @@ KNOWN_TS_FORMATS = [
     "%Y-%m-%d",                # 2024-02-10
 ]
 
-def parse_one_ts(raw_ts: Optional[str]) -> Optional[datetime]:
-    """Parse a single timestamp string into a timezone-aware datetime (UTC)."""
-    if raw_ts is None:
-        return None
+
+def parse_one_ts_strict(raw_ts: str) -> datetime:
     for fmt in KNOWN_TS_FORMATS:
         try:
             dt = datetime.strptime(raw_ts, fmt)
@@ -70,6 +68,13 @@ def parse_one_ts(raw_ts: Optional[str]) -> Optional[datetime]:
         except ValueError:
             continue
     raise ValueError(f"Unrecognized datetime format: {raw_ts!r}")
+
+
+def parse_one_ts(raw_ts: Optional[str]) -> Optional[datetime]:
+    """Parse a single timestamp string into a timezone-aware datetime (UTC)."""
+    if raw_ts is None:
+        return None
+    return parse_one_ts_strict(raw_ts)
 
 
 def apply_time_filter(
@@ -98,6 +103,14 @@ def save_polars_physical_plan_image(lf: pl.LazyFrame, out_path: str):
     else:
         print("\n\nNo DOT output generated!!!\n\n")
     subprocess.run(["dot", "-Tpng", "-Gdpi=220", "plan.dot", "-o", out_path], check=True) 
+
+
+def load_parquet_from_prior(prior_path: Path, prefix: str) -> pl.LazyFrame:
+    # Load the most recent *.parquet found in the given directory
+    candidates = sorted(prior_path.glob(f"{prefix}*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not candidates:
+        raise FileNotFoundError(f"No {prefix}*.parquet found under {prior_path}")
+    return pl.scan_parquet(candidates[0])
 
 
 # ----------------------------------------
