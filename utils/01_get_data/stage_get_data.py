@@ -580,7 +580,7 @@ def _load_posts_core_polars(
     posts_lf = apply_time_filter(posts_lf, start_str, end_str)
 
     # get the total number of posts and calc threshold
-    n_posts_total = posts_lf.select(pl.len()).collect().item()
+    n_posts_total = posts_lf.select(pl.col('at_uri').n_unique()).collect(engine="streaming").item()
     logger.info(f"n_posts_total: {n_posts_total:,}")
     threshold_hash = _compute_random_sample_threshold(n_posts_total, negative_posts_sample)
 
@@ -696,6 +696,7 @@ def _build_posts_candidate_lf(
         )
         # Left join with liked post URIs to tag which posts are in the users' liked set.
         # The right side adds a _is_liked=True marker for all liked post URIs.
+        # Note: liked_post_uris_df is already a UNIQUE list of subject_uri's
         .join(
             liked_post_uris_df.with_columns(pl.lit(True).alias("_is_liked")).lazy(),
             left_on="at_uri",
@@ -711,6 +712,7 @@ def _build_posts_candidate_lf(
         )
         # Only keep posts that are either in the random sample, or are users' liked posts
         .filter(pl.col("in_random_sample") | pl.col("is_liked"))
+        .unique(subset=['at_uri'])
         # Drop temporary helper columns before returning
         .drop(["_is_liked", "_hash_key"])
     )
