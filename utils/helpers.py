@@ -18,28 +18,15 @@ import base64
 import struct
 import zlib
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Set, Any
+from typing import Dict, List, Tuple, Optional, Set, Any, TYPE_CHECKING
 from datetime import datetime, timedelta, timezone
 import multiprocessing as mp
-import polars as pl
 import subprocess
-import numpy as np
-import pandas as pd
 
-# Optional heavy deps: provide stubs/fallbacks to keep imports robust
-try:
-    from tqdm import tqdm  # type: ignore
-except Exception:  # pragma: no cover
-    def tqdm(iterable=None, *args, **kwargs):
-        return iterable if iterable is not None else range(kwargs.get('total', 0) or 0)
-
-try:
-    import torch  # type: ignore
-    import torch.nn as nn  # type: ignore
-except Exception:  # pragma: no cover
-    torch = None  # type: ignore
-    class nn:  # type: ignore
-        Module = object
+if TYPE_CHECKING:  # pragma: no cover
+    import numpy as np  # type: ignore
+    import pandas as pd  # type: ignore
+    import polars as pl  # type: ignore
 
 
 # Avoid HF tokenizers fork warnings/deadlocks in multiprocessing contexts
@@ -87,6 +74,7 @@ def apply_time_filter(
     Note that applying the filter using strings instead of converting to datetimes allows for 
     streaming rather than loading everything into memory.
     """
+    import polars as pl
     if 'record_created_at' not in lf.collect_schema().names():
         raise ValueError("Input LazyFrame does not contain 'record_created_at' column for time filtering")
     if start_str is not None:
@@ -107,6 +95,7 @@ def save_polars_physical_plan_image(lf: pl.LazyFrame, out_path: str):
 
 def load_parquet_from_prior(prior_path: Path, prefix: str) -> pl.LazyFrame:
     # Load the most recent *.parquet found in the given directory
+    import polars as pl
     candidates = sorted(prior_path.glob(f"{prefix}*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not candidates:
         raise FileNotFoundError(f"No {prefix}*.parquet found under {prior_path}")
@@ -152,6 +141,7 @@ def get_embedding_dim_for_model(embedding_model: str) -> int:
 
 
 def get_embeddings_list_col(lf: pl.LazyFrame, embedding_model: str) -> pl.LazyFrame:
+    import polars as pl
     emb_str = (
         pl.col("embeddings")
         .list.eval(
@@ -169,6 +159,7 @@ def get_embeddings_list_col(lf: pl.LazyFrame, embedding_model: str) -> pl.LazyFr
 
 
 def get_embed_dim(lf: pl.LazyFrame, embedding_model: str) -> int:
+    import polars as pl
     lf_with_emb = get_embeddings_list_col(lf, embedding_model)
     return (
         lf_with_emb
@@ -185,6 +176,7 @@ def expand_embeddings_polars(
     embedding_model: str,
     embed_dim: int
 ) -> pl.LazyFrame:
+    import polars as pl
     lf = get_embeddings_list_col(lf, embedding_model)
     return (
         lf
@@ -238,10 +230,6 @@ def get_actual_feature_columns(posts_emb_df: pd.DataFrame) -> Tuple[List[str], L
 # ----------------------------------------
 # User feature construction (mean/multi_centroid/topic_mixture)
 # ----------------------------------------
-try:
-    from sklearn.cluster import MiniBatchKMeans as _MBK  # type: ignore
-except Exception:  # pragma: no cover
-    _MBK = None  # type: ignore
 
 
 def build_user_feature_frame(
@@ -262,6 +250,8 @@ def build_user_feature_frame(
     min_cluster_size: int = 3,
     max_embedding_posts_per_user: int = 20,
 ) -> pd.DataFrame:
+    import numpy as np
+    import pandas as pd
     rng = np.random.RandomState(int(random_seed))
     likes_local = likes_df[likes_df['did'].isin(selected_users)] if selected_users is not None else likes_df.copy()
     if feature_columns is not None:
@@ -309,7 +299,9 @@ def build_user_feature_frame(
         return user_features_df
 
     if schema == 'multi_centroid':
-        if _MBK is None:
+        try:
+            from sklearn.cluster import MiniBatchKMeans as _MBK  # type: ignore
+        except Exception:
             raise RuntimeError("scikit-learn is required for multi_centroid user features")
         if feature_columns is not None:
             # infer K and D
@@ -423,6 +415,13 @@ def create_pairs_dataset(
     random_seed: int = 42,
     use_parallel: bool = True,
 ) -> pd.DataFrame:
+    import numpy as np
+    import pandas as pd
+    try:
+        from tqdm import tqdm  # type: ignore
+    except Exception:  # pragma: no cover
+        def tqdm(iterable=None, *args, **kwargs):
+            return iterable if iterable is not None else range(kwargs.get('total', 0) or 0)
     random.seed(int(random_seed))
     text_emb_cols = [col for col in posts_emb_df.columns if col.startswith("post_emb_")]
     image_emb_cols = [col for col in posts_emb_df.columns if col.startswith("image_emb_")]
@@ -496,6 +495,9 @@ def validate_dataframe_schema(
     column name -> dtype spec, where dtype spec can be a Python type (e.g., int,
     float, str), a pandas/numpy dtype, a dtype string, or an iterable of specs.
     """
+    import numpy as np
+    import pandas as pd
+    import polars as pl
     if not isinstance(expected_schema, dict) or not expected_schema:
         raise ValueError("expected_schema must be a non-empty dict")
 
@@ -689,18 +691,13 @@ def validate_data_integrity(data_dict: Dict) -> bool:
 # ----------------------------------------
 # Visualization helpers (shared)
 # ----------------------------------------
-import matplotlib.pyplot as plt  # type: ignore
-try:
-    import seaborn as sns  # type: ignore
-except Exception:  # pragma: no cover
-    sns = None  # type: ignore
-import matplotlib.patches as mpatches  # type: ignore
 
 FIGURE_SIZE = (10, 6)
 DPI = 300
 
 
 def plot_training_history(history: Dict[str, List[float]], save_path: Optional[Path] = None, best_epoch: Optional[int] = None):
+    import matplotlib.pyplot as plt  # type: ignore
     required_keys = ['train_loss', 'val_loss', 'train_auc', 'val_auc']
     if any(k not in history for k in required_keys) or len(history.get('train_loss', [])) == 0:
         return
@@ -733,6 +730,12 @@ def plot_training_history(history: Dict[str, List[float]], save_path: Optional[P
 
 
 def plot_model_performance(y_true: np.ndarray, y_pred_proba: np.ndarray, save_path: Optional[Path] = None):
+    import numpy as np
+    import matplotlib.pyplot as plt  # type: ignore
+    try:
+        import seaborn as sns  # type: ignore
+    except Exception:  # pragma: no cover
+        sns = None  # type: ignore
     from sklearn.metrics import roc_curve, roc_auc_score, precision_recall_curve, confusion_matrix  # type: ignore
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
     fpr, tpr, _ = roc_curve(y_true, y_pred_proba)
@@ -788,30 +791,6 @@ def create_user_visualization(user_tracking_results: Dict[str, Any], timestamp: 
         pass
 
 
-__all__ = [
-    # Datetime
-    'parse_one_ts',
-    # Stage 1: Memory safety checks and tracking
-    'get_current_memory_usage', 'log_memory_checkpoint', 'MemoryTracker',
-    'estimate_parquet_memory', 'estimate_filtered_data_memory',
-    'compute_memory_model_features', 'predict_memory_gb',
-    'MEMORY_MODEL_COEFFICIENTS', 'MEMORY_MODEL_FEATURE_NAMES',
-    'check_memory_available', 'check_data_load_safe',
-    # Embeddings
-    'expand_embeddings_polars', 'get_embed_col_names', 
-    # Features/columns
-    'get_actual_feature_columns', 'build_user_feature_frame',
-    # Relevel/topic helpers
-    'discover_topics', 'compute_user_topic_mixtures', 'relevel_uniform_mixture',
-    # Dataset construction
-    'create_pairs_dataset',
-    # Validation
-    'validate_dataframe_schema', 'validate_data_integrity',
-    # Viz
-    'plot_training_history', 'plot_model_performance', 'create_user_visualization',
-]
-
-
 # ----------------------------------------
 # Stage 3: Topic discovery and releveling
 # ----------------------------------------
@@ -832,6 +811,7 @@ def discover_topics(
     random_seed: int = 42,
 ) -> TopicArtifacts:
     """Fit MiniBatchKMeans on post embeddings (optionally after PCA) using liked posts as samples."""
+    import numpy as np
     try:
         from sklearn.decomposition import PCA  # type: ignore
         from sklearn.cluster import MiniBatchKMeans  # type: ignore
@@ -858,6 +838,7 @@ def discover_topics(
 
 
 def compute_user_topic_mixtures(artifacts: TopicArtifacts, posts_emb_df: pd.DataFrame, likes_df_joinable: pd.DataFrame, join_like: str, join_post: str) -> Optional[pd.DataFrame]:
+    import numpy as np
     if artifacts.topic_model is None:
         return None
     feat_cols = [c for c in posts_emb_df.columns if c.startswith('post_emb_') or c.startswith('image_emb_')]
@@ -896,6 +877,7 @@ def relevel_uniform_mixture(
 
     Greedy selection to approach per-topic coverage ~ uniform with minimum users per topic constraint.
     """
+    import numpy as np
     rng = np.random.RandomState(int(random_seed))
     target = np.ones((int(global_topic_k),), dtype=np.float32) / float(global_topic_k)
     kept: List[str] = []
@@ -936,7 +918,6 @@ def relevel_uniform_mixture(
 # Logging utilities
 # ----------------------------------------
 import logging
-from datetime import datetime
 
 # Global logger instances per stage (initialized on first use)
 _stage_loggers: Dict[str, logging.Logger] = {}

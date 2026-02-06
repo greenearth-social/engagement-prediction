@@ -580,13 +580,13 @@ def _load_posts_core_polars(
     posts_lf = apply_time_filter(posts_lf, start_str, end_str)
 
     # get the total number of posts and calc threshold
-    n_posts_total = posts_lf.select(pl.len()).collect().item()
+    n_posts_total = posts_lf.select(pl.col('at_uri').n_unique()).collect(engine="streaming").item()
     logger.info(f"n_posts_total: {n_posts_total:,}")
     threshold_hash = _compute_random_sample_threshold(n_posts_total, negative_posts_sample)
 
     # Metadata columns only - NO embeddings during filtering
     cols_metadata = ["at_uri", "record_created_at", "did", "record_text"]
-    
+
     # get posts: sampled via hash, or in liked_post_uris:
     negs_and_likes_lf = _build_posts_candidate_lf(
         posts_lf=posts_lf,
@@ -696,6 +696,7 @@ def _build_posts_candidate_lf(
         )
         # Left join with liked post URIs to tag which posts are in the users' liked set.
         # The right side adds a _is_liked=True marker for all liked post URIs.
+        # Note: liked_post_uris_df is already a UNIQUE list of subject_uri's
         .join(
             liked_post_uris_df.with_columns(pl.lit(True).alias("_is_liked")).lazy(),
             left_on="at_uri",
@@ -711,6 +712,7 @@ def _build_posts_candidate_lf(
         )
         # Only keep posts that are either in the random sample, or are users' liked posts
         .filter(pl.col("in_random_sample") | pl.col("is_liked"))
+        .unique(subset=['at_uri'])
         # Drop temporary helper columns before returning
         .drop(["_is_liked", "_hash_key"])
     )
@@ -739,6 +741,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     negative_posts_sample = int(args.negative_posts_sample)
     cap_random_seed = int(args.cap_random_seed)
     embedding_model = args.embedding_model
+    skip_embeddings = args.skip_embeddings
     memory_check = str(args.memory_check)  # "full", "ignore", or "skip"
     max_memory_gb = args.max_memory_gb
     if max_memory_gb is not None:
@@ -771,7 +774,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         min_likes_per_user=min_likes_per_user,
         negative_posts_sample=negative_posts_sample,
         cap_random_seed=cap_random_seed,
-        embedding_model=embedding_model
+        embedding_model=embedding_model,
+        skip_embeddings=skip_embeddings,
     )
 
     # Validate output schemas
@@ -808,6 +812,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     context.tracker.log_single_value(name="Output - Likes (final)", value=n_likes)
     context.tracker.log_single_value(name="Output - Posts (final)", value=n_posts)
     context.tracker.log_single_value(name="Output - Embedding Dim", value=embed_dim)
+    context.tracker.log_single_value(name="Output - Embeddings Written", value=not skip_embeddings)
 
     # Log to experiment tracker - comprehensive metrics for sweep analysis
     # Metric names use readable format: "Category - Metric Name" for better CSV exports
@@ -831,12 +836,14 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             'negative_posts_sample': negative_posts_sample,
             'cap_random_seed': cap_random_seed,
             'embedding_model': embedding_model,
+            'skip_embeddings': skip_embeddings,
         },
         'outputs': {
             'likes_core_rows': n_likes,
             'posts_core_rows': n_posts,
             'embedding_dim': embed_dim,
-            'embeddings_file': str(embeddings_path.name),
+            'embeddings_file': str(embeddings_path.name) if embeddings_path is not None else None,
+            'embeddings_written': not skip_embeddings,
         },
         'filtering_stats': all_stats,
     }
@@ -850,12 +857,13 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"stage: get_data",
         f"runtime_seconds: {runtime:.2f}",
         f"settings: max_liking_users={max_liking_users}, max_likes_per_user={max_likes_per_user}, "
-        f"min_likes_per_user={min_likes_per_user}, negative_posts_sample={negative_posts_sample}",
+        f"min_likes_per_user={min_likes_per_user}, negative_posts_sample={negative_posts_sample}, "
+        f"skip_embeddings={skip_embeddings}",
         f"inputs: GCS bucket={gcs_bucket}",
         f"N_likes_core: {n_likes}",
         f"N_posts_core: {n_posts}",
         f"embedding_dim: {embed_dim}",
-        f"embeddings_file: {embeddings_path.name}",
+        f"embeddings_file: {embeddings_path.name if embeddings_path is not None else 'SKIPPED'}",
     ]
     (out_dir / 'stage_info.txt').write_text('\n'.join(info_lines) + '\n')
     
@@ -866,7 +874,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'artifacts': {
             'likes_core_path': str(likes_core_path),
             'posts_core_path': str(posts_core_path),
-            'embeddings_path': str(embeddings_path),
+            'embeddings_path': str(embeddings_path) if embeddings_path is not None else None,
             'embed_dim': embed_dim,
         },
     }
@@ -1034,14 +1042,15 @@ def _run_greenearth_pipeline(
     min_likes_per_user: int,
     negative_posts_sample: int,
     cap_random_seed: int,
-    embedding_model: str
-) -> Tuple[pl.DataFrame, pl.DataFrame, Path, Path, Path, int, Dict[str, Any]]:
+    embedding_model: str,
+    skip_embeddings: bool,
+) -> Tuple[pl.DataFrame, pl.DataFrame, Path, Path, Optional[Path], int, Dict[str, Any]]:
     """
     Run the Polars-based filtering pipeline for GreenEarth Ingex data.
     
     Returns:
         Tuple of (likes_core_df, posts_core_df, likes_core_path, posts_core_path, 
-                  embeddings_path, embed_dim, stats_dict)
+                  embeddings_path (or None if skipped), embed_dim, stats_dict)
     """
     all_stats = {}
     
@@ -1091,10 +1100,11 @@ def _run_greenearth_pipeline(
     elif memory_check in ("full", "ignore"):
         # Smart memory check that accounts for filtering parameters
         log_operation_start('Check data load safety', '01_GET_DATA', logger)
+        embedding_dim_for_estimate = 0 if skip_embeddings else get_embedding_dim_for_model(embedding_model)
         memory_estimate = check_data_load_safe(
             likes_paths=likes_paths,
             posts_paths=posts_paths,
-            embedding_dim=get_embedding_dim_for_model(embedding_model),
+            embedding_dim=embedding_dim_for_estimate,
             max_memory_gb=max_memory_gb,
             max_memory_pct=max_memory_pct,
             max_liking_users=max_liking_users,
@@ -1141,6 +1151,7 @@ def _run_greenearth_pipeline(
     
     # Load posts metadata (NO embeddings - those are handled at the end)
     log_operation_start('Load posts metadata (no embeddings)', '01_GET_DATA', logger)
+    embed_dim_override = get_embedding_dim_for_model(embedding_model) if skip_embeddings else None
     posts_core_df, posts_stats, embed_dim = _load_posts_core_polars(
         start_str=posts_start,
         end_str=posts_end,
@@ -1150,71 +1161,97 @@ def _run_greenearth_pipeline(
         embedding_model=embedding_model,
         random_seed=cap_random_seed,
         logger=logger,
+        embed_dim_override=embed_dim_override,
     )
     all_stats['posts'] = posts_stats
     all_stats['embedding_dim'] = embed_dim
     mem_tracker.checkpoint("after_posts_load", quiet=True)
 
-    # ========================================================================
-    # PHASE 3: Write embeddings to memmap FIRST (determines which posts are valid)
-    # ========================================================================
-    # This is done BEFORE filtering/saving parquets to ensure only posts with
-    # valid embeddings are included. The memmap write returns uri_to_idx mapping.
-    log_operation_start('Write embeddings to memmap (validates embeddings)', '01_GET_DATA', logger)
     ts_name = out_dir.name
-    embeddings_path = out_dir / f"embeddings_{ts_name}.npy"
-    
-    uri_to_idx, embedding_stats = _write_embeddings_memmap(
-        posts_paths=posts_paths,
-        posts_start=posts_start,
-        posts_end=posts_end,
-        posts_core_df=posts_core_df,
-        embeddings_path=embeddings_path,
-        embed_dim=embed_dim,
-        embedding_model=embedding_model,
-        logger=logger,
-    )
-    all_stats['embeddings'] = embedding_stats
-    
-    mem_tracker.checkpoint("after_embeddings_write", quiet=True)
-    
-    # ========================================================================
-    # PHASE 4: Filter posts to only those with valid embeddings, add emb_idx
-    # ========================================================================
-    log_operation_start('Filter posts to valid embeddings', '01_GET_DATA', logger)
-    n_posts_before_emb_filter = len(posts_core_df)
-    valid_uris = set(uri_to_idx.keys())
-    
-    # Filter posts_core to only those with valid embeddings
-    posts_core_df = posts_core_df.filter(pl.col("at_uri").is_in(valid_uris))
-    n_posts_after_emb_filter = len(posts_core_df)
-    n_posts_dropped = n_posts_before_emb_filter - n_posts_after_emb_filter
-    
-    if n_posts_dropped > 0:
-        logger.info(f"Filtered posts: {n_posts_before_emb_filter:,} -> {n_posts_after_emb_filter:,} "
-                   f"({n_posts_dropped:,} dropped due to missing/invalid embeddings)")
+    embeddings_path: Optional[Path] = None
+    if skip_embeddings:
+        log_operation_start('Skip embeddings memmap write', '01_GET_DATA', logger)
+        embeddings_path = None
+        embedding_stats = {
+            'skipped': True,
+            'n_embeddings_valid': 0,
+            'n_embeddings_null': 0,
+            'n_embeddings_wrong_dim': 0,
+            'n_embeddings_duplicate_uri': 0,
+            'n_posts_dropped_no_embedding': 0,
+            'memmap_size_mb': 0,
+        }
+        all_stats['embeddings'] = embedding_stats
+        mem_tracker.checkpoint("after_embeddings_write", quiet=True)
+
+        # Assign emb_idx sequentially (no embedding validation)
+        log_operation_start('Assign emb_idx without embedding validation', '01_GET_DATA', logger)
+        posts_core_df = posts_core_df.with_row_index(name="emb_idx")
+        logger.info(f"✓ Added emb_idx to {len(posts_core_df):,} posts (embeddings skipped)")
+
+        all_stats['posts']['n_posts_dropped_no_embedding'] = 0
+        all_stats['posts']['n_posts_core'] = len(posts_core_df)
+        mem_tracker.checkpoint("after_posts_emb_filter", quiet=True)
     else:
-        logger.info(f"All {n_posts_after_emb_filter:,} posts have valid embeddings")
-    
-    # Add emb_idx column from uri_to_idx mapping
-    # Convert to DataFrame for joining
-    uri_idx_df = pl.DataFrame({
-        "at_uri": list(uri_to_idx.keys()),
-        "emb_idx": list(uri_to_idx.values()),
-    })
-    posts_core_df = posts_core_df.join(uri_idx_df, on="at_uri", how="left")
-    
-    # Verify no nulls in emb_idx
-    n_null_post_idx = posts_core_df.filter(pl.col("emb_idx").is_null()).height
-    if n_null_post_idx > 0:
-        raise ValueError(f"CRITICAL: {n_null_post_idx:,} posts have null emb_idx after join - this should not happen")
-    logger.info(f"✓ Added emb_idx to {len(posts_core_df):,} posts")
-    
-    # Update posts stats with embedding filter results
-    all_stats['posts']['n_posts_dropped_no_embedding'] = n_posts_dropped
-    all_stats['posts']['n_posts_core'] = n_posts_after_emb_filter
-    
-    mem_tracker.checkpoint("after_posts_emb_filter", quiet=True)
+        # ========================================================================
+        # PHASE 3: Write embeddings to memmap FIRST (determines which posts are valid)
+        # ========================================================================
+        # This is done BEFORE filtering/saving parquets to ensure only posts with
+        # valid embeddings are included. The memmap write returns uri_to_idx mapping.
+        log_operation_start('Write embeddings to memmap (validates embeddings)', '01_GET_DATA', logger)
+        embeddings_path = out_dir / f"embeddings_{ts_name}.npy"
+
+        uri_to_idx, embedding_stats = _write_embeddings_memmap(
+            posts_paths=posts_paths,
+            posts_start=posts_start,
+            posts_end=posts_end,
+            posts_core_df=posts_core_df,
+            embeddings_path=embeddings_path,
+            embed_dim=embed_dim,
+            embedding_model=embedding_model,
+            logger=logger,
+        )
+        all_stats['embeddings'] = embedding_stats
+
+        mem_tracker.checkpoint("after_embeddings_write", quiet=True)
+
+        # ========================================================================
+        # PHASE 4: Filter posts to only those with valid embeddings, add emb_idx
+        # ========================================================================
+        log_operation_start('Filter posts to valid embeddings', '01_GET_DATA', logger)
+        n_posts_before_emb_filter = len(posts_core_df)
+        valid_uris = set(uri_to_idx.keys())
+
+        # Filter posts_core to only those with valid embeddings
+        posts_core_df = posts_core_df.filter(pl.col("at_uri").is_in(valid_uris))
+        n_posts_after_emb_filter = len(posts_core_df)
+        n_posts_dropped = n_posts_before_emb_filter - n_posts_after_emb_filter
+
+        if n_posts_dropped > 0:
+            logger.info(f"Filtered posts: {n_posts_before_emb_filter:,} -> {n_posts_after_emb_filter:,} "
+                       f"({n_posts_dropped:,} dropped due to missing/invalid embeddings)")
+        else:
+            logger.info(f"All {n_posts_after_emb_filter:,} posts have valid embeddings")
+
+        # Add emb_idx column from uri_to_idx mapping
+        # Convert to DataFrame for joining
+        uri_idx_df = pl.DataFrame({
+            "at_uri": list(uri_to_idx.keys()),
+            "emb_idx": list(uri_to_idx.values()),
+        })
+        posts_core_df = posts_core_df.join(uri_idx_df, on="at_uri", how="left")
+
+        # Verify no nulls in emb_idx
+        n_null_post_idx = posts_core_df.filter(pl.col("emb_idx").is_null()).height
+        if n_null_post_idx > 0:
+            raise ValueError(f"CRITICAL: {n_null_post_idx:,} posts have null emb_idx after join - this should not happen")
+        logger.info(f"✓ Added emb_idx to {len(posts_core_df):,} posts")
+
+        # Update posts stats with embedding filter results
+        all_stats['posts']['n_posts_dropped_no_embedding'] = n_posts_dropped
+        all_stats['posts']['n_posts_core'] = n_posts_after_emb_filter
+
+        mem_tracker.checkpoint("after_posts_emb_filter", quiet=True)
     
     # ========================================================================
     # PHASE 5: Re-filter likes after embedding validation
@@ -1242,11 +1279,15 @@ def _run_greenearth_pipeline(
     # ========================================================================
     log_operation_start('Join emb_idx to likes', '01_GET_DATA', logger)
     posts_uri_to_idx = posts_core_df.select(["at_uri", "emb_idx"])
-    likes_core_df = likes_core_df.join(
-        posts_uri_to_idx,
-        left_on="subject_uri",
-        right_on="at_uri",
-        how="left"
+    likes_core_df = (
+        likes_core_df
+        .join(
+            posts_uri_to_idx,
+            left_on="subject_uri",
+            right_on="at_uri",
+            how="left"
+        )
+        .unique(subset=['did', 'subject_uri'])
     )
     # Verify no nulls in emb_idx (all likes should have matching posts after join filter)
     n_null_idx = likes_core_df.filter(pl.col("emb_idx").is_null()).height
@@ -1319,7 +1360,7 @@ def _filter_likes_after_post_join(
         # Filter users by min likes
         # (no need to use the max_liking_users functionality)
         # Returns: (sampled_users_df, n_users_total, n_likes_total, n_users_eligible)
-        sampled_users_df, n_users_before_min_likes, _, n_users_after_min_likes = _get_sampled_users_with_min_likes(
+        sampled_users_df, n_users_before_min_likes, _, _ = _get_sampled_users_with_min_likes(
             likes_lf=likes_core_df.lazy(),
             min_likes_per_user=min_likes_per_user,
             max_liking_users=None,
