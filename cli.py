@@ -51,6 +51,15 @@ DEFAULTS: Dict[str, Any] = {
     "output_dir": None,
     "run_name": None,
     "debug": False,
+    "random_seed": 42,
+    "embedding_model": "all_MiniLM_L6_v2",
+    "skip_embeddings": False,
+    # Stage 2 Target posts and Split
+    "neg_sample_bucket": "1h",
+    "train_start": None,
+    "val_start": None,
+    "holdout_start": None,
+    # Stage 3 (relevel) / Stage 3 (split)
     # Stage 2/3/4
     "bucket_duration": "hourly",
     "num_buckets_lookback": "168",  # 7 days if hourly
@@ -60,10 +69,6 @@ DEFAULTS: Dict[str, Any] = {
     "relevel_strategy": "uniform_mixture_balanced",
     "relevel_alpha": 0.35,
     "relevel_min_users_per_topic": None,
-    "val_ratio": 0.2,
-    "holdout_ratio": 0.2,
-    "random_seed": 42,
-    "embedding_model": "all_MiniLM_L6_v2",
     # Stage 4 (train)
     "model_type": "mlp",
     "shared_dim": 128,
@@ -397,7 +402,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
     
-    stage_order = ['get_data', 'user_history', relevel_key, 'split', train_key, 'evaluate']
+    stage_order = ['get_data', 'target_posts', 'user_history', relevel_key, 'split', train_key, 'evaluate']
     stage_folder = {}
     for key in stage_order:
         _mp, _folder = reg.get_stage_spec(key)
@@ -475,11 +480,11 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
                     _maybe_choose_prior(prev_key)
             label_map = {
                 'get_data': "Stage 1: Get data…",
+                'target_posts': "Stage 2: Generate target posts…",
                 'user_history': "Stage 2: Generate user history...",
-                'relevel': "Stage 2: Relevel (uniform mixture)…",
-                'relevel_gini': "Stage 2: Relevel (Gini-optimized)…",
-                'relevel_simple': "Stage 2: Relevel (simple)…",
-                'split': "Stage 3: Split users…",
+                'relevel': "Stage 3: Relevel (uniform mixture)…",
+                'relevel_gini': "Stage 3: Relevel (Gini-optimized)…",
+                'relevel_simple': "Stage 3: Relevel (simple)…",
                 'train': "Stage 4: Train model (MLP)…",
                 'train_two_tower': "Stage 4: Train model (Two-Tower)…",
                 'evaluate': "Stage 5: Evaluate model…",
@@ -540,6 +545,12 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Optional suffix for Stage 1 run dir name")
     _add_arg_with_default(p_all, "--debug", action="store_true", default=argparse.SUPPRESS,
                           help_text="Enable verbose debug logging for Stage 1")
+    _add_arg_with_default(p_all, "--random-seed", type=int, default=argparse.SUPPRESS,
+                          help_text="Random seed for splitting")
+    _add_arg_with_default(p_all, "--embedding-model", type=str, choices=["all_MiniLM_L6_v2", "all_MiniLM_L12_v2"],
+                          default=argparse.SUPPRESS, help_text="SentenceTransformers model for embeddings")
+    _add_arg_with_default(p_all, "--skip-embeddings", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Skip embedding validation/memmap write in Stage 1 (faster iteration; later stages that need embeddings will fail)")
     # Stage 2 options
     _add_arg_with_default(p_all, "--bucket-duration", type=str, choices=['hourly', 'daily'], 
                           default=argparse.SUPPRESS, help_text="")
@@ -550,6 +561,14 @@ def build_parser() -> argparse.ArgumentParser:
     # bucket_duration: str,
     # lookback_duration: str,
     # max_likes_per_bucket: Optional[int]
+    _add_arg_with_default(p_all, "--neg-sample-bucket", type=str, default=argparse.SUPPRESS,
+                          help_text="Duration (e.g. 1h) of time buckets for picking negative samples near positive (liked) posts")
+    _add_arg_with_default(p_all, "--train-start", type=str, default=argparse.SUPPRESS,
+                          help_text="ISO date string for start of training dataset window")
+    _add_arg_with_default(p_all, "--val-start", type=str, default=argparse.SUPPRESS,
+                          help_text="ISO date string for start of validation dataset window. Must be >= train-start")
+    _add_arg_with_default(p_all, "--holdout-start", type=str, default=argparse.SUPPRESS,
+                          help_text="ISO date string for start of holdout dataset window (if not supplied, no holdout set)")
     _add_arg_with_default(p_all, "--global-topic-k", type=int, default=argparse.SUPPRESS,
                           help_text="Number of global topics")
     _add_arg_with_default(p_all, "--relevel-method", type=str, choices=["uniform", "gini", "simple"],
@@ -562,14 +581,6 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Minimum users per topic when releveling")
     _add_arg_with_default(p_all, "--min-likes-per-user", type=int, default=argparse.SUPPRESS,
                           help_text="Minimum likes per user for inclusion (used in Stage 1 filtering and later stages)")
-    _add_arg_with_default(p_all, "--val-ratio", type=float, default=argparse.SUPPRESS,
-                          help_text="Validation ratio")
-    _add_arg_with_default(p_all, "--holdout-ratio", type=float, default=argparse.SUPPRESS,
-                          help_text="Holdout ratio")
-    _add_arg_with_default(p_all, "--random-seed", type=int, default=argparse.SUPPRESS,
-                          help_text="Random seed for splitting")
-    _add_arg_with_default(p_all, "--embedding-model", type=str, choices=["all_MiniLM_L6_v2", "all_MiniLM_L12_v2"],
-                          default=argparse.SUPPRESS, help_text="SentenceTransformers model for embeddings")
     # Stage 5 (train) model selection
     _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower"],
                           default=argparse.SUPPRESS, help_text="Model architecture: mlp or two-tower")
