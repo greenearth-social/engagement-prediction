@@ -13,9 +13,9 @@ Inputs:
   {target_did, seen_at, like_uri, like_emb_idx, ..., neg_uri, neg_emb_idx, ..., split}
 
 Outputs under <run_dir>/02_featurize/<timestamp>/:
-- user_history_directory_<timestamp>.parquet: {target_idx, target_did, prior_emb_indices}
-  where prior_emb_indices is a List[UInt32] of embedding indices sorted by recency (most recent first)
-  and target_idx corresponds to the row index in the target_posts file.
+- history_posts_<timestamp>.parquet: {target_did, like_uri, prior_emb_indices}
+  where prior_emb_indices is a List[UInt32] of embedding indices sorted by recency (most recent first),
+  indexed on (target_did, like_uri) so there is one history per (user, like-event) pair.
   Rows where the user has no prior likes in the dataset get an empty list.
 """
 
@@ -39,35 +39,34 @@ def _build_user_history_directory(
     logger: logging.Logger,
 ) -> pl.LazyFrame:
     """
-    Build a directory mapping each target row to prior liked embedding indices.
+    Build a directory mapping each target (user, like-event) to prior liked embedding indices.
 
     The target posts use a wide format where each row represents a (user, like-event)
     training pair.  The user history depends only on the user (target_did) and the
-    event timestamp (seen_at), so a single history list is produced per target row.
+    event timestamp (seen_at), so a single history list is produced per pair.
+    The output is indexed on (target_did, like_uri).
 
     Uses vectorized Polars operations for efficiency:
-    1. Assign a row index (target_idx) to each target row
-    2. Join targets with likes on user (target_did == did)
+    1. Extract unique (target_did, like_uri, seen_at) keys from targets
+    2. Join with likes on user (target_did == did)
     3. Filter to likes that occurred before the target timestamp (seen_at)
-    4. Group by target_idx and collect emb_idx values sorted by recency
-    5. Left-join back to ensure every target row appears (empty list for no history)
+    4. Group by (target_did, like_uri) and collect emb_idx values sorted by recency
+    5. Left-join back to ensure every target appears (empty list for no history)
 
     Args:
-        targets_lf: LazyFrame with at least columns [target_did, seen_at, ...]
+        targets_lf: LazyFrame with at least columns [target_did, seen_at, like_uri, ...]
         likes_lf: LazyFrame with columns [did, subject_uri, record_created_at, emb_idx]
         max_prior_likes: Optional cap on prior likes per target (None = no cap)
         logger: Logger instance
 
     Returns:
-        LazyFrame with columns [target_idx, target_did, prior_emb_indices]
+        LazyFrame with columns [target_did, like_uri, prior_emb_indices]
     """
     logger.info("Building user history directory...")
 
-    # Add a unique row index so we can key each target row unambiguously
-    targets_indexed = targets_lf.with_row_index("target_idx")
-
-    # Select only the columns we need from targets for the join
-    target_keys = targets_indexed.select(["target_idx", "target_did", "seen_at"])
+    # Select only the columns we need from targets for the join.
+    # (target_did, like_uri) is a unique key for each like-event row.
+    target_keys = targets_lf.select(["target_did", "like_uri", "seen_at"])
 
     # Rename likes columns to avoid collision after join
     # We need: did (join key), record_created_at (for filtering/sorting), emb_idx (the result)
@@ -105,18 +104,24 @@ def _build_user_history_directory(
     else:
         logger.info("  No cap on prior likes (using all available history)")
 
-    # Group by target_idx and collect prior emb_idx as list
-    directory_lf = prior_likes.group_by("target_idx").agg(
+    # Group by (target_did, like_uri) and collect prior emb_idx as list
+    directory_lf = prior_likes.group_by(["target_did", "like_uri"]).agg(
         agg_expr.alias("prior_emb_indices")
     )
 
-    # Handle targets with no prior history: left join back to get all targets
+    # Handle targets with no prior history: left join back to get all targets.
     # Targets without prior likes (e.g. a user's first like in the dataset)
     # will have null prior_emb_indices, which we convert to an empty list.
-    all_target_keys = target_keys.select(["target_idx", "target_did"])
+    #
+    # NOTE: The left side (all_target_keys) preserves the original row order from
+    # the target_posts file.  This means the output rows are 1:1 aligned with
+    # target_posts, even though (target_did, like_uri) is the official join key.
+    # Downstream consumers should join on the key columns, but positional
+    # alignment can be relied upon as an optimization if needed.
+    all_target_keys = target_keys.select(["target_did", "like_uri"])
     directory_lf = all_target_keys.join(
         directory_lf,
-        on="target_idx",
+        on=["target_did", "like_uri"],
         how="left",
     ).with_columns(
         pl.when(pl.col("prior_emb_indices").is_null())
@@ -207,6 +212,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     targets_schema = {
         "target_did": str,
         "seen_at": pl.Datetime,
+        "like_uri": str,
     }
     validate_dataframe_schema(targets_lf, targets_schema)
     logger.info("✓ target_posts schema validated")
@@ -234,14 +240,25 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     log_operation_start('Write user history directory', 'STAGE_02_FEATURIZE', logger)
     output_path = out_dir / f"history_posts_{out_dir.name}.parquet"
 
-    # Collect and ensure column order: target_idx, target_did, prior_emb_indices
-    # target_idx is already assigned inside _build_user_history_directory
+    # Collect and ensure column order: target_did, like_uri, prior_emb_indices
     directory_df = directory_lf.collect()
-    directory_df = directory_df.select(["target_idx", "target_did", "prior_emb_indices"])
+    directory_df = directory_df.select(["target_did", "like_uri", "prior_emb_indices"])
 
     directory_df.write_parquet(output_path, compression="zstd")
 
     n_output = len(directory_df)
+
+    # Sanity check: history_posts must have exactly the same number of rows as target_posts
+    if n_output != n_targets:
+        logger.error(
+            f"Row count mismatch! history_posts has {n_output:,} rows but "
+            f"target_posts has {n_targets:,} rows. These should be 1:1."
+        )
+        raise ValueError(
+            f"history_posts row count ({n_output:,}) != target_posts row count ({n_targets:,})"
+        )
+    logger.info(f"✓ Row count check passed: {n_output:,} history rows == {n_targets:,} target rows")
+
     n_with_history = directory_df.filter(pl.col("prior_emb_indices").list.len() > 0).height
     n_empty_history = n_output - n_with_history
 

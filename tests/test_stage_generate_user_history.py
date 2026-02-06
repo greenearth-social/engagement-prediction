@@ -2,13 +2,14 @@
 Tests for stage_generate_user_history.py (directory-based user history)
 
 Tests the _build_user_history_directory function which creates a mapping from
-each target row (keyed by target_idx) to prior liked embedding indices.
+each target (target_did, like_uri) to prior liked embedding indices.
 
 Target posts use a wide format:
   target_did | seen_at | like_uri | like_emb_idx | ... | neg_uri | neg_emb_idx | ... | split
 
 The user history depends only on (target_did, seen_at), so one history list is
-produced per target row.  Rows where the user has no prior likes get an empty list.
+produced per (target_did, like_uri) pair.  Rows where the user has no prior
+likes get an empty list.
 """
 from __future__ import annotations
 
@@ -49,22 +50,20 @@ def _build_user_history_directory(
     """
     Local copy of the function for testing, avoiding import issues.
 
-    Build a directory mapping each target row to prior liked embedding indices.
+    Build a directory mapping each target (target_did, like_uri) to prior liked
+    embedding indices.
 
     Uses vectorized Polars operations for efficiency:
-    1. Assign a row index (target_idx) to each target row
+    1. Extract (target_did, like_uri, seen_at) keys from targets
     2. Join targets with likes on user (target_did == did)
     3. Filter to likes that occurred before the target timestamp (seen_at)
-    4. Group by target_idx and collect emb_idx values sorted by recency
-    5. Left-join back to ensure every target row appears (empty list for no history)
+    4. Group by (target_did, like_uri) and collect emb_idx values sorted by recency
+    5. Left-join back to ensure every target appears (empty list for no history)
     """
     logger.info("Building user history directory...")
 
-    # Add a unique row index so we can key each target row unambiguously
-    targets_indexed = targets_lf.with_row_index("target_idx")
-
     # Select only the columns we need from targets for the join
-    target_keys = targets_indexed.select(["target_idx", "target_did", "seen_at"])
+    target_keys = targets_lf.select(["target_did", "like_uri", "seen_at"])
 
     # Rename likes columns to avoid collision after join
     likes_renamed = likes_lf.select([
@@ -98,16 +97,16 @@ def _build_user_history_directory(
     else:
         logger.info("  No cap on prior likes (using all available history)")
 
-    # Group by target_idx and collect prior emb_idx as list
-    directory_lf = prior_likes.group_by("target_idx").agg(
+    # Group by (target_did, like_uri) and collect prior emb_idx as list
+    directory_lf = prior_likes.group_by(["target_did", "like_uri"]).agg(
         agg_expr.alias("prior_emb_indices")
     )
 
     # Handle targets with no prior history: left join back to get all targets
-    all_target_keys = target_keys.select(["target_idx", "target_did"])
+    all_target_keys = target_keys.select(["target_did", "like_uri"])
     directory_lf = all_target_keys.join(
         directory_lf,
-        on="target_idx",
+        on=["target_did", "like_uri"],
         how="left",
     ).with_columns(
         pl.when(pl.col("prior_emb_indices").is_null())
@@ -125,19 +124,19 @@ def _build_user_history_directory(
 
 def _make_targets(
     target_dids: list[str],
+    like_uris: list[str],
     seen_ats: list[datetime],
 ) -> pl.LazyFrame:
     """Build a minimal wide-format targets LazyFrame with required columns."""
+    n = len(target_dids)
     return pl.DataFrame({
         "target_did": target_dids,
         "seen_at": seen_ats,
-        # Include stub wide-format columns to be realistic, though the
-        # function under test only uses target_did and seen_at.
-        "like_uri": ["stub"] * len(target_dids),
-        "like_emb_idx": [0] * len(target_dids),
-        "neg_uri": ["stub"] * len(target_dids),
-        "neg_emb_idx": [0] * len(target_dids),
-        "split": ["train"] * len(target_dids),
+        "like_uri": like_uris,
+        "like_emb_idx": [0] * n,
+        "neg_uri": ["stub"] * n,
+        "neg_emb_idx": [0] * n,
+        "split": ["train"] * n,
     }).lazy()
 
 
@@ -160,19 +159,20 @@ def test_directory_basic_creation():
         "emb_idx": [100, 200, 300],
     }).lazy()
 
-    targets_lf = _make_targets(["u1"], [datetime(2024, 1, 1, 13, 0)])
+    targets_lf = _make_targets(
+        ["u1"], ["at://u1/like/4"], [datetime(2024, 1, 1, 13, 0)],
+    )
 
-    result_lf = _build_user_history_directory(
+    result = _build_user_history_directory(
         targets_lf=targets_lf,
         likes_lf=likes_lf,
         max_prior_likes=None,
         logger=logger,
-    )
-    result = result_lf.collect()
+    ).collect()
 
     assert result.height == 1
     assert result["target_did"][0] == "u1"
-    assert result["target_idx"][0] == 0
+    assert result["like_uri"][0] == "at://u1/like/4"
     # Should have 3 prior likes, sorted by recency (most recent first)
     prior = result["prior_emb_indices"][0].to_list()
     assert len(prior) == 3
@@ -196,7 +196,9 @@ def test_directory_recency_ordering():
         "emb_idx": [10, 20, 30, 40],
     }).lazy()
 
-    targets_lf = _make_targets(["u1"], [datetime(2024, 1, 15, 0, 0)])
+    targets_lf = _make_targets(
+        ["u1"], ["at://u1/like/5"], [datetime(2024, 1, 15, 0, 0)],
+    )
 
     result = _build_user_history_directory(
         targets_lf=targets_lf,
@@ -224,7 +226,9 @@ def test_directory_max_prior_likes_capping():
         "emb_idx": list(range(1, 6)),
     }).lazy()
 
-    targets_lf = _make_targets(["u1"], [datetime(2024, 1, 10, 0, 0)])
+    targets_lf = _make_targets(
+        ["u1"], ["at://u1/like/6"], [datetime(2024, 1, 10, 0, 0)],
+    )
 
     # Cap to 3 prior likes
     result = _build_user_history_directory(
@@ -254,6 +258,7 @@ def test_directory_no_prior_history_returns_empty_list():
 
     targets_lf = _make_targets(
         ["u1", "u2"],
+        ["at://u1/like/1", "at://u2/like/1"],
         [datetime(2024, 1, 5, 0, 0), datetime(2024, 1, 5, 0, 0)],
     )
 
@@ -293,7 +298,9 @@ def test_directory_first_like_produces_empty_history():
 
     # The target row corresponds to that very first like (seen_at == like time)
     # Since we use strict < (not <=), a like at the same timestamp is NOT prior
-    targets_lf = _make_targets(["u1"], [datetime(2024, 1, 1, 10, 0)])
+    targets_lf = _make_targets(
+        ["u1"], ["at://u1/like/1"], [datetime(2024, 1, 1, 10, 0)],
+    )
 
     result = _build_user_history_directory(
         targets_lf=targets_lf,
@@ -322,7 +329,9 @@ def test_directory_excludes_future_likes():
         "emb_idx": [1, 2, 3],
     }).lazy()
 
-    targets_lf = _make_targets(["u1"], [datetime(2024, 1, 7, 0, 0)])
+    targets_lf = _make_targets(
+        ["u1"], ["at://u1/like/x"], [datetime(2024, 1, 7, 0, 0)],
+    )
 
     result = _build_user_history_directory(
         targets_lf=targets_lf,
@@ -355,6 +364,7 @@ def test_directory_multiple_targets_same_user():
     # Three targets at different times for the same user
     targets_lf = _make_targets(
         ["u1", "u1", "u1"],
+        ["at://u1/like/early", "at://u1/like/mid", "at://u1/like/late"],
         [
             datetime(2024, 1, 2, 0, 0),   # only sees p1
             datetime(2024, 1, 4, 0, 0),   # sees p1, p2
@@ -367,17 +377,16 @@ def test_directory_multiple_targets_same_user():
         likes_lf=likes_lf,
         max_prior_likes=None,
         logger=logger,
-    ).collect().sort("target_idx")
+    ).collect()
 
-    # target_idx 0 = early (Jan 2), 1 = mid (Jan 4), 2 = late (Jan 10)
     result_dict = {
-        row["target_idx"]: list(row["prior_emb_indices"])
+        row["like_uri"]: list(row["prior_emb_indices"])
         for row in result.iter_rows(named=True)
     }
 
-    assert result_dict[0] == [10]           # only p1 before
-    assert result_dict[1] == [20, 10]       # p2, p1 before
-    assert result_dict[2] == [30, 20, 10]   # all three before
+    assert result_dict["at://u1/like/early"] == [10]           # only p1 before
+    assert result_dict["at://u1/like/mid"] == [20, 10]         # p2, p1 before
+    assert result_dict["at://u1/like/late"] == [30, 20, 10]    # all three before
 
 
 def test_directory_multiple_users():
@@ -398,6 +407,7 @@ def test_directory_multiple_users():
 
     targets_lf = _make_targets(
         ["u1", "u2"],
+        ["at://u1/like/t1", "at://u2/like/t1"],
         [datetime(2024, 1, 5, 0, 0), datetime(2024, 1, 5, 0, 0)],
     )
 
@@ -431,7 +441,9 @@ def test_directory_output_schema():
         "emb_idx": [100],
     }).lazy()
 
-    targets_lf = _make_targets(["u1"], [datetime(2024, 1, 5, 0, 0)])
+    targets_lf = _make_targets(
+        ["u1"], ["at://u1/like/1"], [datetime(2024, 1, 5, 0, 0)],
+    )
 
     result = _build_user_history_directory(
         targets_lf=targets_lf,
@@ -440,51 +452,15 @@ def test_directory_output_schema():
         logger=logger,
     ).collect()
 
-    # Check schema
-    assert "target_idx" in result.columns
+    # Check schema: indexed on (target_did, like_uri)
     assert "target_did" in result.columns
+    assert "like_uri" in result.columns
     assert "prior_emb_indices" in result.columns
 
     # Old columns should NOT be present
+    assert "target_idx" not in result.columns
     assert "did" not in result.columns
     assert "post_id" not in result.columns
 
     # Check that prior_emb_indices is List[UInt32]
     assert result.schema["prior_emb_indices"] == pl.List(pl.UInt32)
-
-
-def test_directory_preserves_row_order():
-    """Test that target_idx matches the original row order of target_posts."""
-    logger = _make_test_logger()
-
-    likes_lf = pl.DataFrame({
-        "did": ["u1", "u2"],
-        "record_created_at": [
-            datetime(2024, 1, 1, 0, 0),
-            datetime(2024, 1, 1, 0, 0),
-        ],
-        "subject_uri": ["p1", "p2"],
-        "emb_idx": [10, 20],
-    }).lazy()
-
-    # Three target rows
-    targets_lf = _make_targets(
-        ["u1", "u2", "u1"],
-        [
-            datetime(2024, 1, 5, 0, 0),
-            datetime(2024, 1, 5, 0, 0),
-            datetime(2024, 1, 5, 0, 0),
-        ],
-    )
-
-    result = _build_user_history_directory(
-        targets_lf=targets_lf,
-        likes_lf=likes_lf,
-        max_prior_likes=None,
-        logger=logger,
-    ).collect().sort("target_idx")
-
-    # Should have 3 rows with target_idx 0, 1, 2
-    assert result.height == 3
-    assert result["target_idx"].to_list() == [0, 1, 2]
-    assert result["target_did"].to_list() == ["u1", "u2", "u1"]
