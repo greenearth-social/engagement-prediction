@@ -87,10 +87,23 @@ def create_data_loaders(
     val_dataset: Dataset,
     batch_size: int,
     test_dataset: Optional[Dataset] = None,
+    num_workers: int = 4,
 ):
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False) if test_dataset else None
+    # With pre-computed tensors the workers just do index lookups + collation,
+    # so even a few workers eliminate any remaining CPU-side bottleneck and
+    # keep the GPU continuously fed.
+    worker_kw: Dict[str, Any] = {}
+    if num_workers > 0:
+        worker_kw = dict(
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2,
+        )
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, **worker_kw)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, **worker_kw)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, **worker_kw) if test_dataset else None
     return train_loader, val_loader, test_loader
 
 
@@ -246,7 +259,10 @@ def _holdout_auc(
     if len(holdout_dataset) == 0:
         return {"note": "no holdout samples"}
 
-    loader = DataLoader(holdout_dataset, batch_size=batch_size, shuffle=False)
+    loader = DataLoader(
+        holdout_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=2,
+    )
     all_preds: List[float] = []
     all_labels: List[float] = []
     model.eval()
@@ -366,7 +382,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             trained_model.eval()
 
             def _collect_predictions(ds: Dataset) -> tuple:
-                loader = DataLoader(ds, batch_size=batch_size, shuffle=False, drop_last=False)
+                loader = DataLoader(
+                    ds, batch_size=batch_size, shuffle=False, drop_last=False,
+                    num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=2,
+                )
                 ys, ps = [], []
                 with torch.inference_mode():
                     for batch in loader:

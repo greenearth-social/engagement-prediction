@@ -596,8 +596,21 @@ def run(context: Context, args) -> Dict[str, Any]:
         max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=sequence_collate_fn, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=sequence_collate_fn)
+    # With pre-computed tensors, workers just do index lookups + collation.
+    _worker_kw: Dict[str, Any] = dict(
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
+    )
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        collate_fn=sequence_collate_fn, drop_last=True, **_worker_kw,
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False,
+        collate_fn=sequence_collate_fn, **_worker_kw,
+    )
 
     logger.info(f"Post embedding dim: {embed_dim}")
     logger.info(f"Train items: {len(train_dataset)}, Val items: {len(val_dataset)}")
@@ -690,7 +703,10 @@ def run(context: Context, args) -> Dict[str, Any]:
         )
         if len(holdout_dataset) > 0:
             log_operation_start("Holdout evaluation", STAGE_LOG_NAME, logger)
-            holdout_loader = DataLoader(holdout_dataset, batch_size=batch_size, shuffle=False, collate_fn=sequence_collate_fn)
+            holdout_loader = DataLoader(
+                holdout_dataset, batch_size=batch_size, shuffle=False,
+                collate_fn=sequence_collate_fn, **_worker_kw,
+            )
             holdout_eval = evaluate_model(trained_model, holdout_loader, device)
             holdout_metrics = holdout_eval["metrics"]
             logger.info(f"Holdout metrics: {holdout_metrics}")

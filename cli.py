@@ -391,17 +391,17 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
         stage_folder[key] = _folder
 
     # Respect selective reruns
+    # Map 'train' to the actual train key BEFORE validation
     start_from = args.start_from
-    if start_from and start_from not in stage_order:
-        raise ValueError(f"Unrecognized start_from: {start_from}. Please choose from: {stage_order}")
-    stop_after = args.stop_after
-    if stop_after and stop_after not in stage_order:
-        raise ValueError(f"Unrecognized stop_after: {stop_after}. Please choose from: {stage_order}")
-    # Map 'train' to the actual train key (train_mlp or train_two_tower)
     if start_from == 'train':
         start_from = train_key
+    stop_after = args.stop_after
     if stop_after == 'train':
         stop_after = train_key
+    if start_from and start_from not in stage_order:
+        raise ValueError(f"Unrecognized start_from: {start_from}. Please choose from: {stage_order}")
+    if stop_after and stop_after not in stage_order:
+        raise ValueError(f"Unrecognized stop_after: {stop_after}. Please choose from: {stage_order}")
     start_idx = stage_order.index(start_from) if start_from in stage_order else 0
     stop_idx = stage_order.index(stop_after) if stop_after in stage_order else (len(stage_order) - 1)
 

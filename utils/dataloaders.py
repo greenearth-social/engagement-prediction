@@ -292,6 +292,10 @@ class SummarizedEngagementDataset(Dataset):
 
     Currently consumed by the MLP; future-proof for any model that accepts a
     fixed-length feature vector.
+
+    **Performance**: all user summaries and post embeddings are pre-computed
+    into contiguous float32 tensors at init time, so ``__getitem__`` is a
+    pure in-memory index lookup with zero memmap I/O.
     """
 
     def __init__(
@@ -304,24 +308,42 @@ class SummarizedEngagementDataset(Dataset):
         embed_dim: int,
         logger: Optional[logging.Logger] = None,
     ):
-        self.embeddings = embeddings_mmap
-        self.summarizer = summarizer
         self.embed_dim = embed_dim
 
         (
-            self.like_emb_idx,
-            self.neg_emb_idx,
-            self.prior_emb_indices,
+            like_emb_idx,
+            neg_emb_idx,
+            prior_emb_indices,
             self.target_dids,
             self.like_uris,
         ) = _prepare_split_data(target_posts_df, history_df, split, logger)
 
-        self._n_rows = len(self.like_emb_idx)
+        self._n_rows = len(like_emb_idx)
+
+        # ── Pre-compute user summaries [N, D] ────────────────────────
         if logger:
+            logger.info(f"  Pre-computing user summaries for '{split}' ({self._n_rows:,} rows)…")
+        user_summaries = np.zeros((self._n_rows, embed_dim), dtype=np.float32)
+        for i, hist_indices in enumerate(prior_emb_indices):
+            if len(hist_indices) > 0:
+                hist_embs = embeddings_mmap[hist_indices]  # [seq, D]
+                user_summaries[i] = summarizer.summarize(hist_embs)
+            # else: stays zeros
+        self._user_summaries = torch.from_numpy(user_summaries)
+
+        # ── Pre-fetch post embeddings [N, D] for pos and neg ─────────
+        pos_embs = np.array(embeddings_mmap[like_emb_idx], dtype=np.float32)
+        neg_embs = np.array(embeddings_mmap[neg_emb_idx], dtype=np.float32)
+        self._pos_post_embs = torch.from_numpy(pos_embs)
+        self._neg_post_embs = torch.from_numpy(neg_embs)
+
+        if logger:
+            mem_mb = (user_summaries.nbytes + pos_embs.nbytes + neg_embs.nbytes) / (1024 * 1024)
             logger.info(
                 f"  SummarizedEngagementDataset('{split}'): "
                 f"{self._n_rows:,} rows -> {len(self):,} samples "
-                f"(summarizer={type(summarizer).__name__})"
+                f"(summarizer={type(summarizer).__name__}, "
+                f"pre-computed {mem_mb:.1f} MB)"
             )
 
     def __len__(self) -> int:
@@ -331,27 +353,19 @@ class SummarizedEngagementDataset(Dataset):
         row_idx = idx // 2
         is_positive = (idx % 2) == 0
 
-        # --- user history summary ---
-        hist_indices = self.prior_emb_indices[row_idx]
-        if len(hist_indices) > 0:
-            hist_embs = self.embeddings[hist_indices]  # [seq, D]
-            user_vec = self.summarizer.summarize(hist_embs)
-        else:
-            user_vec = np.zeros(self.embed_dim, dtype=np.float32)
-
-        # --- post embedding ---
+        user_vec = self._user_summaries[row_idx]            # [D]
         if is_positive:
-            post_vec = np.array(self.embeddings[self.like_emb_idx[row_idx]], dtype=np.float32)
+            post_vec = self._pos_post_embs[row_idx]          # [D]
             label = 1.0
             post_id = self.like_uris[row_idx]
         else:
-            post_vec = np.array(self.embeddings[self.neg_emb_idx[row_idx]], dtype=np.float32)
+            post_vec = self._neg_post_embs[row_idx]          # [D]
             label = 0.0
             post_id = f"neg_{row_idx}"
 
-        features = np.concatenate([user_vec, post_vec])  # [2D]
+        features = torch.cat([user_vec, post_vec])           # [2D]
         return {
-            "features": torch.from_numpy(features),
+            "features": features,
             "label": torch.tensor(label, dtype=torch.float32),
             "user_id": self.target_dids[row_idx],
             "post_id": post_id,
@@ -369,6 +383,13 @@ class SequenceEngagementDataset(Dataset):
 
     Currently consumed by the Two-Tower model; future-proof for any model that
     operates on variable-length embedding sequences (e.g. MLP + attention head).
+
+    **Performance**: post embeddings (small: ``2 * N * D * 4`` bytes) are
+    pre-computed into contiguous tensors.  History sequences are constructed
+    on-the-fly from the memmap to avoid the prohibitive memory cost of
+    materializing a dense ``[N, max_seq, D]`` float32 tensor (which would be
+    ~13 GB at N=178K, max_seq=50, D=384).  Multi-worker DataLoaders pipeline
+    the per-sample memmap reads so the GPU stays fed.
     """
 
     def __init__(
@@ -386,19 +407,32 @@ class SequenceEngagementDataset(Dataset):
         self.embed_dim = embed_dim
 
         (
-            self.like_emb_idx,
-            self.neg_emb_idx,
+            like_emb_idx,
+            neg_emb_idx,
             self.prior_emb_indices,
             self.target_dids,
             self.like_uris,
         ) = _prepare_split_data(target_posts_df, history_df, split, logger)
 
-        self._n_rows = len(self.like_emb_idx)
+        self._n_rows = len(like_emb_idx)
+
+        # ── Pre-fetch post embeddings [N, D] for pos and neg (cheap: ~560 MB) ──
+        pos_embs = np.array(embeddings_mmap[like_emb_idx], dtype=np.float32)
+        neg_embs = np.array(embeddings_mmap[neg_emb_idx], dtype=np.float32)
+        self._pos_post_embs = torch.from_numpy(pos_embs)
+        self._neg_post_embs = torch.from_numpy(neg_embs)
+
         if logger:
+            mem_mb = (pos_embs.nbytes + neg_embs.nbytes) / (1024 * 1024)
+            # Estimate what the full pre-compute would have cost
+            full_gb = (self._n_rows * max_history_len * embed_dim * 4) / (1024 ** 3)
             logger.info(
                 f"  SequenceEngagementDataset('{split}'): "
                 f"{self._n_rows:,} rows -> {len(self):,} samples "
-                f"(max_history_len={max_history_len})"
+                f"(max_history_len={max_history_len}, "
+                f"post embs pre-computed {mem_mb:.1f} MB, "
+                f"history sequences on-the-fly via workers "
+                f"[would be {full_gb:.1f} GB if materialized])"
             )
 
     def __len__(self) -> int:
@@ -408,33 +442,32 @@ class SequenceEngagementDataset(Dataset):
         row_idx = idx // 2
         is_positive = (idx % 2) == 0
 
-        # --- user history sequence (pad / truncate) ---
+        # --- history sequence: pad / truncate from memmap (done in worker) ---
         hist_indices = self.prior_emb_indices[row_idx]
         seq_len = min(len(hist_indices), self.max_history_len)
 
         padded = np.zeros((self.max_history_len, self.embed_dim), dtype=np.float32)
-        mask = np.zeros(self.max_history_len, dtype=bool)
+        mask = np.zeros(self.max_history_len, dtype=np.bool_)
 
         if seq_len > 0:
-            # hist_indices are already most-recent-first; take the first max_history_len
             used_indices = hist_indices[: self.max_history_len]
             padded[:seq_len] = self.embeddings[used_indices]
             mask[:seq_len] = True
 
-        # --- post embedding ---
+        # --- post embedding: pre-computed tensor lookup ---
         if is_positive:
-            post_vec = np.array(self.embeddings[self.like_emb_idx[row_idx]], dtype=np.float32)
+            post_vec = self._pos_post_embs[row_idx]          # [D]
             label = 1.0
             post_id = self.like_uris[row_idx]
         else:
-            post_vec = np.array(self.embeddings[self.neg_emb_idx[row_idx]], dtype=np.float32)
+            post_vec = self._neg_post_embs[row_idx]          # [D]
             label = 0.0
             post_id = f"neg_{row_idx}"
 
         return {
-            "history_embeddings": torch.from_numpy(padded),
-            "history_mask": torch.from_numpy(mask),
-            "target_post_embedding": torch.from_numpy(post_vec),
+            "history_embeddings": torch.from_numpy(padded),            # [max_seq, D]
+            "history_mask": torch.from_numpy(mask),                    # [max_seq]
+            "target_post_embedding": post_vec,
             "label": torch.tensor(label, dtype=torch.float32),
             "user_id": self.target_dids[row_idx],
             "post_id": post_id,
