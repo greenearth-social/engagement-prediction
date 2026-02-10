@@ -74,6 +74,7 @@ DEFAULTS: Dict[str, Any] = {
     # Stage 4 (train)
     "user_summarization": "mean",  # MLP user-history summarization: mean, ema, linear_recency
     "ema_alpha": 0.1,  # EMA smoothing factor (only used when user_summarization=ema)
+    "user_encoder": None,  # None = smart default (summarized for mlp, attention for two-tower)
     "model_type": "mlp",
     "shared_dim": 128,
     "user_hidden_dim": 256,
@@ -179,6 +180,7 @@ def _build_tracking_params(args: argparse.Namespace, run_dir: Path) -> Dict[str,
         "train": {
             "user_summarization": args.user_summarization,
             "ema_alpha": args.ema_alpha,
+            "user_encoder": args.user_encoder,
             "model_type": args.model_type,
             "shared_dim": args.shared_dim,
             "user_hidden_dim": args.user_hidden_dim,
@@ -383,6 +385,24 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
         train_key = 'train_two_tower'
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
+
+    # --- Smart default & validation for --user-encoder ---
+    user_encoder = getattr(args, "user_encoder", None)
+    if user_encoder is None:
+        # Apply smart default based on model type
+        user_encoder = "summarized" if model_type == "mlp" else "attention"
+        args.user_encoder = user_encoder
+
+    valid_encoders = {
+        "mlp": ("summarized", "attention"),
+        "two-tower": ("attention", "lightweight"),
+    }
+    allowed = valid_encoders.get(model_type, ())
+    if user_encoder not in allowed:
+        raise ValueError(
+            f"--user-encoder '{user_encoder}' is not valid for --model-type '{model_type}'. "
+            f"Allowed values: {allowed}"
+        )
     
     stage_order = ['get_data', 'target_posts', 'user_history', train_key, 'evaluate']
     stage_folder = {}
@@ -563,6 +583,9 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="User-history summarization strategy for MLP (mean, ema, linear_recency)")
     _add_arg_with_default(p_all, "--ema-alpha", type=float, default=argparse.SUPPRESS,
                           help_text="EMA smoothing factor (0,1]. Higher = more weight on recent likes. Only used when --user-summarization=ema")
+    _add_arg_with_default(p_all, "--user-encoder", type=str, choices=["summarized", "attention", "lightweight"],
+                          default=argparse.SUPPRESS,
+                          help_text="User encoder type: summarized (default for mlp), attention (default for two-tower), lightweight (two-tower only)")
     _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower"],
                           default=argparse.SUPPRESS, help_text="Model architecture: mlp or two-tower")
     # Two-tower specific options

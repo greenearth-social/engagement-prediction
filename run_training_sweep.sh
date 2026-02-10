@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Configuration ──────────────────────────────────────────────────────
-DATA_DIR="outputs/20260206_224255_start_to_user_history_mlp"
+DATA_DIR="outputs/20260210_013142_all_mlp"
 
 EPOCHS=300
 BATCH_SIZE=2048
@@ -26,18 +26,20 @@ EMA_ALPHA=0.1    # only used when user-summarization=ema
 MAX_PARALLEL=4   # max concurrent MLP jobs
 
 # ── Permutations ───────────────────────────────────────────────────────
+# Each entry is "user_encoder:user_summarization" (summarization ignored when encoder != summarized)
+#
 # MLP experiments (parallelisable -- tiny GPU footprint)
 MLP_EXPERIMENTS=(
-  "mean"
-  "ema"
-  "linear_recency"
+  "summarized:mean"
+  "summarized:ema"
+  "summarized:linear_recency"
+  "attention:"
 )
 
 # Two-tower experiments (sequential -- heavy GPU/memory usage)
 TT_EXPERIMENTS=(
-  "mean"
-  "ema"
-  "linear_recency"
+  "attention:"
+  "lightweight:"
 )
 
 # ── Resolve paths ──────────────────────────────────────────────────────
@@ -63,26 +65,32 @@ log "═════════════════════════
 
 # ── Helper: launch one experiment ──────────────────────────────────────
 # Writes exit code to a status file so we can collect results later.
+# Args: MODEL_TYPE  USER_ENCODER  USER_SUMM  RUN_LABEL  RUN_LOG  STATUS_FILE
 run_one() {
   local MODEL_TYPE="$1"
-  local USER_SUMM="$2"
-  local RUN_LABEL="$3"
-  local RUN_LOG="$4"
-  local STATUS_FILE="$5"
+  local USER_ENCODER="$2"
+  local USER_SUMM="$3"
+  local RUN_LABEL="$4"
+  local RUN_LOG="$5"
+  local STATUS_FILE="$6"
 
   local CMD=(
     python3 cli.py run-all --foreground
     --output-dir "$DATA_DIR_ABS"
     --start-from train --stop-after train
     --model-type "$MODEL_TYPE"
-    --user-summarization "$USER_SUMM"
+    --user-encoder "$USER_ENCODER"
     --epochs "$EPOCHS"
     --batch-size "$BATCH_SIZE"
     --patience "$PATIENCE"
   )
 
-  if [[ "$USER_SUMM" == "ema" ]]; then
-    CMD+=(--ema-alpha "$EMA_ALPHA")
+  # Only pass --user-summarization when the encoder is "summarized"
+  if [[ "$USER_ENCODER" == "summarized" && -n "$USER_SUMM" ]]; then
+    CMD+=(--user-summarization "$USER_SUMM")
+    if [[ "$USER_SUMM" == "ema" ]]; then
+      CMD+=(--ema-alpha "$EMA_ALPHA")
+    fi
   fi
 
   log "[$RUN_LABEL] Launching: ${CMD[*]}"
@@ -109,11 +117,15 @@ MLP_LABELS=()
 RUNNING=0
 
 for i in "${!MLP_EXPERIMENTS[@]}"; do
-  USER_SUMM="${MLP_EXPERIMENTS[$i]}"
+  SPEC="${MLP_EXPERIMENTS[$i]}"
+  USER_ENCODER="${SPEC%%:*}"
+  USER_SUMM="${SPEC#*:}"
   RUN_NUM=$((i + 1))
-  RUN_LABEL="MLP ${RUN_NUM}/${#MLP_EXPERIMENTS[@]}  mlp/${USER_SUMM}"
-  RUN_LOG="$LOG_DIR/run_mlp_${USER_SUMM}.log"
-  STATUS_FILE="$LOG_DIR/.status_mlp_${USER_SUMM}"
+  TAG="${USER_ENCODER}"
+  [[ -n "$USER_SUMM" ]] && TAG="${USER_ENCODER}/${USER_SUMM}"
+  RUN_LABEL="MLP ${RUN_NUM}/${#MLP_EXPERIMENTS[@]}  mlp/${TAG}"
+  RUN_LOG="$LOG_DIR/run_mlp_${USER_ENCODER}_${USER_SUMM:-none}.log"
+  STATUS_FILE="$LOG_DIR/.status_mlp_${USER_ENCODER}_${USER_SUMM:-none}"
 
   # Throttle: wait for a slot if we're at capacity
   while (( RUNNING >= MAX_PARALLEL )); do
@@ -128,7 +140,7 @@ for i in "${!MLP_EXPERIMENTS[@]}"; do
     done
   done
 
-  run_one "mlp" "$USER_SUMM" "$RUN_LABEL" "$RUN_LOG" "$STATUS_FILE" &
+  run_one "mlp" "$USER_ENCODER" "$USER_SUMM" "$RUN_LABEL" "$RUN_LOG" "$STATUS_FILE" &
   MLP_PIDS+=($!)
   MLP_STATUS_FILES+=("$STATUS_FILE")
   MLP_LABELS+=("$RUN_LABEL")
@@ -164,41 +176,27 @@ log "║  Phase 2: Two-tower experiments (sequential)                ║"
 log "╚══════════════════════════════════════════════════════════════╝"
 
 for i in "${!TT_EXPERIMENTS[@]}"; do
-  USER_SUMM="${TT_EXPERIMENTS[$i]}"
+  SPEC="${TT_EXPERIMENTS[$i]}"
+  USER_ENCODER="${SPEC%%:*}"
+  USER_SUMM="${SPEC#*:}"
   RUN_NUM=$((i + 1))
-  RUN_LABEL="TT ${RUN_NUM}/${#TT_EXPERIMENTS[@]}  two-tower/${USER_SUMM}"
-  RUN_LOG="$LOG_DIR/run_two-tower_${USER_SUMM}.log"
+  RUN_LABEL="TT ${RUN_NUM}/${#TT_EXPERIMENTS[@]}  two-tower/${USER_ENCODER}"
+  RUN_LOG="$LOG_DIR/run_two-tower_${USER_ENCODER}.log"
+  STATUS_FILE="$LOG_DIR/.status_tt_${USER_ENCODER}"
 
   log ""
   log "────────────────────────────────────────────────────────────────"
   log "[$RUN_LABEL] Starting…"
   log "────────────────────────────────────────────────────────────────"
 
-  CMD=(
-    python3 cli.py run-all --foreground
-    --output-dir "$DATA_DIR_ABS"
-    --start-from train --stop-after train
-    --model-type "two-tower"
-    --user-summarization "$USER_SUMM"
-    --epochs "$EPOCHS"
-    --batch-size "$BATCH_SIZE"
-    --patience "$PATIENCE"
-  )
+  run_one "two-tower" "$USER_ENCODER" "$USER_SUMM" "$RUN_LABEL" "$RUN_LOG" "$STATUS_FILE"
 
-  if [[ "$USER_SUMM" == "ema" ]]; then
-    CMD+=(--ema-alpha "$EMA_ALPHA")
-  fi
-
-  log "Command: ${CMD[*]}"
-
-  if "${CMD[@]}" > >(tee -a "$RUN_LOG") 2>&1; then
-    log "[$RUN_LABEL] ✓ Completed successfully"
+  if [[ -f "$STATUS_FILE" ]] && [[ "$(cat "$STATUS_FILE")" == "0" ]]; then
     (( PASSED++ )) || true
   else
-    EC=$?
-    log "[$RUN_LABEL] ✗ Failed (exit $EC). See $RUN_LOG"
     (( FAILED++ )) || true
   fi
+  rm -f "$STATUS_FILE"
 done
 
 # ── Summary ────────────────────────────────────────────────────────────

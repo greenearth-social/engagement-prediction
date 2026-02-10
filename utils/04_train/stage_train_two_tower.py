@@ -158,6 +158,109 @@ class UserHistoryEncoder(nn.Module):
 
 
 # =============================================================================
+# Lightweight Attention Encoder (cross-attention pooling, no self-attention)
+# =============================================================================
+
+class LightweightAttentionEncoder(nn.Module):
+    """Lightweight user-history encoder: input projection + positional encoding
+    + single learned-query cross-attention pooling.
+
+    Same ``forward(history_embeddings, history_mask) -> [B, output_dim]``
+    interface as :class:`UserHistoryEncoder` but **without** the expensive
+    ``TransformerEncoder`` self-attention layers.  This reduces complexity from
+    O(num_layers * seq_len^2 * hidden_dim) to O(seq_len * hidden_dim) and
+    parameter count from ~2 M to ~150 K (typical settings).
+
+    Designed as the user tower for a *light-ranker* two-tower model that needs
+    to score large candidate sets efficiently.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 256,
+        output_dim: int = 128,
+        max_seq_len: int = 50,
+        dropout_rate: float = 0.1,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.max_seq_len = max_seq_len
+
+        self.input_projection = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+        )
+
+        self.positional_embedding = nn.Embedding(max_seq_len, hidden_dim)
+
+        # Learned query for cross-attention pooling (single head)
+        self.attention_query = nn.Parameter(torch.randn(1, 1, hidden_dim))
+
+        self.output_projection = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0, std=0.02)
+
+    def forward(
+        self,
+        history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
+        history_mask: Optional[torch.Tensor] = None,  # [B, seq_len] True = valid
+    ) -> torch.Tensor:
+        B, seq_len, _ = history_embeddings.shape
+        device = history_embeddings.device
+
+        if history_mask is None:
+            history_mask = torch.ones(B, seq_len, dtype=torch.bool, device=device)
+
+        x = self.input_projection(history_embeddings)
+
+        # Positional embeddings flipped for recency (position 0 = most recent)
+        positions = torch.arange(seq_len, device=device)
+        positions = (self.max_seq_len - 1) - positions.clamp(max=self.max_seq_len - 1)
+        pos_emb = self.positional_embedding(positions)
+        x = x + pos_emb.unsqueeze(0)
+
+        # --- NO TransformerEncoder here (the key cost saving) ---
+
+        # Cross-attention pooling: learned query attends to projected history
+        attn_mask_inv = ~history_mask  # True = ignore
+        query = self.attention_query.expand(B, -1, -1)
+        attn_scores = torch.bmm(query, x.transpose(1, 2))  # [B, 1, seq]
+        attn_scores = attn_scores.masked_fill(attn_mask_inv.unsqueeze(1), float("-inf"))
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = torch.nan_to_num(attn_weights, nan=1.0 / max(seq_len, 1))
+        attention_pooled = torch.bmm(attn_weights, x).squeeze(1)  # [B, hidden]
+
+        # Mean pooling (masked)
+        mask_expanded = history_mask.unsqueeze(-1).float()
+        sum_x = (x * mask_expanded).sum(dim=1)
+        count = mask_expanded.sum(dim=1).clamp(min=1)
+        mean_pooled = sum_x / count
+
+        combined = torch.cat([attention_pooled, mean_pooled], dim=-1)
+        return self.output_projection(combined)
+
+
+# =============================================================================
 # Post Tower
 # =============================================================================
 
@@ -197,7 +300,7 @@ class PostTower(nn.Module):
 # =============================================================================
 
 class TwoTowerEngagement(nn.Module):
-    """Two-tower model: user tower (attention encoder) + post tower (MLP)."""
+    """Two-tower model: user tower (attention or lightweight encoder) + post tower (MLP)."""
 
     def __init__(
         self,
@@ -209,20 +312,36 @@ class TwoTowerEngagement(nn.Module):
         num_attention_layers: int = 2,
         max_history_len: int = 50,
         dropout_rate: float = 0.1,
+        user_encoder_type: str = "attention",
     ):
         super().__init__()
         self.shared_dim = shared_dim
         self.post_embedding_dim = post_embedding_dim
+        self.user_encoder_type = user_encoder_type
 
-        self.user_tower = UserHistoryEncoder(
-            input_dim=post_embedding_dim,
-            hidden_dim=user_hidden_dim,
-            output_dim=shared_dim,
-            num_attention_heads=num_attention_heads,
-            num_attention_layers=num_attention_layers,
-            max_seq_len=max_history_len,
-            dropout_rate=dropout_rate,
-        )
+        if user_encoder_type == "lightweight":
+            self.user_tower = LightweightAttentionEncoder(
+                input_dim=post_embedding_dim,
+                hidden_dim=user_hidden_dim,
+                output_dim=shared_dim,
+                max_seq_len=max_history_len,
+                dropout_rate=dropout_rate,
+            )
+        elif user_encoder_type == "attention":
+            self.user_tower = UserHistoryEncoder(
+                input_dim=post_embedding_dim,
+                hidden_dim=user_hidden_dim,
+                output_dim=shared_dim,
+                num_attention_heads=num_attention_heads,
+                num_attention_layers=num_attention_layers,
+                max_seq_len=max_history_len,
+                dropout_rate=dropout_rate,
+            )
+        else:
+            raise ValueError(
+                f"Unknown user_encoder_type '{user_encoder_type}'. "
+                "Choose 'attention' or 'lightweight'."
+            )
 
         self.post_tower = PostTower(
             input_dim=post_embedding_dim,
@@ -616,7 +735,8 @@ def run(context: Context, args) -> Dict[str, Any]:
     logger.info(f"Train items: {len(train_dataset)}, Val items: {len(val_dataset)}")
 
     # --- create model ---
-    log_operation_start("Create two-tower model", STAGE_LOG_NAME, logger)
+    user_encoder_type = getattr(args, "user_encoder", "attention")
+    log_operation_start(f"Create two-tower model (user_encoder={user_encoder_type})", STAGE_LOG_NAME, logger)
     model = TwoTowerEngagement(
         post_embedding_dim=embed_dim,
         shared_dim=shared_dim,
@@ -626,6 +746,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         num_attention_layers=num_attention_layers,
         max_history_len=max_history_len,
         dropout_rate=dropout_rate,
+        user_encoder_type=user_encoder_type,
     )
 
     # --- train ---
@@ -671,6 +792,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     model_path = checkpoints_dir / f"two_tower_{timestamp}.pth"
     config = {
         "model_type": "two_tower",
+        "user_encoder_type": user_encoder_type,
         "post_embedding_dim": embed_dim,
         "shared_dim": shared_dim,
         "user_hidden_dim": user_hidden_dim,

@@ -21,6 +21,7 @@ Outputs under <run_dir>/04_train/<timestamp>/:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import time
 from datetime import datetime
@@ -30,6 +31,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from utils.pipeline.core import new_stage_timestamp_dir, Context
@@ -43,6 +45,8 @@ from utils.dataloaders import (
     load_training_data,
     get_summarizer,
     SummarizedEngagementDataset,
+    SequenceEngagementDataset,
+    sequence_collate_fn,
 )
 
 STAGE_LOG_NAME = "STAGE_04_TRAIN_MLP"
@@ -72,6 +76,119 @@ class EngagementPredictor(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.network(x)
+
+
+    def train_step(self, batch: Dict[str, torch.Tensor], device: str):
+        """Unified training step: unpack batch, forward, compute loss.
+
+        Returns (loss, predictions_tensor).
+        """
+        feats = batch["features"].to(device)
+        labels = batch["label"].to(device)
+        preds = self.forward(feats).squeeze()
+        loss = F.binary_cross_entropy(preds, labels)
+        return loss, preds
+
+
+# =============================================================================
+# Lazy loader for UserHistoryEncoder (lives in sibling module loaded by path)
+# =============================================================================
+
+def _get_user_history_encoder_class():
+    """Import UserHistoryEncoder from the two-tower stage module in the same directory."""
+    tt_path = Path(__file__).resolve().parent / "stage_train_two_tower.py"
+    spec = importlib.util.spec_from_file_location("stage_train_two_tower", str(tt_path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load two-tower module from {tt_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+    return mod.UserHistoryEncoder
+
+
+class AttentionMLP(nn.Module):
+    """MLP engagement predictor with a learned attention encoder over user history.
+
+    Wraps :class:`UserHistoryEncoder` (from the two-tower module) to produce a
+    fixed-size user vector, concatenates it with the target post embedding, and
+    feeds the result through MLP layers.  The attention encoder is trained
+    end-to-end as part of this model.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        hidden_dims: List[int],
+        dropout_rate: float,
+        user_hidden_dim: int = 256,
+        user_output_dim: int = 128,
+        num_attention_heads: int = 4,
+        num_attention_layers: int = 2,
+        max_history_len: int = 50,
+        attention_dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.user_output_dim = user_output_dim
+
+        UserHistoryEncoder = _get_user_history_encoder_class()
+        self.user_encoder = UserHistoryEncoder(
+            input_dim=embed_dim,
+            hidden_dim=user_hidden_dim,
+            output_dim=user_output_dim,
+            num_attention_heads=num_attention_heads,
+            num_attention_layers=num_attention_layers,
+            max_seq_len=max_history_len,
+            dropout_rate=attention_dropout,
+        )
+
+        # MLP head: [user_vec || post_emb] -> binary prediction
+        mlp_input_dim = user_output_dim + embed_dim
+        layers: List[nn.Module] = []
+        prev = mlp_input_dim
+        for h in hidden_dims:
+            layers.extend([
+                nn.Linear(prev, h),
+                nn.BatchNorm1d(h),
+                nn.GELU(),
+                nn.Dropout(dropout_rate),
+            ])
+            prev = h
+        layers.append(nn.Linear(prev, 1))
+        layers.append(nn.Sigmoid())
+        self.mlp_head = nn.Sequential(*layers)
+
+        # Init MLP head weights (user_encoder does its own init)
+        for m in self.mlp_head.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        print(
+            f"AttentionMLP architecture: user_encoder({embed_dim}->{user_output_dim}) "
+            f"+ post({embed_dim}) -> MLP({mlp_input_dim} -> "
+            f"{' -> '.join(map(str, hidden_dims))} -> 1)"
+        )
+
+    def forward(
+        self,
+        history_embeddings: torch.Tensor,  # [B, seq_len, embed_dim]
+        history_mask: torch.Tensor,         # [B, seq_len]
+        post_embedding: torch.Tensor,       # [B, embed_dim]
+    ) -> torch.Tensor:
+        user_vec = self.user_encoder(history_embeddings, history_mask)
+        x = torch.cat([user_vec, post_embedding], dim=-1)
+        return self.mlp_head(x)
+
+    def train_step(self, batch: Dict[str, torch.Tensor], device: str):
+        """Unified training step: unpack sequence batch, forward, compute loss."""
+        history_emb = batch["history_embeddings"].to(device)
+        history_mask = batch["history_mask"].to(device)
+        target_emb = batch["target_post_embedding"].to(device)
+        labels = batch["label"].to(device)
+        preds = self.forward(history_emb, history_mask, target_emb).squeeze()
+        loss = F.binary_cross_entropy(preds, labels)
+        return loss, preds
 
 
 # =============================================================================
@@ -152,7 +269,6 @@ def train_model(
             return 0.5
 
     model = model.to(device)
-    criterion = nn.BCELoss()
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=5)
     history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "train_auc": [], "val_auc": []}
@@ -169,11 +285,9 @@ def train_model(
         tr_preds: List[float] = []
         tr_labels: List[float] = []
         for batch in _tqdm(train_loader, desc="Training", leave=False, disable=disable_progress):
-            feats = batch["features"].to(device)
             labels = batch["label"].to(device)
             optimizer.zero_grad()
-            preds = model(feats).squeeze()
-            loss = criterion(preds, labels)
+            loss, preds = model.train_step(batch, device)
             loss.backward()
             optimizer.step()
             tr_loss += loss.item()
@@ -186,10 +300,8 @@ def train_model(
         model.eval()
         with torch.inference_mode():
             for batch in _tqdm(val_loader, desc="Validation", leave=False, disable=disable_progress):
-                feats = batch["features"].to(device)
                 labels = batch["label"].to(device)
-                preds = model(feats).squeeze()
-                loss = criterion(preds, labels)
+                loss, preds = model.train_step(batch, device)
                 val_loss += loss.item()
                 val_preds.extend(preds.detach().cpu().numpy().tolist())
                 val_labels.extend(labels.detach().cpu().numpy().tolist())
@@ -246,9 +358,10 @@ def train_model(
 
 def _holdout_auc(
     model: nn.Module,
-    holdout_dataset: SummarizedEngagementDataset,
+    holdout_dataset: Dataset,
     device: str,
     batch_size: int,
+    collate_fn=None,
 ) -> Dict[str, Any]:
     """Compute AUC + accuracy on the holdout split (best-effort)."""
     try:
@@ -259,17 +372,20 @@ def _holdout_auc(
     if len(holdout_dataset) == 0:
         return {"note": "no holdout samples"}
 
-    loader = DataLoader(
-        holdout_dataset, batch_size=batch_size, shuffle=False,
+    loader_kw: Dict[str, Any] = dict(
+        batch_size=batch_size, shuffle=False,
         num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=2,
     )
+    if collate_fn is not None:
+        loader_kw["collate_fn"] = collate_fn
+    loader = DataLoader(holdout_dataset, **loader_kw)
+
     all_preds: List[float] = []
     all_labels: List[float] = []
     model.eval()
     with torch.inference_mode():
         for batch in loader:
-            feats = batch["features"].to(device)
-            preds = model(feats).squeeze()
+            _, preds = model.train_step(batch, device)
             all_preds.extend(preds.cpu().numpy().tolist())
             all_labels.extend(batch["label"].numpy().tolist())
 
@@ -313,30 +429,83 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         run_dir, context, logger=logger,
     )
 
-    # --- summarizer ---
-    summarizer_name = getattr(args, "user_summarization", "mean")
-    ema_alpha = float(getattr(args, "ema_alpha", 0.1))
-    summarizer = get_summarizer(summarizer_name, ema_alpha=ema_alpha)
-    logger.info(f"User summarization: {summarizer_name} (ema_alpha={ema_alpha})")
-
-    # --- datasets ---
-    log_operation_start("Create datasets", STAGE_LOG_NAME, logger)
-    train_dataset = SummarizedEngagementDataset(
-        embeddings_mmap, target_posts_df, history_df, split="train",
-        summarizer=summarizer, embed_dim=embed_dim, logger=logger,
-    )
-    val_dataset = SummarizedEngagementDataset(
-        embeddings_mmap, target_posts_df, history_df, split="val",
-        summarizer=summarizer, embed_dim=embed_dim, logger=logger,
-    )
-
-    input_dim = 2 * embed_dim  # [user_summary || post_embedding]
+    # --- user encoder selection ---
+    user_encoder = getattr(args, "user_encoder", "summarized")
     batch_size = int(args.batch_size)
     hidden_dims = list(args.hidden_dims)
     dropout_rate = float(args.dropout_rate_mlp)
+    collate_fn = None  # non-None only for sequence datasets
 
-    model = create_model(input_dim, hidden_dims, dropout_rate)
-    train_loader, val_loader, _ = create_data_loaders(train_dataset, val_dataset, batch_size)
+    if user_encoder == "summarized":
+        # Classic MLP path: deterministic user summary + post embedding
+        summarizer_name = getattr(args, "user_summarization", "mean")
+        ema_alpha = float(getattr(args, "ema_alpha", 0.1))
+        summarizer = get_summarizer(summarizer_name, ema_alpha=ema_alpha)
+        logger.info(f"User encoder: summarized ({summarizer_name}, ema_alpha={ema_alpha})")
+
+        log_operation_start("Create datasets (summarized)", STAGE_LOG_NAME, logger)
+        train_dataset = SummarizedEngagementDataset(
+            embeddings_mmap, target_posts_df, history_df, split="train",
+            summarizer=summarizer, embed_dim=embed_dim, logger=logger,
+        )
+        val_dataset = SummarizedEngagementDataset(
+            embeddings_mmap, target_posts_df, history_df, split="val",
+            summarizer=summarizer, embed_dim=embed_dim, logger=logger,
+        )
+        input_dim = 2 * embed_dim  # [user_summary || post_embedding]
+        model = create_model(input_dim, hidden_dims, dropout_rate)
+        train_loader, val_loader, _ = create_data_loaders(train_dataset, val_dataset, batch_size)
+
+    elif user_encoder == "attention":
+        # Attention MLP path: sequence dataset + AttentionMLP with learned encoder
+        logger.info("User encoder: attention (UserHistoryEncoder + MLP)")
+        max_history_len = int(args.max_history_len)
+        summarizer_name = "attention"  # for config logging
+        ema_alpha = 0.0
+
+        log_operation_start("Create datasets (sequence)", STAGE_LOG_NAME, logger)
+        train_dataset = SequenceEngagementDataset(
+            embeddings_mmap, target_posts_df, history_df, split="train",
+            max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
+        )
+        val_dataset = SequenceEngagementDataset(
+            embeddings_mmap, target_posts_df, history_df, split="val",
+            max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
+        )
+
+        model = AttentionMLP(
+            embed_dim=embed_dim,
+            hidden_dims=hidden_dims,
+            dropout_rate=dropout_rate,
+            user_hidden_dim=int(args.user_hidden_dim),
+            user_output_dim=int(args.shared_dim),
+            num_attention_heads=int(args.num_attention_heads),
+            num_attention_layers=int(args.num_attention_layers),
+            max_history_len=max_history_len,
+            attention_dropout=float(args.dropout_rate_two_tower),
+        )
+
+        collate_fn = sequence_collate_fn
+        _worker_kw: Dict[str, Any] = dict(
+            num_workers=4,
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2,
+        )
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True,
+            collate_fn=collate_fn, drop_last=True, **_worker_kw,
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=batch_size, shuffle=False,
+            collate_fn=collate_fn, **_worker_kw,
+        )
+        input_dim = int(args.shared_dim) + embed_dim  # for config logging
+    else:
+        raise ValueError(
+            f"Unknown user_encoder '{user_encoder}' for MLP. "
+            "Choose 'summarized' or 'attention'."
+        )
 
     # --- train ---
     log_operation_start(f"Training MLP (epochs={args.epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)
@@ -381,16 +550,18 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         try:
             trained_model.eval()
 
-            def _collect_predictions(ds: Dataset) -> tuple:
-                loader = DataLoader(
-                    ds, batch_size=batch_size, shuffle=False, drop_last=False,
+            def _collect_predictions(ds: Dataset, collate_fn_=None) -> tuple:
+                loader_kw_ = dict(
+                    batch_size=batch_size, shuffle=False, drop_last=False,
                     num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=2,
                 )
+                if collate_fn_ is not None:
+                    loader_kw_["collate_fn"] = collate_fn_
+                loader = DataLoader(ds, **loader_kw_)
                 ys, ps = [], []
                 with torch.inference_mode():
                     for batch in loader:
-                        feats = batch["features"].to(device)
-                        preds = trained_model(feats).squeeze()
+                        _, preds = trained_model.train_step(batch, device)
                         if preds.ndim == 0:
                             ps.append(float(preds.cpu()))
                             ys.append(float(batch["label"].cpu()))
@@ -399,9 +570,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                             ys.extend(batch["label"].numpy().tolist())
                 return np.asarray(ys), np.asarray(ps)
 
-            y_train, p_train = _collect_predictions(train_dataset)
+            y_train, p_train = _collect_predictions(train_dataset, collate_fn_=collate_fn)
             plot_model_performance(y_train, p_train, plots_dir / f"train_model_performance_{timestamp}.png")
-            y_val, p_val = _collect_predictions(val_dataset)
+            y_val, p_val = _collect_predictions(val_dataset, collate_fn_=collate_fn)
             plot_model_performance(y_val, p_val, plots_dir / f"val_model_performance_{timestamp}.png")
         except Exception:
             pass
@@ -416,6 +587,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             {
                 "model_state_dict": trained_model.state_dict(),
                 "model_type": "mlp",
+                "user_encoder": user_encoder,
                 "input_dim": input_dim,
                 "hidden_dims": hidden_dims,
                 "dropout_rate": dropout_rate,
@@ -444,13 +616,21 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # --- lightweight holdout eval ---
     holdout_metrics: Dict[str, Any] = {}
     try:
-        holdout_dataset = SummarizedEngagementDataset(
-            embeddings_mmap, target_posts_df, history_df, split="holdout",
-            summarizer=summarizer, embed_dim=embed_dim, logger=logger,
-        )
+        if user_encoder == "summarized":
+            holdout_dataset = SummarizedEngagementDataset(
+                embeddings_mmap, target_posts_df, history_df, split="holdout",
+                summarizer=summarizer, embed_dim=embed_dim, logger=logger,
+            )
+        else:
+            holdout_dataset = SequenceEngagementDataset(
+                embeddings_mmap, target_posts_df, history_df, split="holdout",
+                max_history_len=int(args.max_history_len), embed_dim=embed_dim, logger=logger,
+            )
         if len(holdout_dataset) > 0:
             log_operation_start("Holdout evaluation", STAGE_LOG_NAME, logger)
-            holdout_metrics = _holdout_auc(trained_model, holdout_dataset, device, batch_size)
+            holdout_metrics = _holdout_auc(
+                trained_model, holdout_dataset, device, batch_size, collate_fn=collate_fn,
+            )
             logger.info(f"Holdout metrics: {holdout_metrics}")
             he_dir = out_dir / "holdout_eval"
             he_dir.mkdir(parents=True, exist_ok=True)
@@ -462,6 +642,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # --- training config ---
     training_config = {
         "model_type": "mlp",
+        "user_encoder": user_encoder,
         "embed_dim": embed_dim,
         "input_dim": input_dim,
         "hidden_dims": hidden_dims,
@@ -487,7 +668,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     info_lines = [
         f"stage: train_mlp",
         f"runtime_seconds: {runtime:.2f}",
-        f"settings: batch_size={batch_size}, lr={args.learning_rate}, epochs={args.epochs}, summarizer={summarizer_name}",
+        f"settings: batch_size={batch_size}, lr={args.learning_rate}, epochs={args.epochs}, user_encoder={user_encoder}, summarizer={summarizer_name}",
         f"inputs: embeddings memmap, target_posts, user_history",
         f"train_samples: {len(train_dataset)}",
         f"val_samples: {len(val_dataset)}",
