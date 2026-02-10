@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-Shared dataloaders for engagement prediction training.
+Shared dataloaders and user-encoder building blocks for engagement prediction.
 
 Provides two dataset classes named by their **output representation**, not by
 which model consumes them.  This keeps user-representation and model-head
@@ -14,9 +14,12 @@ Both read on-the-fly from a numpy memmap (embeddings), a Polars target_posts
 DataFrame, and a Polars user-history DataFrame produced by the earlier pipeline
 stages.
 
-Also provides pluggable UserSummarizer strategies (mean, EMA, linear recency)
-and a shared ``load_training_data()`` helper that locates and opens the three
-upstream artifacts.
+Also provides:
+- Pluggable UserSummarizer strategies (mean, EMA, linear recency)
+- Learned user-history encoders (``UserHistoryEncoder``,
+  ``LightweightAttentionEncoder``) shared by both MLP and Two-Tower models
+- A shared ``load_training_data()`` helper that locates and opens the three
+  upstream artifacts
 """
 
 from __future__ import annotations
@@ -29,6 +32,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import polars as pl
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from utils.pipeline.core import Context, select_prior_output
@@ -115,6 +120,216 @@ def get_summarizer(name: str, **kwargs: Any) -> UserSummarizer:
     if name == "linear_recency":
         return LinearRecencySummarizer()
     raise ValueError(f"Unknown summarizer: {name!r}. Choose from: mean, ema, linear_recency")
+
+
+# ---------------------------------------------------------------------------
+# Learned user-history encoders
+# ---------------------------------------------------------------------------
+
+class UserHistoryEncoder(nn.Module):
+    """Encodes a variable-length sequence of liked post embeddings into a fixed
+    user representation via self-attention + dual pooling (attention + mean).
+
+    Used as the user tower in both the Two-Tower model and AttentionMLP.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 256,
+        output_dim: int = 128,
+        num_attention_heads: int = 4,
+        num_attention_layers: int = 2,
+        max_seq_len: int = 50,
+        dropout_rate: float = 0.1,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.max_seq_len = max_seq_len
+
+        self.input_projection = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+        )
+
+        self.positional_embedding = nn.Embedding(max_seq_len, hidden_dim)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_attention_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout_rate,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_attention_layers,
+        )
+
+        self.attention_query = nn.Parameter(torch.randn(1, 1, hidden_dim))
+
+        self.output_projection = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0, std=0.02)
+
+    def forward(
+        self,
+        history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
+        history_mask: Optional[torch.Tensor] = None,  # [B, seq_len] True = valid
+    ) -> torch.Tensor:
+        B, seq_len, _ = history_embeddings.shape
+        device = history_embeddings.device
+
+        if history_mask is None:
+            history_mask = torch.ones(B, seq_len, dtype=torch.bool, device=device)
+
+        x = self.input_projection(history_embeddings)
+
+        # Positional embeddings flipped for recency (position 0 = most recent)
+        positions = torch.arange(seq_len, device=device)
+        positions = (self.max_seq_len - 1) - positions.clamp(max=self.max_seq_len - 1)
+        pos_emb = self.positional_embedding(positions)
+        x = x + pos_emb.unsqueeze(0)
+
+        # Transformer (PyTorch uses inverted mask: True = ignore)
+        attn_mask = ~history_mask
+        x = self.transformer_encoder(x, src_key_padding_mask=attn_mask)
+
+        # Attention-weighted pooling
+        query = self.attention_query.expand(B, -1, -1)
+        attn_scores = torch.bmm(query, x.transpose(1, 2))
+        attn_scores = attn_scores.masked_fill(attn_mask.unsqueeze(1), float("-inf"))
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = torch.nan_to_num(attn_weights, nan=1.0 / max(seq_len, 1))
+        attention_pooled = torch.bmm(attn_weights, x).squeeze(1)
+
+        # Mean pooling (masked)
+        mask_expanded = history_mask.unsqueeze(-1).float()
+        sum_x = (x * mask_expanded).sum(dim=1)
+        count = mask_expanded.sum(dim=1).clamp(min=1)
+        mean_pooled = sum_x / count
+
+        combined = torch.cat([attention_pooled, mean_pooled], dim=-1)
+        return self.output_projection(combined)
+
+
+class LightweightAttentionEncoder(nn.Module):
+    """Lightweight user-history encoder: input projection + positional encoding
+    + single learned-query cross-attention pooling.
+
+    Same ``forward(history_embeddings, history_mask) -> [B, output_dim]``
+    interface as :class:`UserHistoryEncoder` but **without** the expensive
+    ``TransformerEncoder`` self-attention layers.  This reduces complexity from
+    O(num_layers * seq_len^2 * hidden_dim) to O(seq_len * hidden_dim) and
+    parameter count from ~2 M to ~150 K (typical settings).
+
+    Designed as the user tower for a *light-ranker* two-tower model that needs
+    to score large candidate sets efficiently.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 256,
+        output_dim: int = 128,
+        max_seq_len: int = 50,
+        dropout_rate: float = 0.1,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.max_seq_len = max_seq_len
+
+        self.input_projection = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+        )
+
+        self.positional_embedding = nn.Embedding(max_seq_len, hidden_dim)
+
+        # Learned query for cross-attention pooling (single head)
+        self.attention_query = nn.Parameter(torch.randn(1, 1, hidden_dim))
+
+        self.output_projection = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0, std=0.02)
+
+    def forward(
+        self,
+        history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
+        history_mask: Optional[torch.Tensor] = None,  # [B, seq_len] True = valid
+    ) -> torch.Tensor:
+        B, seq_len, _ = history_embeddings.shape
+        device = history_embeddings.device
+
+        if history_mask is None:
+            history_mask = torch.ones(B, seq_len, dtype=torch.bool, device=device)
+
+        x = self.input_projection(history_embeddings)
+
+        # Positional embeddings flipped for recency (position 0 = most recent)
+        positions = torch.arange(seq_len, device=device)
+        positions = (self.max_seq_len - 1) - positions.clamp(max=self.max_seq_len - 1)
+        pos_emb = self.positional_embedding(positions)
+        x = x + pos_emb.unsqueeze(0)
+
+        # --- NO TransformerEncoder here (the key cost saving) ---
+
+        # Cross-attention pooling: learned query attends to projected history
+        attn_mask_inv = ~history_mask  # True = ignore
+        query = self.attention_query.expand(B, -1, -1)
+        attn_scores = torch.bmm(query, x.transpose(1, 2))  # [B, 1, seq]
+        attn_scores = attn_scores.masked_fill(attn_mask_inv.unsqueeze(1), float("-inf"))
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = torch.nan_to_num(attn_weights, nan=1.0 / max(seq_len, 1))
+        attention_pooled = torch.bmm(attn_weights, x).squeeze(1)  # [B, hidden]
+
+        # Mean pooling (masked)
+        mask_expanded = history_mask.unsqueeze(-1).float()
+        sum_x = (x * mask_expanded).sum(dim=1)
+        count = mask_expanded.sum(dim=1).clamp(min=1)
+        mean_pooled = sum_x / count
+
+        combined = torch.cat([attention_pooled, mean_pooled], dim=-1)
+        return self.output_projection(combined)
 
 
 # ---------------------------------------------------------------------------

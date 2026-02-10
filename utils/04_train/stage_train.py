@@ -21,7 +21,6 @@ Outputs under <run_dir>/04_train/<timestamp>/:
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import time
 from datetime import datetime
@@ -47,6 +46,7 @@ from utils.dataloaders import (
     SummarizedEngagementDataset,
     SequenceEngagementDataset,
     sequence_collate_fn,
+    UserHistoryEncoder,
 )
 
 STAGE_LOG_NAME = "STAGE_04_TRAIN_MLP"
@@ -90,25 +90,10 @@ class EngagementPredictor(nn.Module):
         return loss, preds
 
 
-# =============================================================================
-# Lazy loader for UserHistoryEncoder (lives in sibling module loaded by path)
-# =============================================================================
-
-def _get_user_history_encoder_class():
-    """Import UserHistoryEncoder from the two-tower stage module in the same directory."""
-    tt_path = Path(__file__).resolve().parent / "stage_train_two_tower.py"
-    spec = importlib.util.spec_from_file_location("stage_train_two_tower", str(tt_path))
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot load two-tower module from {tt_path}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)  # type: ignore[attr-defined]
-    return mod.UserHistoryEncoder
-
-
 class AttentionMLP(nn.Module):
     """MLP engagement predictor with a learned attention encoder over user history.
 
-    Wraps :class:`UserHistoryEncoder` (from the two-tower module) to produce a
+    Wraps :class:`UserHistoryEncoder` (from ``utils.dataloaders``) to produce a
     fixed-size user vector, concatenates it with the target post embedding, and
     feeds the result through MLP layers.  The attention encoder is trained
     end-to-end as part of this model.
@@ -130,7 +115,6 @@ class AttentionMLP(nn.Module):
         self.embed_dim = embed_dim
         self.user_output_dim = user_output_dim
 
-        UserHistoryEncoder = _get_user_history_encoder_class()
         self.user_encoder = UserHistoryEncoder(
             input_dim=embed_dim,
             hidden_dim=user_hidden_dim,
@@ -408,7 +392,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # --- output dirs ---
-    out_dir = new_stage_timestamp_dir(run_dir, "04_train")
+    run_tag = getattr(args, "run_tag", "") or ""
+    out_dir = new_stage_timestamp_dir(run_dir, "04_train", tag=run_tag)
     checkpoints_dir = out_dir / "checkpoints"
     plots_dir = out_dir / "plots"
     logs_dir = out_dir / "logs"

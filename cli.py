@@ -93,6 +93,7 @@ DEFAULTS: Dict[str, Any] = {
     "prediction_posts_per_user": 1,
     "device": None,
     "patience": 50,
+    "run_tag": None,  # Optional tag appended to training output directory name
     "no_plots": False,
     "no_save_model": False,
     # Stage 5 (eval)
@@ -154,6 +155,7 @@ def _build_tracking_params(args: argparse.Namespace, run_dir: Path) -> Dict[str,
     return {
         "meta": {
             "run_dir": str(run_dir),
+            "run_tag": getattr(args, "run_tag", None),
             "start_from": args.start_from,
             "stop_after": args.stop_after,
             "cap_random_seed": args.cap_random_seed,
@@ -624,6 +626,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Device for training")
     _add_arg_with_default(p_all, "--patience", type=int, default=argparse.SUPPRESS,
                           help_text="Early stopping patience")
+    _add_arg_with_default(p_all, "--run-tag", type=str, default=argparse.SUPPRESS,
+                          help_text="Tag appended to training output directory name (e.g. mlp_summarized_mean)")
     _add_arg_with_default(p_all, "--no-plots", action="store_true", default=argparse.SUPPRESS,
                           help_text="Disable training plots")
     _add_arg_with_default(p_all, "--no-save-model", action="store_true", default=argparse.SUPPRESS,

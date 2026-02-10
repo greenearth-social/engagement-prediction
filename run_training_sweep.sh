@@ -65,14 +65,15 @@ log "═════════════════════════
 
 # ── Helper: launch one experiment ──────────────────────────────────────
 # Writes exit code to a status file so we can collect results later.
-# Args: MODEL_TYPE  USER_ENCODER  USER_SUMM  RUN_LABEL  RUN_LOG  STATUS_FILE
+# Args: MODEL_TYPE  USER_ENCODER  USER_SUMM  RUN_TAG  RUN_LABEL  RUN_LOG  STATUS_FILE
 run_one() {
   local MODEL_TYPE="$1"
   local USER_ENCODER="$2"
   local USER_SUMM="$3"
-  local RUN_LABEL="$4"
-  local RUN_LOG="$5"
-  local STATUS_FILE="$6"
+  local RUN_TAG="$4"
+  local RUN_LABEL="$5"
+  local RUN_LOG="$6"
+  local STATUS_FILE="$7"
 
   local CMD=(
     python3 cli.py run-all --foreground
@@ -80,6 +81,7 @@ run_one() {
     --start-from train --stop-after train
     --model-type "$MODEL_TYPE"
     --user-encoder "$USER_ENCODER"
+    --run-tag "$RUN_TAG"
     --epochs "$EPOCHS"
     --batch-size "$BATCH_SIZE"
     --patience "$PATIENCE"
@@ -121,11 +123,15 @@ for i in "${!MLP_EXPERIMENTS[@]}"; do
   USER_ENCODER="${SPEC%%:*}"
   USER_SUMM="${SPEC#*:}"
   RUN_NUM=$((i + 1))
-  TAG="${USER_ENCODER}"
-  [[ -n "$USER_SUMM" ]] && TAG="${USER_ENCODER}/${USER_SUMM}"
-  RUN_LABEL="MLP ${RUN_NUM}/${#MLP_EXPERIMENTS[@]}  mlp/${TAG}"
-  RUN_LOG="$LOG_DIR/run_mlp_${USER_ENCODER}_${USER_SUMM:-none}.log"
-  STATUS_FILE="$LOG_DIR/.status_mlp_${USER_ENCODER}_${USER_SUMM:-none}"
+  # Build a human-readable tag for the output directory
+  if [[ -n "$USER_SUMM" ]]; then
+    RUN_TAG="mlp_${USER_ENCODER}_${USER_SUMM}"
+  else
+    RUN_TAG="mlp_${USER_ENCODER}"
+  fi
+  RUN_LABEL="MLP ${RUN_NUM}/${#MLP_EXPERIMENTS[@]}  ${RUN_TAG}"
+  RUN_LOG="$LOG_DIR/run_${RUN_TAG}.log"
+  STATUS_FILE="$LOG_DIR/.status_${RUN_TAG}"
 
   # Throttle: wait for a slot if we're at capacity
   while (( RUNNING >= MAX_PARALLEL )); do
@@ -140,7 +146,7 @@ for i in "${!MLP_EXPERIMENTS[@]}"; do
     done
   done
 
-  run_one "mlp" "$USER_ENCODER" "$USER_SUMM" "$RUN_LABEL" "$RUN_LOG" "$STATUS_FILE" &
+  run_one "mlp" "$USER_ENCODER" "$USER_SUMM" "$RUN_TAG" "$RUN_LABEL" "$RUN_LOG" "$STATUS_FILE" &
   MLP_PIDS+=($!)
   MLP_STATUS_FILES+=("$STATUS_FILE")
   MLP_LABELS+=("$RUN_LABEL")
@@ -180,16 +186,17 @@ for i in "${!TT_EXPERIMENTS[@]}"; do
   USER_ENCODER="${SPEC%%:*}"
   USER_SUMM="${SPEC#*:}"
   RUN_NUM=$((i + 1))
-  RUN_LABEL="TT ${RUN_NUM}/${#TT_EXPERIMENTS[@]}  two-tower/${USER_ENCODER}"
-  RUN_LOG="$LOG_DIR/run_two-tower_${USER_ENCODER}.log"
-  STATUS_FILE="$LOG_DIR/.status_tt_${USER_ENCODER}"
+  RUN_TAG="two-tower_${USER_ENCODER}"
+  RUN_LABEL="TT ${RUN_NUM}/${#TT_EXPERIMENTS[@]}  ${RUN_TAG}"
+  RUN_LOG="$LOG_DIR/run_${RUN_TAG}.log"
+  STATUS_FILE="$LOG_DIR/.status_${RUN_TAG}"
 
   log ""
   log "────────────────────────────────────────────────────────────────"
   log "[$RUN_LABEL] Starting…"
   log "────────────────────────────────────────────────────────────────"
 
-  run_one "two-tower" "$USER_ENCODER" "$USER_SUMM" "$RUN_LABEL" "$RUN_LOG" "$STATUS_FILE"
+  run_one "two-tower" "$USER_ENCODER" "$USER_SUMM" "$RUN_TAG" "$RUN_LABEL" "$RUN_LOG" "$STATUS_FILE"
 
   if [[ -f "$STATUS_FILE" ]] && [[ "$(cat "$STATUS_FILE")" == "0" ]]; then
     (( PASSED++ )) || true

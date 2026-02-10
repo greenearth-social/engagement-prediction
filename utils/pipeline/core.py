@@ -52,10 +52,19 @@ def stage_base_dir(run_dir: Path, stage_name: str) -> Path:
     return base
 
 
-def new_stage_timestamp_dir(run_dir: Path, stage_name: str) -> Path:
+def new_stage_timestamp_dir(run_dir: Path, stage_name: str, tag: str = "") -> Path:
     base = stage_base_dir(run_dir, stage_name)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out = base / ts
+    dirname = f"{ts}_{tag}" if tag else ts
+    out = base / dirname
+    # Collision-safe: if the dir already exists (parallel jobs at same second),
+    # append an incrementing suffix.
+    if out.exists():
+        for suffix in range(2, 100):
+            candidate = base / f"{dirname}_{suffix}"
+            if not candidate.exists():
+                out = candidate
+                break
     out.mkdir(parents=True, exist_ok=True)
     return out
 
