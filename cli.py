@@ -61,11 +61,6 @@ DEFAULTS: Dict[str, Any] = {
     "train_start": None,
     "val_start": None,
     "holdout_start": None,
-    # Stage 2/3/4
-    "bucket_duration": "hourly",
-    "num_buckets_lookback": "168",  # 7 days if hourly
-    "max_likes_per_bucket": -1,
-    "global_topic_k": 20,
     # Stage 4 (train)
     "model_type": "mlp",
     "shared_dim": 128,
@@ -158,9 +153,6 @@ def _build_tracking_params(args: argparse.Namespace, run_dir: Path) -> Dict[str,
             "likes_end": args.likes_end,
             "max_liking_users": args.max_liking_users,
             "max_likes_per_user": args.max_likes_per_user,
-            "bucket_duration": args.bucket_duration,
-            "num_buckets_lookback": args.num_buckets_lookback,
-            "max_likes_per_bucket": args.max_likes_per_bucket,
             "min_likes_per_user": args.min_likes_per_user,
             "negative_posts_sample": args.negative_posts_sample,
             "embedding_model": args.embedding_model,
@@ -501,16 +493,7 @@ def build_parser() -> argparse.ArgumentParser:
                           default=argparse.SUPPRESS, help_text="SentenceTransformers model for embeddings")
     _add_arg_with_default(p_all, "--skip-embeddings", action="store_true", default=argparse.SUPPRESS,
                           help_text="Skip embedding validation/memmap write in Stage 1 (faster iteration; later stages that need embeddings will fail)")
-    # Stage 2 options
-    _add_arg_with_default(p_all, "--bucket-duration", type=str, choices=['hourly', 'daily'], 
-                          default=argparse.SUPPRESS, help_text="")
-    _add_arg_with_default(p_all, "--num-buckets-lookback", type=int, default=argparse.SUPPRESS,
-                          help_text="")
-    _add_arg_with_default(p_all, "--max-likes-per-bucket", type=int, default=argparse.SUPPRESS,
-                          help_text="")
-    # bucket_duration: str,
-    # lookback_duration: str,
-    # max_likes_per_bucket: Optional[int]
+    # Stage 2/3 options
     _add_arg_with_default(p_all, "--max-prior-likes", type=int, default=argparse.SUPPRESS,
                           help_text="Cap on prior likes per target in Stage 3 user history (None = no cap, keeps all prior likes)")
     _add_arg_with_default(p_all, "--history-buffer-hours", type=float, default=argparse.SUPPRESS,
