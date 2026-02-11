@@ -330,20 +330,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "Could not find 02_target_posts output. "
             "Run the target_posts stage first, or use --pick-prior to select interactively."
         )
-    # Find the parquet file inside the target posts output directory
-    target_posts_candidates = sorted(
-        prior_target_posts_dir.glob("target_posts_*.parquet"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    if not target_posts_candidates:
-        raise FileNotFoundError(
-            f"No target_posts_*.parquet found under {prior_target_posts_dir}"
-        )
-    target_posts_path = target_posts_candidates[0]
-
     logger.info(f"Using likes from: {prior_get_data}")
-    logger.info(f"Using target posts from: {target_posts_path}")
+    logger.info(f"Using target posts from: {prior_target_posts_dir}")
 
     # === Get CLI args ===
     max_prior_likes: Optional[int] = args.max_prior_likes
@@ -369,7 +357,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     logger.info("✓ likes_core schema validated")
 
     log_operation_start('Load target_posts', 'STAGE_03_USER_HISTORY', logger)
-    targets_lf: pl.LazyFrame = pl.scan_parquet(target_posts_path)
+    targets_lf: pl.LazyFrame = load_parquet_from_prior(prior_target_posts_dir, "target_posts_")
 
     # Validate target posts schema (wide format)
     targets_schema = {
