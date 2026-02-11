@@ -89,10 +89,11 @@ def select_prior_output(run_dir: Path, stage_name: str, *, use_latest: bool = Tr
     else:
         prefix_map = {
             "get_data": "01_get_data",
-            "relevel": "03_relevel",
-            "split": "04_split",
-            "train": "05_train",
-            "evaluate": "06_evaluate",
+            "target_posts": "02_target_posts",
+            "user_history": "03_user_history",
+            "train_mlp": "04_train",
+            "train_two_tower": "04_train",
+            "evaluate": "05_evaluate",
         }
         alt = prefix_map.get(stage_name, stage_name)
     if alt != stage_name:

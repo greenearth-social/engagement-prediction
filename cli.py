@@ -5,7 +5,7 @@ Unified CLI for Engagement Prediction Pipeline
 =============================================
 
 Subcommands:
-- run-all: Run the 5-stage pipeline end-to-end (get_data → relevel → split → train → evaluate)
+- run-all: Run the 5-stage pipeline end-to-end (get_data → target_posts → user_history → train → evaluate)
 
 Usage examples:
     python cli.py run-all --epochs 150 --embedding-model all_MiniLM_L12_v2
@@ -55,16 +55,12 @@ DEFAULTS: Dict[str, Any] = {
     "embedding_model": "all_MiniLM_L6_v2",
     "skip_embeddings": False,
     # Stage 2 Target posts and Split
+    "max_prior_likes": None,  # Stage 3: cap on prior likes per target for user history (None = no cap)
+    "history_buffer_hours": None,  # Stage 3: buffer in hours between seen_at and prior-like cutoff (None = no buffer)
     "neg_sample_bucket": "1h",
     "train_start": None,
     "val_start": None,
     "holdout_start": None,
-    # Stage 3 (relevel) / Stage 3 (split)
-    "global_topic_k": 20,
-    "relevel_method": "uniform",
-    "relevel_strategy": "uniform_mixture_balanced",
-    "relevel_alpha": 0.35,
-    "relevel_min_users_per_topic": None,
     # Stage 4 (train)
     "model_type": "mlp",
     "shared_dim": 128,
@@ -93,10 +89,6 @@ DEFAULTS: Dict[str, Any] = {
     "use_latest": False,
     "start_from": None,
     "stop_after": None,
-    "prior_get_data": None,
-    "prior_relevel": None,
-    "prior_split": None,
-    "prior_train": None,
     "pick_prior": False,
     # Execution behavior
     "foreground": False,
@@ -166,17 +158,6 @@ def _build_tracking_params(args: argparse.Namespace, run_dir: Path) -> Dict[str,
             "embedding_model": args.embedding_model,
             "max_memory_gb": args.max_memory_gb,
             "max_memory_pct": args.max_memory_pct,
-        },
-        "relevel": {
-            "relevel_method": args.relevel_method,
-            "relevel_strategy": args.relevel_strategy,
-            "relevel_alpha": args.relevel_alpha,
-            "relevel_min_users_per_topic": args.relevel_min_users_per_topic,
-            "global_topic_k": args.global_topic_k,
-        },
-        "split": {
-            "val_ratio": 0.2,
-            "holdout_ratio": 0.2,
         },
         "train": {
             "model_type": args.model_type,
@@ -268,7 +249,7 @@ def _generate_run_name(args: argparse.Namespace) -> str:
             else:
                 stages_str += args.stop_after
 
-    stages_str += f"_{args.model_type}_{args.relevel_method}"
+    stages_str += f"_{args.model_type}"
     return stages_str
 
 
@@ -367,35 +348,24 @@ def cmd_run_all(args: argparse.Namespace) -> int:
 
 
 def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
-    """Execute the 5-stage modular pipeline in the foreground sequentially."""
+    """Execute the modular pipeline stages in the foreground sequentially."""
     # Build Context and invoke stages via registry
     from utils.pipeline import registry as reg
 
     run_dir = Path(args.output_dir).resolve()
     
-    # Helper: map stage keys to enumerated folder names
-    # Override relevel stage key if --relevel-method is specified
-    relevel_method = args.relevel_method
-    relevel_key = 'relevel'  # default
-    if relevel_method == 'gini':
-        relevel_key = 'relevel_gini'
-    elif relevel_method == 'simple':
-        relevel_key = 'relevel_simple'
-    elif relevel_method == 'uniform':
-        relevel_key = 'relevel'
-
     # Override train stage key if --model-type is specified
     # Do not default to MLP if model name is not recognized - raise error instead
     model_type = args.model_type
-    train_key = 'train'  # default MLP
+    train_key = 'train_mlp'  # default MLP
     if model_type == 'mlp':
-        train_key = 'train'
+        train_key = 'train_mlp'
     elif model_type == 'two-tower':
         train_key = 'train_two_tower'
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
     
-    stage_order = ['get_data', 'target_posts', relevel_key, 'split', train_key, 'evaluate']
+    stage_order = ['get_data', 'target_posts', 'user_history', train_key, 'evaluate']
     stage_folder = {}
     for key in stage_order:
         _mp, _folder = reg.get_stage_spec(key)
@@ -408,31 +378,13 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     stop_after = args.stop_after
     if stop_after and stop_after not in stage_order:
         raise ValueError(f"Unrecognized stop_after: {stop_after}. Please choose from: {stage_order}")
-    # Map 'relevel' to the actual relevel key if specified
-    if start_from == 'relevel':
-        start_from = relevel_key
-    if stop_after == 'relevel':
-        stop_after = relevel_key
-    # Map 'train' to the actual train key (train or train_two_tower)
+    # Map 'train' to the actual train key (train_mlp or train_two_tower)
     if start_from == 'train':
         start_from = train_key
     if stop_after == 'train':
         stop_after = train_key
     start_idx = stage_order.index(start_from) if start_from in stage_order else 0
     stop_idx = stage_order.index(stop_after) if stop_after in stage_order else (len(stage_order) - 1)
-
-    # Pin prior outputs if provided
-    def _pin_prior(arg_name: str, stage_key: str):
-        path_str = getattr(args, arg_name, None)
-        if path_str:
-            p = Path(path_str)
-            if p.exists():
-                ctx.prior_outputs[stage_folder[stage_key]] = p
-
-    _pin_prior('prior_get_data', 'get_data')
-    _pin_prior('prior_relevel', relevel_key)  # Use the selected relevel key
-    _pin_prior('prior_split', 'split')
-    _pin_prior('prior_train', 'train')
 
     # Optional interactive chooser (foreground only)
     def _maybe_choose_prior(stage_key: str):
@@ -474,10 +426,8 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
             label_map = {
                 'get_data': "Stage 1: Get data…",
                 'target_posts': "Stage 2: Generate target posts…",
-                'relevel': "Stage 3: Relevel (uniform mixture)…",
-                'relevel_gini': "Stage 3: Relevel (Gini-optimized)…",
-                'relevel_simple': "Stage 3: Relevel (simple)…",
-                'train': "Stage 4: Train model (MLP)…",
+                'user_history': "Stage 3: Generate user history…",
+                'train_mlp': "Stage 4: Train model (MLP)…",
                 'train_two_tower': "Stage 4: Train model (Two-Tower)…",
                 'evaluate': "Stage 5: Evaluate model…",
             }
@@ -543,7 +493,11 @@ def build_parser() -> argparse.ArgumentParser:
                           default=argparse.SUPPRESS, help_text="SentenceTransformers model for embeddings")
     _add_arg_with_default(p_all, "--skip-embeddings", action="store_true", default=argparse.SUPPRESS,
                           help_text="Skip embedding validation/memmap write in Stage 1 (faster iteration; later stages that need embeddings will fail)")
-    # Stage 2 options
+    # Stage 2/3 options
+    _add_arg_with_default(p_all, "--max-prior-likes", type=int, default=argparse.SUPPRESS,
+                          help_text="Cap on prior likes per target in Stage 3 user history (None = no cap, keeps all prior likes)")
+    _add_arg_with_default(p_all, "--history-buffer-hours", type=float, default=argparse.SUPPRESS,
+                          help_text="Buffer in hours subtracted from seen_at when determining prior likes for user history (None = no buffer)")
     _add_arg_with_default(p_all, "--neg-sample-bucket", type=str, default=argparse.SUPPRESS,
                           help_text="Duration (e.g. 1h) of time buckets for picking negative samples near positive (liked) posts")
     _add_arg_with_default(p_all, "--train-start", type=str, default=argparse.SUPPRESS,
@@ -554,14 +508,6 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="ISO date string for start of holdout dataset window (if not supplied, no holdout set)")
     _add_arg_with_default(p_all, "--global-topic-k", type=int, default=argparse.SUPPRESS,
                           help_text="Number of global topics")
-    _add_arg_with_default(p_all, "--relevel-method", type=str, choices=["uniform", "gini", "simple"],
-                          default=argparse.SUPPRESS, help_text="Which relevel script to use: uniform, gini, or simple")
-    _add_arg_with_default(p_all, "--relevel-strategy", type=str, choices=["none", "uniform_mixture_balanced"],
-                          default=argparse.SUPPRESS, help_text="Relevel weighting strategy")
-    _add_arg_with_default(p_all, "--relevel-alpha", type=float, default=argparse.SUPPRESS,
-                          help_text="Alpha parameter for relevel weighting")
-    _add_arg_with_default(p_all, "--relevel-min-users-per-topic", type=int, default=argparse.SUPPRESS,
-                          help_text="Minimum users per topic when releveling")
     _add_arg_with_default(p_all, "--min-likes-per-user", type=int, default=argparse.SUPPRESS,
                           help_text="Minimum likes per user for inclusion (used in Stage 1 filtering and later stages)")
     # Stage 5 (train) model selection
@@ -617,19 +563,11 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="(Deprecated) Always enabled during sequential run-all")
     # Selective reruns and prior pinning
     _add_arg_with_default(p_all, "--start-from", type=str,
-                          choices=["get_data", "relevel", "split", "train", "evaluate"],
+                          choices=["get_data", "target_posts", "user_history", "train", "train_mlp", "train_two_tower", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Begin execution at this stage")
     _add_arg_with_default(p_all, "--stop-after", type=str,
-                          choices=["get_data", "relevel", "split", "train", "evaluate"],
+                          choices=["get_data", "target_posts", "user_history", "train", "train_mlp", "train_two_tower", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Stop after this stage completes")
-    _add_arg_with_default(p_all, "--prior-get-data", type=str, default=argparse.SUPPRESS,
-                          help_text="Path to a specific 01_get_data/<ts> directory")
-    _add_arg_with_default(p_all, "--prior-relevel", type=str, default=argparse.SUPPRESS,
-                          help_text="Path to a specific 03_relevel/<ts> directory")
-    _add_arg_with_default(p_all, "--prior-split", type=str, default=argparse.SUPPRESS,
-                          help_text="Path to a specific 04_split/<ts> directory")
-    _add_arg_with_default(p_all, "--prior-train", type=str, default=argparse.SUPPRESS,
-                          help_text="Path to a specific 05_train/<ts> directory")
     _add_arg_with_default(p_all, "--pick-prior", action="store_true", default=argparse.SUPPRESS,
                           help_text="If multiple prior outputs exist, prompt to pick (foreground only)")
     # Execution behavior
