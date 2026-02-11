@@ -61,16 +61,11 @@ DEFAULTS: Dict[str, Any] = {
     "train_start": None,
     "val_start": None,
     "holdout_start": None,
-    # Stage 3 (relevel) / Stage 3 (split)
     # Stage 2/3/4
     "bucket_duration": "hourly",
     "num_buckets_lookback": "168",  # 7 days if hourly
     "max_likes_per_bucket": -1,
     "global_topic_k": 20,
-    "relevel_method": "uniform",
-    "relevel_strategy": "uniform_mixture_balanced",
-    "relevel_alpha": 0.35,
-    "relevel_min_users_per_topic": None,
     # Stage 4 (train)
     "model_type": "mlp",
     "shared_dim": 128,
@@ -543,14 +538,6 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="ISO date string for start of holdout dataset window (if not supplied, no holdout set)")
     _add_arg_with_default(p_all, "--global-topic-k", type=int, default=argparse.SUPPRESS,
                           help_text="Number of global topics")
-    _add_arg_with_default(p_all, "--relevel-method", type=str, choices=["uniform", "gini", "simple"],
-                          default=argparse.SUPPRESS, help_text="Which relevel script to use: uniform, gini, or simple")
-    _add_arg_with_default(p_all, "--relevel-strategy", type=str, choices=["none", "uniform_mixture_balanced"],
-                          default=argparse.SUPPRESS, help_text="Relevel weighting strategy")
-    _add_arg_with_default(p_all, "--relevel-alpha", type=float, default=argparse.SUPPRESS,
-                          help_text="Alpha parameter for relevel weighting")
-    _add_arg_with_default(p_all, "--relevel-min-users-per-topic", type=int, default=argparse.SUPPRESS,
-                          help_text="Minimum users per topic when releveling")
     _add_arg_with_default(p_all, "--min-likes-per-user", type=int, default=argparse.SUPPRESS,
                           help_text="Minimum likes per user for inclusion (used in Stage 1 filtering and later stages)")
     # Stage 5 (train) model selection
