@@ -19,8 +19,6 @@ from typing import Dict, Any, Optional, Tuple
 
 from utils.pipeline.core import select_prior_output, Context
 from utils.helpers import (
-    build_user_feature_frame,
-    get_actual_feature_columns,
     plot_model_performance,
     create_pairs_dataset,
     get_stage_logger,

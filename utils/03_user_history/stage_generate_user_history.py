@@ -207,11 +207,11 @@ def _log_and_plot_history_distribution(
         logger.info(f"  {label}:")
         logger.info(f"    mean={dist.mean():.1f}, median={dist.median():.1f}")
         logger.info(
-            f"    p25={int(dist.quantile(0.25, 'nearest'))}, "
-            f"p75={int(dist.quantile(0.75, 'nearest'))}, "
-            f"p90={int(dist.quantile(0.90, 'nearest'))}, "
-            f"p95={int(dist.quantile(0.95, 'nearest'))}, "
-            f"p99={int(dist.quantile(0.99, 'nearest'))}"
+            f"    p25={int(dist.quantile(0.25, 'nearest') or 0)}, "
+            f"p75={int(dist.quantile(0.75, 'nearest') or 0)}, "
+            f"p90={int(dist.quantile(0.90, 'nearest') or 0)}, "
+            f"p95={int(dist.quantile(0.95, 'nearest') or 0)}, "
+            f"p99={int(dist.quantile(0.99, 'nearest') or 0)}"
         )
         logger.info(f"    min={dist.min()}, max={dist.max()}")
 
@@ -328,29 +328,17 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     if prior_target_posts_dir is None:
         raise FileNotFoundError(
             "Could not find 02_target_posts output. "
-            "Run the target_posts stage first or provide --prior-output-target-posts."
+            "Run the target_posts stage first, or use --pick-prior to select interactively."
         )
-    # Find the parquet file inside the target posts output directory
-    target_posts_candidates = sorted(
-        prior_target_posts_dir.glob("target_posts_*.parquet"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    if not target_posts_candidates:
-        raise FileNotFoundError(
-            f"No target_posts_*.parquet found under {prior_target_posts_dir}"
-        )
-    target_posts_path = target_posts_candidates[0]
-
     logger.info(f"Using likes from: {prior_get_data}")
-    logger.info(f"Using target posts from: {target_posts_path}")
+    logger.info(f"Using target posts from: {prior_target_posts_dir}")
 
     # === Get CLI args ===
-    max_prior_likes: Optional[int] = getattr(args, 'max_prior_likes', None)
+    max_prior_likes: Optional[int] = args.max_prior_likes
     if max_prior_likes is not None and max_prior_likes <= 0:
         max_prior_likes = None  # Treat 0 or negative as "no cap"
 
-    history_buffer_hours: Optional[float] = getattr(args, 'history_buffer_hours', None)
+    history_buffer_hours: Optional[float] = args.history_buffer_hours
     if history_buffer_hours is not None and history_buffer_hours <= 0:
         history_buffer_hours = None  # Treat 0 or negative as "no buffer"
 
@@ -369,7 +357,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     logger.info("✓ likes_core schema validated")
 
     log_operation_start('Load target_posts', 'STAGE_03_USER_HISTORY', logger)
-    targets_lf: pl.LazyFrame = pl.scan_parquet(target_posts_path)
+    targets_lf: pl.LazyFrame = load_parquet_from_prior(prior_target_posts_dir, "target_posts_")
 
     # Validate target posts schema (wide format)
     targets_schema = {
@@ -407,7 +395,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # Collect using the streaming engine so that the intermediate fan-out join
     # is processed in batches rather than fully materialised in memory.
     # Falls back to the default engine automatically if the plan can't be streamed.
-    directory_df = directory_lf.collect(streaming=True)
+    directory_df = directory_lf.collect(engine="streaming")
 
     # Log and plot the per-user history distribution before/after capping
     _log_and_plot_history_distribution(directory_df, max_prior_likes, out_dir, logger)
