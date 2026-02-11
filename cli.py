@@ -94,8 +94,6 @@ DEFAULTS: Dict[str, Any] = {
     "use_latest": False,
     "start_from": None,
     "stop_after": None,
-    "prior_get_data": None,
-    "prior_train": None,
     "pick_prior": False,
     # Execution behavior
     "foreground": False,
@@ -396,17 +394,6 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     start_idx = stage_order.index(start_from) if start_from in stage_order else 0
     stop_idx = stage_order.index(stop_after) if stop_after in stage_order else (len(stage_order) - 1)
 
-    # Pin prior outputs if provided
-    def _pin_prior(arg_name: str, stage_key: str):
-        path_str = getattr(args, arg_name, None)
-        if path_str:
-            p = Path(path_str)
-            if p.exists():
-                ctx.prior_outputs[stage_folder[stage_key]] = p
-
-    _pin_prior('prior_get_data', 'get_data')
-    _pin_prior('prior_train', train_key)
-
     # Optional interactive chooser (foreground only)
     def _maybe_choose_prior(stage_key: str):
         if not args.pick_prior:
@@ -598,10 +585,6 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--stop-after", type=str,
                           choices=["get_data", "target_posts", "user_history", "train", "train_mlp", "train_two_tower", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Stop after this stage completes")
-    _add_arg_with_default(p_all, "--prior-get-data", type=str, default=argparse.SUPPRESS,
-                          help_text="Path to a specific 01_get_data/<ts> directory")
-    _add_arg_with_default(p_all, "--prior-train", type=str, default=argparse.SUPPRESS,
-                          help_text="Path to a specific 04_train/<ts> directory")
     _add_arg_with_default(p_all, "--pick-prior", action="store_true", default=argparse.SUPPRESS,
                           help_text="If multiple prior outputs exist, prompt to pick (foreground only)")
     # Execution behavior

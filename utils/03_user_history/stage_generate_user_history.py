@@ -328,7 +328,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     if prior_target_posts_dir is None:
         raise FileNotFoundError(
             "Could not find 02_target_posts output. "
-            "Run the target_posts stage first or provide --prior-output-target-posts."
+            "Run the target_posts stage first, or use --pick-prior to select interactively."
         )
     # Find the parquet file inside the target posts output directory
     target_posts_candidates = sorted(
