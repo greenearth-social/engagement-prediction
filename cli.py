@@ -61,16 +61,6 @@ DEFAULTS: Dict[str, Any] = {
     "train_start": None,
     "val_start": None,
     "holdout_start": None,
-    # Stage 3 (relevel) / Stage 3 (split)
-    # Stage 2/3/4
-    "bucket_duration": "hourly",
-    "num_buckets_lookback": "168",  # 7 days if hourly
-    "max_likes_per_bucket": -1,
-    "global_topic_k": 20,
-    "relevel_method": "uniform",
-    "relevel_strategy": "uniform_mixture_balanced",
-    "relevel_alpha": 0.35,
-    "relevel_min_users_per_topic": None,
     # Stage 4 (train)
     "user_summarization": "mean",  # MLP user-history summarization: mean, ema, linear_recency
     "ema_alpha": 0.1,  # EMA smoothing factor (only used when user_summarization=ema)
@@ -103,8 +93,6 @@ DEFAULTS: Dict[str, Any] = {
     "use_latest": False,
     "start_from": None,
     "stop_after": None,
-    "prior_get_data": None,
-    "prior_train": None,
     "pick_prior": False,
     # Execution behavior
     "foreground": False,
@@ -170,9 +158,6 @@ def _build_tracking_params(args: argparse.Namespace, run_dir: Path) -> Dict[str,
             "likes_end": args.likes_end,
             "max_liking_users": args.max_liking_users,
             "max_likes_per_user": args.max_likes_per_user,
-            "bucket_duration": args.bucket_duration,
-            "num_buckets_lookback": args.num_buckets_lookback,
-            "max_likes_per_bucket": args.max_likes_per_bucket,
             "min_likes_per_user": args.min_likes_per_user,
             "negative_posts_sample": args.negative_posts_sample,
             "embedding_model": args.embedding_model,
@@ -427,17 +412,6 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     start_idx = stage_order.index(start_from) if start_from in stage_order else 0
     stop_idx = stage_order.index(stop_after) if stop_after in stage_order else (len(stage_order) - 1)
 
-    # Pin prior outputs if provided
-    def _pin_prior(arg_name: str, stage_key: str):
-        path_str = getattr(args, arg_name, None)
-        if path_str:
-            p = Path(path_str)
-            if p.exists():
-                ctx.prior_outputs[stage_folder[stage_key]] = p
-
-    _pin_prior('prior_get_data', 'get_data')
-    _pin_prior('prior_train', train_key)
-
     # Optional interactive chooser (foreground only)
     def _maybe_choose_prior(stage_key: str):
         if not args.pick_prior:
@@ -545,16 +519,7 @@ def build_parser() -> argparse.ArgumentParser:
                           default=argparse.SUPPRESS, help_text="SentenceTransformers model for embeddings")
     _add_arg_with_default(p_all, "--skip-embeddings", action="store_true", default=argparse.SUPPRESS,
                           help_text="Skip embedding validation/memmap write in Stage 1 (faster iteration; later stages that need embeddings will fail)")
-    # Stage 2 options
-    _add_arg_with_default(p_all, "--bucket-duration", type=str, choices=['hourly', 'daily'], 
-                          default=argparse.SUPPRESS, help_text="")
-    _add_arg_with_default(p_all, "--num-buckets-lookback", type=int, default=argparse.SUPPRESS,
-                          help_text="")
-    _add_arg_with_default(p_all, "--max-likes-per-bucket", type=int, default=argparse.SUPPRESS,
-                          help_text="")
-    # bucket_duration: str,
-    # lookback_duration: str,
-    # max_likes_per_bucket: Optional[int]
+    # Stage 2/3 options
     _add_arg_with_default(p_all, "--max-prior-likes", type=int, default=argparse.SUPPRESS,
                           help_text="Cap on prior likes per target in Stage 3 user history (None = no cap, keeps all prior likes)")
     _add_arg_with_default(p_all, "--history-buffer-hours", type=float, default=argparse.SUPPRESS,
@@ -569,14 +534,6 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="ISO date string for start of holdout dataset window (if not supplied, no holdout set)")
     _add_arg_with_default(p_all, "--global-topic-k", type=int, default=argparse.SUPPRESS,
                           help_text="Number of global topics")
-    _add_arg_with_default(p_all, "--relevel-method", type=str, choices=["uniform", "gini", "simple"],
-                          default=argparse.SUPPRESS, help_text="Which relevel script to use: uniform, gini, or simple")
-    _add_arg_with_default(p_all, "--relevel-strategy", type=str, choices=["none", "uniform_mixture_balanced"],
-                          default=argparse.SUPPRESS, help_text="Relevel weighting strategy")
-    _add_arg_with_default(p_all, "--relevel-alpha", type=float, default=argparse.SUPPRESS,
-                          help_text="Alpha parameter for relevel weighting")
-    _add_arg_with_default(p_all, "--relevel-min-users-per-topic", type=int, default=argparse.SUPPRESS,
-                          help_text="Minimum users per topic when releveling")
     _add_arg_with_default(p_all, "--min-likes-per-user", type=int, default=argparse.SUPPRESS,
                           help_text="Minimum likes per user for inclusion (used in Stage 1 filtering and later stages)")
     # Stage 4 (train) user summarization + model selection
@@ -647,10 +604,6 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--stop-after", type=str,
                           choices=["get_data", "target_posts", "user_history", "train", "train_mlp", "train_two_tower", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Stop after this stage completes")
-    _add_arg_with_default(p_all, "--prior-get-data", type=str, default=argparse.SUPPRESS,
-                          help_text="Path to a specific 01_get_data/<ts> directory")
-    _add_arg_with_default(p_all, "--prior-train", type=str, default=argparse.SUPPRESS,
-                          help_text="Path to a specific 04_train/<ts> directory")
     _add_arg_with_default(p_all, "--pick-prior", action="store_true", default=argparse.SUPPRESS,
                           help_text="If multiple prior outputs exist, prompt to pick (foreground only)")
     # Execution behavior
