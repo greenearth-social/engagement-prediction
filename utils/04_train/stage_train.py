@@ -78,8 +78,8 @@ class EngagementPredictor(nn.Module):
         return self.network(x)
 
 
-    def train_step(self, batch: Dict[str, torch.Tensor], device: str):
-        """Unified training step: unpack batch, forward, compute loss.
+    def compute_loss_and_preds(self, batch: Dict[str, torch.Tensor], device: str):
+        """Compute loss and predictions for training, validation, or inference.
 
         Returns (loss, predictions_tensor).
         """
@@ -164,8 +164,8 @@ class AttentionMLP(nn.Module):
         x = torch.cat([user_vec, post_embedding], dim=-1)
         return self.mlp_head(x)
 
-    def train_step(self, batch: Dict[str, torch.Tensor], device: str):
-        """Unified training step: unpack sequence batch, forward, compute loss."""
+    def compute_loss_and_preds(self, batch: Dict[str, torch.Tensor], device: str):
+        """Compute loss and predictions for training, validation, or inference."""
         history_emb = batch["history_embeddings"].to(device)
         history_mask = batch["history_mask"].to(device)
         target_emb = batch["target_post_embedding"].to(device)
@@ -279,7 +279,7 @@ def train_model(
         for batch in _tqdm(train_loader, desc="Training", leave=False, disable=disable_progress):
             labels = batch["label"].to(device)
             optimizer.zero_grad()
-            loss, preds = model.train_step(batch, device)
+            loss, preds = model.compute_loss_and_preds(batch, device)
             loss.backward()
             optimizer.step()
             tr_loss += loss.item()
@@ -293,7 +293,7 @@ def train_model(
         with torch.inference_mode():
             for batch in _tqdm(val_loader, desc="Validation", leave=False, disable=disable_progress):
                 labels = batch["label"].to(device)
-                loss, preds = model.train_step(batch, device)
+                loss, preds = model.compute_loss_and_preds(batch, device)
                 val_loss += loss.item()
                 val_preds.extend(preds.detach().cpu().numpy().tolist())
                 val_labels.extend(labels.detach().cpu().numpy().tolist())
@@ -534,7 +534,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         trained_model.eval()
         with torch.inference_mode():
             for batch in loader:
-                _, preds = trained_model.train_step(batch, device)
+                _, preds = trained_model.compute_loss_and_preds(batch, device)
                 if preds.ndim == 0:
                     ps.append(float(preds.cpu()))
                     ys.append(float(batch["label"].cpu()))

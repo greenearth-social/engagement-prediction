@@ -155,13 +155,18 @@ class TwoTowerEngagement(nn.Module):
         post_emb = self.encode_post(post_embeddings)
         return (user_emb * post_emb).sum(dim=-1)
 
-    def train_forward(
+    def compute_loss_and_preds(
         self,
         history_embeddings: torch.Tensor,
         history_mask: Optional[torch.Tensor],
         post_embeddings: torch.Tensor,
         labels: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute loss and predictions for training, validation, or inference.
+        
+        Returns:
+            Tuple of (loss, scores) where scores are raw logits before sigmoid.
+        """
         user_emb = self.encode_user(history_embeddings, history_mask)
         post_emb = self.encode_post(post_embeddings)
         scores = (user_emb * post_emb).sum(dim=-1)
@@ -224,7 +229,7 @@ def train_two_tower_model(
             labels = batch["label"].to(device)
 
             optimizer.zero_grad()
-            loss, scores = model.train_forward(history_emb, history_mask, target_emb, labels)
+            loss, scores = model.compute_loss_and_preds(history_emb, history_mask, target_emb, labels)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_max_norm)
             optimizer.step()
@@ -246,7 +251,7 @@ def train_two_tower_model(
                 target_emb = batch["target_post_embedding"].to(device)
                 labels = batch["label"].to(device)
 
-                loss, scores = model.train_forward(history_emb, history_mask, target_emb, labels)
+                loss, scores = model.compute_loss_and_preds(history_emb, history_mask, target_emb, labels)
 
                 val_losses.append(loss.item())
                 val_preds.extend(torch.sigmoid(scores).detach().cpu().numpy().tolist())
