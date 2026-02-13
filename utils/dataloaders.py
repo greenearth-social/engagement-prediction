@@ -60,6 +60,7 @@ class UserSummarizer(ABC):
 
         Returns:
             A single vector of shape ``[D]``.
+            For empty input, returns a zero vector of shape ``[D]``.
         """
         ...
 
@@ -69,7 +70,7 @@ class MeanSummarizer(UserSummarizer):
 
     def summarize(self, embeddings: np.ndarray) -> np.ndarray:
         if len(embeddings) == 0:
-            raise ValueError("MeanSummarizer received empty embeddings; caller should handle the empty case")
+            return np.zeros(embeddings.shape[1], dtype=np.float32)
         return embeddings.mean(axis=0).astype(np.float32)
 
 
@@ -90,7 +91,7 @@ class EMASummarizer(UserSummarizer):
 
     def summarize(self, embeddings: np.ndarray) -> np.ndarray:
         if len(embeddings) == 0:
-            raise ValueError("EMASummarizer received empty embeddings; caller should handle the empty case")
+            return np.zeros(embeddings.shape[1], dtype=np.float32)
         n = len(embeddings)
         raw_weights = self.alpha * ((1.0 - self.alpha) ** np.arange(n, dtype=np.float64))
         weights = (raw_weights / raw_weights.sum()).astype(np.float32)
@@ -102,7 +103,7 @@ class LinearRecencySummarizer(UserSummarizer):
 
     def summarize(self, embeddings: np.ndarray) -> np.ndarray:
         if len(embeddings) == 0:
-            raise ValueError("LinearRecencySummarizer received empty embeddings; caller should handle the empty case")
+            return np.zeros(embeddings.shape[1], dtype=np.float32)
         n = len(embeddings)
         raw_weights = np.arange(n, 0, -1, dtype=np.float32)  # [n, n-1, ..., 1]
         weights = raw_weights / raw_weights.sum()
