@@ -277,14 +277,13 @@ def train_model(
         tr_preds: List[float] = []
         tr_labels: List[float] = []
         for batch in _tqdm(train_loader, desc="Training", leave=False, disable=disable_progress):
-            labels = batch["label"].to(device)
             optimizer.zero_grad()
             loss, preds = model.compute_loss_and_preds(batch, device)
             loss.backward()
             optimizer.step()
             tr_loss += loss.item()
             tr_preds.extend(preds.detach().cpu().numpy().tolist())
-            tr_labels.extend(labels.detach().cpu().numpy().tolist())
+            tr_labels.extend(batch["label"].numpy().tolist())
 
         val_loss = 0.0
         val_preds: List[float] = []
@@ -292,11 +291,10 @@ def train_model(
         model.eval()
         with torch.inference_mode():
             for batch in _tqdm(val_loader, desc="Validation", leave=False, disable=disable_progress):
-                labels = batch["label"].to(device)
                 loss, preds = model.compute_loss_and_preds(batch, device)
                 val_loss += loss.item()
                 val_preds.extend(preds.detach().cpu().numpy().tolist())
-                val_labels.extend(labels.detach().cpu().numpy().tolist())
+                val_labels.extend(batch["label"].numpy().tolist())
 
         tr_auc = roc_auc_score(tr_labels, tr_preds) if len(set(tr_labels)) > 1 else 0.5
         va_auc = roc_auc_score(val_labels, val_preds) if len(set(val_labels)) > 1 else 0.5
