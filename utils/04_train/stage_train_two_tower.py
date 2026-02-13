@@ -559,6 +559,7 @@ def run(context: Context, args) -> Dict[str, Any]:
                 title_suffix="(Train)",
             )
         except Exception:
+            # Plot generation is optional; silently continue if plotting fails
             pass
         try:
             plot_model_performance(
@@ -568,6 +569,7 @@ def run(context: Context, args) -> Dict[str, Any]:
                 title_suffix="(Validation)",
             )
         except Exception:
+            # Plot generation is optional; silently continue if plotting fails
             pass
 
     # --- save model ---
