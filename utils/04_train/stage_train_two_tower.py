@@ -558,9 +558,8 @@ def run(context: Context, args) -> Dict[str, Any]:
                 plots_dir / f"train_performance_{timestamp}.png",
                 title_suffix="(Train)",
             )
-        except Exception:
-            # Plot generation is optional; silently continue if plotting fails
-            pass
+        except Exception as plot_exc:
+            logger.warning(f"Train performance plotting failed (non-fatal): {plot_exc}")
         try:
             plot_model_performance(
                 val_eval["predictions"]["y_true"],
@@ -568,9 +567,8 @@ def run(context: Context, args) -> Dict[str, Any]:
                 plots_dir / f"val_performance_{timestamp}.png",
                 title_suffix="(Validation)",
             )
-        except Exception:
-            # Plot generation is optional; silently continue if plotting fails
-            pass
+        except Exception as plot_exc:
+            logger.warning(f"Validation performance plotting failed (non-fatal): {plot_exc}")
 
     # --- save model ---
     model_path = checkpoints_dir / f"two_tower_{timestamp}.pth"
