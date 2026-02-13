@@ -34,10 +34,10 @@ model architectures:
    enabling LEARNED attention-based encoders to discover optimal history
    aggregation:
    
-   • UserHistoryEncoder          : Full transformer self-attention
-                                   Dual pooling: attention-weighted + mean
-   • LightweightAttentionEncoder : Single learned-query cross-attention
-                                   Faster and fewer parameters
+   • UserHistoryEncoder             : Full transformer self-attention
+                                     Dual pooling: attention-weighted + mean
+   • CrossAttentionPoolingEncoder   : Single learned-query cross-attention pooling
+                                     Faster and fewer parameters
    
    Output format: (padded_sequences, mask, target_post_embedding)
    Memory:        Sequences loaded on-the-fly via memmap (~13 GB if pre-computed)
@@ -49,10 +49,10 @@ ARCHITECTURE PATTERNS
 
 The modular design supports multiple training approaches:
 
-    MLP + Summarizer          : SummarizedEngagementDataset + EngagementPredictor
-    MLP + Attention Encoder   : SequenceEngagementDataset + AttentionMLP
-    Two-Tower + Full Attention: SequenceEngagementDataset + TwoTowerEngagement(user_encoder_type="attention")
-    Two-Tower + Lightweight   : SequenceEngagementDataset + TwoTowerEngagement(user_encoder_type="lightweight")
+    MLP + Summarizer             : SummarizedEngagementDataset + EngagementPredictor
+    MLP + Attention Encoder      : SequenceEngagementDataset + AttentionMLP
+    Two-Tower + Full Attention   : SequenceEngagementDataset + TwoTowerEngagement(user_encoder_type="attention")
+    Two-Tower + Cross-Attention  : SequenceEngagementDataset + TwoTowerEngagement(user_encoder_type="cross_attention")
 
 This separation allows experimentation with different history representations
 without modifying model code, and vice versa.
@@ -72,8 +72,8 @@ Summarization Strategies (pluggable):
     LinearRecencySummarizer      -- Linear recency weighting
 
 Learned Encoders (end-to-end trainable):
-    UserHistoryEncoder           -- Full transformer self-attention + dual pooling
-    LightweightAttentionEncoder  -- Efficient single-query cross-attention
+    UserHistoryEncoder              -- Full transformer self-attention + dual pooling
+    CrossAttentionPoolingEncoder    -- Efficient single-query cross-attention pooling
 
 Utilities:
     load_training_data()         -- Locates and loads upstream pipeline artifacts
@@ -459,8 +459,8 @@ class UserHistoryEncoder(nn.Module):
         return self.output_projection(combined)  # [B, output_dim]
 
 
-class LightweightAttentionEncoder(nn.Module):
-    """Efficient user history encoder using single-query cross-attention.
+class CrossAttentionPoolingEncoder(nn.Module):
+    """Efficient user history encoder using single-query cross-attention pooling.
     
     Designed as a fast alternative to UserHistoryEncoder for production ranking
     scenarios where latency and throughput matter. Achieves significant speedup
@@ -489,7 +489,7 @@ class LightweightAttentionEncoder(nn.Module):
         - Memory: Scales linearly with sequence length
     
     When to use:
-        - Two-tower models needing fast candidate scoring (user_encoder_type="lightweight")
+        - Two-tower models needing fast candidate scoring (user_encoder_type="cross_attention")
         - Production systems with strict latency requirements
         - Cold-start scenarios where simple aggregation may generalize better
     

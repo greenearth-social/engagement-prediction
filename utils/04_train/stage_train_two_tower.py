@@ -44,7 +44,7 @@ This module supports TWO user encoder architectures, selected via user_encoder_t
        - Computational resources allow transformer training
        - User histories contain complex patterns (complementary/contradictory posts)
 
-2. **"lightweight"** - LightweightAttentionEncoder (Single-Query Cross-Attention)
+2. **"cross_attention"** - CrossAttentionPoolingEncoder (Single-Query Cross-Attention)
    ───────────────────────────────────────────────────────────────────────────
    Skips expensive self-attention layers, using only a single learned-query
    cross-attention for aggregation. Significantly faster with fewer parameters.
@@ -116,7 +116,7 @@ from utils.dataloaders import (
     SequenceEngagementDataset,
     sequence_collate_fn,
     UserHistoryEncoder,
-    LightweightAttentionEncoder,
+    CrossAttentionPoolingEncoder,
 )
 
 STAGE_LOG_NAME = "STAGE_04_TRAIN_TWO_TOWER"
@@ -202,7 +202,7 @@ class TwoTowerEngagement(nn.Module):
     ranking systems.
     
     Architecture:
-        User Tower: UserHistoryEncoder OR LightweightAttentionEncoder
+        User Tower: UserHistoryEncoder OR CrossAttentionPoolingEncoder
                     (history_sequence, mask) -> user_vector [shared_dim]
         
         Post Tower: PostTower (simple MLP)
@@ -214,7 +214,7 @@ class TwoTowerEngagement(nn.Module):
     Key characteristics:
         - Shared embedding space: Both towers output same dimensionality
         - Independent computation: Towers never exchange information (until final dot product)
-        - Modular encoders: User tower can be "attention" or "lightweight"
+        - Modular encoders: User tower can be "attention" or "cross_attention"
     
     Deployment pattern:
         1. Pre-compute post_vectors for all candidate posts
@@ -232,7 +232,7 @@ class TwoTowerEngagement(nn.Module):
         max_history_len: Maximum history sequence length (default: 50)
         dropout_rate: Dropout probability (default: 0.1)
         user_encoder_type: User tower architecture - "attention" (full transformer)
-                           or "lightweight" (single-query cross-attention)
+                           or "cross_attention" (single-query cross-attention pooling)
     """
 
     def __init__(
@@ -253,8 +253,8 @@ class TwoTowerEngagement(nn.Module):
         self.user_encoder_type = user_encoder_type
 
         # Instantiate user tower based on encoder type
-        if user_encoder_type == "lightweight":
-            self.user_tower = LightweightAttentionEncoder(
+        if user_encoder_type == "cross_attention":
+            self.user_tower = CrossAttentionPoolingEncoder(
                 input_dim=post_embedding_dim,
                 hidden_dim=user_hidden_dim,
                 output_dim=shared_dim,
@@ -274,7 +274,7 @@ class TwoTowerEngagement(nn.Module):
         else:
             raise ValueError(
                 f"Unknown user_encoder_type '{user_encoder_type}'. "
-                "Choose 'attention' or 'lightweight'."
+                "Choose 'attention' or 'cross_attention'."
             )
 
         # Post tower is the same regardless of user encoder type

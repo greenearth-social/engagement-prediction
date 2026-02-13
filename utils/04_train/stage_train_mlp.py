@@ -449,7 +449,7 @@ def set_random_seeds(seed: int):
 # Training loop
 # =============================================================================
 
-def train_model(
+def train_mlp_model(
     model: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
@@ -695,7 +695,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     lr_scheduler_factor = float(args.lr_scheduler_factor)
     lr_scheduler_patience = int(args.lr_scheduler_patience)
     
-    training_results = train_model(
+    training_results = train_mlp_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
