@@ -8,7 +8,7 @@ This stage trains Multi-Layer Perceptron (MLP) models for binary engagement pred
 user engagement history:
 
 ═══════════════════════════════════════════════════════════════════════════════
-APPROACH 1: MLP + HAND-CRAFTED SUMMARIZATION (EngagementPredictor)
+APPROACH 1: MLP + HAND-CRAFTED SUMMARIZATION (SummarizedMLP)
 ═══════════════════════════════════════════════════════════════════════════════
 
 Uses SummarizedEngagementDataset with pluggable summarization strategies (mean,
@@ -94,13 +94,17 @@ STAGE_LOG_NAME = "STAGE_04_TRAIN_MLP"
 # Model Architectures
 # =============================================================================
 
-class EngagementPredictor(nn.Module):
-    """Vanilla MLP engagement predictor with pre-computed user summaries.
+class SummarizedMLP(nn.Module):
+    """MLP engagement predictor using hand-crafted user history summarization.
     
     This is the simpler of two MLP architectures, accepting fixed-size concatenated
     [user_summary || post_embedding] vectors from SummarizedEngagementDataset.
     The user summary is computed by hand-crafted aggregation strategies (mean, EMA,
     linear recency) applied during dataset initialization.
+    
+    The name "SummarizedMLP" reflects that this model works with pre-computed
+    user history SUMMARIES (via Summarizers like MeanSummarizer, EMASummarizer)
+    rather than learned ENCODERS (like TransformerDualPoolingEncoder).
     
     Architecture:
         Input layer: Concatenated [user_summary || post_embedding] vector [2*D]
@@ -119,7 +123,7 @@ class EngagementPredictor(nn.Module):
         dropout_rate: Dropout probability applied after each hidden layer
     
     Example:
-        >>> model = EngagementPredictor(input_dim=768, hidden_dims=[512, 256], dropout_rate=0.3)
+        >>> model = SummarizedMLP(input_dim=768, hidden_dims=[512, 256], dropout_rate=0.3)
         >>> # Input: [batch, 768] -> Hidden: [batch, 512] -> [batch, 256] -> Output: [batch, 1]
     """
 
@@ -195,7 +199,7 @@ class AttentionMLP(nn.Module):
         Concatenation: [user_vector || post_embedding] -> [user_output_dim + embed_dim]
         MLP head: Stack of (Linear -> BatchNorm -> GELU -> Dropout) -> Linear -> Sigmoid
     
-    Key differences from EngagementPredictor:
+    Key differences from SummarizedMLP:
         ✓ LEARNS history aggregation via attention (not hand-crafted)
         ✓ Consumes SequenceEngagementDataset (not SummarizedEngagementDataset)
         ✓ Can capture complex temporal patterns and inter-post relationships
@@ -331,9 +335,9 @@ class AttentionMLP(nn.Module):
 # Helper Functions
 # =============================================================================
 
-def create_model(input_dim: int, hidden_dims: List[int], dropout_rate: float) -> EngagementPredictor:
-    """Factory function for creating EngagementPredictor instances."""
-    return EngagementPredictor(input_dim, hidden_dims, dropout_rate)
+def create_model(input_dim: int, hidden_dims: List[int], dropout_rate: float) -> SummarizedMLP:
+    """Factory function for creating SummarizedMLP instances."""
+    return SummarizedMLP(input_dim, hidden_dims, dropout_rate)
 
 
 def create_data_loaders(

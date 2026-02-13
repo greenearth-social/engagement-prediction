@@ -69,7 +69,7 @@ ARCHITECTURE PATTERNS
 
 The modular design supports multiple training approaches:
 
-    MLP + Summarizer             : SummarizedEngagementDataset + EngagementPredictor
+    MLP + Summarizer             : SummarizedEngagementDataset + SummarizedMLP
     MLP + Attention Encoder      : SequenceEngagementDataset + AttentionMLP
     Two-Tower + Full Attention   : SequenceEngagementDataset + TwoTowerEngagement(user_encoder_type="attention")
     Two-Tower + Cross-Attention  : SequenceEngagementDataset + TwoTowerEngagement(user_encoder_type="cross_attention")
