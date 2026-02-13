@@ -3,23 +3,81 @@
 """
 Shared dataloaders and user-encoder building blocks for engagement prediction.
 
-Provides two dataset classes named by their **output representation**, not by
-which model consumes them.  This keeps user-representation and model-head
-concerns orthogonal:
+This module provides a **modular framework for representing user engagement history**
+in different formats, enabling flexible model architectures while maintaining
+code reuse and memory efficiency.
 
-    SummarizedEngagementDataset  -- fixed-size [user_summary ‖ post_emb] vectors
-    SequenceEngagementDataset    -- padded variable-length history sequences + mask
+═══════════════════════════════════════════════════════════════════════════════
+MODULAR USER-HISTORY REPRESENTATION
+═══════════════════════════════════════════════════════════════════════════════
 
-Both read on-the-fly from a numpy memmap (embeddings), a Polars target_posts
-DataFrame, and a Polars user-history DataFrame produced by the earlier pipeline
-stages.
+User engagement history (the sequence of posts a user has liked) can be
+represented in two fundamentally different ways, each optimized for different
+model architectures:
 
-Also provides:
-- Pluggable UserSummarizer strategies (mean, EMA, linear recency)
-- Learned user-history encoders (``UserHistoryEncoder``,
-  ``LightweightAttentionEncoder``) shared by both MLP and Two-Tower models
-- A shared ``load_training_data()`` helper that locates and opens the three
-  upstream artifacts
+1. **Fixed-Size Summary Vectors** (SummarizedEngagementDataset)
+   ─────────────────────────────────────────────────────────────────────────
+   Reduces variable-length history to a single fixed-dimensional vector using
+   PLUGGABLE summarization strategies:
+   
+   • MeanSummarizer          : Simple arithmetic average of all liked posts
+   • EMASummarizer           : Exponential moving average (recent posts weighted higher)
+   • LinearRecencySummarizer : Linear decay weighting (most recent = highest weight)
+   
+   Output format: Concatenated [user_summary || post_embedding] vector
+   Memory:        Pre-computed and cached in RAM (~280 MB for 178K samples)
+   Best for:      Simple MLP models that need fixed-size inputs
+   
+2. **Variable-Length Sequences** (SequenceEngagementDataset)
+   ─────────────────────────────────────────────────────────────────────────
+   Preserves full temporal structure as padded/masked embedding sequences,
+   enabling LEARNED attention-based encoders to discover optimal history
+   aggregation:
+   
+   • UserHistoryEncoder          : Full transformer self-attention
+                                   Dual pooling: attention-weighted + mean
+   • LightweightAttentionEncoder : Single learned-query cross-attention
+                                   Faster and fewer parameters
+   
+   Output format: (padded_sequences, mask, target_post_embedding)
+   Memory:        Sequences loaded on-the-fly via memmap (~13 GB if pre-computed)
+   Best for:      Two-Tower models and Attention-MLP variants
+
+═══════════════════════════════════════════════════════════════════════════════
+ARCHITECTURE PATTERNS
+═══════════════════════════════════════════════════════════════════════════════
+
+The modular design supports multiple training approaches:
+
+    MLP + Summarizer          : SummarizedEngagementDataset + EngagementPredictor
+    MLP + Attention Encoder   : SequenceEngagementDataset + AttentionMLP
+    Two-Tower + Full Attention: SequenceEngagementDataset + TwoTowerEngagement(user_encoder_type="attention")
+    Two-Tower + Lightweight   : SequenceEngagementDataset + TwoTowerEngagement(user_encoder_type="lightweight")
+
+This separation allows experimentation with different history representations
+without modifying model code, and vice versa.
+
+═══════════════════════════════════════════════════════════════════════════════
+MAIN COMPONENTS
+═══════════════════════════════════════════════════════════════════════════════
+
+Datasets:
+    SummarizedEngagementDataset  -- Fixed-size [user_summary ‖ post_emb] vectors
+    SequenceEngagementDataset    -- Padded variable-length history sequences + mask
+
+Summarization Strategies (pluggable):
+    UserSummarizer               -- Abstract base class
+    MeanSummarizer               -- Arithmetic mean
+    EMASummarizer                -- Exponential moving average with recency bias
+    LinearRecencySummarizer      -- Linear recency weighting
+
+Learned Encoders (end-to-end trainable):
+    UserHistoryEncoder           -- Full transformer self-attention + dual pooling
+    LightweightAttentionEncoder  -- Efficient single-query cross-attention
+
+Utilities:
+    load_training_data()         -- Locates and loads upstream pipeline artifacts
+    sequence_collate_fn()        -- Collation function for SequenceEngagementDataset
 """
 
 from __future__ import annotations
@@ -48,40 +106,100 @@ from utils.helpers import (
 # ---------------------------------------------------------------------------
 
 class UserSummarizer(ABC):
-    """Base class for turning a variable-length history of embeddings into a
-    single fixed-size vector."""
+    """Base class for user-history summarization strategies.
+    
+    Summarizers collapse a variable-length sequence of post embeddings (user's
+    engagement history) into a single fixed-size vector that captures their
+    preferences. This enables MLP models to consume user histories of arbitrary
+    length through a consistent input dimensionality.
+    
+    All concrete summarizers must:
+    - Handle empty histories gracefully (return zero vector)
+    - Preserve embedding dimensionality: input [seq_len, D] -> output [D]
+    - Expect embeddings sorted most-recent-first (index 0 = most recent like)
+    
+    Design rationale:
+        Pluggable summarizers allow experimentation with different history
+        aggregation strategies without changing dataset or model code. Simple
+        strategies (mean, EMA) are fast and interpretable; more complex strategies
+        could incorporate learned weights or content-based filtering.
+    """
 
     @abstractmethod
     def summarize(self, embeddings: np.ndarray) -> np.ndarray:
-        """
+        """Aggregate a variable-length history into a single fixed-size vector.
+        
         Args:
-            embeddings: shape ``[seq_len, D]``, sorted most-recent-first.
-                        May be empty (``seq_len == 0``).
+            embeddings: User's engagement history as embeddings, shape [seq_len, D].
+                       Sorted most-recent-first (index 0 = most recent liked post).
+                       May be empty (seq_len == 0) if user has no history.
 
         Returns:
-            A single vector of shape ``[D]``.
-            For empty input, returns a zero vector of shape ``[D]``.
+            Single summary vector of shape [D]. For empty input, returns a zero
+            vector to represent "no engagement history available".
+            
+        Implementation note:
+            Subclasses should use float32 for consistency with PyTorch training.
         """
         ...
 
 
 class MeanSummarizer(UserSummarizer):
-    """Simple arithmetic mean over all history embeddings."""
+    """Simple arithmetic mean summarizer - all history posts weighted equally.
+    
+    Treats all engagement equally regardless of recency. This is the simplest
+    baseline summarization strategy and works surprisingly well when users have
+    consistent preferences over time.
+    
+    Computation: mean(embeddings) along the sequence dimension
+    Complexity:  O(seq_len * D)
+    
+    When to use:
+        - Baseline experiments
+        - Users with stable, long-term preferences
+        - When recency bias is undesirable
+    """
 
     def summarize(self, embeddings: np.ndarray) -> np.ndarray:
+        """Compute unweighted mean of all history embeddings.
+        
+        Args:
+            embeddings: History sequence, shape [seq_len, D]
+            
+        Returns:
+            Mean vector [D], or zero vector if empty
+        """
         if len(embeddings) == 0:
             return np.zeros(embeddings.shape[1], dtype=np.float32)
         return embeddings.mean(axis=0).astype(np.float32)
 
 
 class EMASummarizer(UserSummarizer):
-    """Exponential moving average weighted towards more recent likes.
-
-    Embeddings are expected most-recent-first.  Weight for position *i* is
-    ``alpha * (1 - alpha)^i``, normalised to sum to 1.
-
+    """Exponential moving average summarizer with recency bias.
+    
+    Applies exponentially decaying weights to history, with recent likes weighted
+    more heavily than older ones. This captures the intuition that recent
+    engagement better reflects current user preferences.
+    
+    Weight formula:
+        For position i (0 = most recent): w_i = alpha * (1 - alpha)^i
+        Weights are normalized to sum to 1.
+    
     Args:
-        alpha: smoothing factor in (0, 1].  Higher = more weight on recent.
+        alpha: Smoothing factor in (0, 1]. Higher values increase recency bias.
+               α=0.1 (default) gives ~50% weight to the 7 most recent likes.
+               α=0.3 gives ~50% weight to the 2 most recent likes.
+               α=1.0 uses only the most recent like.
+    
+    Computation: O(seq_len * D)
+    
+    When to use:
+        - Fashion, news, trending content (preferences shift over time)
+        - Users with evolving tastes
+        - When recent engagement is more predictive than distant history
+    
+    Raises:
+        ValueError: If alpha is not in range (0, 1]
     """
 
     def __init__(self, alpha: float = 0.1):
@@ -90,28 +208,78 @@ class EMASummarizer(UserSummarizer):
         self.alpha = alpha
 
     def summarize(self, embeddings: np.ndarray) -> np.ndarray:
+        """Compute exponentially-weighted mean favoring recent history.
+        
+        Args:
+            embeddings: History sequence, shape [seq_len, D], most-recent-first
+            
+        Returns:
+            Weighted mean vector [D], or zero vector if empty
+        """
         if len(embeddings) == 0:
             return np.zeros(embeddings.shape[1], dtype=np.float32)
         n = len(embeddings)
+        # Compute raw weights: alpha * (1-alpha)^i for i in [0, n)
         raw_weights = self.alpha * ((1.0 - self.alpha) ** np.arange(n, dtype=np.float64))
+        # Normalize to sum to 1
         weights = (raw_weights / raw_weights.sum()).astype(np.float32)
         return (weights[:, None] * embeddings).sum(axis=0).astype(np.float32)
 
 
 class LinearRecencySummarizer(UserSummarizer):
-    """Linear recency weighting: most-recent gets weight *n*, next *n-1*, etc."""
+    """Linear recency weighting: most recent gets highest weight, oldest gets lowest.
+    
+    Applies linearly decreasing weights based on position in the history sequence.
+    Simpler and more intuitive than EMA, with predictable weight distribution.
+    
+    Weight formula:
+        For n items, position i gets weight (n - i), then normalize
+        Example (n=4): weights = [4, 3, 2, 1] / 10 = [0.4, 0.3, 0.2, 0.1]
+    
+    Computation: O(seq_len * D)
+    
+    When to use:
+        - Similar to EMA but prefer interpretable linear decay
+        - Moderate recency bias without exponential drop-off
+        - When you want recent posts to matter more, but not overwhelmingly so
+    """
 
     def summarize(self, embeddings: np.ndarray) -> np.ndarray:
+        """Compute linearly-weighted mean with recency bias.
+        
+        Args:
+            embeddings: History sequence, shape [seq_len, D], most-recent-first
+            
+        Returns:
+            Weighted mean vector [D], or zero vector if empty
+        """
         if len(embeddings) == 0:
             return np.zeros(embeddings.shape[1], dtype=np.float32)
         n = len(embeddings)
-        raw_weights = np.arange(n, 0, -1, dtype=np.float32)  # [n, n-1, ..., 1]
+        # Weights: [n, n-1, ..., 2, 1] normalized
+        raw_weights = np.arange(n, 0, -1, dtype=np.float32)
         weights = raw_weights / raw_weights.sum()
         return (weights[:, None] * embeddings).sum(axis=0).astype(np.float32)
 
 
 def get_summarizer(name: str, **kwargs: Any) -> UserSummarizer:
-    """Factory: ``"mean"`` | ``"ema"`` | ``"linear_recency"``."""
+    """Factory function: instantiate a summarizer by name.
+    
+    Args:
+        name: One of "mean", "ema", "linear_recency"
+        **kwargs: Summarizer-specific parameters:
+                  - For "ema": alpha (or ema_alpha) controls recency bias
+    
+    Returns:
+        Configured UserSummarizer instance
+        
+    Raises:
+        ValueError: If name is not recognized
+        
+    Example:
+        >>> summarizer = get_summarizer("ema", alpha=0.2)
+        >>> summary = summarizer.summarize(history_embeddings)
+    """
     if name == "mean":
         return MeanSummarizer()
     if name == "ema":
@@ -127,10 +295,47 @@ def get_summarizer(name: str, **kwargs: Any) -> UserSummarizer:
 # ---------------------------------------------------------------------------
 
 class UserHistoryEncoder(nn.Module):
-    """Encodes a variable-length sequence of liked post embeddings into a fixed
-    user representation via self-attention + dual pooling (attention + mean).
-
-    Used as the user tower in both the Two-Tower model and AttentionMLP.
+    """Full-featured transformer-based user history encoder with dual pooling.
+    
+    Encodes variable-length engagement history into a fixed user representation
+    using self-attention + dual pooling strategy. This allows the model to LEARN
+    which historical engagement patterns are most predictive, rather than using
+    hand-crafted aggregation rules.
+    
+    Architecture:
+        1. Input projection: Raw embeddings -> hidden_dim
+        2. Positional encoding: Explicit recency signal (position 0 = most recent)
+        3. Transformer encoder: Multi-head self-attention captures inter-post relationships
+        4. Dual pooling: 
+           - Learned-query attention pooling (adaptive, content-aware)
+           - Mean pooling (robust, aggregates all information)
+        5. Output projection: Combined pooled features -> output_dim
+    
+    Design rationale:
+        - Self-attention allows the model to identify complementary/contradictory
+          preferences within a user's history
+        - Dual pooling combines adaptive focus (attention) with comprehensive
+          coverage (mean), providing robustness
+        - Flipped positional embeddings ensure position 0 = most recent, matching
+          the recency-biased intuition of traditional summarizers
+    
+    Complexity:
+        - Parameters: ~2M (typical settings)
+        - Forward pass: O(num_layers * seq_len^2 * hidden_dim) due to self-attention
+        - Memory: Scales quadratically with sequence length
+    
+    Used by:
+        - TwoTowerEngagement (user_encoder_type="attention")
+        - AttentionMLP (user encoder component)
+    
+    Args:
+        input_dim: Dimensionality of input post embeddings
+        hidden_dim: Internal transformer hidden size (default: 256)
+        output_dim: Final user representation size (default: 128)
+        num_attention_heads: Number of attention heads per layer (default: 4)
+        num_attention_layers: Depth of transformer stack (default: 2)
+        max_seq_len: Maximum history length for positional embeddings (default: 50)
+        dropout_rate: Dropout probability for regularization (default: 0.1)
     """
 
     def __init__(
@@ -149,6 +354,7 @@ class UserHistoryEncoder(nn.Module):
         self.output_dim = output_dim
         self.max_seq_len = max_seq_len
 
+        # Project raw embeddings to transformer hidden dimension
         self.input_projection = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -156,12 +362,14 @@ class UserHistoryEncoder(nn.Module):
             nn.Dropout(dropout_rate),
         )
 
+        # Learnable positional embeddings (one per position up to max_seq_len)
         self.positional_embedding = nn.Embedding(max_seq_len, hidden_dim)
 
+        # Stack of transformer encoder layers (multi-head self-attention + FFN)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=num_attention_heads,
-            dim_feedforward=hidden_dim * 4,
+            dim_feedforward=hidden_dim * 4,  # Standard 4x expansion in FFN
             dropout=dropout_rate,
             activation="gelu",
             batch_first=True,
@@ -171,10 +379,12 @@ class UserHistoryEncoder(nn.Module):
             num_layers=num_attention_layers,
         )
 
+        # Learnable query vector for attention pooling
         self.attention_query = nn.Parameter(torch.randn(1, 1, hidden_dim))
 
+        # Project concatenated dual-pooled features to final output dimension
         self.output_projection = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Linear(hidden_dim * 2, hidden_dim),  # 2x because we concatenate two pooling outputs
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout_rate),
@@ -184,6 +394,7 @@ class UserHistoryEncoder(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
+        """Initialize weights using Xavier uniform for linear layers."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -197,54 +408,97 @@ class UserHistoryEncoder(nn.Module):
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
         history_mask: Optional[torch.Tensor] = None,  # [B, seq_len] True = valid
     ) -> torch.Tensor:
+        """Encode user history into fixed-size representation.
+        
+        Args:
+            history_embeddings: Padded history sequences [batch, seq_len, input_dim]
+            history_mask: Boolean mask [batch, seq_len], True = valid position
+            
+        Returns:
+            User representations [batch, output_dim]
+        """
         B, seq_len, _ = history_embeddings.shape
         device = history_embeddings.device
 
+        # Default to all-valid mask if not provided
         if history_mask is None:
             history_mask = torch.ones(B, seq_len, dtype=torch.bool, device=device)
 
+        # Project embeddings to hidden dimension
         x = self.input_projection(history_embeddings)
 
-        # Positional embeddings flipped for recency (position 0 = most recent)
+        # Add positional information (flipped: position 0 = most recent)
         positions = torch.arange(seq_len, device=device)
         positions = (self.max_seq_len - 1) - positions.clamp(max=self.max_seq_len - 1)
         pos_emb = self.positional_embedding(positions)
-        x = x + pos_emb.unsqueeze(0)
+        x = x + pos_emb.unsqueeze(0)  # Broadcast across batch
 
-        # Transformer (PyTorch uses inverted mask: True = ignore)
-        attn_mask = ~history_mask
+        # Pass through transformer (note: PyTorch uses inverted mask convention)
+        attn_mask = ~history_mask  # Convert to PyTorch convention: True = ignore
         x = self.transformer_encoder(x, src_key_padding_mask=attn_mask)
 
-        # Attention-weighted pooling
-        query = self.attention_query.expand(B, -1, -1)
-        attn_scores = torch.bmm(query, x.transpose(1, 2))
+        # ─── Attention-weighted pooling ───
+        # Use learned query to compute content-aware weights over sequence
+        query = self.attention_query.expand(B, -1, -1)  # [B, 1, hidden]
+        attn_scores = torch.bmm(query, x.transpose(1, 2))  # [B, 1, seq_len]
         attn_scores = attn_scores.masked_fill(attn_mask.unsqueeze(1), float("-inf"))
         attn_weights = F.softmax(attn_scores, dim=-1)
+        # Handle all-masked sequences (avoids NaN from softmax over all -inf)
         attn_weights = torch.nan_to_num(attn_weights, nan=1.0 / max(seq_len, 1))
-        attention_pooled = torch.bmm(attn_weights, x).squeeze(1)
+        attention_pooled = torch.bmm(attn_weights, x).squeeze(1)  # [B, hidden]
 
-        # Mean pooling (masked)
-        mask_expanded = history_mask.unsqueeze(-1).float()
+        # ─── Mean pooling (masked) ───
+        # Provides stable, comprehensive coverage of all history
+        mask_expanded = history_mask.unsqueeze(-1).float()  # [B, seq_len, 1]
         sum_x = (x * mask_expanded).sum(dim=1)
-        count = mask_expanded.sum(dim=1).clamp(min=1)
-        mean_pooled = sum_x / count
+        count = mask_expanded.sum(dim=1).clamp(min=1)  # Avoid division by zero
+        mean_pooled = sum_x / count  # [B, hidden]
 
-        combined = torch.cat([attention_pooled, mean_pooled], dim=-1)
-        return self.output_projection(combined)
+        # Concatenate both pooling strategies and project to output dimension
+        combined = torch.cat([attention_pooled, mean_pooled], dim=-1)  # [B, hidden*2]
+        return self.output_projection(combined)  # [B, output_dim]
 
 
 class LightweightAttentionEncoder(nn.Module):
-    """Lightweight user-history encoder: input projection + positional encoding
-    + single learned-query cross-attention pooling.
-
-    Same ``forward(history_embeddings, history_mask) -> [B, output_dim]``
-    interface as :class:`UserHistoryEncoder` but **without** the expensive
-    ``TransformerEncoder`` self-attention layers.  This reduces complexity from
-    O(num_layers * seq_len^2 * hidden_dim) to O(seq_len * hidden_dim) and
-    parameter count from ~2 M to ~150 K (typical settings).
-
-    Designed as the user tower for a *light-ranker* two-tower model that needs
-    to score large candidate sets efficiently.
+    """Efficient user history encoder using single-query cross-attention.
+    
+    Designed as a fast alternative to UserHistoryEncoder for production ranking
+    scenarios where latency and throughput matter. Achieves significant speedup
+    and parameter reduction while maintaining competitive accuracy.
+    
+    Key difference from UserHistoryEncoder:
+        **NO SELF-ATTENTION** - removes the expensive O(seq_len²) transformer layers
+        that capture inter-post relationships. Instead, relies on:
+        - Input projection + positional encoding to embed history
+        - Single learned-query cross-attention to aggregate
+        - Mean pooling for stability
+    
+    This trades off some modeling capacity (can't capture complex inter-post
+    dependencies) for dramatic efficiency gains.
+    
+    Architecture:
+        1. Input projection: Raw embeddings -> hidden_dim
+        2. Positional encoding: Explicit recency signal
+        3. Cross-attention pooling: Single learned query attends to projected history
+        4. Mean pooling: Robust baseline aggregation
+        5. Output projection: Combined features -> output_dim
+    
+    Complexity:
+        - Parameters: Significantly fewer than UserHistoryEncoder (~150K vs ~2M typical)
+        - Forward pass: O(seq_len * hidden_dim) - linear in sequence length
+        - Memory: Scales linearly with sequence length
+    
+    When to use:
+        - Two-tower models needing fast candidate scoring (user_encoder_type="lightweight")
+        - Production systems with strict latency requirements
+        - Cold-start scenarios where simple aggregation may generalize better
+    
+    Args:
+        input_dim: Dimensionality of input post embeddings
+        hidden_dim: Internal hidden size (default: 256)
+        output_dim: Final user representation size (default: 128)
+        max_seq_len: Maximum history length for positional embeddings (default: 50)
+        dropout_rate: Dropout probability for regularization (default: 0.1)
     """
 
     def __init__(
@@ -261,6 +515,7 @@ class LightweightAttentionEncoder(nn.Module):
         self.output_dim = output_dim
         self.max_seq_len = max_seq_len
 
+        # Project raw embeddings to hidden dimension
         self.input_projection = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -268,11 +523,13 @@ class LightweightAttentionEncoder(nn.Module):
             nn.Dropout(dropout_rate),
         )
 
+        # Learnable positional embeddings
         self.positional_embedding = nn.Embedding(max_seq_len, hidden_dim)
 
-        # Learned query for cross-attention pooling (single head)
+        # Single learned query for cross-attention pooling
         self.attention_query = nn.Parameter(torch.randn(1, 1, hidden_dim))
 
+        # Project concatenated pooled features to final output dimension
         self.output_projection = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -284,6 +541,7 @@ class LightweightAttentionEncoder(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
+        """Initialize weights using Xavier uniform for linear layers."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -297,37 +555,53 @@ class LightweightAttentionEncoder(nn.Module):
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
         history_mask: Optional[torch.Tensor] = None,  # [B, seq_len] True = valid
     ) -> torch.Tensor:
+        """Encode user history into fixed-size representation.
+        
+        Args:
+            history_embeddings: Padded history sequences [batch, seq_len, input_dim]
+            history_mask: Boolean mask [batch, seq_len], True = valid position
+            
+        Returns:
+            User representations [batch, output_dim]
+        """
         B, seq_len, _ = history_embeddings.shape
         device = history_embeddings.device
 
+        # Default to all-valid mask if not provided
         if history_mask is None:
             history_mask = torch.ones(B, seq_len, dtype=torch.bool, device=device)
 
+        # Project embeddings to hidden dimension
         x = self.input_projection(history_embeddings)
 
-        # Positional embeddings flipped for recency (position 0 = most recent)
+        # Add positional information (flipped: position 0 = most recent)
         positions = torch.arange(seq_len, device=device)
         positions = (self.max_seq_len - 1) - positions.clamp(max=self.max_seq_len - 1)
         pos_emb = self.positional_embedding(positions)
-        x = x + pos_emb.unsqueeze(0)
+        x = x + pos_emb.unsqueeze(0)  # Broadcast across batch
 
-        # --- NO TransformerEncoder here (the key cost saving) ---
+        # ─── KEY DIFFERENCE: No TransformerEncoder here ───
+        # We skip the expensive self-attention layers that capture inter-post
+        # relationships. This is the primary source of speedup and parameter reduction.
 
-        # Cross-attention pooling: learned query attends to projected history
-        attn_mask_inv = ~history_mask  # True = ignore
-        query = self.attention_query.expand(B, -1, -1)
+        # ─── Cross-attention pooling ───
+        # Learned query attends directly to the projected, position-encoded history
+        attn_mask_inv = ~history_mask  # PyTorch convention: True = ignore
+        query = self.attention_query.expand(B, -1, -1)  # [B, 1, hidden]
         attn_scores = torch.bmm(query, x.transpose(1, 2))  # [B, 1, seq]
         attn_scores = attn_scores.masked_fill(attn_mask_inv.unsqueeze(1), float("-inf"))
         attn_weights = F.softmax(attn_scores, dim=-1)
+        # Handle all-masked sequences
         attn_weights = torch.nan_to_num(attn_weights, nan=1.0 / max(seq_len, 1))
         attention_pooled = torch.bmm(attn_weights, x).squeeze(1)  # [B, hidden]
 
-        # Mean pooling (masked)
+        # ─── Mean pooling (masked) ───
         mask_expanded = history_mask.unsqueeze(-1).float()
         sum_x = (x * mask_expanded).sum(dim=1)
         count = mask_expanded.sum(dim=1).clamp(min=1)
         mean_pooled = sum_x / count
 
+        # Concatenate both pooling strategies and project to output dimension
         combined = torch.cat([attention_pooled, mean_pooled], dim=-1)
         return self.output_projection(combined)
 
@@ -341,25 +615,52 @@ def load_training_data(
     context: Context,
     logger: Optional[logging.Logger] = None,
 ) -> Tuple[np.ndarray, pl.DataFrame, pl.DataFrame, int]:
-    """Locate and load the three upstream artifacts needed for training.
-
+    """Locate and load the three upstream pipeline artifacts needed for training.
+    
+    This function abstracts away the complexity of finding prior stage outputs,
+    supporting both same-session pipeline runs (via context.artifacts) and
+    multi-session workflows (via filesystem scanning).
+    
     Resolution order for each artifact:
-    1. ``context.artifacts`` (populated during a same-session pipeline run)
-    2. ``select_prior_output()`` filesystem scan
-
+        1. context.artifacts - Set by pipeline when stages run in same session
+        2. select_prior_output() - Filesystem scan for standalone training runs
+        3. Fallback folders - Legacy compatibility (e.g., 02_featurize for history)
+    
+    The three required artifacts:
+        1. embeddings_*.npy   : Memmap array of post embeddings from Stage 1
+        2. target_posts_*.parquet : Train/val/test split assignments from Stage 2
+        3. history_posts_*.parquet: User engagement history from Stage 3
+    
+    Args:
+        run_dir: Root directory of the pipeline run
+        context: Pipeline context with artifact tracking and configuration
+        logger: Optional logger for progress reporting
+    
     Returns:
-        ``(embeddings_mmap, target_posts_df, history_df, embed_dim)``
-
-        * ``embeddings_mmap`` -- read-only numpy memmap, shape ``[n_posts, D]``
-        * ``target_posts_df`` -- collected Polars DataFrame from Stage 2
-        * ``history_df``      -- collected Polars DataFrame from Stage 3
-        * ``embed_dim``       -- int, the embedding dimensionality *D*
+        Tuple of (embeddings_mmap, target_posts_df, history_df, embed_dim):
+            - embeddings_mmap: Read-only numpy memmap [n_posts, D]
+            - target_posts_df: Polars DataFrame with split, like_emb_idx, neg_emb_idx
+            - history_df: Polars DataFrame with target_did, like_uri, prior_emb_indices
+            - embed_dim: Integer embedding dimensionality D
+    
+    Raises:
+        FileNotFoundError: If any required artifact cannot be located
+        
+    Example:
+        >>> embeddings, targets, history, dim = load_training_data(
+        ...     run_dir=Path("/runs/experiment_001"),
+        ...     context=context,
+        ...     logger=logger
+        ... )
+        >>> print(f"Loaded {len(targets):,} target posts with {dim}-d embeddings")
     """
     if logger is None:
         logger = get_stage_logger("DATALOADERS")
     run_dir = Path(run_dir).resolve()
 
     # --- 1. Embeddings memmap from 01_get_data ---
+    # This is a read-only memory-mapped array that allows accessing post
+    # embeddings without loading the entire matrix into RAM
     log_operation_start("Locate embeddings memmap", "DATALOADERS", logger)
     get_data_dir = _resolve_prior(run_dir, context, stage_key="get_data", folder="01_get_data")
     emb_candidates = sorted(get_data_dir.glob("embeddings_*.npy"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -371,6 +672,7 @@ def load_training_data(
     logger.info(f"Loaded embeddings memmap: shape={embeddings_mmap.shape}, path={embeddings_path}")
 
     # --- 2. Target posts from 02_target_posts ---
+    # Contains the train/val/test split assignments and negative sampling results
     log_operation_start("Locate target_posts", "DATALOADERS", logger)
     target_posts_dir = _resolve_prior(run_dir, context, stage_key="target_posts", folder="02_target_posts")
     tp_candidates = sorted(target_posts_dir.glob("target_posts_*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -380,12 +682,13 @@ def load_training_data(
     logger.info(f"Loaded target_posts: {len(target_posts_df):,} rows from {tp_candidates[0].name}")
 
     # --- 3. User history from 03_user_history (or legacy 02_featurize) ---
+    # Contains the chronologically-ordered list of post indices each user engaged with
     log_operation_start("Locate user_history", "DATALOADERS", logger)
     history_dir = _resolve_prior(
         run_dir, context,
         stage_key="user_history",
         folder="03_user_history",
-        fallback_folder="02_featurize",
+        fallback_folder="02_featurize",  # Legacy compatibility
     )
     hist_candidates = sorted(history_dir.glob("history_posts_*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not hist_candidates:
@@ -445,48 +748,79 @@ def _prepare_split_data(
     split: str,
     logger: Optional[logging.Logger] = None,
 ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], np.ndarray, np.ndarray]:
-    """Filter to a single split and return aligned numpy arrays.
-
+    """Filter data to a single split and return aligned numpy arrays.
+    
+    This internal helper performs the core data preparation logic shared by both
+    SummarizedEngagementDataset and SequenceEngagementDataset. It:
+    1. Filters target_posts to the requested split (train/val/test)
+    2. Drops rows with missing negative samples
+    3. Joins with user history to get engagement sequences
+    4. Converts to numpy arrays for fast indexing
+    
+    The returned arrays are **row-aligned**: position i in each array corresponds
+    to the same user-post interaction. This alignment is critical for dataset
+    __getitem__ to efficiently construct training samples.
+    
+    Args:
+        target_posts_df: Full target posts DataFrame with all splits
+        history_df: User engagement history DataFrame
+        split: Split name to filter to ("train", "val", or "test")
+        logger: Optional logger for progress reporting
+    
     Returns:
-        ``(like_emb_idx, neg_emb_idx, prior_emb_indices_list,
-          target_dids, like_uris)``
-
-    Where:
-        * ``like_emb_idx``  -- int32 array [N]
-        * ``neg_emb_idx``   -- int32 array [N]
-        * ``prior_emb_indices_list`` -- Python list of N numpy arrays (each
-          variable-length uint32, most-recent-first)
-        * ``target_dids``   -- object array [N] of user-id strings
-        * ``like_uris``     -- object array [N] of like-uri strings
+        Tuple of (like_emb_idx, neg_emb_idx, prior_emb_indices_list, 
+                  target_dids, like_uris):
+        
+        - like_emb_idx: Indices into embeddings memmap for positive posts [N]
+        - neg_emb_idx: Indices into embeddings memmap for negative posts [N]
+        - prior_emb_indices_list: List of N variable-length arrays, each containing
+                                  embedding indices for that user's history
+                                  (most-recent-first, uint32)
+        - target_dids: User IDs as string array [N]
+        - like_uris: Post URIs as string array [N]
+        
+        Where N = number of target posts in the requested split (after filtering).
+    
+    Note:
+        Each target post row produces TWO training samples (positive + negative),
+        so dataset length will be 2*N. This function returns N-length arrays that
+        the datasets will expand to 2*N samples in their __getitem__ methods.
     """
     if logger is None:
         logger = get_stage_logger("DATALOADERS")
 
-    # Filter target_posts to requested split, drop rows with null neg_emb_idx
+    # Filter to requested split and drop rows missing negative samples
+    # (negative samples may be missing if the negative sampling stage failed
+    # to find a suitable negative for that user-post pair)
     tp = target_posts_df.filter(
         (pl.col("split") == split) & pl.col("neg_emb_idx").is_not_null()
     )
     logger.info(f"  Split '{split}': {len(tp):,} target rows (after dropping null neg_emb_idx)")
 
-    # History is 1:1 aligned by row with target_posts.  Join on (target_did, like_uri)
-    # to get the correct history for each target row.
+    # Join target posts with user history on (user_id, post_uri) to get the
+    # engagement sequence for each target. History is pre-filtered to exclude
+    # the target post itself (temporal validity).
     joined = tp.join(
         history_df.select(["target_did", "like_uri", "prior_emb_indices"]),
         on=["target_did", "like_uri"],
         how="left",
     )
 
+    # Extract embedding indices for positive and negative posts
     like_emb_idx = joined["like_emb_idx"].to_numpy().astype(np.int64)
     neg_emb_idx = joined["neg_emb_idx"].to_numpy().astype(np.int64)
     target_dids = joined["target_did"].to_list()
     like_uris = joined["like_uri"].to_list()
 
-    # prior_emb_indices is a List[UInt32] column.  Convert each element to a
-    # numpy array; null (no history match) becomes an empty array.
+    # Convert Polars List[UInt32] column to Python list of numpy arrays
+    # This allows each user to have a different history length (variable-length)
+    # while still supporting fast numpy indexing into the embeddings memmap
     prior_col = joined["prior_emb_indices"]
     prior_emb_indices_list: List[np.ndarray] = []
     for row_val in prior_col.to_list():
         if row_val is None or len(row_val) == 0:
+            # Users with no history get an empty array (will become zero vector
+            # in SummarizedEngagementDataset or all-masked sequence in SequenceEngagementDataset)
             prior_emb_indices_list.append(np.array([], dtype=np.uint32))
         else:
             prior_emb_indices_list.append(np.array(row_val, dtype=np.uint32))
@@ -499,18 +833,74 @@ def _prepare_split_data(
 # ---------------------------------------------------------------------------
 
 class SummarizedEngagementDataset(Dataset):
-    """Produces fixed-size feature vectors ``[user_summary || post_embedding]``.
-
-    Each target-posts row yields **two** training samples (positive + negative).
-    Index ``2*k`` is the positive sample for row *k*; index ``2*k+1`` is the
-    negative.
-
-    Currently consumed by the MLP; future-proof for any model that accepts a
-    fixed-length feature vector.
-
-    **Performance**: all user summaries and post embeddings are pre-computed
-    into contiguous float32 tensors at init time, so ``__getitem__`` is a
-    pure in-memory index lookup with zero memmap I/O.
+    """Fixed-size feature vector dataset: [user_summary || post_embedding].
+    
+    This dataset represents user engagement history as FIXED-SIZE summary vectors
+    computed by pluggable UserSummarizer strategies. It's designed for models that
+    require consistent input dimensionality (e.g., vanilla MLPs).
+    
+    ═══════════════════════════════════════════════════════════════════════════
+    DATASET STRUCTURE
+    ═══════════════════════════════════════════════════════════════════════════
+    
+    Each target post generates TWO training samples:
+        - Positive sample (index 2*k):   [user_summary || liked_post_embedding] -> label=1
+        - Negative sample (index 2*k+1): [user_summary || random_post_embedding] -> label=0
+    
+    This paired structure ensures balanced training and allows the model to learn
+    discriminative features between engaged and non-engaged content.
+    
+    Sample indexing:
+        len(dataset) = 2 * num_target_posts
+        dataset[0]   = positive sample for target post 0
+        dataset[1]   = negative sample for target post 0
+        dataset[2]   = positive sample for target post 1
+        ...
+    
+    ═══════════════════════════════════════════════════════════════════════════
+    MEMORY & PERFORMANCE
+    ═══════════════════════════════════════════════════════════════════════════
+    
+    **Pre-computation strategy**: All user summaries and post embeddings are
+    materialized into contiguous float32 tensors at init time (~280 MB for 178K
+    samples with D=384). This makes __getitem__ a pure in-memory index lookup
+    with ZERO memmap I/O during training.
+    
+    Trade-offs:
+        ✓ Pros: Lightning-fast __getitem__, minimal CPU overhead, works with any
+                number of DataLoader workers
+        ✗ Cons: Upfront memory cost, user summaries baked in (can't change
+                summarization strategy without recreating dataset)
+    
+    When to use:
+        - Training simple MLP models
+        - When memory allows pre-computation (~1.5 MB per 1000 samples)
+        - When you want maximum training throughput
+        - When you don't need to experiment with different summarization strategies
+          within the same training run
+    
+    ═══════════════════════════════════════════════════════════════════════════
+    
+    Args:
+        embeddings_mmap: Read-only numpy memmap of post embeddings [n_posts, D]
+        target_posts_df: DataFrame with split, like_emb_idx, neg_emb_idx columns
+        history_df: DataFrame with target_did, like_uri, prior_emb_indices columns
+        split: Split to load ("train", "val", or "test")
+        summarizer: UserSummarizer instance for aggregating engagement history
+        embed_dim: Embedding dimensionality D
+        logger: Optional logger for progress reporting
+    
+    Attributes:
+        embed_dim: Embedding dimensionality
+        target_dids: User IDs for each target post [N]
+        like_uris: Post URIs for each target post [N]
+    
+    Returns (from __getitem__):
+        Dictionary with keys:
+            - "features": Concatenated [user_summary || post_emb] tensor [2*D]
+            - "label": Binary label (1.0 for positive, 0.0 for negative)
+            - "user_id": User ID string
+            - "post_id": Post URI string (or "neg_{row_idx}" for negatives)
     """
 
     def __init__(
@@ -525,6 +915,7 @@ class SummarizedEngagementDataset(Dataset):
     ):
         self.embed_dim = embed_dim
 
+        # Prepare aligned arrays for the requested split
         (
             like_emb_idx,
             neg_emb_idx,
@@ -536,17 +927,22 @@ class SummarizedEngagementDataset(Dataset):
         self._n_rows = len(like_emb_idx)
 
         # ── Pre-compute user summaries [N, D] ────────────────────────
+        # Apply the summarizer to each user's engagement history. This happens
+        # once at init time so __getitem__ can be a pure lookup.
         if logger:
             logger.info(f"  Pre-computing user summaries for '{split}' ({self._n_rows:,} rows)…")
         user_summaries = np.zeros((self._n_rows, embed_dim), dtype=np.float32)
         for i, hist_indices in enumerate(prior_emb_indices):
             if len(hist_indices) > 0:
+                # Fetch history embeddings from memmap and summarize
                 hist_embs = embeddings_mmap[hist_indices]  # [seq, D]
                 user_summaries[i] = summarizer.summarize(hist_embs)
-            # else: stays zeros
+            # else: Users with no history stay as zero vectors
         self._user_summaries = torch.from_numpy(user_summaries)
 
         # ── Pre-fetch post embeddings [N, D] for pos and neg ─────────
+        # Materialize positive and negative post embeddings into contiguous tensors
+        # for fast __getitem__ lookups. This is cheap compared to history sequences.
         pos_embs = np.array(embeddings_mmap[like_emb_idx], dtype=np.float32)
         neg_embs = np.array(embeddings_mmap[neg_emb_idx], dtype=np.float32)
         self._pos_post_embs = torch.from_numpy(pos_embs)
@@ -562,23 +958,42 @@ class SummarizedEngagementDataset(Dataset):
             )
 
     def __len__(self) -> int:
+        """Return total number of samples (2 per target post: positive + negative)."""
         return self._n_rows * 2
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        row_idx = idx // 2
-        is_positive = (idx % 2) == 0
+        """Get a single training sample by index.
+        
+        Args:
+            idx: Sample index in [0, 2*N). Even indices are positive samples,
+                 odd indices are negative samples.
+        
+        Returns:
+            Dictionary with:
+                - "features": [2*D] concatenated [user_summary || post_embedding]
+                - "label": 1.0 for positive, 0.0 for negative
+                - "user_id": User identifier string
+                - "post_id": Post URI (or "neg_{row_idx}" for negatives)
+        """
+        # Map dataset index to target post row and sample type
+        row_idx = idx // 2  # Which target post
+        is_positive = (idx % 2) == 0  # Even = positive, odd = negative
 
-        user_vec = self._user_summaries[row_idx]            # [D]
+        # User summary is shared between positive and negative samples
+        user_vec = self._user_summaries[row_idx]  # [D]
+        
+        # Select post embedding based on sample type
         if is_positive:
-            post_vec = self._pos_post_embs[row_idx]          # [D]
+            post_vec = self._pos_post_embs[row_idx]  # [D]
             label = 1.0
             post_id = self.like_uris[row_idx]
         else:
-            post_vec = self._neg_post_embs[row_idx]          # [D]
+            post_vec = self._neg_post_embs[row_idx]  # [D]
             label = 0.0
-            post_id = f"neg_{row_idx}"
+            post_id = f"neg_{row_idx}"  # Synthetic ID for negative samples
 
-        features = torch.cat([user_vec, post_vec])           # [2D]
+        # Concatenate user summary and post embedding
+        features = torch.cat([user_vec, post_vec])  # [2D]
         return {
             "features": features,
             "label": torch.tensor(label, dtype=torch.float32),
@@ -592,19 +1007,84 @@ class SummarizedEngagementDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 class SequenceEngagementDataset(Dataset):
-    """Produces padded history sequences + mask + target post embedding.
-
-    Each target-posts row yields **two** training samples (positive + negative).
-
-    Currently consumed by the Two-Tower model; future-proof for any model that
-    operates on variable-length embedding sequences (e.g. MLP + attention head).
-
-    **Performance**: post embeddings (small: ``2 * N * D * 4`` bytes) are
-    pre-computed into contiguous tensors.  History sequences are constructed
-    on-the-fly from the memmap to avoid the prohibitive memory cost of
-    materializing a dense ``[N, max_seq, D]`` float32 tensor (which would be
-    ~13 GB at N=178K, max_seq=50, D=384).  Multi-worker DataLoaders pipeline
-    the per-sample memmap reads so the GPU stays fed.
+    """Variable-length sequence dataset: padded history + mask + target post embedding.
+    
+    This dataset represents user engagement history as VARIABLE-LENGTH SEQUENCES
+    with padding and masking. It preserves temporal structure and allows learned
+    encoders (attention mechanisms) to discover optimal aggregation strategies.
+    
+    ═══════════════════════════════════════════════════════════════════════════
+    DATASET STRUCTURE
+    ═══════════════════════════════════════════════════════════════════════════
+    
+    Each target post generates TWO training samples:
+        - Positive sample (index 2*k):   (history_seq, mask, liked_post_emb) -> label=1
+        - Negative sample (index 2*k+1): (history_seq, mask, random_post_emb) -> label=0
+    
+    History sequences are:
+        - Padded to max_history_len
+        - Masked (True = valid position, False = padding)
+        - Most-recent-first (index 0 = most recent engagement)
+    
+    Sample indexing:
+        len(dataset) = 2 * num_target_posts
+        dataset[0]   = positive sample for target post 0
+        dataset[1]   = negative sample for target post 0
+        ...
+    
+    ═══════════════════════════════════════════════════════════════════════════
+    MEMORY & PERFORMANCE
+    ═══════════════════════════════════════════════════════════════════════════
+    
+    **Hybrid pre-computation strategy**:
+        ✓ Target post embeddings: Pre-computed into tensors (~560 MB for 178K samples)
+        ✓ History sequences: Constructed on-the-fly from memmap during __getitem__
+    
+    Rationale:
+        A fully materialized [N, max_seq, D] tensor would consume ~13 GB for typical
+        parameters (N=178K, max_seq=50, D=384). By loading sequences on-demand, we
+        keep memory footprint manageable while multi-worker DataLoaders pipeline the
+        I/O to keep GPUs fed.
+    
+    Trade-offs:
+        ✓ Pros: Massively reduced memory footprint, flexible max_history_len
+        ✗ Cons: Per-sample memmap I/O overhead (mitigated by DataLoader workers),
+                slightly slower __getitem__ than fully pre-computed
+    
+    When to use:
+        - Training Two-Tower models with attention encoders
+        - Training Attention-MLP models
+        - When you want learned (not hand-crafted) history aggregation
+        - When you need to experiment with different max_history_len values
+        - When memory constraints prevent full pre-computation
+    
+    ═══════════════════════════════════════════════════════════════════════════
+    
+    Args:
+        embeddings_mmap: Read-only numpy memmap of post embeddings [n_posts, D]
+        target_posts_df: DataFrame with split, like_emb_idx, neg_emb_idx columns
+        history_df: DataFrame with target_did, like_uri, prior_emb_indices columns
+        split: Split to load ("train", "val", or "test")
+        max_history_len: Maximum sequence length for padding (truncate if longer)
+        embed_dim: Embedding dimensionality D
+        logger: Optional logger for progress reporting
+    
+    Attributes:
+        embeddings: Reference to memmap for on-the-fly loading
+        max_history_len: Maximum sequence length
+        embed_dim: Embedding dimensionality
+        prior_emb_indices: List of variable-length index arrays per target post
+        target_dids: User IDs [N]
+        like_uris: Post URIs [N]
+    
+    Returns (from __getitem__):
+        Dictionary with keys:
+            - "history_embeddings": Padded sequence [max_seq_len, D]
+            - "history_mask": Boolean mask [max_seq_len], True = valid position
+            - "target_post_embedding": Target post embedding [D]
+            - "label": Binary label (1.0 for positive, 0.0 for negative)
+            - "user_id": User ID string
+            - "post_id": Post URI string (or "neg_{row_idx}" for negatives)
     """
 
     def __init__(
@@ -617,10 +1097,12 @@ class SequenceEngagementDataset(Dataset):
         embed_dim: int,
         logger: Optional[logging.Logger] = None,
     ):
+        # Store memmap reference for on-the-fly sequence loading
         self.embeddings = embeddings_mmap
         self.max_history_len = max_history_len
         self.embed_dim = embed_dim
 
+        # Prepare aligned arrays for the requested split
         (
             like_emb_idx,
             neg_emb_idx,
@@ -632,6 +1114,8 @@ class SequenceEngagementDataset(Dataset):
         self._n_rows = len(like_emb_idx)
 
         # ── Pre-fetch post embeddings [N, D] for pos and neg (cheap: ~560 MB) ──
+        # Target post embeddings are small enough to pre-compute, avoiding repeated
+        # memmap lookups for the same posts during training
         pos_embs = np.array(embeddings_mmap[like_emb_idx], dtype=np.float32)
         neg_embs = np.array(embeddings_mmap[neg_emb_idx], dtype=np.float32)
         self._pos_post_embs = torch.from_numpy(pos_embs)
@@ -651,37 +1135,62 @@ class SequenceEngagementDataset(Dataset):
             )
 
     def __len__(self) -> int:
+        """Return total number of samples (2 per target post: positive + negative)."""
         return self._n_rows * 2
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """Get a single training sample by index.
+        
+        This method performs on-the-fly loading of history sequences from the
+        memmap. When using multi-worker DataLoaders, this I/O happens in parallel
+        worker processes, keeping the main training loop fed.
+        
+        Args:
+            idx: Sample index in [0, 2*N). Even indices are positive samples,
+                 odd indices are negative samples.
+        
+        Returns:
+            Dictionary with:
+                - "history_embeddings": [max_seq_len, D] padded/truncated history
+                - "history_mask": [max_seq_len] boolean, True = valid position
+                - "target_post_embedding": [D] target post embedding
+                - "label": 1.0 for positive, 0.0 for negative
+                - "user_id": User identifier string
+                - "post_id": Post URI (or "neg_{row_idx}" for negatives)
+        """
+        # Map dataset index to target post row and sample type
         row_idx = idx // 2
         is_positive = (idx % 2) == 0
 
-        # --- history sequence: pad / truncate from memmap (done in worker) ---
+        # --- Load and pad/truncate history sequence from memmap ---
+        # This is the key difference from SummarizedEngagementDataset: we load
+        # the raw sequence here rather than using a pre-computed summary
         hist_indices = self.prior_emb_indices[row_idx]
         seq_len = min(len(hist_indices), self.max_history_len)
 
+        # Initialize padded arrays
         padded = np.zeros((self.max_history_len, self.embed_dim), dtype=np.float32)
         mask = np.zeros(self.max_history_len, dtype=bool)
 
         if seq_len > 0:
+            # Truncate to max_history_len if needed, load from memmap
             used_indices = hist_indices[: self.max_history_len]
             padded[:seq_len] = self.embeddings[used_indices]
             mask[:seq_len] = True
 
-        # --- post embedding: pre-computed tensor lookup ---
+        # --- Select target post embedding (pre-computed) ---
         if is_positive:
-            post_vec = self._pos_post_embs[row_idx]          # [D]
+            post_vec = self._pos_post_embs[row_idx]  # [D]
             label = 1.0
             post_id = self.like_uris[row_idx]
         else:
-            post_vec = self._neg_post_embs[row_idx]          # [D]
+            post_vec = self._neg_post_embs[row_idx]  # [D]
             label = 0.0
             post_id = f"neg_{row_idx}"
 
         return {
-            "history_embeddings": torch.from_numpy(padded),            # [max_seq, D]
-            "history_mask": torch.from_numpy(mask),                    # [max_seq]
+            "history_embeddings": torch.from_numpy(padded),  # [max_seq, D]
+            "history_mask": torch.from_numpy(mask),  # [max_seq]
             "target_post_embedding": post_vec,
             "label": torch.tensor(label, dtype=torch.float32),
             "user_id": self.target_dids[row_idx],
@@ -690,7 +1199,29 @@ class SequenceEngagementDataset(Dataset):
 
 
 def sequence_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Collate for ``SequenceEngagementDataset`` -- stacks pre-padded tensors."""
+    """Collate function for SequenceEngagementDataset batches.
+    
+    Stacks individual sample tensors into batch tensors. Since samples are already
+    padded to max_history_len by __getitem__, we can simply stack along a new
+    batch dimension.
+    
+    Args:
+        batch: List of sample dictionaries from SequenceEngagementDataset.__getitem__
+    
+    Returns:
+        Batched dictionary with:
+            - "history_embeddings": [batch, max_seq_len, D]
+            - "history_mask": [batch, max_seq_len]
+            - "target_post_embedding": [batch, D]
+            - "label": [batch]
+            - "user_ids": List of batch user ID strings (not stacked)
+            - "post_ids": List of batch post ID strings (not stacked)
+    
+    Note:
+        user_ids and post_ids remain as lists rather than being stacked into
+        tensors, since they're string identifiers used for logging/debugging
+        rather than model inputs.
+    """
     return {
         "history_embeddings": torch.stack([b["history_embeddings"] for b in batch]),
         "history_mask": torch.stack([b["history_mask"] for b in batch]),
