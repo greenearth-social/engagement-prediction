@@ -1,25 +1,92 @@
 #!/usr/bin/env python3
 
 """
-Stage 4 (Two-Tower): Train a two-tower engagement prediction model using
-on-the-fly embedding sequence retrieval from memmap.
+Stage 4 (Two-Tower): Train two-tower engagement prediction models with flexible user encoders.
 
-User Tower: Self-attention encoder over liked-post history sequence
-Post Tower: MLP projection of post embeddings to shared space
-Training: BCE loss with explicit positive/negative pairs
+This stage trains Two-Tower models, a popular architecture for large-scale recommendation
+systems that separates user and item (post) representations into independent "towers",
+enabling efficient candidate retrieval and ranking.
+
+═══════════════════════════════════════════════════════════════════════════════
+TWO-TOWER ARCHITECTURE
+═══════════════════════════════════════════════════════════════════════════════
+
+Core concept: Project users and posts into a SHARED EMBEDDING SPACE where
+engagement is predicted by computing similarity (dot product) between representations.
+
+    User Tower:  history_sequence -> UserEncoder -> user_vector [shared_dim]
+    Post Tower:  post_embedding -> MLP -> post_vector [shared_dim]
+    Prediction:  sigmoid(user_vector · post_vector) -> engagement_probability
+
+Benefits:
+    ✓ Decoupled representations: User and post towers can be independently cached
+    ✓ Efficient retrieval: Pre-compute all post_vectors, then find top-K by
+      dot product similarity (can use approximate nearest neighbor search)
+    ✓ Scalable: Avoids expensive cross-feature interactions until final dot product
+
+═══════════════════════════════════════════════════════════════════════════════
+USER ENCODER OPTIONS
+═══════════════════════════════════════════════════════════════════════════════
+
+This module supports TWO user encoder architectures, selected via user_encoder_type:
+
+1. **"attention"** - UserHistoryEncoder (Full Transformer Self-Attention)
+   ───────────────────────────────────────────────────────────────────────────
+   Uses transformer encoder with multi-head self-attention to capture complex
+   inter-post relationships in user history. Best modeling capacity but highest
+   computational cost.
+   
+   Architecture: Input projection -> Positional encoding -> Transformer encoder
+                 layers -> Dual pooling (attention + mean) -> Output projection
+   
+   When to use:
+       - Accuracy is paramount
+       - Computational resources allow transformer training
+       - User histories contain complex patterns (complementary/contradictory posts)
+
+2. **"lightweight"** - LightweightAttentionEncoder (Single-Query Cross-Attention)
+   ───────────────────────────────────────────────────────────────────────────
+   Skips expensive self-attention layers, using only a single learned-query
+   cross-attention for aggregation. Significantly faster with fewer parameters.
+   
+   Architecture: Input projection -> Positional encoding -> Cross-attention
+                 pooling (single query) + Mean pooling -> Output projection
+   
+   When to use:
+       - Production systems with strict latency requirements
+       - Large candidate sets need fast scoring
+       - Simpler history patterns (user preferences are consistent)
+
+═══════════════════════════════════════════════════════════════════════════════
+TRAINING DETAILS
+═══════════════════════════════════════════════════════════════════════════════
+
+Loss:       Binary cross-entropy on sigmoid(dot_product)
+Sampling:   Balanced positive/negative pairs (1:1 ratio)
+Optimizer:  AdamW with weight decay for regularization
+Scheduling: ReduceLROnPlateau based on validation AUC
+Regularization: Gradient clipping, dropout, early stopping
+
+The model is trained to maximize dot product for engaged pairs and minimize for
+non-engaged pairs, learning a metric space where similar preferences cluster.
+
+═══════════════════════════════════════════════════════════════════════════════
 
 Inputs (from prior pipeline stages):
-- embeddings_*.npy memmap from 01_get_data
-- target_posts_*.parquet from 02_target_posts
-- history_posts_*.parquet from 03_user_history
+    - embeddings_*.npy memmap from 01_get_data
+    - target_posts_*.parquet from 02_target_posts
+    - history_posts_*.parquet from 03_user_history
 
 Outputs under <run_dir>/04_train/<timestamp>/:
-- checkpoints/two_tower_*.pth
-- plots/training_history_*.png, train_performance_*.png, val_performance_*.png, holdout_performance_*.png
-- logs/
-- training_config.json
-- stage_info.txt
-- holdout_eval/metrics_overall.json, predictions.parquet
+    - checkpoints/two_tower_*.pth (full checkpoint with training state)
+    - checkpoints/two_tower_*_weights.pth (model weights only)
+    - plots/training_history_*.png (loss and AUC curves)
+    - plots/{train,val,holdout}_performance_*.png (precision-recall, ROC curves)
+    - logs/ (training logs)
+    - training_config.json (hyperparameters and configuration)
+    - stage_info.txt (pipeline metadata)
+    - holdout_eval/metrics_overall.json (final test set metrics)
+    - holdout_eval/predictions.parquet (detailed predictions for analysis)
 """
 
 from __future__ import annotations
@@ -60,7 +127,30 @@ STAGE_LOG_NAME = "STAGE_04_TRAIN_TWO_TOWER"
 # =============================================================================
 
 class PostTower(nn.Module):
-    """Projects post embeddings to shared embedding space."""
+    """Post tower: Projects post embeddings to shared embedding space.
+    
+    This is the "item tower" of the two-tower architecture. It maps raw post
+    embeddings into the same latent space as user representations, enabling
+    dot-product similarity scoring.
+    
+    Architecture:
+        Input: Post embedding [input_dim]
+        Hidden: Linear -> LayerNorm -> GELU -> Dropout
+        Output: Linear -> Shared space representation [output_dim]
+    
+    Design choices:
+        - LayerNorm (not BatchNorm): Post embeddings don't have batch-level
+          statistics during inference (we process posts independently)
+        - GELU activation: Smooth gradients for better optimization
+        - Single hidden layer: Posts are already semantic embeddings from a
+          pre-trained model, so minimal transformation is often sufficient
+    
+    Args:
+        input_dim: Dimensionality of input post embeddings (e.g., 384 for all-MiniLM)
+        hidden_dim: Internal hidden layer size (default: 256)
+        output_dim: Shared space dimensionality (default: 128)
+        dropout_rate: Dropout probability for regularization (default: 0.1)
+    """
 
     def __init__(
         self,
@@ -80,6 +170,7 @@ class PostTower(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
+        """Initialize weights using Xavier uniform for stable training."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -87,6 +178,14 @@ class PostTower(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, post_embeddings: torch.Tensor) -> torch.Tensor:
+        """Project post embeddings to shared space.
+        
+        Args:
+            post_embeddings: Batch of post embeddings [batch, input_dim]
+        
+        Returns:
+            Shared space representations [batch, output_dim]
+        """
         return self.network(post_embeddings)
 
 
@@ -95,7 +194,46 @@ class PostTower(nn.Module):
 # =============================================================================
 
 class TwoTowerEngagement(nn.Module):
-    """Two-tower model: user tower (attention or lightweight encoder) + post tower (MLP)."""
+    """Two-tower engagement prediction model with pluggable user encoders.
+    
+    Implements the two-tower architecture where user and post representations
+    are independently computed and combined via dot product similarity. This
+    architecture is particularly well-suited for large-scale retrieval and
+    ranking systems.
+    
+    Architecture:
+        User Tower: UserHistoryEncoder OR LightweightAttentionEncoder
+                    (history_sequence, mask) -> user_vector [shared_dim]
+        
+        Post Tower: PostTower (simple MLP)
+                    post_embedding -> post_vector [shared_dim]
+        
+        Scoring: dot_product(user_vector, post_vector) -> raw score
+                 sigmoid(raw_score) -> engagement_probability
+    
+    Key characteristics:
+        - Shared embedding space: Both towers output same dimensionality
+        - Independent computation: Towers never exchange information (until final dot product)
+        - Modular encoders: User tower can be "attention" or "lightweight"
+    
+    Deployment pattern:
+        1. Pre-compute post_vectors for all candidate posts
+        2. At inference, encode user history once -> user_vector
+        3. Find top-K posts by dot product (can use ANN for scale)
+        4. Return ranked candidates
+    
+    Args:
+        post_embedding_dim: Dimensionality of input post embeddings
+        shared_dim: Output dimension for both towers (default: 128)
+        user_hidden_dim: User tower internal hidden size (default: 256)
+        post_hidden_dim: Post tower internal hidden size (default: 256)
+        num_attention_heads: Attention heads for UserHistoryEncoder (default: 4)
+        num_attention_layers: Transformer layers for UserHistoryEncoder (default: 2)
+        max_history_len: Maximum history sequence length (default: 50)
+        dropout_rate: Dropout probability (default: 0.1)
+        user_encoder_type: User tower architecture - "attention" (full transformer)
+                           or "lightweight" (single-query cross-attention)
+    """
 
     def __init__(
         self,
@@ -114,6 +252,7 @@ class TwoTowerEngagement(nn.Module):
         self.post_embedding_dim = post_embedding_dim
         self.user_encoder_type = user_encoder_type
 
+        # Instantiate user tower based on encoder type
         if user_encoder_type == "lightweight":
             self.user_tower = LightweightAttentionEncoder(
                 input_dim=post_embedding_dim,
@@ -138,6 +277,7 @@ class TwoTowerEngagement(nn.Module):
                 "Choose 'attention' or 'lightweight'."
             )
 
+        # Post tower is the same regardless of user encoder type
         self.post_tower = PostTower(
             input_dim=post_embedding_dim,
             hidden_dim=post_hidden_dim,
@@ -146,9 +286,26 @@ class TwoTowerEngagement(nn.Module):
         )
 
     def encode_user(self, history_embeddings: torch.Tensor, history_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Encode user engagement history into shared space representation.
+        
+        Args:
+            history_embeddings: Padded history sequences [batch, seq_len, input_dim]
+            history_mask: Boolean mask [batch, seq_len], True = valid position
+        
+        Returns:
+            User vectors in shared space [batch, shared_dim]
+        """
         return self.user_tower(history_embeddings, history_mask)
 
     def encode_post(self, post_embeddings: torch.Tensor) -> torch.Tensor:
+        """Encode post embeddings into shared space representation.
+        
+        Args:
+            post_embeddings: Raw post embeddings [batch, input_dim]
+        
+        Returns:
+            Post vectors in shared space [batch, shared_dim]
+        """
         return self.post_tower(post_embeddings)
 
     def forward(
@@ -157,8 +314,23 @@ class TwoTowerEngagement(nn.Module):
         history_mask: Optional[torch.Tensor],
         post_embeddings: torch.Tensor,
     ) -> torch.Tensor:
+        """Compute engagement scores via dot product in shared space.
+        
+        This is the core two-tower computation: encode user and post independently,
+        then measure similarity via dot product. Higher dot product = higher
+        predicted engagement probability.
+        
+        Args:
+            history_embeddings: User history sequences [batch, seq_len, input_dim]
+            history_mask: History validity mask [batch, seq_len]
+            post_embeddings: Target post embeddings [batch, input_dim]
+        
+        Returns:
+            Raw engagement scores [batch] (logits before sigmoid)
+        """
         user_emb = self.encode_user(history_embeddings, history_mask)
         post_emb = self.encode_post(post_embeddings)
+        # Dot product: element-wise multiply then sum over shared_dim
         return (user_emb * post_emb).sum(dim=-1)
 
     def compute_loss_and_preds(
@@ -168,10 +340,26 @@ class TwoTowerEngagement(nn.Module):
         post_embeddings: torch.Tensor,
         labels: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute loss and predictions for training, validation, or inference.
+        """Compute loss and predictions for a batch.
+        
+        This method provides a unified interface for training, validation, and
+        inference loops. It computes raw scores (dot products), applies sigmoid
+        to get probabilities, and calculates binary cross-entropy loss.
+        
+        Args:
+            history_embeddings: User history sequences [batch, seq_len, input_dim]
+            history_mask: History validity mask [batch, seq_len]
+            post_embeddings: Target post embeddings [batch, input_dim]
+            labels: Binary engagement labels [batch]
         
         Returns:
-            Tuple of (loss, scores) where scores are raw logits before sigmoid.
+            Tuple of (loss, scores):
+                - loss: Scalar BCE loss tensor
+                - scores: Raw dot product scores [batch] (before sigmoid)
+        
+        Note:
+            Returns raw scores (not probabilities) for flexibility in evaluation.
+            Apply sigmoid(scores) to get probabilities.
         """
         user_emb = self.encode_user(history_embeddings, history_mask)
         post_emb = self.encode_post(post_embeddings)
