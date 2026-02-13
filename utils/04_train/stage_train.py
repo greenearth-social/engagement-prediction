@@ -196,11 +196,12 @@ def create_data_loaders(
     # With pre-computed tensors the workers just do index lookups + collation,
     # so even a few workers eliminate any remaining CPU-side bottleneck and
     # keep the GPU continuously fed.
-    worker_kw: Dict[str, Any] = {}
+    worker_kw: Dict[str, Any] = {
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
     if num_workers > 0:
-        worker_kw = dict(
-            num_workers=num_workers,
-            pin_memory=pin_memory,
+        worker_kw.update(
             persistent_workers=persistent_workers,
             prefetch_factor=prefetch_factor,
         )
