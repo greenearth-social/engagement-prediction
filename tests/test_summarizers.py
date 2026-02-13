@@ -1,6 +1,5 @@
 """Tests for UserSummarizer classes in dataloaders."""
 import numpy as np
-import pytest
 
 from utils.dataloaders import MeanSummarizer, EMASummarizer, LinearRecencySummarizer
 
