@@ -242,13 +242,13 @@ def train_model(
     learning_rate: float,
     weight_decay: float,
     patience: int,
+    lr_scheduler_mode: Literal["min", "max"],
+    lr_scheduler_factor: float,
+    lr_scheduler_patience: int,
     model_name: str = "engagement_model",
     load_best_checkpoint: bool = False,
     checkpoints_dir: Optional[Path] = None,
     disable_progress: bool = False,
-    lr_scheduler_mode: Literal["min", "max"] = "max",
-    lr_scheduler_factor: float = 0.5,
-    lr_scheduler_patience: int = 5,
 ) -> Dict[str, Any]:
     from torch.optim.lr_scheduler import ReduceLROnPlateau
     import torch.optim as optim
