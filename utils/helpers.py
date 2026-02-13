@@ -536,8 +536,9 @@ def _configure_matplotlib_backend():
     """Configure matplotlib to use non-interactive Agg backend.
     
     This should be called before any matplotlib.pyplot imports to avoid
-    display issues in headless environments. Only sets backend if matplotlib
-    hasn't been imported yet to avoid warnings.
+    display issues in headless environments. Checks if matplotlib has already
+    been imported and only sets the backend if it hasn't, avoiding warnings
+    about changing backends after initialization.
     """
     import sys
     if 'matplotlib' not in sys.modules:
