@@ -443,7 +443,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             num_attention_heads=int(args.num_attention_heads),
             num_attention_layers=int(args.num_attention_layers),
             max_history_len=max_history_len,
-            attention_dropout=float(args.dropout_rate_two_tower),
+            attention_dropout=dropout_rate,  # Use MLP dropout rate for consistency
         )
 
         collate_fn = sequence_collate_fn

@@ -269,81 +269,18 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         elif he_dir is not None and (he_dir / 'predictions.csv').exists():
             preds_df = pd.read_csv(he_dir / 'predictions.csv')
         else:
-            # Fallback: compute predictions as in pairs mode, then proceed
-            # Reuse pairs branch to generate y_true/y_pred and ids quickly
-            # Then compute per-user stats
-            # Build via pairs path below, but do not save pairs artifacts
-            # (Minimal duplication for brevity)
-            text_emb_cols = [c for c in posts_emb_df.columns if c.startswith('post_emb_')]
-            image_emb_cols = [c for c in posts_emb_df.columns if c.startswith('image_emb_')]
-            post_emb_cols = text_emb_cols + image_emb_cols
-            from utils.helpers import build_user_feature_frame, get_actual_feature_columns  # type: ignore[attr-defined]  # TODO: remove with train/eval refactor
-            feature_columns = checkpoint.get('feature_columns') if isinstance(checkpoint, dict) else None
-            if feature_columns is None:
-                feature_columns = get_actual_feature_columns(posts_emb_df)
-            # Compute selected users (same as below)
-            likes_hou = likes_df.copy()
-            likes_hou[join_like] = likes_hou[join_like].astype(str)
-            likes_hou = likes_hou[likes_hou[join_like].isin(set(posts_emb_df[join_post].astype(str).unique()))]
-            selected_users = list(likes_hou['did'].astype(str).unique())
-            # Simple per-user allocation
-            embedding_likes_list = []
-            prediction_likes_list = []
-            for user_id, g in likes_hou.groupby('did'):
-                user_posts = sorted(list(set(g[join_like].astype(str).unique())))
-                if len(user_posts) < 2:
-                    continue
-                posts_for_prediction = set([user_posts[-1]])
-                posts_for_embedding = set(user_posts[:-1])
-                if posts_for_embedding:
-                    embedding_likes_list.append(g[g[join_like].isin(posts_for_embedding)])
-                prediction_likes_list.append(g[g[join_like].isin(posts_for_prediction)])
-            embedding_likes_df = pd.concat(embedding_likes_list, ignore_index=True) if embedding_likes_list else pd.DataFrame()
-            prediction_likes_df = pd.concat(prediction_likes_list, ignore_index=True) if prediction_likes_list else pd.DataFrame()
-            user_emb_df = build_user_feature_frame(
-                schema='multi_centroid' if any(c.startswith('user_k') for c in feature_columns[0]) else ('topic_mixture' if any(c.startswith('user_topic_') for c in feature_columns[0]) else 'mean'),
-                likes_df=embedding_likes_df if len(embedding_likes_df) else likes_hou,
-                posts_emb_df=posts_emb_df,
-                join_like=join_like,
-                join_post=join_post,
-                embedding_dim=int(embedding_dim),
-                selected_users=selected_users,
-                feature_columns=feature_columns,
-                random_seed=int(args.random_seed),
+            # Legacy model checkpoint without holdout predictions
+            # This fallback path requires deprecated functions (build_user_feature_frame, 
+            # get_actual_feature_columns) that were removed in the dataloader refactor.
+            # Modern models (MLP and Two-Tower trained with dataloaders) save predictions
+            # during training, so this path should not be reached.
+            raise RuntimeError(
+                "No holdout predictions found in training output. This evaluation stage "
+                "requires a model trained with the modern dataloader-based training pipeline "
+                "(utils/04_train/stage_train_mlp.py or stage_train_two_tower.py), which "
+                "automatically saves holdout predictions during training. Please retrain your "
+                "model or use an older version of the evaluation code for legacy checkpoints."
             )
-            pos_df = prediction_likes_df.merge(
-                posts_emb_df[[join_post] + post_emb_cols], left_on=join_like, right_on=join_post, how='inner'
-            ) if len(prediction_likes_df) else pd.DataFrame(columns=[join_post]+post_emb_cols+['did'])
-            if len(pos_df) > 0:
-                pos_df['liked'] = 1
-                prediction_pairs_df = pos_df.merge(user_emb_df, on='did', how='inner')
-                # Inference
-                user_emb_cols, post_emb_cols, feature_cols = feature_columns
-                def _coerce_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-                    return df[cols].apply(pd.to_numeric, errors='coerce').fillna(0.0)
-                X = np.concatenate([
-                    _coerce_numeric(prediction_pairs_df, user_emb_cols).values,
-                    _coerce_numeric(prediction_pairs_df, post_emb_cols).values
-                ], axis=1).astype(np.float32, copy=False)
-                import torch
-                preds_list: List[np.ndarray] = []
-                bs = max(1024, min(batch_size, 131072))
-                model.eval()
-                with torch.no_grad():
-                    for start in range(0, X.shape[0], bs):
-                        end = min(start + bs, X.shape[0])
-                        xb = torch.as_tensor(X[start:end], dtype=torch.float32, device=device)
-                        pb = model(xb).squeeze().detach().cpu().numpy()
-                        preds_list.append(pb)
-                y_pred = np.concatenate(preds_list, axis=0).astype(np.float32, copy=False)
-                preds_df = pd.DataFrame({
-                    'did': prediction_pairs_df['did'].astype(str).tolist(),
-                    'post_id': prediction_pairs_df[join_post].astype(str).tolist(),
-                    'y_true': prediction_pairs_df['liked'].astype(np.int8).tolist(),
-                    'y_pred_proba': y_pred.tolist(),
-                })
-            else:
-                preds_df = pd.DataFrame(columns=['did','post_id','y_true','y_pred_proba'])
 
         # Compute per-user metrics and inequality
         rows = []
@@ -473,8 +410,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
         # Ensure feature_columns available for pairs mode
         if feature_columns is None:
-            from utils.helpers import get_actual_feature_columns as _get_cols  # type: ignore[attr-defined]  # TODO: remove with train/eval refactor
-            feature_columns = _get_cols(posts_emb_df)
+            # Fallback: construct feature_columns from dataframe columns
+            # Modern models don't use feature_columns, so this is for legacy compatibility
+            user_emb_cols = [c for c in prediction_pairs_df.columns if c.startswith('user_')]
+            post_emb_cols = [c for c in prediction_pairs_df.columns if c.startswith('post_emb_') or c.startswith('image_emb_')]
+            feature_cols = user_emb_cols + post_emb_cols
+            feature_columns = (user_emb_cols, post_emb_cols, feature_cols)
         # Score pairs
         user_emb_cols, post_emb_cols, feature_cols = feature_columns
         def _coerce_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
