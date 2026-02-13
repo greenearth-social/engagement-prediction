@@ -68,7 +68,7 @@ DEFAULTS: Dict[str, Any] = {
     "model_type": "mlp",
     "shared_dim": 128,
     "user_hidden_dim": 256,
-    "user_output_dim": 128,  # Output dimension for user encoder (attention-based models)
+    "user_output_dim": 128,  # Output dimension for user encoder in AttentionMLP; separate from shared_dim which is used in TwoTower
     "post_hidden_dim": 256,
     "num_attention_heads": 4,
     "num_attention_layers": 2,

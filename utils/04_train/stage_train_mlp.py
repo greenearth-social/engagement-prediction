@@ -661,6 +661,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
         )
 
+        # AttentionMLP uses user_output_dim (not shared_dim) since user vector is 
+        # concatenated with post embedding, not compared via dot product like TwoTower
         model = AttentionMLP(
             embed_dim=embed_dim,
             hidden_dims=hidden_dims,
