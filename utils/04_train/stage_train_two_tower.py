@@ -429,7 +429,7 @@ def train_two_tower_model(
         val_preds: List[float] = []
         val_labels: List[float] = []
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for batch in tqdm(val_loader, desc="Validation", leave=False, disable=disable_progress):
                 history_emb = batch["history_embeddings"].to(device)
                 history_mask = batch["history_mask"].to(device)
@@ -509,7 +509,7 @@ def evaluate_two_tower_model(
     all_user_ids: List[str] = []
     all_post_ids: List[str] = []
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch in data_loader:
             history_emb = batch["history_embeddings"].to(device)
             history_mask = batch["history_mask"].to(device)
@@ -581,9 +581,12 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # --- seeds ---
     random_seed = int(args.random_seed)
+    import random as _random
+    _random.seed(random_seed)
     np.random.seed(random_seed)
     torch.manual_seed(random_seed)
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        torch.cuda.manual_seed(random_seed)
         torch.cuda.manual_seed_all(random_seed)
 
     # --- load data from prior stages ---
@@ -628,9 +631,12 @@ def run(context: Context, args) -> Dict[str, Any]:
     _worker_kw: Dict[str, Any] = dict(
         num_workers=num_workers,
         pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor,
     )
+    if num_workers > 0:
+        _worker_kw.update(
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+        )
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
         collate_fn=sequence_collate_fn, drop_last=True, **_worker_kw,
@@ -700,7 +706,7 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     if generate_plots:
         try:
-            best_epoch = int(np.argmin(hist.get("val_loss", []))) + 1 if hist.get("val_loss") and len(hist.get("val_loss")) > 0 else None
+            best_epoch = int(np.argmax(hist.get("val_auc", []))) + 1 if hist.get("val_auc") and len(hist.get("val_auc")) > 0 else None
         except Exception as e:
             logger.warning(f"Could not determine best epoch from training history: {e}")
             best_epoch = None
@@ -733,7 +739,7 @@ def run(context: Context, args) -> Dict[str, Any]:
             logger.warning(f"Validation performance plotting failed: {plot_exc}")
 
     # --- save model ---
-    model_path = checkpoints_dir / f"two_tower_{timestamp}.pth"
+    model_path = None
     config = {
         "model_type": "two_tower",
         "user_encoder_type": user_encoder_type,
@@ -746,18 +752,20 @@ def run(context: Context, args) -> Dict[str, Any]:
         "max_history_len": max_history_len,
         "dropout_rate": dropout_rate,
     }
-    torch.save(
-        {
-            "model_state_dict": trained_model.state_dict(),
-            "config": config,
-            "training_history": training_results["history"],
-            "best_val_auc": training_results["best_val_auc"],
-            "best_val_loss": training_results["best_val_loss"],
-        },
-        model_path,
-    )
-    logger.info(f"Model saved to: {model_path}")
-    context.tracker.log_artifact(name="trained_model_two_tower", path=model_path)
+    if not bool(args.no_save_model):
+        model_path = checkpoints_dir / f"two_tower_{timestamp}.pth"
+        torch.save(
+            {
+                "model_state_dict": trained_model.state_dict(),
+                "config": config,
+                "training_history": training_results["history"],
+                "best_val_auc": training_results["best_val_auc"],
+                "best_val_loss": training_results["best_val_loss"],
+            },
+            model_path,
+        )
+        logger.info(f"Model saved to: {model_path}")
+        context.tracker.log_artifact(name="trained_model_two_tower", path=model_path)
 
     # --- holdout evaluation ---
     holdout_metrics: Dict[str, Any] = {}
@@ -844,7 +852,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     return {
         "output_dir": out_dir,
         "artifacts": {
-            "model_path": str(model_path),
+            "model_path": str(model_path) if model_path else None,
             "training_config": str(out_dir / "training_config.json"),
         },
     }

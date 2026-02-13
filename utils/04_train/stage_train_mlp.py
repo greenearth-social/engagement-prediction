@@ -181,7 +181,7 @@ class SummarizedMLP(nn.Module):
         """
         feats = batch["features"].to(device)
         labels = batch["label"].to(device)
-        preds = self.forward(feats).squeeze()
+        preds = self.forward(feats).squeeze(-1)
         loss = F.binary_cross_entropy(preds, labels)
         return loss, preds
 
@@ -326,7 +326,7 @@ class AttentionMLP(nn.Module):
         history_mask = batch["history_mask"].to(device)
         target_emb = batch["target_post_embedding"].to(device)
         labels = batch["label"].to(device)
-        preds = self.forward(history_emb, history_mask, target_emb).squeeze()
+        preds = self.forward(history_emb, history_mask, target_emb).squeeze(-1)
         loss = F.binary_cross_entropy(preds, labels)
         return loss, preds
 
@@ -469,6 +469,7 @@ def train_mlp_model(
     load_best_checkpoint: bool = False,
     checkpoints_dir: Optional[Path] = None,
     disable_progress: bool = False,
+    gradient_clip_max_norm: float = 1.0,
 ) -> Dict[str, Any]:
     from torch.optim.lr_scheduler import ReduceLROnPlateau
     import torch.optim as optim
@@ -498,6 +499,7 @@ def train_mlp_model(
             optimizer.zero_grad()
             loss, preds = model.compute_loss_and_preds(batch, device)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_max_norm)
             optimizer.step()
             train_loss += loss.item()
             train_preds.extend(preds.detach().cpu().numpy().tolist())
@@ -516,19 +518,21 @@ def train_mlp_model(
 
         train_auc = roc_auc_score(train_labels, train_preds) if len(set(train_labels)) > 1 else 0.5
         val_auc = roc_auc_score(val_labels, val_preds) if len(set(val_labels)) > 1 else 0.5
-        history["train_loss"].append(float(train_loss / max(1, len(train_loader))))
-        history["val_loss"].append(float(val_loss / max(1, len(val_loader))))
+        avg_train_loss = float(train_loss / max(1, len(train_loader)))
+        avg_val_loss = float(val_loss / max(1, len(val_loader)))
+        history["train_loss"].append(avg_train_loss)
+        history["val_loss"].append(avg_val_loss)
         history["train_auc"].append(float(train_auc))
         history["val_auc"].append(float(val_auc))
         scheduler.step(val_auc)
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
             checkpoint_full = checkpoint_dir / f"{model_name}_best.pth"
             checkpoint_weights = checkpoint_dir / f"{model_name}_best_weights.pth"
             history_clean = {k: [float(x) for x in v] for k, v in history.items()}
             torch.save(
-                {"epoch": int(epoch), "model_state_dict": model.state_dict(), "val_loss": float(val_loss), "val_auc": float(val_auc), "history": history_clean},
+                {"epoch": int(epoch), "model_state_dict": model.state_dict(), "val_loss": avg_val_loss, "val_auc": float(val_auc), "history": history_clean},
                 checkpoint_full,
             )
             torch.save(model.state_dict(), checkpoint_weights)
@@ -672,9 +676,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         _worker_kw: Dict[str, Any] = dict(
             num_workers=num_workers,
             pin_memory=pin_memory,
-            persistent_workers=persistent_workers,
-            prefetch_factor=prefetch_factor,
         )
+        if num_workers > 0:
+            _worker_kw.update(
+                persistent_workers=persistent_workers,
+                prefetch_factor=prefetch_factor,
+            )
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True,
             collate_fn=collate_fn, drop_last=True, **_worker_kw,
@@ -683,7 +690,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             val_dataset, batch_size=batch_size, shuffle=False,
             collate_fn=collate_fn, **_worker_kw,
         )
-        input_dim = int(args.shared_dim) + embed_dim  # for config logging
+        input_dim = int(args.user_output_dim) + embed_dim  # for config logging
     else:
         raise ValueError(
             f"Unknown user_encoder '{user_encoder}' for MLP. "
@@ -694,10 +701,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     log_operation_start(f"Training MLP (epochs={args.epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)
     disable_progress = bool(args.disable_progress)
     
-    # Get scheduler settings from args
+    # Get scheduler and training optimization settings from args
     lr_scheduler_mode = str(args.lr_scheduler_mode)
     lr_scheduler_factor = float(args.lr_scheduler_factor)
     lr_scheduler_patience = int(args.lr_scheduler_patience)
+    gradient_clip_max_norm = float(args.gradient_clip_max_norm)
     
     training_results = train_mlp_model(
         model=model,
@@ -714,6 +722,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         lr_scheduler_mode=lr_scheduler_mode,
         lr_scheduler_factor=lr_scheduler_factor,
         lr_scheduler_patience=lr_scheduler_patience,
+        gradient_clip_max_norm=gradient_clip_max_norm,
     )
     trained_model: nn.Module = training_results["model"]
     clear_cuda_memory()
@@ -744,9 +753,13 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     def _collect_predictions(ds: Dataset, collate_fn_=None) -> tuple:
         loader_kw_ = dict(
             batch_size=batch_size, shuffle=False, drop_last=False,
-            num_workers=num_workers, pin_memory=pin_memory, 
-            persistent_workers=persistent_workers, prefetch_factor=prefetch_factor,
+            num_workers=num_workers, pin_memory=pin_memory,
         )
+        if num_workers > 0:
+            loader_kw_.update(
+                persistent_workers=persistent_workers,
+                prefetch_factor=prefetch_factor,
+            )
         if collate_fn_ is not None:
             loader_kw_["collate_fn"] = collate_fn_
         loader = DataLoader(ds, **loader_kw_)
