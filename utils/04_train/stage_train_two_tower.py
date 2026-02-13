@@ -638,8 +638,8 @@ def run(context: Context, args) -> Dict[str, Any]:
                         plots_dir / f"holdout_performance_{timestamp}.png",
                         title_suffix="(Holdout)",
                     )
-                except Exception:
-                    pass
+                except Exception as plot_exc:
+                    logger.warning(f"Holdout performance plotting failed (non-fatal): {plot_exc}")
     except Exception as exc:
         logger.warning(f"Holdout evaluation failed (non-fatal): {exc}")
 
