@@ -28,17 +28,17 @@ This document summarizes redundancies, inconsistencies, and dead code identified
 **Commit:** ac6b579
 
 ### 3. Dead Code with Non-Existent Function References
-**Status:** ⚠️ Partially Addressed (Reverted per new requirement)
+**Status:** ⏸️ Deferred
 
 **Issue:** `utils/05_evaluate/stage_evaluate.py` contained ~75 lines of legacy fallback code (lines 271-346) that imported non-existent functions `build_user_feature_frame` and `get_actual_feature_columns` from `utils/helpers.py`.
 
-**Initial Resolution:** 
+**Initial Action:** 
 - Replaced legacy fallback with clear error message explaining modern models save predictions during training
 - Fixed another reference at line 413-414 with a proper fallback implementation
 
-**Current Status:** Changes reverted as evaluation stage is being refactored elsewhere per maintainer request.
+**Final Status:** All changes to stage_evaluate.py reverted per maintainer request, as the evaluation stage is being refactored independently. The dead code remains for now but has been documented in this cleanup summary for future reference.
 
-**Commit:** ac6b579 (reverted in 915e272)
+**Note:** This issue should be addressed in the separate evaluation refactor effort.
 
 ### 4. Silent Exception Handlers Without Logging
 **Status:** ✅ Fixed
