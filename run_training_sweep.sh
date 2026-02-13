@@ -137,10 +137,12 @@ for i in "${!MLP_EXPERIMENTS[@]}"; do
   while (( RUNNING >= MAX_PARALLEL )); do
     # Wait for any one background job to finish
     wait -n 2>/dev/null || true
-    # Recount how many are still running
+    # Recount how many are still running (only count jobs owned by this shell)
     RUNNING=0
+    # Capture current running job PIDs for this shell
+    mapfile -t CURRENT_JOB_PIDS < <(jobs -pr)
     for pid in "${MLP_PIDS[@]}"; do
-      if kill -0 "$pid" 2>/dev/null; then
+      if printf '%s\n' "${CURRENT_JOB_PIDS[@]}" | grep -qw -- "$pid"; then
         (( RUNNING++ )) || true
       fi
     done
