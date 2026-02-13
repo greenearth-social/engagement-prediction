@@ -562,7 +562,7 @@ def plot_training_history(history: Dict[str, List[float]], save_path: Optional[P
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
-    plt.show()
+    plt.close(fig)
 
 
 def plot_model_performance(
