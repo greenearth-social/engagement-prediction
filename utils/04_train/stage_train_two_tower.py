@@ -37,7 +37,13 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from utils.pipeline.core import new_stage_timestamp_dir, Context
-from utils.helpers import get_stage_logger, log_operation_start, get_device, plot_model_performance
+from utils.helpers import (
+    get_stage_logger,
+    log_operation_start,
+    get_device,
+    plot_model_performance,
+    plot_training_history,
+)
 from utils.dataloaders import (
     load_training_data,
     SequenceEngagementDataset,
@@ -371,35 +377,6 @@ def evaluate_model(
 # Plotting
 # =============================================================================
 
-def plot_training_history(history: Dict[str, List[float]], save_path: Path):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-    epochs = range(1, len(history["train_loss"]) + 1)
-
-    ax1.plot(epochs, history["train_loss"], "b-", label="Train Loss", linewidth=2)
-    ax1.plot(epochs, history["val_loss"], "r-", label="Val Loss", linewidth=2)
-    ax1.set_title("Two-Tower - Loss")
-    ax1.set_xlabel("Epoch")
-    ax1.set_ylabel("Loss")
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-
-    ax2.plot(epochs, history["train_auc"], "b-", label="Train AUC", linewidth=2)
-    ax2.plot(epochs, history["val_auc"], "r-", label="Val AUC", linewidth=2)
-    ax2.set_title("Two-Tower - AUC")
-    ax2.set_xlabel("Epoch")
-    ax2.set_ylabel("AUC")
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches="tight")
-    plt.close()
-
-
 # =============================================================================
 # Pipeline entry point
 # =============================================================================
@@ -542,7 +519,12 @@ def run(context: Context, args) -> Dict[str, Any]:
         context.tracker.log_scalar(title="Training AUC History", series="Validation AUC", value=hist["val_auc"][e], iteration=e + 1)
 
     if generate_plots:
-        plot_training_history(hist, plots_dir / f"training_history_{timestamp}.png")
+        try:
+            best_epoch = int(np.argmin(hist.get("val_loss", []))) + 1 if hist.get("val_loss") and len(hist.get("val_loss")) > 0 else None
+        except Exception as e:
+            logger.warning(f"Could not determine best epoch from training history: {e}")
+            best_epoch = None
+        plot_training_history(hist, plots_dir / f"training_history_{timestamp}.png", best_epoch=best_epoch)
 
     # Collect train + val predictions for performance plots & metrics
     train_eval = evaluate_model(trained_model, train_loader, device)
@@ -559,7 +541,7 @@ def run(context: Context, args) -> Dict[str, Any]:
                 title_suffix="(Train)",
             )
         except Exception as plot_exc:
-            logger.warning(f"Train performance plotting failed (non-fatal): {plot_exc}")
+            logger.warning(f"Train performance plotting failed: {plot_exc}")
         try:
             plot_model_performance(
                 val_eval["predictions"]["y_true"],
@@ -568,7 +550,7 @@ def run(context: Context, args) -> Dict[str, Any]:
                 title_suffix="(Validation)",
             )
         except Exception as plot_exc:
-            logger.warning(f"Validation performance plotting failed (non-fatal): {plot_exc}")
+            logger.warning(f"Validation performance plotting failed: {plot_exc}")
 
     # --- save model ---
     model_path = checkpoints_dir / f"two_tower_{timestamp}.pth"
@@ -639,7 +621,7 @@ def run(context: Context, args) -> Dict[str, Any]:
                         title_suffix="(Holdout)",
                     )
                 except Exception as plot_exc:
-                    logger.warning(f"Holdout performance plotting failed (non-fatal): {plot_exc}")
+                    logger.warning(f"Holdout performance plotting failed: {plot_exc}")
     except Exception as exc:
         logger.warning(f"Holdout evaluation failed (non-fatal): {exc}")
 
