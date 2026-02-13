@@ -193,7 +193,7 @@ class PostTower(nn.Module):
 # Two-Tower Engagement Model
 # =============================================================================
 
-class TwoTowerEngagement(nn.Module):
+class TwoTowerModel(nn.Module):
     """Two-tower engagement prediction model with pluggable user encoders.
     
     Implements the two-tower architecture where user and post representations
@@ -374,7 +374,7 @@ class TwoTowerEngagement(nn.Module):
 # =============================================================================
 
 def train_two_tower_model(
-    model: TwoTowerEngagement,
+    model: TwoTowerModel,
     train_loader: DataLoader,
     val_loader: DataLoader,
     device: str,
@@ -497,7 +497,7 @@ def train_two_tower_model(
 # =============================================================================
 
 def evaluate_two_tower_model(
-    model: TwoTowerEngagement,
+    model: TwoTowerModel,
     data_loader: DataLoader,
     device: str,
 ) -> Dict[str, Any]:
@@ -656,7 +656,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     # Get encoder type from args with smart defaults applied in CLI
     user_encoder_type = args.user_encoder
     log_operation_start(f"Create two-tower model (user_encoder={user_encoder_type})", STAGE_LOG_NAME, logger)
-    model = TwoTowerEngagement(
+    model = TwoTowerModel(
         post_embedding_dim=embed_dim,
         shared_dim=shared_dim,
         user_hidden_dim=user_hidden_dim,
@@ -693,7 +693,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         lr_scheduler_patience=lr_scheduler_patience,
         gradient_clip_max_norm=gradient_clip_max_norm,
     )
-    trained_model: TwoTowerEngagement = training_results["model"]
+    trained_model: TwoTowerModel = training_results["model"]
 
     # --- plots & evaluation ---
     generate_plots = not bool(args.no_plots)

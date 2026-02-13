@@ -71,8 +71,8 @@ The modular design supports multiple training approaches:
 
     MLP + Summarizer             : SummarizedEngagementDataset + SummarizedMLP
     MLP + Attention Encoder      : SequenceEngagementDataset + AttentionMLP
-    Two-Tower + Full Attention   : SequenceEngagementDataset + TwoTowerEngagement(user_encoder_type="attention")
-    Two-Tower + Cross-Attention  : SequenceEngagementDataset + TwoTowerEngagement(user_encoder_type="cross_attention")
+    Two-Tower + Full Attention   : SequenceEngagementDataset + TwoTowerModel(user_encoder_type="attention")
+    Two-Tower + Cross-Attention  : SequenceEngagementDataset + TwoTowerModel(user_encoder_type="cross_attention")
 
 This separation allows experimentation with different history representations
 without modifying model code, and vice versa.
@@ -366,7 +366,7 @@ class TransformerDualPoolingEncoder(nn.Module):
         - Memory: Scales quadratically with sequence length
     
     Used by:
-        - TwoTowerEngagement (user_encoder_type="attention")
+        - TwoTowerModel (user_encoder_type="attention")
         - AttentionMLP (user encoder component)
     
     Args:
