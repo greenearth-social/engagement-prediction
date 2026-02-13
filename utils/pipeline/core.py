@@ -65,6 +65,11 @@ def new_stage_timestamp_dir(run_dir: Path, stage_name: str, tag: str = "") -> Pa
             if not candidate.exists():
                 out = candidate
                 break
+        else:
+            raise RuntimeError(
+                f"Unable to create unique stage output directory under '{base}' "
+                f"for base name '{dirname}' after exhausting suffixes 2-99."
+            )
     out.mkdir(parents=True, exist_ok=True)
     return out
 
