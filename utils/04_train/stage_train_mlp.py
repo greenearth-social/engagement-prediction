@@ -553,8 +553,10 @@ def train_mlp_model(
                 model.load_state_dict(state)
                 if isinstance(checkpoint, dict) and "history" in checkpoint:
                     history = checkpoint["history"]
-            except Exception:
-                pass
+            except Exception as exc:
+                # If loading the best checkpoint fails (e.g., file is missing or corrupted),
+                # continue using the current in-memory model but emit a warning for visibility.
+                print(f"Warning: failed to load best checkpoint from {checkpoint_full}: {exc}")
 
     return {
         "model": model,
