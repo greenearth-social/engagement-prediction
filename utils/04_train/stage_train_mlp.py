@@ -1,21 +1,70 @@
 #!/usr/bin/env python3
 
 """
-Stage 4 (MLP): Train an MLP engagement predictor using on-the-fly
-user-history summarization backed by memmap embeddings.
+Stage 4 (MLP): Train MLP engagement prediction models with flexible user-history representation.
+
+This stage trains Multi-Layer Perceptron (MLP) models for binary engagement prediction
+(will user engage with post?). It supports TWO modular approaches for representing
+user engagement history:
+
+═══════════════════════════════════════════════════════════════════════════════
+APPROACH 1: MLP + HAND-CRAFTED SUMMARIZATION (EngagementPredictor)
+═══════════════════════════════════════════════════════════════════════════════
+
+Uses SummarizedEngagementDataset with pluggable summarization strategies (mean,
+EMA, linear recency) to reduce variable-length history to fixed-size vectors.
+
+Architecture:
+    Input: [user_summary || post_embedding] concatenated vector
+    Hidden: Stack of Linear -> BatchNorm -> GELU -> Dropout layers
+    Output: Single sigmoid-activated probability
+
+When to use:
+    - Baseline models
+    - Fast training and inference
+    - Interpretable aggregation (can analyze summarizer behavior)
+    - Limited compute resources
+
+═══════════════════════════════════════════════════════════════════════════════
+APPROACH 2: MLP + LEARNED ATTENTION ENCODER (AttentionMLP)
+═══════════════════════════════════════════════════════════════════════════════
+
+Uses SequenceEngagementDataset with UserHistoryEncoder (transformer self-attention)
+to LEARN optimal history aggregation end-to-end.
+
+Architecture:
+    User tower: UserHistoryEncoder(history_sequence) -> user_vector
+    Concat: [user_vector || post_embedding]
+    MLP head: Stack of Linear -> BatchNorm -> GELU -> Dropout -> sigmoid
+
+When to use:
+    - When you want the model to discover complex history patterns
+    - Sufficient training data to learn attention weights
+    - Can afford higher computational cost
+
+═══════════════════════════════════════════════════════════════════════════════
+
+Both models are trained with:
+    - Binary cross-entropy loss
+    - Balanced positive/negative sampling (1:1 ratio)
+    - AdamW optimizer with learning rate scheduling
+    - Early stopping based on validation loss
+    - Comprehensive metrics tracking (loss, AUC, precision, recall)
 
 Inputs (from prior pipeline stages):
-- embeddings_*.npy memmap from 01_get_data
-- target_posts_*.parquet from 02_target_posts
-- history_posts_*.parquet from 03_user_history
+    - embeddings_*.npy memmap from 01_get_data
+    - target_posts_*.parquet from 02_target_posts
+    - history_posts_*.parquet from 03_user_history
 
 Outputs under <run_dir>/04_train/<timestamp>/:
-- checkpoints/engagement_model_*.pth
-- plots/training_history_*.png, train_performance_*.png, val_performance_*.png, holdout_performance_*.png
-- logs/
-- training_config.json
-- stage_info.txt
-- holdout_eval/metrics_overall.json
+    - checkpoints/engagement_model_*.pth (full checkpoint with training state)
+    - checkpoints/engagement_model_*_weights.pth (model weights only)
+    - plots/training_history_*.png (loss and AUC curves)
+    - plots/{train,val,holdout}_performance_*.png (precision-recall, ROC curves)
+    - logs/ (training logs)
+    - training_config.json (hyperparameters and configuration)
+    - stage_info.txt (pipeline metadata)
+    - holdout_eval/metrics_overall.json (final test set metrics)
 """
 
 from __future__ import annotations
@@ -53,20 +102,57 @@ STAGE_LOG_NAME = "STAGE_04_TRAIN_MLP"
 
 
 # =============================================================================
-# Model
+# Model Architectures
 # =============================================================================
 
 class EngagementPredictor(nn.Module):
+    """Vanilla MLP engagement predictor with pre-computed user summaries.
+    
+    This is the simpler of two MLP architectures, accepting fixed-size concatenated
+    [user_summary || post_embedding] vectors from SummarizedEngagementDataset.
+    The user summary is computed by hand-crafted aggregation strategies (mean, EMA,
+    linear recency) applied during dataset initialization.
+    
+    Architecture:
+        Input layer: Concatenated [user_summary || post_embedding] vector [2*D]
+        Hidden layers: Configurable stack of (Linear -> BatchNorm -> GELU -> Dropout)
+        Output layer: Linear -> Sigmoid producing engagement probability [0, 1]
+    
+    Design choices:
+        - BatchNorm for stable training with varying input distributions
+        - GELU activation for smooth gradients and better optimization
+        - Dropout for regularization (prevents overfitting to training users)
+        - Xavier initialization for faster convergence
+    
+    Args:
+        input_dim: Dimension of concatenated input (2 * embedding_dim)
+        hidden_dims: List of hidden layer sizes (e.g., [512, 256, 128])
+        dropout_rate: Dropout probability applied after each hidden layer
+    
+    Example:
+        >>> model = EngagementPredictor(input_dim=768, hidden_dims=[512, 256], dropout_rate=0.3)
+        >>> # Input: [batch, 768] -> Hidden: [batch, 512] -> [batch, 256] -> Output: [batch, 1]
+    """
+
     def __init__(self, input_dim: int, hidden_dims: List[int], dropout_rate: float):
         super().__init__()
+        # Build sequential network: repeated (Linear -> BatchNorm -> GELU -> Dropout) blocks
         layers: List[nn.Module] = []
         prev = input_dim
         for h in hidden_dims:
-            layers.extend([nn.Linear(prev, h), nn.BatchNorm1d(h), nn.GELU(), nn.Dropout(dropout_rate)])
+            layers.extend([
+                nn.Linear(prev, h),
+                nn.BatchNorm1d(h),
+                nn.GELU(),
+                nn.Dropout(dropout_rate),
+            ])
             prev = h
+        # Final layer: Linear -> Sigmoid for binary classification
         layers.append(nn.Linear(prev, 1))
         layers.append(nn.Sigmoid())
         self.network = nn.Sequential(*layers)
+        
+        # Initialize weights for stable training
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -75,13 +161,30 @@ class EngagementPredictor(nn.Module):
         print(f"model architecture: {input_dim} -> {' -> '.join(map(str, hidden_dims))} -> 1")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the MLP.
+        
+        Args:
+            x: Input tensor [batch, input_dim]
+        
+        Returns:
+            Engagement probabilities [batch] in range [0, 1]
+        """
         return self.network(x)
 
-
     def compute_loss_and_preds(self, batch: Dict[str, torch.Tensor], device: str):
-        """Compute loss and predictions for training, validation, or inference.
-
-        Returns (loss, predictions_tensor).
+        """Compute loss and predictions for a batch.
+        
+        This method provides a unified interface for training, validation, and
+        inference loops. It handles device transfer and loss computation.
+        
+        Args:
+            batch: Dictionary with "features" and "label" keys from SummarizedEngagementDataset
+            device: Device to run computation on ("cpu" or "cuda")
+        
+        Returns:
+            Tuple of (loss, predictions):
+                - loss: Scalar BCE loss tensor
+                - predictions: Predicted probabilities [batch]
         """
         feats = batch["features"].to(device)
         labels = batch["label"].to(device)
@@ -91,12 +194,41 @@ class EngagementPredictor(nn.Module):
 
 
 class AttentionMLP(nn.Module):
-    """MLP engagement predictor with a learned attention encoder over user history.
-
-    Wraps :class:`UserHistoryEncoder` (from ``utils.dataloaders``) to produce a
-    fixed-size user vector, concatenates it with the target post embedding, and
-    feeds the result through MLP layers.  The attention encoder is trained
-    end-to-end as part of this model.
+    """MLP engagement predictor with learned attention-based user history encoder.
+    
+    This is the more sophisticated of two MLP architectures, using a trainable
+    UserHistoryEncoder (transformer self-attention) to learn optimal history
+    aggregation from raw embedding sequences. The encoder and MLP head are
+    trained jointly end-to-end.
+    
+    Architecture:
+        User encoder: UserHistoryEncoder(history_sequence, mask) -> user_vector [user_output_dim]
+        Concatenation: [user_vector || post_embedding] -> [user_output_dim + embed_dim]
+        MLP head: Stack of (Linear -> BatchNorm -> GELU -> Dropout) -> Linear -> Sigmoid
+    
+    Key differences from EngagementPredictor:
+        ✓ LEARNS history aggregation via attention (not hand-crafted)
+        ✓ Consumes SequenceEngagementDataset (not SummarizedEngagementDataset)
+        ✓ Can capture complex temporal patterns and inter-post relationships
+        ✗ More parameters to train (~2M for encoder + MLP)
+        ✗ Slower training and inference
+    
+    When to use:
+        - You have sufficient training data (>50K samples)
+        - Hand-crafted summarizers underperform
+        - You want the model to discover optimal aggregation
+        - Computational resources allow transformer training
+    
+    Args:
+        embed_dim: Dimensionality of post embeddings
+        hidden_dims: MLP head hidden layer sizes
+        dropout_rate: Dropout for MLP layers (not encoder, which has its own)
+        user_hidden_dim: UserHistoryEncoder internal hidden dimension
+        user_output_dim: UserHistoryEncoder output dimension (user vector size)
+        num_attention_heads: Number of attention heads in transformer
+        num_attention_layers: Number of transformer encoder layers
+        max_history_len: Maximum sequence length for positional embeddings
+        attention_dropout: Dropout rate for the UserHistoryEncoder
     """
 
     def __init__(
@@ -115,6 +247,7 @@ class AttentionMLP(nn.Module):
         self.embed_dim = embed_dim
         self.user_output_dim = user_output_dim
 
+        # User tower: Learned attention-based encoder over engagement history
         self.user_encoder = UserHistoryEncoder(
             input_dim=embed_dim,
             hidden_dim=user_hidden_dim,
@@ -125,7 +258,7 @@ class AttentionMLP(nn.Module):
             dropout_rate=attention_dropout,
         )
 
-        # MLP head: [user_vec || post_emb] -> binary prediction
+        # MLP head: Processes concatenated [user_vec || post_emb] -> engagement probability
         mlp_input_dim = user_output_dim + embed_dim
         layers: List[nn.Module] = []
         prev = mlp_input_dim
@@ -141,7 +274,7 @@ class AttentionMLP(nn.Module):
         layers.append(nn.Sigmoid())
         self.mlp_head = nn.Sequential(*layers)
 
-        # Init MLP head weights (user_encoder does its own init)
+        # Initialize MLP head weights (user_encoder handles its own initialization)
         for m in self.mlp_head.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -160,12 +293,42 @@ class AttentionMLP(nn.Module):
         history_mask: torch.Tensor,         # [B, seq_len]
         post_embedding: torch.Tensor,       # [B, embed_dim]
     ) -> torch.Tensor:
+        """Forward pass through user encoder and MLP head.
+        
+        Args:
+            history_embeddings: Padded user history sequences [batch, seq_len, embed_dim]
+            history_mask: Boolean mask [batch, seq_len], True = valid position
+            post_embedding: Target post embeddings [batch, embed_dim]
+        
+        Returns:
+            Engagement probabilities [batch] in range [0, 1]
+        """
+        # Encode user history into fixed-size representation
         user_vec = self.user_encoder(history_embeddings, history_mask)
+        # Concatenate user and post representations
         x = torch.cat([user_vec, post_embedding], dim=-1)
+        # Pass through MLP head
         return self.mlp_head(x)
 
     def compute_loss_and_preds(self, batch: Dict[str, torch.Tensor], device: str):
-        """Compute loss and predictions for training, validation, or inference."""
+        """Compute loss and predictions for a batch.
+        
+        This method provides a unified interface for training, validation, and
+        inference loops. It handles device transfer and loss computation.
+        
+        Args:
+            batch: Dictionary from SequenceEngagementDataset with keys:
+                   - "history_embeddings": [batch, seq_len, embed_dim]
+                   - "history_mask": [batch, seq_len]
+                   - "target_post_embedding": [batch, embed_dim]
+                   - "label": [batch]
+            device: Device to run computation on ("cpu" or "cuda")
+        
+        Returns:
+            Tuple of (loss, predictions):
+                - loss: Scalar BCE loss tensor
+                - predictions: Predicted probabilities [batch]
+        """
         history_emb = batch["history_embeddings"].to(device)
         history_mask = batch["history_mask"].to(device)
         target_emb = batch["target_post_embedding"].to(device)
@@ -176,10 +339,11 @@ class AttentionMLP(nn.Module):
 
 
 # =============================================================================
-# Helpers
+# Helper Functions
 # =============================================================================
 
 def create_model(input_dim: int, hidden_dims: List[int], dropout_rate: float) -> EngagementPredictor:
+    """Factory function for creating EngagementPredictor instances."""
     return EngagementPredictor(input_dim, hidden_dims, dropout_rate)
 
 
@@ -193,26 +357,78 @@ def create_data_loaders(
     persistent_workers: bool = True,
     prefetch_factor: int = 2,
 ):
-    # With pre-computed tensors the workers just do index lookups + collation,
-    # so even a few workers eliminate any remaining CPU-side bottleneck and
-    # keep the GPU continuously fed.
+    """Create PyTorch DataLoaders for training, validation, and optionally test sets.
+    
+    Configures efficient data loading with multi-worker parallelism and GPU pinning.
+    
+    DataLoader configuration rationale:
+        - num_workers > 0: Parallel data loading prevents GPU starvation
+        - pin_memory: Speeds up CPU->GPU transfer by using page-locked memory
+        - persistent_workers: Avoids worker process respawn overhead between epochs
+        - prefetch_factor: Workers pre-load batches to hide data loading latency
+        - drop_last=True for training: Ensures consistent batch sizes for BatchNorm
+        
+    Args:
+        train_dataset: Training dataset
+        val_dataset: Validation dataset
+        batch_size: Number of samples per batch
+        test_dataset: Optional test/holdout dataset
+        num_workers: Number of parallel data loading workers (0 = main process only)
+        pin_memory: Use pinned (page-locked) memory for faster GPU transfer
+        persistent_workers: Keep workers alive between epochs
+        prefetch_factor: Number of batches to prefetch per worker
+    
+    Returns:
+        Tuple of (train_loader, val_loader, test_loader).
+        test_loader is None if test_dataset is not provided.
+    
+    Note:
+        With SummarizedEngagementDataset (pre-computed tensors), workers just do
+        index lookups and collation, so even a few workers eliminate CPU bottlenecks.
+        With SequenceEngagementDataset (on-the-fly memmap loading), workers pipeline
+        the I/O to keep GPUs fed during training.
+    """
+    # Base worker configuration
     worker_kw: Dict[str, Any] = {
         "num_workers": num_workers,
         "pin_memory": pin_memory,
     }
+    # Add worker-specific options only when using multiple workers
     if num_workers > 0:
         worker_kw.update(
             persistent_workers=persistent_workers,
             prefetch_factor=prefetch_factor,
         )
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, **worker_kw)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, **worker_kw)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, **worker_kw) if test_dataset else None
+    # Create DataLoaders with appropriate settings for each split
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True,  # Shuffle for stochastic training
+        drop_last=True,  # Drop incomplete final batch for BatchNorm stability
+        **worker_kw
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size, 
+        shuffle=False,  # No shuffle for validation (deterministic evaluation)
+        **worker_kw
+    )
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        **worker_kw
+    ) if test_dataset else None
     return train_loader, val_loader, test_loader
 
 
 def clear_cuda_memory():
+    """Aggressively clear CUDA cache and run garbage collection.
+    
+    Useful for freeing GPU memory between model creation, particularly when
+    experimenting with different model sizes or batch sizes.
+    """
     import gc
     gc.collect()
     if torch.cuda.is_available() and torch.cuda.is_initialized():
@@ -221,6 +437,16 @@ def clear_cuda_memory():
 
 
 def set_random_seeds(seed: int):
+    """Set random seeds for reproducibility across Python, NumPy, and PyTorch.
+    
+    Args:
+        seed: Random seed value
+        
+    Note:
+        This ensures deterministic behavior for model initialization, data
+        shuffling, and stochastic operations like dropout. However, some
+        CUDA operations may still have non-deterministic behavior.
+    """
     import random as _random
     _random.seed(seed)
     np.random.seed(seed)
