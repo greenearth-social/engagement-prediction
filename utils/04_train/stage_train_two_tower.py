@@ -519,7 +519,11 @@ def run(context: Context, args) -> Dict[str, Any]:
         context.tracker.log_scalar(title="Training AUC History", series="Validation AUC", value=hist["val_auc"][e], iteration=e + 1)
 
     if generate_plots:
-        best_epoch = int(np.argmin(hist.get("val_loss", []))) + 1 if hist.get("val_loss") else None
+        try:
+            best_epoch = int(np.argmin(hist.get("val_loss", []))) + 1 if hist.get("val_loss") and len(hist.get("val_loss")) > 0 else None
+        except Exception as e:
+            logger.warning(f"Could not determine best epoch from training history: {e}")
+            best_epoch = None
         plot_training_history(hist, plots_dir / f"training_history_{timestamp}.png", best_epoch=best_epoch)
 
     # Collect train + val predictions for performance plots & metrics

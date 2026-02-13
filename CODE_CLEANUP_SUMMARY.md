@@ -54,7 +54,9 @@ This document summarizes redundancies, inconsistencies, and dead code identified
 - `utils/04_train/stage_train_mlp.py`: 4 exception handlers improved
 - `utils/04_train/stage_train_two_tower.py`: 3 exception handlers improved
 
-**Commit:** e7ff737, 915e272
+**Commits:** 
+- e7ff737 (Add explanatory comments to exception handlers and document memory_helper_artifacts)
+- 915e272 (Replace silent exception handlers with informative logging in training stages)
 
 ### 5. Label Handling Consistency
 **Status:** ✅ Verified (No changes needed)
@@ -78,7 +80,7 @@ This document summarizes redundancies, inconsistencies, and dead code identified
   - Usage in the pipeline
   - How to update/retrain the memory model
 
-**Commit:** e7ff737
+**Commit:** e7ff737 (Add explanatory comments to exception handlers and document memory_helper_artifacts)
 
 ## Remaining Considerations
 
