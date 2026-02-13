@@ -34,10 +34,10 @@ model architectures:
    enabling LEARNED attention-based encoders to discover optimal history
    aggregation:
    
-   • UserHistoryEncoder             : Full transformer self-attention
-                                     Dual pooling: attention-weighted + mean
+   • TransformerDualPoolingEncoder  : Full transformer self-attention
+                                      Dual pooling: attention-weighted + mean
    • CrossAttentionPoolingEncoder   : Single learned-query cross-attention pooling
-                                     Faster and fewer parameters
+                                      Faster and fewer parameters
    
    Output format: (padded_sequences, mask, target_post_embedding)
    Memory:        Sequences loaded on-the-fly via memmap (~13 GB if pre-computed)
@@ -72,7 +72,7 @@ Summarization Strategies (pluggable):
     LinearRecencySummarizer      -- Linear recency weighting
 
 Learned Encoders (end-to-end trainable):
-    UserHistoryEncoder              -- Full transformer self-attention + dual pooling
+    TransformerDualPoolingEncoder   -- Full transformer self-attention + dual pooling
     CrossAttentionPoolingEncoder    -- Efficient single-query cross-attention pooling
 
 Utilities:
@@ -294,7 +294,7 @@ def get_summarizer(name: str, **kwargs: Any) -> UserSummarizer:
 # Learned user-history encoders
 # ---------------------------------------------------------------------------
 
-class UserHistoryEncoder(nn.Module):
+class TransformerDualPoolingEncoder(nn.Module):
     """Full-featured transformer-based user history encoder with dual pooling.
     
     Encodes variable-length engagement history into a fixed user representation
@@ -462,11 +462,11 @@ class UserHistoryEncoder(nn.Module):
 class CrossAttentionPoolingEncoder(nn.Module):
     """Efficient user history encoder using single-query cross-attention pooling.
     
-    Designed as a fast alternative to UserHistoryEncoder for production ranking
+    Designed as a fast alternative to TransformerDualPoolingEncoder for production ranking
     scenarios where latency and throughput matter. Achieves significant speedup
     and parameter reduction while maintaining competitive accuracy.
     
-    Key difference from UserHistoryEncoder:
+    Key difference from TransformerDualPoolingEncoder:
         **NO SELF-ATTENTION** - removes the expensive O(seq_len²) transformer layers
         that capture inter-post relationships. Instead, relies on:
         - Input projection + positional encoding to embed history
@@ -484,7 +484,7 @@ class CrossAttentionPoolingEncoder(nn.Module):
         5. Output projection: Combined features -> output_dim
     
     Complexity:
-        - Parameters: Significantly fewer than UserHistoryEncoder (~150K vs ~2M typical)
+        - Parameters: Significantly fewer than TransformerDualPoolingEncoder (~150K vs ~2M typical)
         - Forward pass: O(seq_len * hidden_dim) - linear in sequence length
         - Memory: Scales linearly with sequence length
     

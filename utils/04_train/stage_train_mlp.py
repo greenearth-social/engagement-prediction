@@ -23,11 +23,11 @@ Architecture:
 APPROACH 2: MLP + LEARNED ATTENTION ENCODER (AttentionMLP)
 ═══════════════════════════════════════════════════════════════════════════════
 
-Uses SequenceEngagementDataset with UserHistoryEncoder (transformer self-attention)
+Uses SequenceEngagementDataset with TransformerDualPoolingEncoder (transformer self-attention)
 to LEARN optimal history aggregation end-to-end.
 
 Architecture:
-    User tower: UserHistoryEncoder(history_sequence) -> user_vector
+    User tower: TransformerDualPoolingEncoder(history_sequence) -> user_vector
     Concat: [user_vector || post_embedding]
     MLP head: Stack of Linear -> BatchNorm -> GELU -> Dropout -> sigmoid
 
@@ -84,7 +84,7 @@ from utils.dataloaders import (
     SummarizedEngagementDataset,
     SequenceEngagementDataset,
     sequence_collate_fn,
-    UserHistoryEncoder,
+    TransformerDualPoolingEncoder,
 )
 
 STAGE_LOG_NAME = "STAGE_04_TRAIN_MLP"
@@ -186,12 +186,12 @@ class AttentionMLP(nn.Module):
     """MLP engagement predictor with learned attention-based user history encoder.
     
     This is the more sophisticated of two MLP architectures, using a trainable
-    UserHistoryEncoder (transformer self-attention) to learn optimal history
+    TransformerDualPoolingEncoder (transformer self-attention) to learn optimal history
     aggregation from raw embedding sequences. The encoder and MLP head are
     trained jointly end-to-end. NOTE: THIS MODEL DOES NOT ACTUALLY PERFORM BETTER YET -- SOMETHING TO WORK ON.
     
     Architecture:
-        User encoder: UserHistoryEncoder(history_sequence, mask) -> user_vector [user_output_dim]
+        User encoder: TransformerDualPoolingEncoder(history_sequence, mask) -> user_vector [user_output_dim]
         Concatenation: [user_vector || post_embedding] -> [user_output_dim + embed_dim]
         MLP head: Stack of (Linear -> BatchNorm -> GELU -> Dropout) -> Linear -> Sigmoid
     
@@ -212,12 +212,12 @@ class AttentionMLP(nn.Module):
         embed_dim: Dimensionality of post embeddings
         hidden_dims: MLP head hidden layer sizes
         dropout_rate: Dropout for MLP layers (not encoder, which has its own)
-        user_hidden_dim: UserHistoryEncoder internal hidden dimension
-        user_output_dim: UserHistoryEncoder output dimension (user vector size)
+        user_hidden_dim: TransformerDualPoolingEncoder internal hidden dimension
+        user_output_dim: TransformerDualPoolingEncoder output dimension (user vector size)
         num_attention_heads: Number of attention heads in transformer
         num_attention_layers: Number of transformer encoder layers
         max_history_len: Maximum sequence length for positional embeddings
-        attention_dropout: Dropout rate for the UserHistoryEncoder
+        attention_dropout: Dropout rate for the TransformerDualPoolingEncoder
     """
 
     def __init__(
@@ -237,7 +237,7 @@ class AttentionMLP(nn.Module):
         self.user_output_dim = user_output_dim
 
         # User tower: Learned attention-based encoder over engagement history
-        self.user_encoder = UserHistoryEncoder(
+        self.user_encoder = TransformerDualPoolingEncoder(
             input_dim=embed_dim,
             hidden_dim=user_hidden_dim,
             output_dim=user_output_dim,
@@ -635,7 +635,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     elif user_encoder == "attention":
         # Attention MLP path: sequence dataset + AttentionMLP with learned encoder
-        logger.info("User encoder: attention (UserHistoryEncoder + MLP)")
+        logger.info("User encoder: attention (TransformerDualPoolingEncoder + MLP)")
         max_history_len = int(args.max_history_len)
         summarizer_name = "attention"  # for config logging
         ema_alpha = 0.0

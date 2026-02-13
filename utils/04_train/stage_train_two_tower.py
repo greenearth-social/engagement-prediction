@@ -30,7 +30,7 @@ USER ENCODER OPTIONS
 
 This module supports TWO user encoder architectures, selected via user_encoder_type:
 
-1. **"attention"** - UserHistoryEncoder (Full Transformer Self-Attention)
+1. **"attention"** - TransformerDualPoolingEncoder (Full Transformer Self-Attention)
    ───────────────────────────────────────────────────────────────────────────
    Uses transformer encoder with multi-head self-attention to capture complex
    inter-post relationships in user history. Best modeling capacity but highest
@@ -115,7 +115,7 @@ from utils.dataloaders import (
     load_training_data,
     SequenceEngagementDataset,
     sequence_collate_fn,
-    UserHistoryEncoder,
+    TransformerDualPoolingEncoder,
     CrossAttentionPoolingEncoder,
 )
 
@@ -202,7 +202,7 @@ class TwoTowerEngagement(nn.Module):
     ranking systems.
     
     Architecture:
-        User Tower: UserHistoryEncoder OR CrossAttentionPoolingEncoder
+        User Tower: TransformerDualPoolingEncoder OR CrossAttentionPoolingEncoder
                     (history_sequence, mask) -> user_vector [shared_dim]
         
         Post Tower: PostTower (simple MLP)
@@ -227,8 +227,8 @@ class TwoTowerEngagement(nn.Module):
         shared_dim: Output dimension for both towers (default: 128)
         user_hidden_dim: User tower internal hidden size (default: 256)
         post_hidden_dim: Post tower internal hidden size (default: 256)
-        num_attention_heads: Attention heads for UserHistoryEncoder (default: 4)
-        num_attention_layers: Transformer layers for UserHistoryEncoder (default: 2)
+        num_attention_heads: Attention heads for TransformerDualPoolingEncoder (default: 4)
+        num_attention_layers: Transformer layers for TransformerDualPoolingEncoder (default: 2)
         max_history_len: Maximum history sequence length (default: 50)
         dropout_rate: Dropout probability (default: 0.1)
         user_encoder_type: User tower architecture - "attention" (full transformer)
@@ -262,7 +262,7 @@ class TwoTowerEngagement(nn.Module):
                 dropout_rate=dropout_rate,
             )
         elif user_encoder_type == "attention":
-            self.user_tower = UserHistoryEncoder(
+            self.user_tower = TransformerDualPoolingEncoder(
                 input_dim=post_embedding_dim,
                 hidden_dim=user_hidden_dim,
                 output_dim=shared_dim,
