@@ -524,7 +524,7 @@ def train_mlp_model(
             checkpoint_weights = checkpoint_dir / f"{model_name}_best_weights.pth"
             history_clean = {k: [float(x) for x in v] for k, v in history.items()}
             torch.save(
-                {"epoch": int(epoch), "model_state_dict": model.state_dict(), "val_loss": float(val_loss), "val_auc": float(va_auc), "history": history_clean},
+                {"epoch": int(epoch), "model_state_dict": model.state_dict(), "val_loss": float(val_loss), "val_auc": float(val_auc), "history": history_clean},
                 checkpoint_full,
             )
             torch.save(model.state_dict(), checkpoint_weights)
@@ -543,8 +543,8 @@ def train_mlp_model(
                 checkpoint = torch.load(checkpoint_full, weights_only=False)
                 state = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
                 model.load_state_dict(state)
-                if isinstance(ckpt, dict) and "history" in ckpt:
-                    history = ckpt["history"]
+                if isinstance(checkpoint, dict) and "history" in checkpoint:
+                    history = checkpoint["history"]
             except Exception:
                 pass
 
