@@ -181,7 +181,7 @@ class SummarizedMLP(nn.Module):
         """
         feats = batch["features"].to(device)
         labels = batch["label"].to(device)
-        preds = self.forward(feats).squeeze(-1)
+        preds = self(feats).squeeze(-1)
         loss = F.binary_cross_entropy(preds, labels)
         return loss, preds
 
@@ -326,7 +326,7 @@ class AttentionMLP(nn.Module):
         history_mask = batch["history_mask"].to(device)
         target_emb = batch["target_post_embedding"].to(device)
         labels = batch["label"].to(device)
-        preds = self.forward(history_emb, history_mask, target_emb).squeeze(-1)
+        preds = self(history_emb, history_mask, target_emb).squeeze(-1)
         loss = F.binary_cross_entropy(preds, labels)
         return loss, preds
 
