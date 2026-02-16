@@ -353,9 +353,7 @@ class TwoTowerModel(nn.Module):
             Returns raw scores (not probabilities) for flexibility in evaluation.
             Apply sigmoid(scores) to get probabilities.
         """
-        user_emb = self.encode_user(history_embeddings, history_mask)
-        post_emb = self.encode_post(post_embeddings)
-        scores = (user_emb * post_emb).sum(dim=-1)
+        scores = self.forward(history_embeddings, history_mask, post_embeddings)
         probs = torch.sigmoid(scores)
         loss = F.binary_cross_entropy(probs, labels.float())
         return loss, scores
