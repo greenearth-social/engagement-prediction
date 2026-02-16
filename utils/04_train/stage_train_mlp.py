@@ -335,11 +335,6 @@ class AttentionMLP(nn.Module):
 # Helper Functions
 # =============================================================================
 
-def create_summarized_mlp(input_dim: int, hidden_dims: List[int], dropout_rate: float) -> SummarizedMLP:
-    """Factory function for creating SummarizedMLP instances."""
-    return SummarizedMLP(input_dim, hidden_dims, dropout_rate)
-
-
 def create_data_loaders(
     train_dataset: Dataset,
     val_dataset: Dataset,
@@ -633,7 +628,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             summarizer=summarizer, embed_dim=embed_dim, logger=logger,
         )
         input_dim = 2 * embed_dim  # [user_summary || post_embedding]
-        model = create_summarized_mlp(input_dim, hidden_dims, dropout_rate)
+        model = SummarizedMLP(input_dim, hidden_dims, dropout_rate)
         
         train_loader, val_loader, _ = create_data_loaders(
             train_dataset, val_dataset, batch_size,
