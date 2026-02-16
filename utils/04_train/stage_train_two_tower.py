@@ -111,6 +111,7 @@ from utils.dataloaders import (
     sequence_collate_fn,
     TransformerDualPoolingEncoder,
     CrossAttentionPoolingEncoder,
+    create_data_loaders,
 )
 
 STAGE_LOG_NAME = "STAGE_04_TRAIN_TWO_TOWER"
@@ -612,23 +613,14 @@ def run(context: Context, args) -> Dict[str, Any]:
         max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
     )
 
-    # With pre-computed tensors, workers just do index lookups + collation.
-    _worker_kw: Dict[str, Any] = dict(
+    # Create data loaders using centralized helper
+    train_loader, val_loader, _ = create_data_loaders(
+        train_dataset, val_dataset, batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
-    )
-    if num_workers > 0:
-        _worker_kw.update(
-            persistent_workers=persistent_workers,
-            prefetch_factor=prefetch_factor,
-        )
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True,
-        collate_fn=sequence_collate_fn, drop_last=True, **_worker_kw,
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False,
-        collate_fn=sequence_collate_fn, **_worker_kw,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+        collate_fn=sequence_collate_fn,
     )
 
     logger.info(f"Post embedding dim: {embed_dim}")
@@ -751,9 +743,15 @@ def run(context: Context, args) -> Dict[str, Any]:
         )
         if len(holdout_dataset) > 0:
             log_operation_start("Holdout evaluation", STAGE_LOG_NAME, logger)
-            holdout_loader = DataLoader(
-                holdout_dataset, batch_size=batch_size, shuffle=False,
-                collate_fn=sequence_collate_fn, **_worker_kw,
+            # Use centralized function for consistency (train_loader unused, just a placeholder)
+            _, _, holdout_loader = create_data_loaders(
+                train_dataset, train_dataset, batch_size,  # train/val unused here
+                holdout_dataset=holdout_dataset,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                persistent_workers=persistent_workers,
+                prefetch_factor=prefetch_factor,
+                collate_fn=sequence_collate_fn,
             )
             holdout_eval = evaluate_two_tower_model(trained_model, holdout_loader, device)
             holdout_metrics = holdout_eval["metrics"]

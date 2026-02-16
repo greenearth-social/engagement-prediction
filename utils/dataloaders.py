@@ -1206,3 +1206,90 @@ def sequence_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "user_ids": [b["user_id"] for b in batch],
         "post_ids": [b["post_id"] for b in batch],
     }
+
+
+# ---------------------------------------------------------------------------
+# DataLoader factory
+# ---------------------------------------------------------------------------
+
+def create_data_loaders(
+    train_dataset: Dataset,
+    val_dataset: Dataset,
+    batch_size: int,
+    holdout_dataset: Optional[Dataset] = None,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 2,
+    collate_fn = None,
+):
+    """Create PyTorch DataLoaders for training, validation, and optionally holdout sets.
+    
+    Configures efficient data loading with multi-worker parallelism and GPU pinning.
+    
+    DataLoader configuration rationale:
+        - num_workers > 0: Parallel data loading prevents GPU starvation
+        - pin_memory: Speeds up CPU->GPU transfer by using page-locked memory
+        - persistent_workers: Avoids worker process respawn overhead between epochs
+        - prefetch_factor: Workers pre-load batches to hide data loading latency
+        - drop_last=True for training: Ensures consistent batch sizes for BatchNorm
+        
+    Args:
+        train_dataset: Training dataset
+        val_dataset: Validation dataset
+        batch_size: Number of samples per batch
+        holdout_dataset: Optional holdout dataset for final evaluation
+        num_workers: Number of parallel data loading workers (0 = main process only)
+        pin_memory: Use pinned (page-locked) memory for faster GPU transfer
+        persistent_workers: Keep workers alive between epochs
+        prefetch_factor: Number of batches to prefetch per worker
+        collate_fn: Optional custom collate function for batching (e.g., sequence_collate_fn)
+    
+    Returns:
+        Tuple of (train_loader, val_loader, holdout_loader).
+        holdout_loader is None if holdout_dataset is not provided.
+    
+    Note:
+        With SummarizedEngagementDataset (pre-computed tensors), workers just do
+        index lookups and collation, so even a few workers eliminate CPU bottlenecks.
+        With SequenceEngagementDataset (on-the-fly memmap loading), workers pipeline
+        the I/O to keep GPUs fed during training.
+    """
+    from torch.utils.data import DataLoader
+    
+    # Base worker configuration
+    worker_kw: Dict[str, Any] = {
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    # Add worker-specific options only when using multiple workers
+    if num_workers > 0:
+        worker_kw.update(
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+        )
+
+    # Create DataLoaders with appropriate settings for each split
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True,  # Shuffle for stochastic training
+        drop_last=True,  # Drop incomplete final batch for BatchNorm stability
+        collate_fn=collate_fn,
+        **worker_kw
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size, 
+        shuffle=False,  # No shuffle for validation (deterministic evaluation)
+        collate_fn=collate_fn,
+        **worker_kw
+    )
+    holdout_loader = DataLoader(
+        holdout_dataset, 
+        batch_size=batch_size, 
+        shuffle=False,
+        collate_fn=collate_fn,
+        **worker_kw
+    ) if holdout_dataset else None
+    return train_loader, val_loader, holdout_loader
