@@ -95,7 +95,6 @@ DEFAULTS: Dict[str, Any] = {
     "dataloader_persistent_workers": True,
     "dataloader_prefetch_factor": 2,
     # Stage 4 (train) - Learning rate scheduler
-    "lr_scheduler_mode": "max",
     "lr_scheduler_factor": 0.5,
     "lr_scheduler_patience": 5,
     # Stage 4 (train) - Training optimization
@@ -619,8 +618,6 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--dataloader-prefetch-factor", type=int, default=argparse.SUPPRESS,
                           help_text="Number of batches to prefetch per DataLoader worker")
     # Stage 4 (train) - Learning rate scheduler
-    _add_arg_with_default(p_all, "--lr-scheduler-mode", type=str, choices=["min", "max"], default=argparse.SUPPRESS,
-                          help_text="Learning rate scheduler mode (min for loss, max for accuracy/AUC)")
     _add_arg_with_default(p_all, "--lr-scheduler-factor", type=float, default=argparse.SUPPRESS,
                           help_text="Factor by which to reduce learning rate")
     _add_arg_with_default(p_all, "--lr-scheduler-patience", type=int, default=argparse.SUPPRESS,

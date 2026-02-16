@@ -63,7 +63,7 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -458,7 +458,6 @@ def train_mlp_model(
     learning_rate: float,
     weight_decay: float,
     patience: int,
-    lr_scheduler_mode: Literal["min", "max"],
     lr_scheduler_factor: float,
     lr_scheduler_patience: int,
     model_name: str = "engagement_model",
@@ -472,8 +471,9 @@ def train_mlp_model(
 
     model = model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = ReduceLROnPlateau(optimizer, mode=lr_scheduler_mode, factor=lr_scheduler_factor, patience=lr_scheduler_patience)
+    scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=lr_scheduler_factor, patience=lr_scheduler_patience)
     history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "train_auc": [], "val_auc": []}
+    best_val_auc = 0.0
     best_val_loss = float("inf")
     patience_counter = 0
     checkpoint_dir = Path(checkpoints_dir) if checkpoints_dir is not None else (Path(__file__).resolve().parents[2] / "outputs" / "checkpoints")
@@ -517,7 +517,8 @@ def train_mlp_model(
         history["val_auc"].append(float(val_auc))
         scheduler.step(val_auc)
 
-        if avg_val_loss < best_val_loss:
+        if val_auc > best_val_auc:
+            best_val_auc = val_auc
             best_val_loss = avg_val_loss
             checkpoint_full = checkpoint_dir / f"{model_name}_best.pth"
             checkpoint_weights = checkpoint_dir / f"{model_name}_best_weights.pth"
@@ -553,7 +554,7 @@ def train_mlp_model(
         "model": model,
         "history": history,
         "best_val_loss": best_val_loss,
-        "best_val_auc": max(history["val_auc"]) if history["val_auc"] else 0.0,
+        "best_val_auc": best_val_auc,
     }
 
 # =============================================================================
@@ -601,7 +602,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     disable_progress = bool(args.disable_progress)
     generate_plots = not bool(args.no_plots)
     save_model = not bool(args.no_save_model)
-    lr_scheduler_mode = str(args.lr_scheduler_mode)
     lr_scheduler_factor = float(args.lr_scheduler_factor)
     lr_scheduler_patience = int(args.lr_scheduler_patience)
     gradient_clip_max_norm = float(args.gradient_clip_max_norm)
@@ -715,7 +715,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         load_best_checkpoint=True,
         checkpoints_dir=checkpoints_dir,
         disable_progress=disable_progress,
-        lr_scheduler_mode=lr_scheduler_mode,
         lr_scheduler_factor=lr_scheduler_factor,
         lr_scheduler_patience=lr_scheduler_patience,
         gradient_clip_max_norm=gradient_clip_max_norm,

@@ -376,7 +376,6 @@ def train_two_tower_model(
     patience: int = 20,
     checkpoints_dir: Optional[Path] = None,
     disable_progress: bool = False,
-    lr_scheduler_mode: str = "max",
     lr_scheduler_factor: float = 0.5,
     lr_scheduler_patience: int = 5,
     gradient_clip_max_norm: float = 1.0,
@@ -386,7 +385,7 @@ def train_two_tower_model(
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode=lr_scheduler_mode, factor=lr_scheduler_factor, patience=lr_scheduler_patience
+        optimizer, mode="max", factor=lr_scheduler_factor, patience=lr_scheduler_patience
     )
 
     history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "train_auc": [], "val_auc": []}
@@ -597,7 +596,6 @@ def run(context: Context, args) -> Dict[str, Any]:
     user_encoder_type = args.user_encoder
     generate_plots = not bool(args.no_plots)
     save_model = not bool(args.no_save_model)
-    lr_scheduler_mode = str(args.lr_scheduler_mode)
     lr_scheduler_factor = float(args.lr_scheduler_factor)
     lr_scheduler_patience = int(args.lr_scheduler_patience)
     gradient_clip_max_norm = float(args.gradient_clip_max_norm)
@@ -668,7 +666,6 @@ def run(context: Context, args) -> Dict[str, Any]:
         patience=patience,
         checkpoints_dir=checkpoints_dir,
         disable_progress=disable_progress,
-        lr_scheduler_mode=lr_scheduler_mode,
         lr_scheduler_factor=lr_scheduler_factor,
         lr_scheduler_patience=lr_scheduler_patience,
         gradient_clip_max_norm=gradient_clip_max_norm,
