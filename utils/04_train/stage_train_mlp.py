@@ -27,7 +27,7 @@ Uses SequenceEngagementDataset with TransformerDualPoolingEncoder (transformer s
 to LEARN optimal history aggregation end-to-end.
 
 Architecture:
-    User tower: TransformerDualPoolingEncoder(history_sequence) -> user_vector
+    User "tower": TransformerDualPoolingEncoder(history_sequence) -> user_vector
     Concat: [user_vector || post_embedding]
     MLP head: Stack of Linear -> BatchNorm -> GELU -> Dropout -> sigmoid
 
@@ -240,7 +240,7 @@ class AttentionMLP(nn.Module):
         self.embed_dim = embed_dim
         self.user_output_dim = user_output_dim
 
-        # User tower: Learned attention-based encoder over engagement history
+        # User "tower": Learned attention-based encoder over engagement history (can't actually be used separately like a true 2-tower)
         self.user_encoder = TransformerDualPoolingEncoder(
             input_dim=embed_dim,
             hidden_dim=user_hidden_dim,
