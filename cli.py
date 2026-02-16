@@ -8,8 +8,8 @@ Subcommands:
 - run-all: Run the 5-stage pipeline end-to-end (get_data → target_posts → user_history → train → evaluate)
 
 Usage examples:
-    python cli.py run-all --epochs 150 --embedding-model all_MiniLM_L12_v2
-    python cli.py run-all --config configs/pipeline.yml --foreground
+    python cli.py run-all --user-encoder summarized --epochs 150 --embedding-model all_MiniLM_L12_v2
+    python cli.py run-all --user-encoder attention --model-type two-tower --config configs/pipeline.yml --foreground
 """
 
 import argparse
@@ -64,7 +64,7 @@ DEFAULTS: Dict[str, Any] = {
     # Stage 4 (train) - Model architecture
     "user_summarization": "mean",  # MLP user-history summarization: mean, ema, linear_recency
     "ema_alpha": 0.1,  # EMA smoothing factor (only used when user_summarization=ema)
-    "user_encoder": None,  # None = sentinel: cmd__run_all_exec applies model-type-specific smart default (summarized for mlp, attention for two-tower)
+    "user_encoder": "summarized",  # User encoder type: must be explicitly specified and compatible with model_type
     "model_type": "mlp",
     "shared_dim": 128,
     "user_hidden_dim": 256,
@@ -95,7 +95,6 @@ DEFAULTS: Dict[str, Any] = {
     "dataloader_persistent_workers": True,
     "dataloader_prefetch_factor": 2,
     # Stage 4 (train) - Learning rate scheduler
-    "lr_scheduler_mode": "max",
     "lr_scheduler_factor": 0.5,
     "lr_scheduler_patience": 5,
     # Stage 4 (train) - Training optimization
@@ -387,13 +386,8 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
-    # --- Smart default & validation for --user-encoder ---
+    # --- Validation for --user-encoder ---
     user_encoder = args.user_encoder
-    if user_encoder is None:
-        # Apply smart default based on model type
-        user_encoder = "summarized" if model_type == "mlp" else "attention"
-        args.user_encoder = user_encoder
-
     valid_encoders = {
         "mlp": ("summarized", "attention"),
         "two-tower": ("attention", "cross_attention"),
@@ -402,7 +396,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     if user_encoder not in allowed:
         raise ValueError(
             f"--user-encoder '{user_encoder}' is not valid for --model-type '{model_type}'. "
-            f"Allowed values: {allowed}"
+            + f"Allowed values: {allowed}"
         )
     
     stage_order = ['get_data', 'target_posts', 'user_history', train_key, 'evaluate']
@@ -558,7 +552,7 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="EMA smoothing factor (0,1]. Higher = more weight on recent likes. Only used when --user-summarization=ema")
     _add_arg_with_default(p_all, "--user-encoder", type=str, choices=["summarized", "attention", "cross_attention"],
                           default=argparse.SUPPRESS,
-                          help_text="User encoder type: summarized (default for mlp), attention (default for two-tower), cross_attention (two-tower only - efficient single-query cross-attention pooling)")
+                          help_text="User encoder type (must match model-type: summarized for mlp, attention for two-tower, cross_attention for two-tower only)")
     _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower"],
                           default=argparse.SUPPRESS, help_text="Model architecture: mlp or two-tower")
     # Two-tower specific options
@@ -619,8 +613,6 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--dataloader-prefetch-factor", type=int, default=argparse.SUPPRESS,
                           help_text="Number of batches to prefetch per DataLoader worker")
     # Stage 4 (train) - Learning rate scheduler
-    _add_arg_with_default(p_all, "--lr-scheduler-mode", type=str, choices=["min", "max"], default=argparse.SUPPRESS,
-                          help_text="Learning rate scheduler mode (min for loss, max for accuracy/AUC)")
     _add_arg_with_default(p_all, "--lr-scheduler-factor", type=float, default=argparse.SUPPRESS,
                           help_text="Factor by which to reduce learning rate")
     _add_arg_with_default(p_all, "--lr-scheduler-patience", type=int, default=argparse.SUPPRESS,

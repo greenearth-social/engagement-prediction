@@ -92,6 +92,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.metrics import roc_auc_score, accuracy_score, average_precision_score
 from torch.utils.data import DataLoader, Dataset
 
 from utils.pipeline.core import new_stage_timestamp_dir, Context
@@ -101,6 +102,8 @@ from utils.helpers import (
     get_device,
     plot_model_performance,
     plot_training_history,
+    clear_cuda_memory,
+    set_random_seeds,
 )
 from utils.dataloaders import (
     load_training_data,
@@ -108,6 +111,7 @@ from utils.dataloaders import (
     sequence_collate_fn,
     TransformerDualPoolingEncoder,
     CrossAttentionPoolingEncoder,
+    create_data_loaders,
 )
 
 STAGE_LOG_NAME = "STAGE_04_TRAIN_TWO_TOWER"
@@ -138,17 +142,17 @@ class PostTower(nn.Module):
     
     Args:
         input_dim: Dimensionality of input post embeddings (e.g., 384 for all-MiniLM)
-        hidden_dim: Internal hidden layer size (default: 256)
-        output_dim: Shared space dimensionality (default: 128)
-        dropout_rate: Dropout probability for regularization (default: 0.1)
+        hidden_dim: Internal hidden layer size
+        output_dim: Shared space dimensionality
+        dropout_rate: Dropout probability for regularization
     """
 
     def __init__(
         self,
         input_dim: int,
-        hidden_dim: int = 256,
-        output_dim: int = 128,
-        dropout_rate: float = 0.1,
+        hidden_dim: int,
+        output_dim: int,
+        dropout_rate: float,
     ):
         super().__init__()
         self.network = nn.Sequential(
@@ -215,13 +219,13 @@ class TwoTowerModel(nn.Module):
     
     Args:
         post_embedding_dim: Dimensionality of input post embeddings
-        shared_dim: Output dimension for both towers (default: 128)
-        user_hidden_dim: User tower internal hidden size (default: 256)
-        post_hidden_dim: Post tower internal hidden size (default: 256)
-        num_attention_heads: Attention heads for TransformerDualPoolingEncoder (default: 4)
-        num_attention_layers: Transformer layers for TransformerDualPoolingEncoder (default: 2)
-        max_history_len: Maximum history sequence length (default: 50)
-        dropout_rate: Dropout probability (default: 0.1)
+        shared_dim: Output dimension for both towers
+        user_hidden_dim: User tower internal hidden size
+        post_hidden_dim: Post tower internal hidden size
+        num_attention_heads: Attention heads for TransformerDualPoolingEncoder
+        num_attention_layers: Transformer layers for TransformerDualPoolingEncoder
+        max_history_len: Maximum history sequence length
+        dropout_rate: Dropout probability
         user_encoder_type: User tower architecture - "attention" (full transformer)
                            or "cross_attention" (single-query cross-attention pooling)
     """
@@ -229,14 +233,14 @@ class TwoTowerModel(nn.Module):
     def __init__(
         self,
         post_embedding_dim: int,
-        shared_dim: int = 128,
-        user_hidden_dim: int = 256,
-        post_hidden_dim: int = 256,
-        num_attention_heads: int = 4,
-        num_attention_layers: int = 2,
-        max_history_len: int = 50,
-        dropout_rate: float = 0.1,
-        user_encoder_type: str = "attention",
+        shared_dim: int,
+        user_hidden_dim: int,
+        post_hidden_dim: int,
+        num_attention_heads: int,
+        num_attention_layers: int,
+        max_history_len: int,
+        dropout_rate: float,
+        user_encoder_type: str,
     ):
         super().__init__()
         self.shared_dim = shared_dim
@@ -352,9 +356,7 @@ class TwoTowerModel(nn.Module):
             Returns raw scores (not probabilities) for flexibility in evaluation.
             Apply sigmoid(scores) to get probabilities.
         """
-        user_emb = self.encode_user(history_embeddings, history_mask)
-        post_emb = self.encode_post(post_embeddings)
-        scores = (user_emb * post_emb).sum(dim=-1)
+        scores = self.forward(history_embeddings, history_mask, post_embeddings)
         probs = torch.sigmoid(scores)
         loss = F.binary_cross_entropy(probs, labels.float())
         return loss, scores
@@ -375,7 +377,6 @@ def train_two_tower_model(
     patience: int = 20,
     checkpoints_dir: Optional[Path] = None,
     disable_progress: bool = False,
-    lr_scheduler_mode: str = "max",
     lr_scheduler_factor: float = 0.5,
     lr_scheduler_patience: int = 5,
     gradient_clip_max_norm: float = 1.0,
@@ -385,7 +386,7 @@ def train_two_tower_model(
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode=lr_scheduler_mode, factor=lr_scheduler_factor, patience=lr_scheduler_patience
+        optimizer, mode="max", factor=lr_scheduler_factor, patience=lr_scheduler_patience
     )
 
     history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "train_auc": [], "val_auc": []}
@@ -393,12 +394,6 @@ def train_two_tower_model(
     best_val_loss = float("inf")
     patience_counter = 0
     best_state_dict = None
-
-    try:
-        from sklearn.metrics import roc_auc_score
-    except ImportError:
-        def roc_auc_score(y_true, y_score):  # type: ignore[misc]
-            return 0.5
 
     for epoch in tqdm(range(epochs), desc="Training epochs", disable=disable_progress):
         # --- Training ---
@@ -493,14 +488,6 @@ def evaluate_two_tower_model(
     device: str,
 ) -> Dict[str, Any]:
     """Evaluate two-tower model and return metrics + predictions."""
-    try:
-        from sklearn.metrics import roc_auc_score, accuracy_score, average_precision_score
-    except ImportError:
-        def roc_auc_score(y_true, y_score):  # type: ignore[misc]
-            return 0.5
-        accuracy_score = None  # type: ignore[assignment]
-        average_precision_score = None  # type: ignore[assignment]
-
     model = model.to(device)
     model.eval()
 
@@ -535,11 +522,9 @@ def evaluate_two_tower_model(
 
     if len(set(y_true)) > 1:
         metrics["auc_roc"] = float(roc_auc_score(y_true, y_pred))
-        if average_precision_score is not None:
-            metrics["average_precision"] = float(average_precision_score(y_true, y_pred))
+        metrics["average_precision"] = float(average_precision_score(y_true, y_pred))
 
-    if accuracy_score is not None:
-        metrics["accuracy_at_0.5"] = float(accuracy_score(y_true, (y_pred > 0.5).astype(int)))
+    metrics["accuracy_at_0.5"] = float(accuracy_score(y_true, (y_pred > 0.5).astype(int)))
 
     return {
         "metrics": metrics,
@@ -579,15 +564,10 @@ def run(context: Context, args) -> Dict[str, Any]:
     log_operation_start("Stage 4 Two-Tower training", STAGE_LOG_NAME, logger)
     t0 = time.time()
 
-    # --- seeds ---
+    # --- seeds & cuda ---
+    clear_cuda_memory()
     random_seed = int(args.random_seed)
-    import random as _random
-    _random.seed(random_seed)
-    np.random.seed(random_seed)
-    torch.manual_seed(random_seed)
-    if torch.cuda.is_available() and torch.cuda.is_initialized():
-        torch.cuda.manual_seed(random_seed)
-        torch.cuda.manual_seed_all(random_seed)
+    set_random_seeds(random_seed)
 
     # --- load data from prior stages ---
     log_operation_start("Load training data from prior stages", STAGE_LOG_NAME, logger)
@@ -595,7 +575,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         run_dir, context, logger=logger,
     )
 
-    # --- hyperparams ---
+    # --- hyperparams (extract all args once, use locals everywhere below) ---
     max_history_len = int(args.max_history_len)
     shared_dim = int(args.shared_dim)
     user_hidden_dim = int(args.user_hidden_dim)
@@ -609,8 +589,14 @@ def run(context: Context, args) -> Dict[str, Any]:
     epochs = int(args.epochs)
     patience = int(args.patience)
     disable_progress = bool(args.disable_progress)
+    user_encoder_type = args.user_encoder
+    generate_plots = not bool(args.no_plots)
+    save_model = not bool(args.no_save_model)
+    lr_scheduler_factor = float(args.lr_scheduler_factor)
+    lr_scheduler_patience = int(args.lr_scheduler_patience)
+    gradient_clip_max_norm = float(args.gradient_clip_max_norm)
 
-    # Get worker settings from args
+    # Worker settings
     num_workers = int(args.num_dataloader_workers)
     pin_memory = bool(args.dataloader_pin_memory)
     persistent_workers = bool(args.dataloader_persistent_workers)
@@ -627,31 +613,20 @@ def run(context: Context, args) -> Dict[str, Any]:
         max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
     )
 
-    # With pre-computed tensors, workers just do index lookups + collation.
-    _worker_kw: Dict[str, Any] = dict(
+    # Create data loaders using centralized helper
+    train_loader, val_loader, _ = create_data_loaders(
+        train_dataset, val_dataset, batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
-    )
-    if num_workers > 0:
-        _worker_kw.update(
-            persistent_workers=persistent_workers,
-            prefetch_factor=prefetch_factor,
-        )
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True,
-        collate_fn=sequence_collate_fn, drop_last=True, **_worker_kw,
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False,
-        collate_fn=sequence_collate_fn, **_worker_kw,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+        collate_fn=sequence_collate_fn,
     )
 
     logger.info(f"Post embedding dim: {embed_dim}")
     logger.info(f"Train items: {len(train_dataset)}, Val items: {len(val_dataset)}")
 
     # --- create model ---
-    # Get encoder type from args with smart defaults applied in CLI
-    user_encoder_type = args.user_encoder
     log_operation_start(f"Create two-tower model (user_encoder={user_encoder_type})", STAGE_LOG_NAME, logger)
     model = TwoTowerModel(
         post_embedding_dim=embed_dim,
@@ -667,13 +642,6 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # --- train ---
     log_operation_start(f"Train two-tower (epochs={epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)
-    
-    # Get scheduler and training optimization settings from args
-    lr_scheduler_mode = str(args.lr_scheduler_mode)
-    lr_scheduler_factor = float(args.lr_scheduler_factor)
-    lr_scheduler_patience = int(args.lr_scheduler_patience)
-    gradient_clip_max_norm = float(args.gradient_clip_max_norm)
-    
     training_results = train_two_tower_model(
         model=model,
         train_loader=train_loader,
@@ -685,16 +653,14 @@ def run(context: Context, args) -> Dict[str, Any]:
         patience=patience,
         checkpoints_dir=checkpoints_dir,
         disable_progress=disable_progress,
-        lr_scheduler_mode=lr_scheduler_mode,
         lr_scheduler_factor=lr_scheduler_factor,
         lr_scheduler_patience=lr_scheduler_patience,
         gradient_clip_max_norm=gradient_clip_max_norm,
     )
     trained_model: TwoTowerModel = training_results["model"]
+    clear_cuda_memory()
 
     # --- plots & evaluation ---
-    generate_plots = not bool(args.no_plots)
-
     hist = training_results["history"]
 
     # experiment tracker scalars (always logged, regardless of --no-plots)
@@ -752,7 +718,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         "max_history_len": max_history_len,
         "dropout_rate": dropout_rate,
     }
-    if not bool(args.no_save_model):
+    if save_model:
         model_path = checkpoints_dir / f"two_tower_{timestamp}.pt"
         torch.save(
             {
@@ -778,9 +744,15 @@ def run(context: Context, args) -> Dict[str, Any]:
         )
         if len(holdout_dataset) > 0:
             log_operation_start("Holdout evaluation", STAGE_LOG_NAME, logger)
-            holdout_loader = DataLoader(
-                holdout_dataset, batch_size=batch_size, shuffle=False,
-                collate_fn=sequence_collate_fn, **_worker_kw,
+            # Use centralized function for consistency (train_loader unused, just a placeholder)
+            _, _, holdout_loader = create_data_loaders(
+                train_dataset, train_dataset, batch_size,  # train/val unused here
+                holdout_dataset=holdout_dataset,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                persistent_workers=persistent_workers,
+                prefetch_factor=prefetch_factor,
+                collate_fn=sequence_collate_fn,
             )
             holdout_eval = evaluate_two_tower_model(trained_model, holdout_loader, device)
             holdout_metrics = holdout_eval["metrics"]

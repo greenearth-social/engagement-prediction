@@ -27,7 +27,7 @@ Uses SequenceEngagementDataset with TransformerDualPoolingEncoder (transformer s
 to LEARN optimal history aggregation end-to-end.
 
 Architecture:
-    User tower: TransformerDualPoolingEncoder(history_sequence) -> user_vector
+    User "tower": TransformerDualPoolingEncoder(history_sequence) -> user_vector
     Concat: [user_vector || post_embedding]
     MLP head: Stack of Linear -> BatchNorm -> GELU -> Dropout -> sigmoid
 
@@ -63,12 +63,13 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.metrics import roc_auc_score, accuracy_score
 from torch.utils.data import DataLoader, Dataset
 
 from utils.pipeline.core import new_stage_timestamp_dir, Context
@@ -77,6 +78,8 @@ from utils.helpers import (
     log_operation_start,
     get_device,
     plot_model_performance,
+    clear_cuda_memory,
+    set_random_seeds,
 )
 from utils.dataloaders import (
     load_training_data,
@@ -85,6 +88,7 @@ from utils.dataloaders import (
     SequenceEngagementDataset,
     sequence_collate_fn,
     TransformerDualPoolingEncoder,
+    create_data_loaders,
 )
 
 STAGE_LOG_NAME = "STAGE_04_TRAIN_MLP"
@@ -229,18 +233,18 @@ class AttentionMLP(nn.Module):
         embed_dim: int,
         hidden_dims: List[int],
         dropout_rate: float,
-        user_hidden_dim: int = 256,
-        user_output_dim: int = 128,
-        num_attention_heads: int = 4,
-        num_attention_layers: int = 2,
-        max_history_len: int = 50,
-        attention_dropout: float = 0.1,
+        user_hidden_dim: int,
+        user_output_dim: int,
+        num_attention_heads: int,
+        num_attention_layers: int,
+        max_history_len: int,
+        attention_dropout: float,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.user_output_dim = user_output_dim
 
-        # User tower: Learned attention-based encoder over engagement history
+        # User "tower": Learned attention-based encoder over engagement history (can't actually be used separately like a true 2-tower)
         self.user_encoder = TransformerDualPoolingEncoder(
             input_dim=embed_dim,
             hidden_dim=user_hidden_dim,
@@ -332,124 +336,6 @@ class AttentionMLP(nn.Module):
 
 
 # =============================================================================
-# Helper Functions
-# =============================================================================
-
-def create_summarized_mlp(input_dim: int, hidden_dims: List[int], dropout_rate: float) -> SummarizedMLP:
-    """Factory function for creating SummarizedMLP instances."""
-    return SummarizedMLP(input_dim, hidden_dims, dropout_rate)
-
-
-def create_data_loaders(
-    train_dataset: Dataset,
-    val_dataset: Dataset,
-    batch_size: int,
-    holdout_dataset: Optional[Dataset] = None,
-    num_workers: int = 4,
-    pin_memory: bool = True,
-    persistent_workers: bool = True,
-    prefetch_factor: int = 2,
-):
-    """Create PyTorch DataLoaders for training, validation, and optionally holdout sets.
-    
-    Configures efficient data loading with multi-worker parallelism and GPU pinning.
-    
-    DataLoader configuration rationale:
-        - num_workers > 0: Parallel data loading prevents GPU starvation
-        - pin_memory: Speeds up CPU->GPU transfer by using page-locked memory
-        - persistent_workers: Avoids worker process respawn overhead between epochs
-        - prefetch_factor: Workers pre-load batches to hide data loading latency
-        - drop_last=True for training: Ensures consistent batch sizes for BatchNorm
-        
-    Args:
-        train_dataset: Training dataset
-        val_dataset: Validation dataset
-        batch_size: Number of samples per batch
-        holdout_dataset: Optional holdout dataset for final evaluation
-        num_workers: Number of parallel data loading workers (0 = main process only)
-        pin_memory: Use pinned (page-locked) memory for faster GPU transfer
-        persistent_workers: Keep workers alive between epochs
-        prefetch_factor: Number of batches to prefetch per worker
-    
-    Returns:
-        Tuple of (train_loader, val_loader, holdout_loader).
-        holdout_loader is None if holdout_dataset is not provided.
-    
-    Note:
-        With SummarizedEngagementDataset (pre-computed tensors), workers just do
-        index lookups and collation, so even a few workers eliminate CPU bottlenecks.
-        With SequenceEngagementDataset (on-the-fly memmap loading), workers pipeline
-        the I/O to keep GPUs fed during training.
-    """
-    # Base worker configuration
-    worker_kw: Dict[str, Any] = {
-        "num_workers": num_workers,
-        "pin_memory": pin_memory,
-    }
-    # Add worker-specific options only when using multiple workers
-    if num_workers > 0:
-        worker_kw.update(
-            persistent_workers=persistent_workers,
-            prefetch_factor=prefetch_factor,
-        )
-
-    # Create DataLoaders with appropriate settings for each split
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True,  # Shuffle for stochastic training
-        drop_last=True,  # Drop incomplete final batch for BatchNorm stability
-        **worker_kw
-    )
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=batch_size, 
-        shuffle=False,  # No shuffle for validation (deterministic evaluation)
-        **worker_kw
-    )
-    holdout_loader = DataLoader(
-        holdout_dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        **worker_kw
-    ) if holdout_dataset else None
-    return train_loader, val_loader, holdout_loader
-
-
-def clear_cuda_memory():
-    """Aggressively clear CUDA cache and run garbage collection.
-    
-    Useful for freeing GPU memory between model creation, particularly when
-    experimenting with different model sizes or batch sizes.
-    """
-    import gc
-    gc.collect()
-    if torch.cuda.is_available() and torch.cuda.is_initialized():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-
-
-def set_random_seeds(seed: int):
-    """Set random seeds for reproducibility across Python, NumPy, and PyTorch.
-    
-    Args:
-        seed: Random seed value
-        
-    Note:
-        This ensures deterministic behavior for model initialization, data
-        shuffling, and stochastic operations like dropout. However, some
-        CUDA operations may still have non-deterministic behavior.
-    """
-    import random as _random
-    _random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available() and torch.cuda.is_initialized():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-
-
-# =============================================================================
 # Training loop
 # =============================================================================
 
@@ -462,7 +348,6 @@ def train_mlp_model(
     learning_rate: float,
     weight_decay: float,
     patience: int,
-    lr_scheduler_mode: Literal["min", "max"],
     lr_scheduler_factor: float,
     lr_scheduler_patience: int,
     model_name: str = "engagement_model",
@@ -473,16 +358,12 @@ def train_mlp_model(
 ) -> Dict[str, Any]:
     from torch.optim.lr_scheduler import ReduceLROnPlateau
     import torch.optim as optim
-    try:
-        from sklearn.metrics import roc_auc_score
-    except ImportError:
-        def roc_auc_score(y_true, y_score):  # type: ignore[misc]
-            return 0.5
 
     model = model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = ReduceLROnPlateau(optimizer, mode=lr_scheduler_mode, factor=lr_scheduler_factor, patience=lr_scheduler_patience)
+    scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=lr_scheduler_factor, patience=lr_scheduler_patience)
     history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "train_auc": [], "val_auc": []}
+    best_val_auc = 0.0
     best_val_loss = float("inf")
     patience_counter = 0
     checkpoint_dir = Path(checkpoints_dir) if checkpoints_dir is not None else (Path(__file__).resolve().parents[2] / "outputs" / "checkpoints")
@@ -526,7 +407,8 @@ def train_mlp_model(
         history["val_auc"].append(float(val_auc))
         scheduler.step(val_auc)
 
-        if avg_val_loss < best_val_loss:
+        if val_auc > best_val_auc:
+            best_val_auc = val_auc
             best_val_loss = avg_val_loss
             checkpoint_full = checkpoint_dir / f"{model_name}_best.pth"
             checkpoint_weights = checkpoint_dir / f"{model_name}_best_weights.pth"
@@ -562,13 +444,8 @@ def train_mlp_model(
         "model": model,
         "history": history,
         "best_val_loss": best_val_loss,
-        "best_val_auc": max(history["val_auc"]) if history["val_auc"] else 0.0,
+        "best_val_auc": best_val_auc,
     }
-
-
-# =============================================================================
-# Lightweight holdout evaluation
-# =============================================================================
 
 # =============================================================================
 # Pipeline entry point
@@ -594,7 +471,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # --- seeds & cuda ---
     clear_cuda_memory()
-    set_random_seeds(int(args.random_seed))
+    random_seed = int(args.random_seed)
+    set_random_seeds(random_seed)
 
     # --- load data from prior stages ---
     log_operation_start("Load training data from prior stages", STAGE_LOG_NAME, logger)
@@ -602,15 +480,24 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         run_dir, context, logger=logger,
     )
 
-    # --- user encoder selection ---
-    # Smart defaults already applied in CLI (summarized for MLP, attention for two-tower)
+    # --- hyperparams (extract all args once, use locals everywhere below) ---
     user_encoder = args.user_encoder
     batch_size = int(args.batch_size)
     hidden_dims = list(args.hidden_dims)
     dropout_rate = float(args.dropout_rate_mlp)
+    epochs = int(args.epochs)
+    learning_rate = float(args.learning_rate)
+    weight_decay = float(args.weight_decay_mlp)
+    patience = int(args.patience)
+    disable_progress = bool(args.disable_progress)
+    generate_plots = not bool(args.no_plots)
+    save_model = not bool(args.no_save_model)
+    lr_scheduler_factor = float(args.lr_scheduler_factor)
+    lr_scheduler_patience = int(args.lr_scheduler_patience)
+    gradient_clip_max_norm = float(args.gradient_clip_max_norm)
     collate_fn = None  # non-None only for sequence datasets
-    
-    # Get worker settings from args (shared by all encoder types)
+
+    # Worker settings (shared by all encoder types)
     num_workers = int(args.num_dataloader_workers)
     pin_memory = bool(args.dataloader_pin_memory)
     persistent_workers = bool(args.dataloader_persistent_workers)
@@ -633,7 +520,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             summarizer=summarizer, embed_dim=embed_dim, logger=logger,
         )
         input_dim = 2 * embed_dim  # [user_summary || post_embedding]
-        model = create_summarized_mlp(input_dim, hidden_dims, dropout_rate)
+        model = SummarizedMLP(input_dim, hidden_dims, dropout_rate)
         
         train_loader, val_loader, _ = create_data_loaders(
             train_dataset, val_dataset, batch_size,
@@ -647,6 +534,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         # Attention MLP path: sequence dataset + AttentionMLP with learned encoder
         logger.info("User encoder: attention (TransformerDualPoolingEncoder + MLP)")
         max_history_len = int(args.max_history_len)
+        user_hidden_dim = int(args.user_hidden_dim)
+        user_output_dim = int(args.user_output_dim)
+        num_attention_heads = int(args.num_attention_heads)
+        num_attention_layers = int(args.num_attention_layers)
+        attention_dropout = float(args.attention_dropout)
         summarizer_name = "attention"  # for config logging
         ema_alpha = 0.0
 
@@ -666,33 +558,24 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             embed_dim=embed_dim,
             hidden_dims=hidden_dims,
             dropout_rate=dropout_rate,
-            user_hidden_dim=int(args.user_hidden_dim),
-            user_output_dim=int(args.user_output_dim),
-            num_attention_heads=int(args.num_attention_heads),
-            num_attention_layers=int(args.num_attention_layers),
+            user_hidden_dim=user_hidden_dim,
+            user_output_dim=user_output_dim,
+            num_attention_heads=num_attention_heads,
+            num_attention_layers=num_attention_layers,
             max_history_len=max_history_len,
-            attention_dropout=float(args.attention_dropout),
+            attention_dropout=attention_dropout,
         )
 
         collate_fn = sequence_collate_fn
-        _worker_kw: Dict[str, Any] = dict(
+        train_loader, val_loader, _ = create_data_loaders(
+            train_dataset, val_dataset, batch_size,
             num_workers=num_workers,
             pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+            collate_fn=collate_fn,
         )
-        if num_workers > 0:
-            _worker_kw.update(
-                persistent_workers=persistent_workers,
-                prefetch_factor=prefetch_factor,
-            )
-        train_loader = DataLoader(
-            train_dataset, batch_size=batch_size, shuffle=True,
-            collate_fn=collate_fn, drop_last=True, **_worker_kw,
-        )
-        val_loader = DataLoader(
-            val_dataset, batch_size=batch_size, shuffle=False,
-            collate_fn=collate_fn, **_worker_kw,
-        )
-        input_dim = int(args.user_output_dim) + embed_dim  # for config logging
+        input_dim = user_output_dim + embed_dim  # for config logging
     else:
         raise ValueError(
             f"Unknown user_encoder '{user_encoder}' for MLP. "
@@ -700,28 +583,19 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         )
 
     # --- train ---
-    log_operation_start(f"Training MLP (epochs={args.epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)
-    disable_progress = bool(args.disable_progress)
-    
-    # Get scheduler and training optimization settings from args
-    lr_scheduler_mode = str(args.lr_scheduler_mode)
-    lr_scheduler_factor = float(args.lr_scheduler_factor)
-    lr_scheduler_patience = int(args.lr_scheduler_patience)
-    gradient_clip_max_norm = float(args.gradient_clip_max_norm)
-    
+    log_operation_start(f"Training MLP (epochs={epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)
     training_results = train_mlp_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
         device=device,
-        epochs=int(args.epochs),
-        learning_rate=float(args.learning_rate),
-        weight_decay=float(args.weight_decay_mlp),
-        patience=int(args.patience),
+        epochs=epochs,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        patience=patience,
         load_best_checkpoint=True,
         checkpoints_dir=checkpoints_dir,
         disable_progress=disable_progress,
-        lr_scheduler_mode=lr_scheduler_mode,
         lr_scheduler_factor=lr_scheduler_factor,
         lr_scheduler_patience=lr_scheduler_patience,
         gradient_clip_max_norm=gradient_clip_max_norm,
@@ -730,7 +604,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     clear_cuda_memory()
 
     # --- plots & evaluation ---
-    generate_plots = not bool(args.no_plots)
     hist = training_results["history"]
 
     # experiment tracker scalars (always logged, regardless of --no-plots)
@@ -753,7 +626,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # Collect train + val predictions for performance plots & metrics
     def _collect_predictions(ds: Dataset, collate_fn_=None) -> tuple:
-        loader_kw_ = dict(
+        loader_kw_: Dict[str, Any] = dict(
             batch_size=batch_size, shuffle=False, drop_last=False,
             num_workers=num_workers, pin_memory=pin_memory,
         )
@@ -778,18 +651,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                     ys.extend(batch["label"].numpy().tolist())
         return np.asarray(ys), np.asarray(ps)
 
-    try:
-        from sklearn.metrics import roc_auc_score, accuracy_score
-        _have_sklearn = True
-    except ImportError:
-        _have_sklearn = False
-
     def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, Any]:
         m: Dict[str, Any] = {"total_samples": len(y_true), "positive_samples": int(y_true.sum())}
-        if _have_sklearn and len(set(y_true)) > 1:
+        if len(set(y_true)) > 1:
             m["auc_roc"] = float(roc_auc_score(y_true, y_pred))
-        if _have_sklearn:
-            m["accuracy@0.5"] = float(accuracy_score(y_true, (y_pred > 0.5).astype(int)))
+        m["accuracy@0.5"] = float(accuracy_score(y_true, (y_pred > 0.5).astype(int)))
         return m
 
     y_train, p_train = _collect_predictions(train_dataset, collate_fn_=collate_fn)
@@ -811,7 +677,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # --- save model ---
     model_path = None
-    if not bool(args.no_save_model):
+    if save_model:
         log_operation_start("Save model checkpoint", STAGE_LOG_NAME, logger)
         model_path = checkpoints_dir / f"engagement_model_{timestamp}.pt"
         tr_sanitized = {k: v for k, v in training_results.items() if k != "model"}
@@ -829,10 +695,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                 "training_results": tr_sanitized,
                 "training_parameters": {
                     "batch_size": batch_size,
-                    "learning_rate": float(args.learning_rate),
-                    "weight_decay": float(args.weight_decay_mlp),
-                    "epochs": int(args.epochs),
-                    "patience": int(args.patience),
+                    "learning_rate": learning_rate,
+                    "weight_decay": weight_decay,
+                    "epochs": epochs,
+                    "patience": patience,
                 },
                 "data_info": {
                     "train_samples": len(train_dataset),
@@ -857,7 +723,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         else:
             holdout_dataset = SequenceEngagementDataset(
                 embeddings_mmap, target_posts_df, history_df, split="holdout",
-                max_history_len=int(args.max_history_len), embed_dim=embed_dim, logger=logger,
+                max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
             )
         if len(holdout_dataset) > 0:
             log_operation_start("Holdout evaluation", STAGE_LOG_NAME, logger)
@@ -893,11 +759,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "user_summarization": summarizer_name,
         "ema_alpha": ema_alpha,
         "batch_size": batch_size,
-        "learning_rate": float(args.learning_rate),
-        "weight_decay": float(args.weight_decay_mlp),
-        "epochs": int(args.epochs),
-        "patience": int(args.patience),
-        "random_seed": int(args.random_seed),
+        "learning_rate": learning_rate,
+        "weight_decay": weight_decay,
+        "epochs": epochs,
+        "patience": patience,
+        "random_seed": random_seed,
         "train_samples": len(train_dataset),
         "val_samples": len(val_dataset),
         "train_metrics": train_metrics,
@@ -914,7 +780,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"stage: train_mlp",
         f"timestamp: {timestamp}",
         f"runtime_seconds: {runtime:.2f}",
-        f"settings: batch_size={batch_size}, lr={args.learning_rate}, epochs={args.epochs}, user_encoder={user_encoder}, summarizer={summarizer_name}",
+        f"settings: batch_size={batch_size}, lr={learning_rate}, epochs={epochs}, user_encoder={user_encoder}, summarizer={summarizer_name}",
         f"inputs: embeddings memmap, target_posts, user_history",
         f"train_samples: {len(train_dataset)}",
         f"val_samples: {len(val_dataset)}",

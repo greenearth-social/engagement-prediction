@@ -115,6 +115,7 @@ from torch.utils.data import Dataset
 from utils.pipeline.core import Context, select_prior_output
 from utils.helpers import (
     get_stage_logger,
+    load_parquet_from_prior,
     log_operation_start,
 )
 
@@ -446,12 +447,12 @@ class TransformerDualPoolingEncoder(BaseAttentionEncoder):
     
     Args:
         input_dim: Dimensionality of input post embeddings
-        hidden_dim: Internal transformer hidden size (default: 256)
-        output_dim: Final user representation size (default: 128)
-        num_attention_heads: Number of attention heads per layer (default: 4)
-        num_attention_layers: Depth of transformer stack (default: 2)
-        max_seq_len: Maximum history length for positional embeddings (default: 50)
-        dropout_rate: Dropout probability for regularization (default: 0.1)
+        hidden_dim: Internal transformer hidden size
+        output_dim: Final user representation size
+        num_attention_heads: Number of attention heads per layer
+        num_attention_layers: Depth of transformer stack
+        max_seq_len: Maximum history length for positional embeddings
+        dropout_rate: Dropout probability for regularization
     """
 
     def __init__(
@@ -549,10 +550,10 @@ class CrossAttentionPoolingEncoder(BaseAttentionEncoder):
     
     Args:
         input_dim: Dimensionality of input post embeddings
-        hidden_dim: Internal hidden size (default: 256)
-        output_dim: Final user representation size (default: 128)
-        max_seq_len: Maximum history length for positional embeddings (default: 50)
-        dropout_rate: Dropout probability for regularization (default: 0.1)
+        hidden_dim: Internal hidden size
+        output_dim: Final user representation size
+        max_seq_len: Maximum history length for positional embeddings
+        dropout_rate: Dropout probability for regularization
     """
 
     def __init__(
@@ -668,11 +669,8 @@ def load_training_data(
     # Contains the train/val/holdout split assignments and negative sampling results
     log_operation_start("Locate target_posts", "DATALOADERS", logger)
     target_posts_dir = _resolve_prior(run_dir, context, stage_key="target_posts", folder="02_target_posts")
-    tp_candidates = sorted(target_posts_dir.glob("target_posts_*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not tp_candidates:
-        raise FileNotFoundError(f"No target_posts_*.parquet found under {target_posts_dir}")
-    target_posts_df = pl.read_parquet(tp_candidates[0])
-    logger.info(f"Loaded target_posts: {len(target_posts_df):,} rows from {tp_candidates[0].name}")
+    target_posts_df = load_parquet_from_prior(target_posts_dir, "target_posts_").collect()
+    logger.info(f"Loaded target_posts: {len(target_posts_df):,} rows")
 
     # --- 3. User history from 03_user_history (or legacy 02_featurize) ---
     # Contains the chronologically-ordered list of post indices each user engaged with
@@ -683,11 +681,8 @@ def load_training_data(
         folder="03_user_history",
         fallback_folder="02_featurize",  # Legacy compatibility
     )
-    hist_candidates = sorted(history_dir.glob("history_posts_*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not hist_candidates:
-        raise FileNotFoundError(f"No history_posts_*.parquet found under {history_dir}")
-    history_df = pl.read_parquet(hist_candidates[0])
-    logger.info(f"Loaded user_history: {len(history_df):,} rows from {hist_candidates[0].name}")
+    history_df = load_parquet_from_prior(history_dir, "history_posts_").collect()
+    logger.info(f"Loaded user_history: {len(history_df):,} rows")
 
     return embeddings_mmap, target_posts_df, history_df, embed_dim
 
@@ -880,7 +875,7 @@ class SummarizedEngagementDataset(Dataset):
             - "features": Concatenated [user_summary || post_emb] tensor [2*D]
             - "label": Binary label (1.0 for positive, 0.0 for negative)
             - "user_id": User ID string
-            - "post_id": Post URI string (or "neg_{row_idx}" for negatives)
+            - "post_id": Post URI string (or "neg_uri" for negatives)
     """
 
     def __init__(
@@ -953,7 +948,7 @@ class SummarizedEngagementDataset(Dataset):
                 - "features": [2*D] concatenated [user_summary || post_embedding]
                 - "label": 1.0 for positive, 0.0 for negative
                 - "user_id": User identifier string
-                - "post_id": Post URI (or "neg_{row_idx}" for negatives)
+                - "post_id": Post URI (or "neg_uri" for negatives)
         """
         # Map dataset index to target post row and sample type
         row_idx = idx // 2  # Which target post
@@ -970,7 +965,7 @@ class SummarizedEngagementDataset(Dataset):
         else:
             post_vec = self._neg_post_embs[row_idx]  # [D]
             label = 0.0
-            post_id = f"neg_{row_idx}"  # Synthetic ID for negative samples
+            post_id = "neg_uri"  # Synthetic ID for negative samples
 
         # Concatenate user summary and post embedding
         features = torch.cat([user_vec, post_vec])  # [2D]
@@ -1052,7 +1047,7 @@ class SequenceEngagementDataset(Dataset):
             - "target_post_embedding": Target post embedding [D]
             - "label": Binary label (1.0 for positive, 0.0 for negative)
             - "user_id": User ID string
-            - "post_id": Post URI string (or "neg_{row_idx}" for negatives)
+            - "post_id": Post URI string (or "neg_uri" for negatives)
     """
 
     def __init__(
@@ -1124,7 +1119,7 @@ class SequenceEngagementDataset(Dataset):
                 - "target_post_embedding": [D] target post embedding
                 - "label": 1.0 for positive, 0.0 for negative
                 - "user_id": User identifier string
-                - "post_id": Post URI (or "neg_{row_idx}" for negatives)
+                - "post_id": Post URI (or "neg_uri" for negatives)
         """
         # Map dataset index to target post row and sample type
         row_idx = idx // 2
@@ -1154,7 +1149,7 @@ class SequenceEngagementDataset(Dataset):
         else:
             post_vec = self._neg_post_embs[row_idx]  # [D]
             label = 0.0
-            post_id = f"neg_{row_idx}"
+            post_id = "neg_uri"
 
         return {
             "history_embeddings": torch.from_numpy(padded),  # [max_seq, D]
@@ -1198,3 +1193,90 @@ def sequence_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "user_ids": [b["user_id"] for b in batch],
         "post_ids": [b["post_id"] for b in batch],
     }
+
+
+# ---------------------------------------------------------------------------
+# DataLoader factory
+# ---------------------------------------------------------------------------
+
+def create_data_loaders(
+    train_dataset: Dataset,
+    val_dataset: Dataset,
+    batch_size: int,
+    holdout_dataset: Optional[Dataset] = None,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 2,
+    collate_fn = None,
+):
+    """Create PyTorch DataLoaders for training, validation, and optionally holdout sets.
+    
+    Configures efficient data loading with multi-worker parallelism and GPU pinning.
+    
+    DataLoader configuration rationale:
+        - num_workers > 0: Parallel data loading prevents GPU starvation
+        - pin_memory: Speeds up CPU->GPU transfer by using page-locked memory
+        - persistent_workers: Avoids worker process respawn overhead between epochs
+        - prefetch_factor: Workers pre-load batches to hide data loading latency
+        - drop_last=True for training: Ensures consistent batch sizes for BatchNorm
+        
+    Args:
+        train_dataset: Training dataset
+        val_dataset: Validation dataset
+        batch_size: Number of samples per batch
+        holdout_dataset: Optional holdout dataset for final evaluation
+        num_workers: Number of parallel data loading workers (0 = main process only)
+        pin_memory: Use pinned (page-locked) memory for faster GPU transfer
+        persistent_workers: Keep workers alive between epochs
+        prefetch_factor: Number of batches to prefetch per worker
+        collate_fn: Optional custom collate function for batching (e.g., sequence_collate_fn)
+    
+    Returns:
+        Tuple of (train_loader, val_loader, holdout_loader).
+        holdout_loader is None if holdout_dataset is not provided.
+    
+    Note:
+        With SummarizedEngagementDataset (pre-computed tensors), workers just do
+        index lookups and collation, so even a few workers eliminate CPU bottlenecks.
+        With SequenceEngagementDataset (on-the-fly memmap loading), workers pipeline
+        the I/O to keep GPUs fed during training.
+    """
+    from torch.utils.data import DataLoader
+    
+    # Base worker configuration
+    worker_kw: Dict[str, Any] = {
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    # Add worker-specific options only when using multiple workers
+    if num_workers > 0:
+        worker_kw.update(
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+        )
+
+    # Create DataLoaders with appropriate settings for each split
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True,  # Shuffle for stochastic training
+        drop_last=True,  # Drop incomplete final batch for BatchNorm stability
+        collate_fn=collate_fn,
+        **worker_kw
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size, 
+        shuffle=False,  # No shuffle for validation (deterministic evaluation)
+        collate_fn=collate_fn,
+        **worker_kw
+    )
+    holdout_loader = DataLoader(
+        holdout_dataset, 
+        batch_size=batch_size, 
+        shuffle=False,
+        collate_fn=collate_fn,
+        **worker_kw
+    ) if holdout_dataset else None
+    return train_loader, val_loader, holdout_loader
