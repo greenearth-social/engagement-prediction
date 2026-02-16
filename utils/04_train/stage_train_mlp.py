@@ -69,6 +69,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.metrics import roc_auc_score, accuracy_score
 from torch.utils.data import DataLoader, Dataset
 
 from utils.pipeline.core import new_stage_timestamp_dir, Context
@@ -468,11 +469,6 @@ def train_mlp_model(
 ) -> Dict[str, Any]:
     from torch.optim.lr_scheduler import ReduceLROnPlateau
     import torch.optim as optim
-    try:
-        from sklearn.metrics import roc_auc_score
-    except ImportError:
-        def roc_auc_score(y_true, y_score):  # type: ignore[misc]
-            return 0.5
 
     model = model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -768,18 +764,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                     ys.extend(batch["label"].numpy().tolist())
         return np.asarray(ys), np.asarray(ps)
 
-    try:
-        from sklearn.metrics import roc_auc_score, accuracy_score
-        _have_sklearn = True
-    except ImportError:
-        _have_sklearn = False
-
     def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, Any]:
         m: Dict[str, Any] = {"total_samples": len(y_true), "positive_samples": int(y_true.sum())}
-        if _have_sklearn and len(set(y_true)) > 1:
+        if len(set(y_true)) > 1:
             m["auc_roc"] = float(roc_auc_score(y_true, y_pred))
-        if _have_sklearn:
-            m["accuracy@0.5"] = float(accuracy_score(y_true, (y_pred > 0.5).astype(int)))
+        m["accuracy@0.5"] = float(accuracy_score(y_true, (y_pred > 0.5).astype(int)))
         return m
 
     y_train, p_train = _collect_predictions(train_dataset, collate_fn_=collate_fn)
