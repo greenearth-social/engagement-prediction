@@ -115,6 +115,7 @@ from torch.utils.data import Dataset
 from utils.pipeline.core import Context, select_prior_output
 from utils.helpers import (
     get_stage_logger,
+    load_parquet_from_prior,
     log_operation_start,
 )
 
@@ -681,11 +682,8 @@ def load_training_data(
     # Contains the train/val/holdout split assignments and negative sampling results
     log_operation_start("Locate target_posts", "DATALOADERS", logger)
     target_posts_dir = _resolve_prior(run_dir, context, stage_key="target_posts", folder="02_target_posts")
-    tp_candidates = sorted(target_posts_dir.glob("target_posts_*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not tp_candidates:
-        raise FileNotFoundError(f"No target_posts_*.parquet found under {target_posts_dir}")
-    target_posts_df = pl.read_parquet(tp_candidates[0])
-    logger.info(f"Loaded target_posts: {len(target_posts_df):,} rows from {tp_candidates[0].name}")
+    target_posts_df = load_parquet_from_prior(target_posts_dir, "target_posts_").collect()
+    logger.info(f"Loaded target_posts: {len(target_posts_df):,} rows")
 
     # --- 3. User history from 03_user_history (or legacy 02_featurize) ---
     # Contains the chronologically-ordered list of post indices each user engaged with
@@ -696,11 +694,8 @@ def load_training_data(
         folder="03_user_history",
         fallback_folder="02_featurize",  # Legacy compatibility
     )
-    hist_candidates = sorted(history_dir.glob("history_posts_*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not hist_candidates:
-        raise FileNotFoundError(f"No history_posts_*.parquet found under {history_dir}")
-    history_df = pl.read_parquet(hist_candidates[0])
-    logger.info(f"Loaded user_history: {len(history_df):,} rows from {hist_candidates[0].name}")
+    history_df = load_parquet_from_prior(history_dir, "history_posts_").collect()
+    logger.info(f"Loaded user_history: {len(history_df):,} rows")
 
     return embeddings_mmap, target_posts_df, history_df, embed_dim
 
