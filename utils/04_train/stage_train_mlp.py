@@ -580,7 +580,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # --- seeds & cuda ---
     clear_cuda_memory()
-    set_random_seeds(int(args.random_seed))
+    random_seed = int(args.random_seed)
+    set_random_seeds(random_seed)
 
     # --- load data from prior stages ---
     log_operation_start("Load training data from prior stages", STAGE_LOG_NAME, logger)
@@ -588,15 +589,25 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         run_dir, context, logger=logger,
     )
 
-    # --- user encoder selection ---
-    # Smart defaults already applied in CLI (summarized for MLP, attention for two-tower)
+    # --- hyperparams (extract all args once, use locals everywhere below) ---
     user_encoder = args.user_encoder
     batch_size = int(args.batch_size)
     hidden_dims = list(args.hidden_dims)
     dropout_rate = float(args.dropout_rate_mlp)
+    epochs = int(args.epochs)
+    learning_rate = float(args.learning_rate)
+    weight_decay = float(args.weight_decay_mlp)
+    patience = int(args.patience)
+    disable_progress = bool(args.disable_progress)
+    generate_plots = not bool(args.no_plots)
+    save_model = not bool(args.no_save_model)
+    lr_scheduler_mode = str(args.lr_scheduler_mode)
+    lr_scheduler_factor = float(args.lr_scheduler_factor)
+    lr_scheduler_patience = int(args.lr_scheduler_patience)
+    gradient_clip_max_norm = float(args.gradient_clip_max_norm)
     collate_fn = None  # non-None only for sequence datasets
-    
-    # Get worker settings from args (shared by all encoder types)
+
+    # Worker settings (shared by all encoder types)
     num_workers = int(args.num_dataloader_workers)
     pin_memory = bool(args.dataloader_pin_memory)
     persistent_workers = bool(args.dataloader_persistent_workers)
@@ -633,6 +644,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         # Attention MLP path: sequence dataset + AttentionMLP with learned encoder
         logger.info("User encoder: attention (TransformerDualPoolingEncoder + MLP)")
         max_history_len = int(args.max_history_len)
+        user_hidden_dim = int(args.user_hidden_dim)
+        user_output_dim = int(args.user_output_dim)
+        num_attention_heads = int(args.num_attention_heads)
+        num_attention_layers = int(args.num_attention_layers)
+        attention_dropout = float(args.attention_dropout)
         summarizer_name = "attention"  # for config logging
         ema_alpha = 0.0
 
@@ -652,12 +668,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             embed_dim=embed_dim,
             hidden_dims=hidden_dims,
             dropout_rate=dropout_rate,
-            user_hidden_dim=int(args.user_hidden_dim),
-            user_output_dim=int(args.user_output_dim),
-            num_attention_heads=int(args.num_attention_heads),
-            num_attention_layers=int(args.num_attention_layers),
+            user_hidden_dim=user_hidden_dim,
+            user_output_dim=user_output_dim,
+            num_attention_heads=num_attention_heads,
+            num_attention_layers=num_attention_layers,
             max_history_len=max_history_len,
-            attention_dropout=float(args.attention_dropout),
+            attention_dropout=attention_dropout,
         )
 
         collate_fn = sequence_collate_fn
@@ -678,7 +694,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             val_dataset, batch_size=batch_size, shuffle=False,
             collate_fn=collate_fn, **_worker_kw,
         )
-        input_dim = int(args.user_output_dim) + embed_dim  # for config logging
+        input_dim = user_output_dim + embed_dim  # for config logging
     else:
         raise ValueError(
             f"Unknown user_encoder '{user_encoder}' for MLP. "
@@ -686,24 +702,16 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         )
 
     # --- train ---
-    log_operation_start(f"Training MLP (epochs={args.epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)
-    disable_progress = bool(args.disable_progress)
-    
-    # Get scheduler and training optimization settings from args
-    lr_scheduler_mode = str(args.lr_scheduler_mode)
-    lr_scheduler_factor = float(args.lr_scheduler_factor)
-    lr_scheduler_patience = int(args.lr_scheduler_patience)
-    gradient_clip_max_norm = float(args.gradient_clip_max_norm)
-    
+    log_operation_start(f"Training MLP (epochs={epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)
     training_results = train_mlp_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
         device=device,
-        epochs=int(args.epochs),
-        learning_rate=float(args.learning_rate),
-        weight_decay=float(args.weight_decay_mlp),
-        patience=int(args.patience),
+        epochs=epochs,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        patience=patience,
         load_best_checkpoint=True,
         checkpoints_dir=checkpoints_dir,
         disable_progress=disable_progress,
@@ -716,7 +724,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     clear_cuda_memory()
 
     # --- plots & evaluation ---
-    generate_plots = not bool(args.no_plots)
     hist = training_results["history"]
 
     # experiment tracker scalars (always logged, regardless of --no-plots)
@@ -790,7 +797,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # --- save model ---
     model_path = None
-    if not bool(args.no_save_model):
+    if save_model:
         log_operation_start("Save model checkpoint", STAGE_LOG_NAME, logger)
         model_path = checkpoints_dir / f"engagement_model_{timestamp}.pth"
         tr_sanitized = {k: v for k, v in training_results.items() if k != "model"}
@@ -808,10 +815,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                 "training_results": tr_sanitized,
                 "training_parameters": {
                     "batch_size": batch_size,
-                    "learning_rate": float(args.learning_rate),
-                    "weight_decay": float(args.weight_decay_mlp),
-                    "epochs": int(args.epochs),
-                    "patience": int(args.patience),
+                    "learning_rate": learning_rate,
+                    "weight_decay": weight_decay,
+                    "epochs": epochs,
+                    "patience": patience,
                 },
                 "data_info": {
                     "train_samples": len(train_dataset),
@@ -835,7 +842,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         else:
             holdout_dataset = SequenceEngagementDataset(
                 embeddings_mmap, target_posts_df, history_df, split="holdout",
-                max_history_len=int(args.max_history_len), embed_dim=embed_dim, logger=logger,
+                max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
             )
         if len(holdout_dataset) > 0:
             log_operation_start("Holdout evaluation", STAGE_LOG_NAME, logger)
@@ -871,11 +878,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "user_summarization": summarizer_name,
         "ema_alpha": ema_alpha,
         "batch_size": batch_size,
-        "learning_rate": float(args.learning_rate),
-        "weight_decay": float(args.weight_decay_mlp),
-        "epochs": int(args.epochs),
-        "patience": int(args.patience),
-        "random_seed": int(args.random_seed),
+        "learning_rate": learning_rate,
+        "weight_decay": weight_decay,
+        "epochs": epochs,
+        "patience": patience,
+        "random_seed": random_seed,
         "train_samples": len(train_dataset),
         "val_samples": len(val_dataset),
         "train_metrics": train_metrics,
@@ -892,7 +899,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"stage: train_mlp",
         f"timestamp: {timestamp}",
         f"runtime_seconds: {runtime:.2f}",
-        f"settings: batch_size={batch_size}, lr={args.learning_rate}, epochs={args.epochs}, user_encoder={user_encoder}, summarizer={summarizer_name}",
+        f"settings: batch_size={batch_size}, lr={learning_rate}, epochs={epochs}, user_encoder={user_encoder}, summarizer={summarizer_name}",
         f"inputs: embeddings memmap, target_posts, user_history",
         f"train_samples: {len(train_dataset)}",
         f"val_samples: {len(val_dataset)}",

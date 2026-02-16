@@ -11,3 +11,11 @@ This file documents conventions for AI agents and contributors working on this r
 - When adding a new CLI-controlled hyperparameter: add it to `DEFAULTS` in `cli.py`, add the corresponding `--flag` to the run-all parser, and pass the value from `args` into the model/encoder constructors without defining a default in those constructors.
 
 This keeps a single source of truth and avoids drift between CLI defaults and in-code defaults.
+
+## Args extraction in stage `run()` functions
+
+In each stage's `run(context, args)` function, **extract all `args.*` values into local variables once** at the top of the function (in a single `# --- hyperparams ---` block), then use only the local variables in all downstream code. Do not scatter `args.*`, `int(args.*)`, or `float(args.*)` throughout the function body.
+
+- This makes it easy to see every parameter at a glance.
+- If a value ever needs post-processing (e.g. clamping, conditional override), the change happens in one place and is consistent for all downstream uses.
+- Encoder-specific args (e.g. attention params) can be extracted at the top of the relevant branch rather than the universal block.

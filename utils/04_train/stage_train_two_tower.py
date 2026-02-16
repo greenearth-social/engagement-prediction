@@ -92,6 +92,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.metrics import roc_auc_score, accuracy_score, average_precision_score
 from torch.utils.data import DataLoader, Dataset
 
 from utils.pipeline.core import new_stage_timestamp_dir, Context
@@ -394,12 +395,6 @@ def train_two_tower_model(
     patience_counter = 0
     best_state_dict = None
 
-    try:
-        from sklearn.metrics import roc_auc_score
-    except ImportError:
-        def roc_auc_score(y_true, y_score):  # type: ignore[misc]
-            return 0.5
-
     for epoch in tqdm(range(epochs), desc="Training epochs", disable=disable_progress):
         # --- Training ---
         model.train()
@@ -493,14 +488,6 @@ def evaluate_two_tower_model(
     device: str,
 ) -> Dict[str, Any]:
     """Evaluate two-tower model and return metrics + predictions."""
-    try:
-        from sklearn.metrics import roc_auc_score, accuracy_score, average_precision_score
-    except ImportError:
-        def roc_auc_score(y_true, y_score):  # type: ignore[misc]
-            return 0.5
-        accuracy_score = None  # type: ignore[assignment]
-        average_precision_score = None  # type: ignore[assignment]
-
     model = model.to(device)
     model.eval()
 
@@ -535,11 +522,9 @@ def evaluate_two_tower_model(
 
     if len(set(y_true)) > 1:
         metrics["auc_roc"] = float(roc_auc_score(y_true, y_pred))
-        if average_precision_score is not None:
-            metrics["average_precision"] = float(average_precision_score(y_true, y_pred))
+        metrics["average_precision"] = float(average_precision_score(y_true, y_pred))
 
-    if accuracy_score is not None:
-        metrics["accuracy_at_0.5"] = float(accuracy_score(y_true, (y_pred > 0.5).astype(int)))
+    metrics["accuracy_at_0.5"] = float(accuracy_score(y_true, (y_pred > 0.5).astype(int)))
 
     return {
         "metrics": metrics,
@@ -595,7 +580,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         run_dir, context, logger=logger,
     )
 
-    # --- hyperparams ---
+    # --- hyperparams (extract all args once, use locals everywhere below) ---
     max_history_len = int(args.max_history_len)
     shared_dim = int(args.shared_dim)
     user_hidden_dim = int(args.user_hidden_dim)
@@ -609,8 +594,15 @@ def run(context: Context, args) -> Dict[str, Any]:
     epochs = int(args.epochs)
     patience = int(args.patience)
     disable_progress = bool(args.disable_progress)
+    user_encoder_type = args.user_encoder
+    generate_plots = not bool(args.no_plots)
+    save_model = not bool(args.no_save_model)
+    lr_scheduler_mode = str(args.lr_scheduler_mode)
+    lr_scheduler_factor = float(args.lr_scheduler_factor)
+    lr_scheduler_patience = int(args.lr_scheduler_patience)
+    gradient_clip_max_norm = float(args.gradient_clip_max_norm)
 
-    # Get worker settings from args
+    # Worker settings
     num_workers = int(args.num_dataloader_workers)
     pin_memory = bool(args.dataloader_pin_memory)
     persistent_workers = bool(args.dataloader_persistent_workers)
@@ -650,8 +642,6 @@ def run(context: Context, args) -> Dict[str, Any]:
     logger.info(f"Train items: {len(train_dataset)}, Val items: {len(val_dataset)}")
 
     # --- create model ---
-    # Get encoder type from args with smart defaults applied in CLI
-    user_encoder_type = args.user_encoder
     log_operation_start(f"Create two-tower model (user_encoder={user_encoder_type})", STAGE_LOG_NAME, logger)
     model = TwoTowerModel(
         post_embedding_dim=embed_dim,
@@ -667,13 +657,6 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # --- train ---
     log_operation_start(f"Train two-tower (epochs={epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)
-    
-    # Get scheduler and training optimization settings from args
-    lr_scheduler_mode = str(args.lr_scheduler_mode)
-    lr_scheduler_factor = float(args.lr_scheduler_factor)
-    lr_scheduler_patience = int(args.lr_scheduler_patience)
-    gradient_clip_max_norm = float(args.gradient_clip_max_norm)
-    
     training_results = train_two_tower_model(
         model=model,
         train_loader=train_loader,
@@ -693,8 +676,6 @@ def run(context: Context, args) -> Dict[str, Any]:
     trained_model: TwoTowerModel = training_results["model"]
 
     # --- plots & evaluation ---
-    generate_plots = not bool(args.no_plots)
-
     hist = training_results["history"]
 
     # experiment tracker scalars (always logged, regardless of --no-plots)
@@ -752,7 +733,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         "max_history_len": max_history_len,
         "dropout_rate": dropout_rate,
     }
-    if not bool(args.no_save_model):
+    if save_model:
         model_path = checkpoints_dir / f"two_tower_{timestamp}.pth"
         torch.save(
             {
