@@ -888,7 +888,7 @@ class SummarizedEngagementDataset(Dataset):
             - "features": Concatenated [user_summary || post_emb] tensor [2*D]
             - "label": Binary label (1.0 for positive, 0.0 for negative)
             - "user_id": User ID string
-            - "post_id": Post URI string (or "neg_{row_idx}" for negatives)
+            - "post_id": Post URI string (or "neg_uri" for negatives)
     """
 
     def __init__(
@@ -961,7 +961,7 @@ class SummarizedEngagementDataset(Dataset):
                 - "features": [2*D] concatenated [user_summary || post_embedding]
                 - "label": 1.0 for positive, 0.0 for negative
                 - "user_id": User identifier string
-                - "post_id": Post URI (or "neg_{row_idx}" for negatives)
+                - "post_id": Post URI (or "neg_uri" for negatives)
         """
         # Map dataset index to target post row and sample type
         row_idx = idx // 2  # Which target post
@@ -978,7 +978,7 @@ class SummarizedEngagementDataset(Dataset):
         else:
             post_vec = self._neg_post_embs[row_idx]  # [D]
             label = 0.0
-            post_id = f"neg_{row_idx}"  # Synthetic ID for negative samples
+            post_id = "neg_uri"  # Synthetic ID for negative samples
 
         # Concatenate user summary and post embedding
         features = torch.cat([user_vec, post_vec])  # [2D]
@@ -1060,7 +1060,7 @@ class SequenceEngagementDataset(Dataset):
             - "target_post_embedding": Target post embedding [D]
             - "label": Binary label (1.0 for positive, 0.0 for negative)
             - "user_id": User ID string
-            - "post_id": Post URI string (or "neg_{row_idx}" for negatives)
+            - "post_id": Post URI string (or "neg_uri" for negatives)
     """
 
     def __init__(
@@ -1132,7 +1132,7 @@ class SequenceEngagementDataset(Dataset):
                 - "target_post_embedding": [D] target post embedding
                 - "label": 1.0 for positive, 0.0 for negative
                 - "user_id": User identifier string
-                - "post_id": Post URI (or "neg_{row_idx}" for negatives)
+                - "post_id": Post URI (or "neg_uri" for negatives)
         """
         # Map dataset index to target post row and sample type
         row_idx = idx // 2
@@ -1162,7 +1162,7 @@ class SequenceEngagementDataset(Dataset):
         else:
             post_vec = self._neg_post_embs[row_idx]  # [D]
             label = 0.0
-            post_id = f"neg_{row_idx}"
+            post_id = "neg_uri"
 
         return {
             "history_embeddings": torch.from_numpy(padded),  # [max_seq, D]
