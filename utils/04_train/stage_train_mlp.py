@@ -345,6 +345,7 @@ def create_data_loaders(
     pin_memory: bool = True,
     persistent_workers: bool = True,
     prefetch_factor: int = 2,
+    collate_fn = None,
 ):
     """Create PyTorch DataLoaders for training, validation, and optionally holdout sets.
     
@@ -366,6 +367,7 @@ def create_data_loaders(
         pin_memory: Use pinned (page-locked) memory for faster GPU transfer
         persistent_workers: Keep workers alive between epochs
         prefetch_factor: Number of batches to prefetch per worker
+        collate_fn: Optional custom collate function for batching (e.g., sequence_collate_fn)
     
     Returns:
         Tuple of (train_loader, val_loader, holdout_loader).
@@ -395,18 +397,21 @@ def create_data_loaders(
         batch_size=batch_size, 
         shuffle=True,  # Shuffle for stochastic training
         drop_last=True,  # Drop incomplete final batch for BatchNorm stability
+        collate_fn=collate_fn,
         **worker_kw
     )
     val_loader = DataLoader(
         val_dataset, 
         batch_size=batch_size, 
         shuffle=False,  # No shuffle for validation (deterministic evaluation)
+        collate_fn=collate_fn,
         **worker_kw
     )
     holdout_loader = DataLoader(
         holdout_dataset, 
         batch_size=batch_size, 
-        shuffle=False, 
+        shuffle=False,
+        collate_fn=collate_fn,
         **worker_kw
     ) if holdout_dataset else None
     return train_loader, val_loader, holdout_loader
@@ -677,22 +682,13 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         )
 
         collate_fn = sequence_collate_fn
-        _worker_kw: Dict[str, Any] = dict(
+        train_loader, val_loader, _ = create_data_loaders(
+            train_dataset, val_dataset, batch_size,
             num_workers=num_workers,
             pin_memory=pin_memory,
-        )
-        if num_workers > 0:
-            _worker_kw.update(
-                persistent_workers=persistent_workers,
-                prefetch_factor=prefetch_factor,
-            )
-        train_loader = DataLoader(
-            train_dataset, batch_size=batch_size, shuffle=True,
-            collate_fn=collate_fn, drop_last=True, **_worker_kw,
-        )
-        val_loader = DataLoader(
-            val_dataset, batch_size=batch_size, shuffle=False,
-            collate_fn=collate_fn, **_worker_kw,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+            collate_fn=collate_fn,
         )
         input_dim = user_output_dim + embed_dim  # for config logging
     else:
