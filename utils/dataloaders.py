@@ -737,7 +737,7 @@ def _prepare_split_data(
     history_df: pl.DataFrame,
     split: str,
     logger: Optional[logging.Logger] = None,
-) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
     """Filter data to a single split and return aligned numpy arrays.
     
     This internal helper performs the core data preparation logic shared by both
@@ -801,6 +801,7 @@ def _prepare_split_data(
     neg_emb_idx = joined["neg_emb_idx"].to_numpy().astype(np.int64)
     target_dids = joined["target_did"].to_list()
     like_uris = joined["like_uri"].to_list()
+    neg_uris = joined["neg_uri"].to_list()
 
     # Convert Polars List[UInt32] column to Python list of numpy arrays
     # This allows each user to have a different history length (variable-length)
@@ -815,7 +816,7 @@ def _prepare_split_data(
         else:
             prior_emb_indices_list.append(np.array(row_val, dtype=np.uint32))
 
-    return like_emb_idx, neg_emb_idx, prior_emb_indices_list, np.array(target_dids), np.array(like_uris)
+    return like_emb_idx, neg_emb_idx, prior_emb_indices_list, np.array(target_dids), np.array(like_uris), np.array(neg_uris)
 
 
 # ---------------------------------------------------------------------------
@@ -902,6 +903,7 @@ class SummarizedEngagementDataset(Dataset):
             prior_emb_indices,
             self.target_dids,
             self.like_uris,
+            self.neg_uris,
         ) = _prepare_split_data(target_posts_df, history_df, split, logger)
 
         self._n_rows = len(like_emb_idx)
@@ -970,7 +972,7 @@ class SummarizedEngagementDataset(Dataset):
         else:
             post_vec = self._neg_post_embs[row_idx]  # [D]
             label = 0.0
-            post_id = "neg_uri"  # Synthetic ID for negative samples
+            post_id = self.neg_uris[row_idx]
 
         # Concatenate user summary and post embedding
         features = torch.cat([user_vec, post_vec])  # [2D]
@@ -1077,6 +1079,7 @@ class SequenceEngagementDataset(Dataset):
             self.prior_emb_indices,
             self.target_dids,
             self.like_uris,
+            self.neg_uris,
         ) = _prepare_split_data(target_posts_df, history_df, split, logger)
 
         self._n_rows = len(like_emb_idx)
@@ -1154,7 +1157,7 @@ class SequenceEngagementDataset(Dataset):
         else:
             post_vec = self._neg_post_embs[row_idx]  # [D]
             label = 0.0
-            post_id = "neg_uri"
+            post_id = self.neg_uris[row_idx]
 
         return {
             "history_embeddings": torch.from_numpy(padded),  # [max_seq, D]
