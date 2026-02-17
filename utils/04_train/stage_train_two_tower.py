@@ -500,7 +500,7 @@ def train_two_tower_model(
 # Evaluation
 # =============================================================================
 
-def evaluate_two_tower_model(
+def _evaluate_two_tower_model(
     model: TwoTowerModel,
     data_loader: DataLoader,
     device: str,
@@ -715,8 +715,8 @@ def run(context: Context, args) -> Dict[str, Any]:
         plot_training_history(hist, plots_dir / f"training_history_{timestamp}.png", best_epoch=best_epoch)
 
     # Collect train + val predictions for performance plots & metrics
-    train_eval = evaluate_two_tower_model(trained_model, train_loader, device, embed_dim)
-    val_eval = evaluate_two_tower_model(trained_model, val_loader, device, embed_dim)
+    train_eval = _evaluate_two_tower_model(trained_model, train_loader, device, embed_dim)
+    val_eval = _evaluate_two_tower_model(trained_model, val_loader, device, embed_dim)
     logger.info(f"Train metrics: {train_eval['metrics']}")
     logger.info(f"Validation metrics: {val_eval['metrics']}")
 
@@ -796,7 +796,7 @@ def run(context: Context, args) -> Dict[str, Any]:
                 prefetch_factor=prefetch_factor,
                 collate_fn=collate_fn,
             )
-            holdout_eval = evaluate_two_tower_model(trained_model, holdout_loader, device, embed_dim)
+            holdout_eval = _evaluate_two_tower_model(trained_model, holdout_loader, device, embed_dim)
             holdout_metrics = holdout_eval["metrics"]
             logger.info(f"Holdout metrics: {holdout_metrics}")
 
