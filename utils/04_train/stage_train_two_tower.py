@@ -15,7 +15,9 @@ Core concept: Project users and posts into a SHARED EMBEDDING SPACE where
 engagement is predicted by computing similarity (dot product) between representations.
 
     User Tower:  history_sequence -> UserEncoder -> user_vector [shared_dim]
-    Post Tower:  post_embedding -> MLP -> post_vector [shared_dim]
+                (or "summarized": user_vector is provided by the dataset)
+    Post Tower:  post_embedding -> (optional) PostTower -> post_vector [shared_dim]
+                (or identity when use_post_encoder=False)
     Prediction:  sigmoid(user_vector · post_vector) -> engagement_probability
 
 Benefits:
@@ -28,7 +30,14 @@ Benefits:
 USER ENCODER OPTIONS
 ═══════════════════════════════════════════════════════════════════════════════
 
-This module supports TWO user encoder architectures, selected via user_encoder_type:
+This stage supports THREE user-history encoders, selected via `--user-encoder`:
+
+0. **"summarized"** - Hand-crafted summarization (no trainable user encoder)
+   ───────────────────────────────────────────────────────────────────────────
+   Uses `SummarizedEngagementDataset` to pre-compute a fixed-size user summary
+   vector (e.g. mean / EMA / linear recency). In this mode the "user tower" is
+   effectively the identity function at training time because the dataset has
+   already produced the user vector.
 
 1. **"attention"** - TransformerDualPoolingEncoder (Full Transformer Self-Attention)
    ───────────────────────────────────────────────────────────────────────────
@@ -69,8 +78,9 @@ Inputs (from prior pipeline stages):
     - history_posts_*.parquet from 03_user_history
 
 Outputs under <run_dir>/04_train/<timestamp>/:
-    - checkpoints/two_tower_*.pth (full checkpoint with training state)
-    - checkpoints/two_tower_*_weights.pth (model weights only)
+    - checkpoints/two_tower_best.pth (best-by-validation checkpoint during training)
+    - checkpoints/two_tower_<timestamp>.pt (final model checkpoint)
+    - checkpoints/two_tower_<timestamp>_ts.pt (TorchScript model)
     - plots/training_history_*.png (loss and AUC curves)
     - plots/{train,val,holdout}_performance_*.png (precision-recall, ROC curves)
     - logs/ (training logs)
@@ -198,19 +208,23 @@ class TwoTowerModel(nn.Module):
     ranking systems.
     
     Architecture:
-        User Tower: TransformerDualPoolingEncoder OR CrossAttentionPoolingEncoder
-                    (history_sequence, mask) -> user_vector [shared_dim]
+        User Tower:
+            - "attention": TransformerDualPoolingEncoder(history_sequence, mask) -> user_vector [shared_dim]
+            - "cross_attention": CrossAttentionPoolingEncoder(history_sequence, mask) -> user_vector [shared_dim]
+            - "summarized": user_vector is provided by SummarizedEngagementDataset
+              (the model treats the dataset-provided user summary as the user embedding)
         
-        Post Tower: PostTower (simple MLP)
-                    post_embedding -> post_vector [shared_dim]
+        Post Tower:
+            - use_post_encoder=True:  PostTower(post_embedding) -> post_vector [shared_dim]
+            - use_post_encoder=False: post_vector is the raw post embedding (identity)
         
         Scoring: dot_product(user_vector, post_vector) -> raw score
                  sigmoid(raw_score) -> engagement_probability
     
     Key characteristics:
-        - Shared embedding space: Both towers output same dimensionality
+        - Shared embedding space: Both towers output the same dimensionality for dot product
         - Independent computation: Towers never exchange information (until final dot product)
-        - Modular encoders: User tower can be "attention" or "cross_attention"
+        - Modular encoders: User tower can be "summarized", "attention", or "cross_attention"
     
     Deployment pattern:
         1. Pre-compute post_vectors for all candidate posts
@@ -227,8 +241,8 @@ class TwoTowerModel(nn.Module):
         num_attention_layers: Transformer layers for TransformerDualPoolingEncoder
         max_history_len: Maximum history sequence length
         dropout_rate: Dropout probability
-        user_encoder_type: User tower architecture - "attention" (full transformer)
-                           or "cross_attention" (single-query cross-attention pooling)
+        user_encoder_type: User tower architecture - "summarized", "attention", or "cross_attention"
+        use_post_encoder: If True, learn a post projection (PostTower). If False, use raw post embeddings.
     """
 
     def __init__(
@@ -270,13 +284,15 @@ class TwoTowerModel(nn.Module):
                 dropout_rate=dropout_rate,
             )
         elif user_encoder_type == "summarized":
-            # nothing to do in here, we get the summarization from the SummarizedEngagementDataset automatically
-            # note that the user_tower is not actually used in this case (see forward())
+            # In "summarized" mode, the dataset provides the user vector directly
+            # (e.g., mean/EMA/linear-recency summary). The model treats the
+            # history input as an already-encoded user embedding.
             def _dummy_user_tower(history_embeddings: torch.Tensor, history_mask: Optional[torch.Tensor] = None):
                 return history_embeddings
             self.user_tower = _dummy_user_tower
 
-            # if using summarization for user tower, then the post tower has to use the same output dimension
+            # If we still learn a post projection (use_post_encoder=True), its output
+            # dimension must match the dataset-provided user embedding dimension.
             if use_post_encoder and (shared_dim != post_embedding_dim):
                 raise ValueError(f"--shared-dim ({shared_dim}) and post embedding dim ({post_embedding_dim}) do not match! They must match for two tower with user summarization.")
         else:
@@ -336,8 +352,10 @@ class TwoTowerModel(nn.Module):
         predicted engagement probability.
         
         Args:
-            history_embeddings: User history sequences [batch, seq_len, input_dim]
-            history_mask: History validity mask [batch, seq_len]
+            history_embeddings: User history input.
+                - summarized: user vectors [batch, embed_dim]
+                - otherwise: padded history sequences [batch, seq_len, input_dim]
+            history_mask: History validity mask [batch, seq_len] (None in summarized mode)
             post_embeddings: Target post embeddings [batch, input_dim]
         
         Returns:
@@ -369,10 +387,12 @@ class TwoTowerModel(nn.Module):
         to get probabilities, and calculates binary cross-entropy loss.
         
         Args:
-            history_embeddings: User history sequences [batch, seq_len, input_dim]
-            history_mask: History validity mask [batch, seq_len]
-            post_embeddings: Target post embeddings [batch, input_dim]
-            labels: Binary engagement labels [batch]
+            batch: Batch dictionary. Expected keys depend on `user_encoder_type`:
+                - "summarized": {"features", "label"} where features is
+                  [B, 2*embed_dim] concatenated [user_summary || post_embedding]
+                - otherwise: {"history_embeddings", "history_mask", "target_post_embedding", "label"}
+            device: Device string (e.g. "cpu" or "cuda")
+            embed_dim: Post embedding dimensionality D (used only to split "features" in summarized mode)
         
         Returns:
             Tuple of (loss, scores):

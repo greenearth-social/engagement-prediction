@@ -9,7 +9,7 @@ Subcommands:
 
 Usage examples:
     python cli.py run-all --user-encoder summarized --epochs 150 --embedding-model all_MiniLM_L12_v2
-    python cli.py run-all --user-encoder attention --model-type two-tower --config configs/pipeline.yml --foreground
+    python cli.py run-all --user-encoder attention --model-type two-tower --config config.yml --foreground
 """
 
 import argparse
@@ -276,7 +276,7 @@ def _generate_run_name(args: argparse.Namespace) -> str:
 
 
 def cmd_run_all(args: argparse.Namespace) -> int:
-    """Run the 4-stage pipeline.
+    """Run the 5-stage pipeline.
 
     Creates a run directory up front and backgrounds itself with nohup unless --foreground.
     """
@@ -406,8 +406,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
         _mp, _folder = reg.get_stage_spec(key)
         stage_folder[key] = _folder
 
-    # Respect selective reruns
-    # Map 'train' to the actual train key BEFORE validation
+    # Respect selective reruns (map the generic "train" alias to the concrete train stage key)
     start_from = args.start_from
     if start_from == 'train':
         start_from = train_key

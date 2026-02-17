@@ -37,7 +37,7 @@ Both models are trained with:
     - Binary cross-entropy loss
     - Balanced positive/negative sampling (1:1 ratio)
     - AdamW optimizer with learning rate scheduling
-    - Early stopping based on validation loss
+    - Early stopping based on validation AUC
     - Comprehensive metrics tracking (loss, AUC, precision, recall)
 
 Inputs (from prior pipeline stages):

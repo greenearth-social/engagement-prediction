@@ -25,7 +25,9 @@ model architectures:
    • LinearRecencySummarizer : Linear decay weighting (most recent = highest weight)
    
    Output format: Concatenated [user_summary || post_embedding] vector
-   Memory:        Pre-computed and cached in RAM (~280 MB for 178K samples)
+   Memory:        Pre-computed and cached in RAM (user summaries + pos/neg post
+                  embeddings). Roughly ~3 * N * D * 4 bytes for float32 tensors
+                  (e.g., N=178K, D=384 → ~0.8 GB).
    
 2. **Variable-Length Sequences** (SequenceEngagementDataset)
    ─────────────────────────────────────────────────────────────────────────
@@ -38,7 +40,8 @@ model architectures:
    • CrossAttentionPoolingEncoder   : Single learned-query cross-attention pooling
                                       Faster and fewer parameters
    
-   Output format: (padded_sequences, mask, target_post_embedding)
+   Output format: Dict with keys {"history_embeddings", "history_mask",
+                  "target_post_embedding", "label", "user_id", "post_id"}
    Memory:        Sequences loaded on-the-fly via memmap (~13 GB if pre-computed)
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -849,9 +852,12 @@ class SummarizedEngagementDataset(Dataset):
     ═══════════════════════════════════════════════════════════════════════════
     
     **Pre-computation strategy**: All user summaries and post embeddings are
-    materialized into contiguous float32 tensors at init time (~280 MB for 178K
-    samples with D=384). This makes __getitem__ a pure in-memory index lookup
-    with ZERO memmap I/O during training.
+    materialized into contiguous float32 tensors at init time. This makes
+    __getitem__ a pure in-memory index lookup with ZERO memmap I/O during
+    training.
+    
+    Memory scales as ~3 * N * D * 4 bytes for float32 (user summaries + pos post
+    embs + neg post embs). For example, N=178K and D=384 is ~0.8 GB.
     
     ═══════════════════════════════════════════════════════════════════════════
     
