@@ -86,7 +86,6 @@ from utils.dataloaders import (
     get_summarizer,
     SummarizedEngagementDataset,
     SequenceEngagementDataset,
-    sequence_collate_fn,
     TransformerDualPoolingEncoder,
     create_data_loaders,
 )
@@ -495,7 +494,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     lr_scheduler_factor = float(args.lr_scheduler_factor)
     lr_scheduler_patience = int(args.lr_scheduler_patience)
     gradient_clip_max_norm = float(args.gradient_clip_max_norm)
-    collate_fn = None  # non-None only for sequence datasets
 
     # Worker settings (shared by all encoder types)
     num_workers = int(args.num_dataloader_workers)
@@ -566,14 +564,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             attention_dropout=attention_dropout,
         )
 
-        collate_fn = sequence_collate_fn
         train_loader, val_loader, _ = create_data_loaders(
             train_dataset, val_dataset, batch_size,
             num_workers=num_workers,
             pin_memory=pin_memory,
             persistent_workers=persistent_workers,
             prefetch_factor=prefetch_factor,
-            collate_fn=collate_fn,
         )
         input_dim = user_output_dim + embed_dim  # for config logging
     else:
@@ -625,7 +621,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         plot_training_history(hist, plots_dir / f"training_history_{timestamp}.png", best_epoch=best_epoch)
 
     # Collect train + val predictions for performance plots & metrics
-    def _collect_predictions(ds: Dataset, collate_fn_=None) -> tuple:
+    def _collect_predictions(ds: Dataset) -> tuple:
         loader_kw_: Dict[str, Any] = dict(
             batch_size=batch_size, shuffle=False, drop_last=False,
             num_workers=num_workers, pin_memory=pin_memory,
@@ -635,8 +631,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                 persistent_workers=persistent_workers,
                 prefetch_factor=prefetch_factor,
             )
-        if collate_fn_ is not None:
-            loader_kw_["collate_fn"] = collate_fn_
         loader = DataLoader(ds, **loader_kw_)
         ys, ps = [], []
         trained_model.eval()
@@ -658,8 +652,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         m["accuracy@0.5"] = float(accuracy_score(y_true, (y_pred > 0.5).astype(int)))
         return m
 
-    y_train, p_train = _collect_predictions(train_dataset, collate_fn_=collate_fn)
-    y_val, p_val = _collect_predictions(val_dataset, collate_fn_=collate_fn)
+    y_train, p_train = _collect_predictions(train_dataset)
+    y_val, p_val = _collect_predictions(val_dataset)
     train_metrics = _compute_metrics(y_train, p_train)
     val_metrics = _compute_metrics(y_val, p_val)
     logger.info(f"Train metrics: {train_metrics}")
@@ -727,7 +721,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             )
         if len(holdout_dataset) > 0:
             log_operation_start("Holdout evaluation", STAGE_LOG_NAME, logger)
-            y_holdout, p_holdout = _collect_predictions(holdout_dataset, collate_fn_=collate_fn)
+            y_holdout, p_holdout = _collect_predictions(holdout_dataset)
             holdout_metrics = _compute_metrics(y_holdout, p_holdout)
             logger.info(f"Holdout metrics: {holdout_metrics}")
 

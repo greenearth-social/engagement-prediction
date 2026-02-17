@@ -95,7 +95,6 @@ Learned Encoders (trainable neural networks):
 
 Utilities:
     load_training_data()         -- Locates and loads upstream pipeline artifacts
-    sequence_collate_fn()        -- Collation function for SequenceEngagementDataset
 """
 
 from __future__ import annotations
@@ -972,8 +971,8 @@ class SummarizedEngagementDataset(Dataset):
         return {
             "features": features,
             "label": torch.tensor(label, dtype=torch.float32),
-            "user_ids": self.target_dids[row_idx],
-            "post_ids": post_id,
+            "user_id": self.target_dids[row_idx],
+            "post_id": post_id,
         }
 
 
@@ -1161,40 +1160,6 @@ class SequenceEngagementDataset(Dataset):
         }
 
 
-def sequence_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Collate function for SequenceEngagementDataset batches.
-    
-    Stacks individual sample tensors into batch tensors. Since samples are already
-    padded to max_history_len by __getitem__, we can simply stack along a new
-    batch dimension.
-    
-    Args:
-        batch: List of sample dictionaries from SequenceEngagementDataset.__getitem__
-    
-    Returns:
-        Batched dictionary with:
-            - "history_embeddings": [batch, max_seq_len, D]
-            - "history_mask": [batch, max_seq_len]
-            - "target_post_embedding": [batch, D]
-            - "label": [batch]
-            - "user_ids": List of batch user ID strings (not stacked)
-            - "post_ids": List of batch post ID strings (not stacked)
-    
-    Note:
-        user_ids and post_ids remain as lists rather than being stacked into
-        tensors, since they're string identifiers used for logging/debugging
-        rather than model inputs.
-    """
-    return {
-        "history_embeddings": torch.stack([b["history_embeddings"] for b in batch]),
-        "history_mask": torch.stack([b["history_mask"] for b in batch]),
-        "target_post_embedding": torch.stack([b["target_post_embedding"] for b in batch]),
-        "label": torch.stack([b["label"] for b in batch]),
-        "user_ids": [b["user_id"] for b in batch],
-        "post_ids": [b["post_id"] for b in batch],
-    }
-
-
 # ---------------------------------------------------------------------------
 # DataLoader factory
 # ---------------------------------------------------------------------------
@@ -1208,7 +1173,6 @@ def create_data_loaders(
     pin_memory: bool = True,
     persistent_workers: bool = True,
     prefetch_factor: int = 2,
-    collate_fn = None,
 ):
     """Create PyTorch DataLoaders for training, validation, and optionally holdout sets.
     
@@ -1230,7 +1194,6 @@ def create_data_loaders(
         pin_memory: Use pinned (page-locked) memory for faster GPU transfer
         persistent_workers: Keep workers alive between epochs
         prefetch_factor: Number of batches to prefetch per worker
-        collate_fn: Optional custom collate function for batching (e.g., sequence_collate_fn)
     
     Returns:
         Tuple of (train_loader, val_loader, holdout_loader).
@@ -1262,21 +1225,18 @@ def create_data_loaders(
         batch_size=batch_size, 
         shuffle=True,  # Shuffle for stochastic training
         drop_last=True,  # Drop incomplete final batch for BatchNorm stability
-        collate_fn=collate_fn,
         **worker_kw
     )
     val_loader = DataLoader(
         val_dataset, 
         batch_size=batch_size, 
         shuffle=False,  # No shuffle for validation (deterministic evaluation)
-        collate_fn=collate_fn,
         **worker_kw
     )
     holdout_loader = DataLoader(
         holdout_dataset, 
         batch_size=batch_size, 
         shuffle=False,
-        collate_fn=collate_fn,
         **worker_kw
     ) if holdout_dataset else None
     return train_loader, val_loader, holdout_loader

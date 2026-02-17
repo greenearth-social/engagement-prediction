@@ -109,7 +109,6 @@ from utils.dataloaders import (
     load_training_data,
     SequenceEngagementDataset,
     SummarizedEngagementDataset,
-    sequence_collate_fn,
     TransformerDualPoolingEncoder,
     CrossAttentionPoolingEncoder,
     create_data_loaders,
@@ -524,8 +523,8 @@ def _evaluate_two_tower_model(
 
             all_preds.extend(probs.cpu().numpy().tolist())
             all_labels.extend(labels.numpy().tolist())
-            all_user_ids.extend(batch["user_ids"])
-            all_post_ids.extend(batch["post_ids"])
+            all_user_ids.extend(batch["user_id"])
+            all_post_ids.extend(batch["post_id"])
 
     y_true = np.array(all_labels)
     y_pred = np.array(all_preds)
@@ -545,8 +544,8 @@ def _evaluate_two_tower_model(
     return {
         "metrics": metrics,
         "predictions": {
-            "user_ids": all_user_ids,
-            "post_ids": all_post_ids,
+            "user_id": all_user_ids,
+            "post_id": all_post_ids,
             "y_true": y_true,
             "y_pred": y_pred,
         },
@@ -645,17 +644,12 @@ def run(context: Context, args) -> Dict[str, Any]:
         )
 
     # Create data loaders using centralized helper
-    collate_fn = None
-    if user_encoder_type != "summarized":
-        collate_fn = sequence_collate_fn
-
     train_loader, val_loader, _ = create_data_loaders(
         train_dataset, val_dataset, batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
-        collate_fn=collate_fn,
     )
 
     logger.info(f"Post embedding dim: {embed_dim}")
@@ -794,7 +788,6 @@ def run(context: Context, args) -> Dict[str, Any]:
                 pin_memory=pin_memory,
                 persistent_workers=persistent_workers,
                 prefetch_factor=prefetch_factor,
-                collate_fn=collate_fn,
             )
             holdout_eval = _evaluate_two_tower_model(trained_model, holdout_loader, device, embed_dim)
             holdout_metrics = holdout_eval["metrics"]
@@ -805,8 +798,8 @@ def run(context: Context, args) -> Dict[str, Any]:
             # Save predictions
             import pandas as pd
             pred_df = pd.DataFrame({
-                "did": holdout_eval["predictions"]["user_ids"],
-                "post_id": holdout_eval["predictions"]["post_ids"],
+                "did": holdout_eval["predictions"]["user_id"],
+                "post_id": holdout_eval["predictions"]["post_id"],
                 "y_true": holdout_eval["predictions"]["y_true"],
                 "y_pred_proba": holdout_eval["predictions"]["y_pred"],
             })
