@@ -528,16 +528,16 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             prefetch_factor=prefetch_factor,
         )
 
-    elif user_encoder == "attention":
+    elif user_encoder == "full_transformer":
         # Attention MLP path: sequence dataset + AttentionMLP with learned encoder
-        logger.info("User encoder: attention (TransformerDualPoolingEncoder + MLP)")
+        logger.info("User encoder: full_transformer (TransformerDualPoolingEncoder + MLP)")
         max_history_len = int(args.max_history_len)
         user_hidden_dim = int(args.user_hidden_dim)
         user_output_dim = int(args.user_output_dim)
         num_attention_heads = int(args.num_attention_heads)
         num_attention_layers = int(args.num_attention_layers)
         attention_dropout = float(args.attention_dropout)
-        summarizer_name = "attention"  # for config logging
+        summarizer_name = "full_transformer"  # for config logging
         ema_alpha = 0.0
 
         log_operation_start("Create datasets (sequence)", STAGE_LOG_NAME, logger)
@@ -575,7 +575,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     else:
         raise ValueError(
             f"Unknown user_encoder '{user_encoder}' for MLP. "
-            "Choose 'summarized' or 'attention'."
+            "Choose 'summarized' or 'full_transformer'."
         )
 
     # --- train ---

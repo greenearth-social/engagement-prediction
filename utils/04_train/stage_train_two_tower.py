@@ -39,7 +39,7 @@ This stage supports THREE user-history encoders, selected via `--user-encoder`:
    effectively the identity function at training time because the dataset has
    already produced the user vector.
 
-1. **"attention"** - TransformerDualPoolingEncoder (Full Transformer Self-Attention)
+1. **"full_transformer"** - TransformerDualPoolingEncoder (Full Transformer Self-Attention)
    ───────────────────────────────────────────────────────────────────────────
    Uses transformer encoder with multi-head self-attention to capture complex
    inter-post relationships in user history. Best modeling capacity but highest
@@ -208,7 +208,7 @@ class TwoTowerModel(nn.Module):
     
     Architecture:
         User Tower:
-            - "attention": TransformerDualPoolingEncoder(history_sequence, mask) -> user_vector [shared_dim]
+            - "full_transformer": TransformerDualPoolingEncoder(history_sequence, mask) -> user_vector [shared_dim]
             - "cross_attention": CrossAttentionPoolingEncoder(history_sequence, mask) -> user_vector [shared_dim]
             - "summarized": user_vector is provided by SummarizedEngagementDataset
               (the model treats the dataset-provided user summary as the user embedding)
@@ -223,7 +223,7 @@ class TwoTowerModel(nn.Module):
     Key characteristics:
         - Shared embedding space: Both towers output the same dimensionality for dot product
         - Independent computation: Towers never exchange information (until final dot product)
-        - Modular encoders: User tower can be "summarized", "attention", or "cross_attention"
+        - Modular encoders: User tower can be "summarized", "full_transformer", or "cross_attention"
     
     Deployment pattern:
         1. Pre-compute post_vectors for all candidate posts
@@ -240,7 +240,7 @@ class TwoTowerModel(nn.Module):
         num_attention_layers: Transformer layers for TransformerDualPoolingEncoder
         max_history_len: Maximum history sequence length
         dropout_rate: Dropout probability
-        user_encoder_type: User tower architecture - "summarized", "attention", or "cross_attention"
+        user_encoder_type: User tower architecture - "summarized", "full_transformer", or "cross_attention"
         use_post_encoder: If True, learn a post projection (PostTower). If False, use raw post embeddings.
     """
 
@@ -272,7 +272,7 @@ class TwoTowerModel(nn.Module):
                 max_seq_len=max_history_len,
                 dropout_rate=dropout_rate,
             )
-        elif user_encoder_type == "attention":
+        elif user_encoder_type == "full_transformer":
             self.user_tower = TransformerDualPoolingEncoder(
                 input_dim=post_embedding_dim,
                 hidden_dim=user_hidden_dim,
@@ -297,7 +297,7 @@ class TwoTowerModel(nn.Module):
         else:
             raise ValueError(
                 f"Unknown user_encoder_type '{user_encoder_type}'. "
-                "Choose 'summarized', 'attention' or 'cross_attention'."
+                "Choose 'summarized', 'full_transformer' or 'cross_attention'."
             )
 
         if use_post_encoder:
