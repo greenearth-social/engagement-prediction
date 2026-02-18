@@ -763,7 +763,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     if training_results is not None:
         best_val_auc = training_results["best_val_auc"]
     else:
-        best_val_auc = roc_auc_score(train_eval["predictions"]["y_true"], train_eval["predictions"]["y_pred"])
+        best_val_auc = roc_auc_score(val_eval["predictions"]["y_true"], val_eval["predictions"]["y_pred"])
 
     if generate_plots:
         try:
