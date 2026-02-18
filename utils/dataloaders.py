@@ -891,7 +891,7 @@ def _prepare_split_data(
     
     Returns:
         Tuple of (like_emb_idx, neg_emb_idx, prior_emb_indices_list, 
-                  target_dids, like_uris):
+                  target_dids, like_uris, neg_uris):
         
         - like_emb_idx: Indices into embeddings memmap for positive posts [N]
         - neg_emb_idx: Indices into embeddings memmap for negative posts [N]
@@ -899,7 +899,8 @@ def _prepare_split_data(
                                   embedding indices for that user's history
                                   (most-recent-first, uint32)
         - target_dids: User IDs as string array [N]
-        - like_uris: Post URIs as string array [N]
+        - like_uris: Liked post URIs as string array [N]
+        - neg_uris: Non-liked post URIs as string array [N]
         
         Where N = number of target posts in the requested split (after filtering).
     

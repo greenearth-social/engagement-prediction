@@ -817,7 +817,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         try:
             ts_model_path = checkpoints_dir / f"two_tower_{timestamp}_ts.pt"
             torch.jit.script(trained_model).save(ts_model_path)
-            context.tracker.log_artifact(name="trained_model_mlp", path=ts_model_path)
+            context.tracker.log_artifact(name="trained_model_two_tower", path=ts_model_path)
         except Exception as exc:
             logger.warning(f"TorchScript export failed (non-fatal): {exc}")
 
