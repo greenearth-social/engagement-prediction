@@ -564,8 +564,15 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="User encoder output dimension")
     _add_arg_with_default(p_all, "--post-hidden-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower post encoder hidden dimension")
-    _add_arg_with_default(p_all, "--use-post-encoder", type=bool, default=argparse.SUPPRESS,
-                          help_text="Use a neural transformation for the post tower (True) or use the post embedding directly (False)")
+    _add_arg_with_default(
+        p_all,
+        "--post-encoder",
+        key="use_post_encoder",
+        dest="use_post_encoder",
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+        help_text="Enable or disable a neural post-tower encoder. Use --post-encoder to enable, --no-post-encoder to disable",
+    )
     _add_arg_with_default(p_all, "--num-attention-heads", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower attention heads")
     _add_arg_with_default(p_all, "--num-attention-layers", type=int, default=argparse.SUPPRESS,
