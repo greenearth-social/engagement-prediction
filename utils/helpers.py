@@ -5,7 +5,7 @@ Consolidated Helpers for Engagement Prediction Pipeline
 
 This module centralizes the shared helper functions used across pipeline stages.
 Only truly cross-stage utilities live here. Stage-specific helpers should live
-inside their respective stage scripts (e.g., utils/05_train/stage_train.py).
+inside their respective stage scripts (e.g., utils/04_train/stage_train_mlp.py).
 """
 
 from __future__ import annotations
@@ -532,7 +532,22 @@ FIGURE_SIZE = (10, 6)
 DPI = 300
 
 
+def _configure_matplotlib_backend():
+    """Configure matplotlib to use non-interactive Agg backend.
+    
+    This should be called before any matplotlib.pyplot imports to avoid
+    display issues in headless environments. Checks if matplotlib has already
+    been imported and only sets the backend if it hasn't, avoiding warnings
+    about changing backends after initialization.
+    """
+    import sys
+    if 'matplotlib' not in sys.modules:
+        import matplotlib
+        matplotlib.use("Agg")
+
+
 def plot_training_history(history: Dict[str, List[float]], save_path: Optional[Path] = None, best_epoch: Optional[int] = None):
+    _configure_matplotlib_backend()
     import matplotlib.pyplot as plt  # type: ignore
     required_keys = ['train_loss', 'val_loss', 'train_auc', 'val_auc']
     if any(k not in history for k in required_keys) or len(history.get('train_loss', [])) == 0:
@@ -562,11 +577,17 @@ def plot_training_history(history: Dict[str, List[float]], save_path: Optional[P
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
-    plt.show()
+    plt.close(fig)
 
 
-def plot_model_performance(y_true: np.ndarray, y_pred_proba: np.ndarray, save_path: Optional[Path] = None):
+def plot_model_performance(
+    y_true: np.ndarray,
+    y_pred_proba: np.ndarray,
+    save_path: Optional[Path] = None,
+    title_suffix: str = "",
+):
     import numpy as np
+    _configure_matplotlib_backend()
     import matplotlib.pyplot as plt  # type: ignore
     try:
         import seaborn as sns  # type: ignore
@@ -580,14 +601,14 @@ def plot_model_performance(y_true: np.ndarray, y_pred_proba: np.ndarray, save_pa
     axes[0, 0].plot([0, 1], [0, 1], 'k--', alpha=0.5)
     axes[0, 0].set_xlabel('False Positive Rate')
     axes[0, 0].set_ylabel('True Positive Rate')
-    axes[0, 0].set_title('ROC Curve')
+    axes[0, 0].set_title(f'ROC Curve {title_suffix}'.strip())
     axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
     precision, recall, _ = precision_recall_curve(y_true, y_pred_proba)
     axes[0, 1].plot(recall, precision)
     axes[0, 1].set_xlabel('Recall')
     axes[0, 1].set_ylabel('Precision')
-    axes[0, 1].set_title('Precision-Recall Curve')
+    axes[0, 1].set_title(f'Precision-Recall Curve {title_suffix}'.strip())
     axes[0, 1].grid(True, alpha=0.3)
     y_pred_binary = (y_pred_proba > 0.5).astype(int)
     cm = confusion_matrix(y_true, y_pred_binary)
@@ -597,20 +618,20 @@ def plot_model_performance(y_true: np.ndarray, y_pred_proba: np.ndarray, save_pa
         axes[1, 0].imshow(cm, cmap='Blues')
         for (i, j), val in np.ndenumerate(np.array(cm)):
             axes[1, 0].text(j, i, int(val), ha='center', va='center')
-    axes[1, 0].set_title('Confusion Matrix')
+    axes[1, 0].set_title(f'Confusion Matrix {title_suffix}'.strip())
     axes[1, 0].set_xlabel('Predicted')
     axes[1, 0].set_ylabel('Actual')
     axes[1, 1].hist(y_pred_proba[y_true == 0], bins=50, alpha=0.7, label='Not Liked')
     axes[1, 1].hist(y_pred_proba[y_true == 1], bins=50, alpha=0.7, label='Liked')
     axes[1, 1].set_xlabel('Predicted Probability')
     axes[1, 1].set_ylabel('Frequency')
-    axes[1, 1].set_title('Prediction Distribution')
+    axes[1, 1].set_title(f'Prediction Distribution {title_suffix}'.strip())
     axes[1, 1].legend()
     axes[1, 1].grid(True, alpha=0.3)
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
-    plt.show()
+    plt.close()
 
 
 def create_user_visualization(user_tracking_results: Dict[str, Any], timestamp: str, save_dir: Path) -> None:
@@ -707,3 +728,43 @@ def get_device(arg_device: Optional[str]) -> str:
         return device
     else:
         return arg_device
+
+
+# ----------------------------------------
+# PyTorch utilities
+# ----------------------------------------
+
+def clear_cuda_memory():
+    """Aggressively clear CUDA cache and run garbage collection.
+    
+    Useful for freeing GPU memory between model creation, particularly when
+    experimenting with different model sizes or batch sizes.
+    """
+    import gc
+    import torch
+    gc.collect()
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
+def set_random_seeds(seed: int):
+    """Set random seeds for reproducibility across Python, NumPy, and PyTorch.
+    
+    Args:
+        seed: Random seed value
+        
+    Note:
+        This ensures deterministic behavior for model initialization, data
+        shuffling, and stochastic operations like dropout. However, some
+        CUDA operations may still have non-deterministic behavior.
+    """
+    import random as _random
+    import numpy as np
+    import torch
+    _random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)

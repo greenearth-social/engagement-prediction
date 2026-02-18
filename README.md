@@ -76,8 +76,8 @@ Tests all reside in the `tests/` directory and should use the file naming conven
 - `utils/02_featurize/stage_featurize.py`: Stage 2 — Build candidate post set and compute text+image embeddings → save `embedding_bundle_*.pkl`.
 - `utils/03_relevel/stage_relevel_uniform.py`: Stage 3 — Discover topics and compute per-user mixtures; optional uniform-mixture-balanced relevel selection.
 - `utils/04_split/stage_split_users.py`: Stage 4 — Produce `user_splits.json` (train/val/holdout).
-- `utils/05_train/stage_train.py`: Stage 5 (MLP) — Train MLP model using bundle + splits; saves checkpoint and `training_config.json`.
-- `utils/05_train/stage_train_two_tower.py`: Stage 5 (Two-Tower) — Train two-tower model with user history attention encoder.
+- `utils/04_train/stage_train_mlp.py`: Stage 4 (MLP) — Train MLP model using bundle + splits; saves checkpoint and `training_config.json`.
+- `utils/04_train/stage_train_two_tower.py`: Stage 4 (Two-Tower) — Train two-tower model with user history attention encoder.
 - `utils/06_evaluate/stage_evaluate.py`: Stage 6 — Consolidated evaluation (pairs, matrix, global_unliked).
 - `utils/00_helpers/helpers.py`: Minimal cross-stage helpers (re-exported from existing modules).
 - `utils/pipeline/{core.py, registry.py}`: Context, timestamped output dirs, and stage registry.
@@ -197,7 +197,7 @@ The previous `src/preprocess.py` → `src/train.py` → `src/evaluate_full_feed_
 #### MLP Model (default)
 Run all six stages with the default MLP architecture:
 ```bash
-python cli.py run-all \
+python cli.py run-all --user-encoder summarized \
   --max-files-per-table 7 --max-posts-per-author 3 --image-mode auto \
   --global-topic-k 20 --relevel-strategy uniform_mixture_balanced --min-likes-per-user 10 \
   --epochs 300 --batch-size 256 --device cuda
@@ -206,7 +206,7 @@ python cli.py run-all \
 #### Two-Tower Model
 Run all six stages with the two-tower architecture:
 ```bash
-python cli.py run-all --model-type two-tower \
+python cli.py run-all --model-type two-tower --user-encoder attention \
   --max-files-per-table 7 --max-posts-per-author 3 --image-mode auto \
   --global-topic-k 20 --relevel-strategy uniform_mixture_balanced --min-likes-per-user 10 \
   --epochs 100 --batch-size 256 --device cuda
@@ -214,6 +214,7 @@ python cli.py run-all --model-type two-tower \
 
 Two-tower specific options:
 - `--model-type two-tower`: Use the two-tower architecture instead of MLP
+- `--user-encoder attention`: User encoder type (required; attention or cross_attention for two-tower)
 - `--shared-dim 128`: Output embedding dimension for both towers
 - `--num-attention-heads 4`: Number of attention heads in user history encoder
 - `--num-attention-layers 2`: Number of transformer layers in user history encoder
@@ -222,14 +223,14 @@ Two-tower specific options:
 #### Train-Eval with Two-Tower
 Train a two-tower model on an existing run directory:
 ```bash
-python cli.py train-eval --model-type two-tower \
+python cli.py train-eval --model-type two-tower --user-encoder attention \
   --run-dir outputs/20231215_run_d7_mppa3/ \
   --epochs 100 --batch-size 256 --device cuda
 ```
 
 Or with explicit paths:
 ```bash
-python cli.py train-eval --model-type two-tower \
+python cli.py train-eval --model-type two-tower --user-encoder attention \
   --embedding-bundle outputs/run/02_featurize/embedding_bundle_*.pkl \
   --user-splits outputs/run/04_split/user_splits.json \
   --shared-dim 256 --num-attention-heads 8 --max-history-len 50
@@ -276,10 +277,10 @@ pytest -q
 
 Two-tower model:
 ```bash
-python cli.py run-all --model-type two-tower   --max-files-per-table 14 --max-posts-per-author 5 --image-mode off   --global-topic-k 20 --relevel-strategy uniform_mixture_balanced --min-likes-per-user 10   --epochs 100 --batch-size 256 --device cuda
+python cli.py run-all --model-type two-tower --user-encoder attention   --max-files-per-table 14 --max-posts-per-author 5 --image-mode off   --global-topic-k 20 --relevel-strategy uniform_mixture_balanced --min-likes-per-user 10   --epochs 100 --batch-size 256 --device cuda
 ```
 
 MLP model:
 ```bash
-python cli.py run-all --model-type mlp   --max-files-per-table 14 --max-posts-per-author 5 --image-mode off   --global-topic-k 20 --relevel-strategy uniform_mixture_balanced --min-likes-per-user 10   --epochs 100 --batch-size 256 --device cuda
+python cli.py run-all --model-type mlp --user-encoder summarized   --max-files-per-table 14 --max-posts-per-author 5 --image-mode off   --global-topic-k 20 --relevel-strategy uniform_mixture_balanced --min-likes-per-user 10   --epochs 100 --batch-size 256 --device cuda
 ```

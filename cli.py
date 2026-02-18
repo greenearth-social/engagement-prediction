@@ -8,8 +8,8 @@ Subcommands:
 - run-all: Run the 5-stage pipeline end-to-end (get_data → target_posts → user_history → train → evaluate)
 
 Usage examples:
-    python cli.py run-all --epochs 150 --embedding-model all_MiniLM_L12_v2
-    python cli.py run-all --config configs/pipeline.yml --foreground
+    python cli.py run-all --user-encoder summarized --epochs 150 --embedding-model all_MiniLM_L12_v2
+    python cli.py run-all --user-encoder attention --model-type two-tower --config configs/pipeline.yml --foreground
 """
 
 import argparse
@@ -61,14 +61,19 @@ DEFAULTS: Dict[str, Any] = {
     "train_start": None,
     "val_start": None,
     "holdout_start": None,
-    # Stage 4 (train)
+    # Stage 4 (train) - Model architecture
+    "user_summarization": "mean",  # MLP user-history summarization: mean, ema, linear_recency
+    "ema_alpha": 0.1,  # EMA smoothing factor (only used when user_summarization=ema)
+    "user_encoder": "summarized",  # User encoder type: must be explicitly specified and compatible with model_type
     "model_type": "mlp",
     "shared_dim": 128,
     "user_hidden_dim": 256,
+    "user_output_dim": 128,  # Output dimension for user encoder in AttentionMLP; separate from shared_dim which is used in TwoTower
     "post_hidden_dim": 256,
     "num_attention_heads": 4,
     "num_attention_layers": 2,
     "max_history_len": 20,
+    "attention_dropout": 0.1,  # Dropout rate for attention-based user encoders
     "epochs": 300,
     "batch_size": 256,
     "learning_rate": 0.001,
@@ -80,8 +85,20 @@ DEFAULTS: Dict[str, Any] = {
     "prediction_posts_per_user": 1,
     "device": None,
     "patience": 50,
+    "run_tag": None,  # Optional tag appended to training output directory name
     "no_plots": False,
     "no_save_model": False,
+    "disable_progress": False,  # Disable progress bars during training
+    # Stage 4 (train) - DataLoader settings
+    "num_dataloader_workers": 4,
+    "dataloader_pin_memory": True,
+    "dataloader_persistent_workers": True,
+    "dataloader_prefetch_factor": 2,
+    # Stage 4 (train) - Learning rate scheduler
+    "lr_scheduler_factor": 0.5,
+    "lr_scheduler_patience": 5,
+    # Stage 4 (train) - Training optimization
+    "gradient_clip_max_norm": 1.0,
     # Stage 5 (eval)
     "eval_batch_size": 8192,
     "eval_max_users": None,
@@ -139,6 +156,7 @@ def _build_tracking_params(args: argparse.Namespace, run_dir: Path) -> Dict[str,
     return {
         "meta": {
             "run_dir": str(run_dir),
+            "run_tag": getattr(args, "run_tag", None),
             "start_from": args.start_from,
             "stop_after": args.stop_after,
             "cap_random_seed": args.cap_random_seed,
@@ -160,6 +178,9 @@ def _build_tracking_params(args: argparse.Namespace, run_dir: Path) -> Dict[str,
             "max_memory_pct": args.max_memory_pct,
         },
         "train": {
+            "user_summarization": args.user_summarization,
+            "ema_alpha": args.ema_alpha,
+            "user_encoder": args.user_encoder,
             "model_type": args.model_type,
             "shared_dim": args.shared_dim,
             "user_hidden_dim": args.user_hidden_dim,
@@ -178,6 +199,13 @@ def _build_tracking_params(args: argparse.Namespace, run_dir: Path) -> Dict[str,
             "prediction_posts_per_user": args.prediction_posts_per_user,
             "patience": args.patience,
             "device": args.device,
+            "num_dataloader_workers": args.num_dataloader_workers,
+            "dataloader_pin_memory": args.dataloader_pin_memory,
+            "dataloader_persistent_workers": args.dataloader_persistent_workers,
+            "dataloader_prefetch_factor": args.dataloader_prefetch_factor,
+            "lr_scheduler_factor": args.lr_scheduler_factor,
+            "lr_scheduler_patience": args.lr_scheduler_patience,
+            "gradient_clip_max_norm": args.gradient_clip_max_norm,
         },
         "eval": {
             "eval_batch_size": args.eval_batch_size,
@@ -364,6 +392,19 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
         train_key = 'train_two_tower'
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
+
+    # --- Validation for --user-encoder ---
+    user_encoder = args.user_encoder
+    valid_encoders = {
+        "mlp": ("summarized", "attention"),
+        "two-tower": ("attention", "cross_attention"),
+    }
+    allowed = valid_encoders.get(model_type, ())
+    if user_encoder not in allowed:
+        raise ValueError(
+            f"--user-encoder '{user_encoder}' is not valid for --model-type '{model_type}'. "
+            + f"Allowed values: {allowed}"
+        )
     
     stage_order = ['get_data', 'target_posts', 'user_history', train_key, 'evaluate']
     stage_folder = {}
@@ -372,17 +413,17 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
         stage_folder[key] = _folder
 
     # Respect selective reruns
+    # Map 'train' to the actual train key BEFORE validation
     start_from = args.start_from
-    if start_from and start_from not in stage_order:
-        raise ValueError(f"Unrecognized start_from: {start_from}. Please choose from: {stage_order}")
-    stop_after = args.stop_after
-    if stop_after and stop_after not in stage_order:
-        raise ValueError(f"Unrecognized stop_after: {stop_after}. Please choose from: {stage_order}")
-    # Map 'train' to the actual train key (train_mlp or train_two_tower)
     if start_from == 'train':
         start_from = train_key
+    stop_after = args.stop_after
     if stop_after == 'train':
         stop_after = train_key
+    if start_from and start_from not in stage_order:
+        raise ValueError(f"Unrecognized start_from: {start_from}. Please choose from: {stage_order}")
+    if stop_after and stop_after not in stage_order:
+        raise ValueError(f"Unrecognized stop_after: {stop_after}. Please choose from: {stage_order}")
     start_idx = stage_order.index(start_from) if start_from in stage_order else 0
     stop_idx = stage_order.index(stop_after) if stop_after in stage_order else (len(stage_order) - 1)
 
@@ -510,14 +551,24 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Number of global topics")
     _add_arg_with_default(p_all, "--min-likes-per-user", type=int, default=argparse.SUPPRESS,
                           help_text="Minimum likes per user for inclusion (used in Stage 1 filtering and later stages)")
-    # Stage 5 (train) model selection
+    # Stage 4 (train) user summarization + model selection
+    _add_arg_with_default(p_all, "--user-summarization", type=str, choices=["mean", "ema", "linear_recency"],
+                          default=argparse.SUPPRESS,
+                          help_text="User-history summarization strategy for MLP (mean, ema, linear_recency)")
+    _add_arg_with_default(p_all, "--ema-alpha", type=float, default=argparse.SUPPRESS,
+                          help_text="EMA smoothing factor (0,1]. Higher = more weight on recent likes. Only used when --user-summarization=ema")
+    _add_arg_with_default(p_all, "--user-encoder", type=str, choices=["summarized", "attention", "cross_attention"],
+                          default=argparse.SUPPRESS,
+                          help_text="User encoder type (must match model-type: summarized for mlp, attention for two-tower, cross_attention for two-tower only)")
     _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower"],
                           default=argparse.SUPPRESS, help_text="Model architecture: mlp or two-tower")
     # Two-tower specific options
     _add_arg_with_default(p_all, "--shared-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower shared embedding dimension")
     _add_arg_with_default(p_all, "--user-hidden-dim", type=int, default=argparse.SUPPRESS,
-                          help_text="Two-tower user encoder hidden dimension")
+                          help_text="User encoder hidden dimension")
+    _add_arg_with_default(p_all, "--user-output-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="User encoder output dimension")
     _add_arg_with_default(p_all, "--post-hidden-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower post encoder hidden dimension")
     _add_arg_with_default(p_all, "--num-attention-heads", type=int, default=argparse.SUPPRESS,
@@ -525,7 +576,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--num-attention-layers", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower attention layers")
     _add_arg_with_default(p_all, "--max-history-len", type=int, default=argparse.SUPPRESS,
-                          help_text="Two-tower max user history length")
+                          help_text="Max user history length")
+    _add_arg_with_default(p_all, "--attention-dropout", type=float, default=argparse.SUPPRESS,
+                          help_text="Dropout rate for attention-based user encoders")
     # Stage 5 options (shared)
     _add_arg_with_default(p_all, "--epochs", type=int, default=argparse.SUPPRESS,
                           help_text="Training epochs")
@@ -549,11 +602,32 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Device for training")
     _add_arg_with_default(p_all, "--patience", type=int, default=argparse.SUPPRESS,
                           help_text="Early stopping patience")
+    _add_arg_with_default(p_all, "--run-tag", type=str, default=argparse.SUPPRESS,
+                          help_text="Tag appended to training output directory name (e.g. mlp_summarized_mean)")
     _add_arg_with_default(p_all, "--no-plots", action="store_true", default=argparse.SUPPRESS,
                           help_text="Disable training plots")
     _add_arg_with_default(p_all, "--no-save-model", action="store_true", default=argparse.SUPPRESS,
                           help_text="Skip saving model checkpoints")
-    # Stage 4 options (subset)
+    _add_arg_with_default(p_all, "--disable-progress", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Disable progress bars during training")
+    # Stage 4 (train) - DataLoader settings
+    _add_arg_with_default(p_all, "--num-dataloader-workers", type=int, default=argparse.SUPPRESS,
+                          help_text="Number of DataLoader worker processes")
+    _add_arg_with_default(p_all, "--dataloader-pin-memory", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Enable DataLoader pin_memory for faster GPU transfer")
+    _add_arg_with_default(p_all, "--dataloader-persistent-workers", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Keep DataLoader workers alive between epochs")
+    _add_arg_with_default(p_all, "--dataloader-prefetch-factor", type=int, default=argparse.SUPPRESS,
+                          help_text="Number of batches to prefetch per DataLoader worker")
+    # Stage 4 (train) - Learning rate scheduler
+    _add_arg_with_default(p_all, "--lr-scheduler-factor", type=float, default=argparse.SUPPRESS,
+                          help_text="Factor by which to reduce learning rate")
+    _add_arg_with_default(p_all, "--lr-scheduler-patience", type=int, default=argparse.SUPPRESS,
+                          help_text="Number of epochs with no improvement before reducing LR")
+    # Stage 4 (train) - Training optimization
+    _add_arg_with_default(p_all, "--gradient-clip-max-norm", type=float, default=argparse.SUPPRESS,
+                          help_text="Maximum gradient norm for clipping (two-tower only)")
+    # Stage 5 options (subset)
     _add_arg_with_default(p_all, "--eval-batch-size", type=int, default=argparse.SUPPRESS,
                           help_text="Batch size for evaluation")
     _add_arg_with_default(p_all, "--eval-max-users", type=int, default=argparse.SUPPRESS,
