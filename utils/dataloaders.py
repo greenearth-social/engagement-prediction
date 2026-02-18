@@ -301,6 +301,26 @@ def get_summarizer(name: str, **kwargs: Any) -> UserSummarizer:
 # ---------------------------------------------------------------------------
 
 class BaseAttentionEncoder(nn.Module, ABC):
+    """Shared building blocks for learned user-history encoders that use attention-style pooling.
+
+    This base class centralizes the parts that are common across multiple "learned"
+    history encoders:
+      - projecting raw per-post embeddings into a model hidden space
+      - adding learnable positional embeddings that encode *recency*
+      - pooling a variable-length sequence into a fixed-size vector via:
+          (1) learned-query attention pooling (content-aware)
+          (2) masked mean pooling (coverage / stability)
+      - projecting pooled features into a final `output_dim` representation
+
+    Subclasses are responsible for defining the "sequence modeling" portion between
+    positional encoding and pooling (e.g., a TransformerEncoder stack, or no
+    self-attention at all).
+
+    Mask conventions:
+      - Public `forward()` expects `history_mask` where **True means valid**.
+      - PyTorch transformer modules often expect an inverted key-padding mask where
+        **True means ignore**; subclasses should invert as needed.
+    """
 
     def __init__(
         self,
@@ -310,6 +330,26 @@ class BaseAttentionEncoder(nn.Module, ABC):
         max_seq_len: int,
         dropout_rate: float,
     ):
+        """Construct shared layers used by attention-based history encoders.
+
+        Args:
+            input_dim: Dimensionality of each item in the input sequence (e.g. a
+                post/content embedding size).
+            hidden_dim: Internal model dimension used for attention/pooling.
+            output_dim: Dimensionality of the final user representation produced by
+                the encoder.
+            max_seq_len: Maximum supported history length. This controls the size of
+                the learnable positional-embedding table.
+            dropout_rate: Dropout probability applied in projection MLPs.
+
+        Notes:
+            - Positional embeddings are learnable (not sinusoidal) and are applied
+              after the input projection.
+            - The positional scheme is *recency-flipped*: position 0 corresponds to
+              the most recent item (see `_forward_up_to_pos_embed`).
+            - The final projection expects concatenated pooled features of size
+              `2 * hidden_dim` (attention pooled + mean pooled).
+        """
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -354,6 +394,31 @@ class BaseAttentionEncoder(nn.Module, ABC):
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
         history_mask: Optional[torch.Tensor] = None,  # [B, seq_len] True = valid
     ) -> Tuple[int, int, torch.Tensor, torch.Tensor]:
+        """Project inputs, normalize mask, and add (recency-flipped) positional embeddings.
+
+        This helper performs the common "front half" of every attention-based encoder:
+          1) ensure we have a boolean validity mask on the right device
+          2) project raw input embeddings into `hidden_dim`
+          3) add a learnable positional embedding for each sequence position
+
+        The positional embedding indexing is intentionally **flipped** so that the
+        earliest positions in the tensor (index 0, 1, 2, ...) represent *more recent*
+        events. This matches the typical "most recent first" intuition and allows
+        the model to learn a consistent recency prior independent of padding.
+
+        Args:
+            history_embeddings: Padded input sequence tensor `[B, seq_len, input_dim]`.
+            history_mask: Optional boolean validity mask `[B, seq_len]` where True
+                means the corresponding position is real (not padding). If omitted,
+                all positions are treated as valid.
+
+        Returns:
+            A 4-tuple `(B, seq_len, history_mask, x)` where:
+              - `B` and `seq_len` are extracted from the input for convenience.
+              - `history_mask` is a boolean tensor on the same device as inputs.
+              - `x` is the projected + position-encoded representation
+                `[B, seq_len, hidden_dim]`.
+        """
         B, seq_len, _ = history_embeddings.shape
         device = history_embeddings.device
 
@@ -367,6 +432,9 @@ class BaseAttentionEncoder(nn.Module, ABC):
         x = self.input_projection(history_embeddings)
 
         # Add positional information (flipped: position 0 = most recent)
+        # `positions` indexes into the learnable table `self.positional_embedding`.
+        # We clamp to `max_seq_len - 1` so that longer sequences reuse the "oldest"
+        # available positional embedding rather than indexing out of range.
         positions = torch.arange(seq_len, device=device)
         positions = (self.max_seq_len - 1) - positions.clamp(max=self.max_seq_len - 1)
         pos_emb = self.positional_embedding(positions)
@@ -380,12 +448,43 @@ class BaseAttentionEncoder(nn.Module, ABC):
         attn_mask_inv: torch.Tensor, 
         seq_len: int
     ) -> torch.Tensor:
+        """Pool a sequence into a single vector using learned-query attention.
+
+        Conceptually, this performs a single "cross-attention" step where a learned
+        query vector attends over the sequence:
+          - query: a trainable vector shared across all examples
+          - keys/values: the sequence representations `x`
+
+        This yields a content-aware weighted average of the sequence. The mask is
+        applied so padding positions do not receive attention mass.
+
+        Args:
+            B: Batch size.
+            x: Sequence representations `[B, seq_len, hidden_dim]`.
+            attn_mask_inv: Inverted key-padding mask `[B, seq_len]` where True means
+                "ignore this position" (PyTorch transformer convention).
+            seq_len: Sequence length (used for a safe fallback in the all-masked case).
+
+        Returns:
+            Attention-pooled representations `[B, hidden_dim]`.
+        """
+        # Expand the shared learned query to one per batch element.
         query = self.attention_query.expand(B, -1, -1)  # [B, 1, hidden]
+
+        # Compute raw dot-product scores between the query and each sequence element.
         attn_scores = torch.bmm(query, x.transpose(1, 2))  # [B, 1, seq]
+
+        # Prevent padded (ignored) positions from contributing by assigning -inf
+        # before softmax. This forces their probability mass to 0.
         attn_scores = attn_scores.masked_fill(attn_mask_inv.unsqueeze(1), float("-inf"))
         attn_weights = F.softmax(attn_scores, dim=-1)
-        # Handle all-masked sequences
+
+        # Handle the edge case where the entire sequence is masked (e.g., a user
+        # with no valid history in the current batch). In that case, softmax can
+        # produce NaNs (all -inf). We replace NaNs with a uniform distribution.
         attn_weights = torch.nan_to_num(attn_weights, nan=1.0 / max(seq_len, 1))
+
+        # Weighted sum of values (the same `x` sequence) -> one vector per example.
         attention_pooled = torch.bmm(attn_weights, x).squeeze(1)  # [B, hidden]
         return attention_pooled
     
@@ -394,8 +493,24 @@ class BaseAttentionEncoder(nn.Module, ABC):
         x: torch.Tensor, 
         history_mask: torch.Tensor
     ) -> torch.Tensor:
+        """Compute a masked mean over the sequence dimension.
+
+        Mean pooling acts as a robust "coverage" baseline: every valid item
+        contributes equally, and padding contributes zero.
+
+        Args:
+            x: Sequence representations `[B, seq_len, hidden_dim]`.
+            history_mask: Validity mask `[B, seq_len]` where True means valid.
+
+        Returns:
+            Mean-pooled representations `[B, hidden_dim]`.
+        """
+        # Expand the mask to match `[B, seq_len, hidden_dim]` for elementwise multiply.
         mask_expanded = history_mask.unsqueeze(-1).float()
         sum_x = (x * mask_expanded).sum(dim=1)
+
+        # `count` is the number of valid (non-padding) positions. Clamp to 1 to
+        # avoid division-by-zero for empty histories.
         count = mask_expanded.sum(dim=1).clamp(min=1)
         mean_pooled = sum_x / count
         return mean_pooled
@@ -406,6 +521,23 @@ class BaseAttentionEncoder(nn.Module, ABC):
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
         history_mask: Optional[torch.Tensor] = None,  # [B, seq_len] True = valid
     ) -> torch.Tensor:
+        """Encode a padded history sequence into a fixed-size representation.
+
+        Subclasses should:
+          1) call `_forward_up_to_pos_embed()` to obtain projected + position-encoded `x`
+          2) optionally apply a sequence model (e.g. TransformerEncoder) using the
+             appropriate key-padding mask convention
+          3) pool the sequence into one or more fixed vectors (often using
+             `_forward_attention_pooled()` and `_forward_mean_pooled()`)
+          4) project pooled features to `[B, output_dim]`
+
+        Args:
+            history_embeddings: Padded history `[B, seq_len, input_dim]`.
+            history_mask: Optional validity mask `[B, seq_len]` where True = valid.
+
+        Returns:
+            Encoded user representations `[B, output_dim]`.
+        """
         ...
 
 
