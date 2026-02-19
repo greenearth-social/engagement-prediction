@@ -323,6 +323,16 @@ class TwoTowerModel(nn.Module):
                 "Choose 'summarized', 'full_transformer' or 'cross_attention'."
             )
 
+        # If we don't project posts, then `post_embeddings` stays in the raw embedding
+        # space and must match the user embedding dim for dot product scoring.
+        #
+        # In summarized mode, the user embedding is also in the raw embedding space.
+        if (not use_post_encoder) and (user_encoder_type != "summarized") and (shared_dim != post_embedding_dim):
+            raise ValueError(
+                f"use_post_encoder=False requires --shared-dim ({shared_dim}) to equal post embedding dim ({post_embedding_dim}) "
+                f"(or set use_post_encoder=True to project posts to shared_dim)."
+            )
+
         if use_post_encoder:
             # Post tower is the same regardless of user encoder type
             self.post_tower = PostTower(
@@ -332,10 +342,7 @@ class TwoTowerModel(nn.Module):
                 dropout_rate=dropout_rate,
             )
         else:
-            # just use the post embedding directly. note that the post_tower is not actually used in this case (see forward())
-            def _dummy_post_tower(post_embeddings: torch.Tensor):
-                return post_embeddings
-            self.post_tower = _dummy_post_tower
+            self.post_tower = nn.Identity()
 
 
     def encode_user(self, history_embeddings: torch.Tensor, history_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -357,7 +364,9 @@ class TwoTowerModel(nn.Module):
             post_embeddings: Raw post embeddings [batch, input_dim]
         
         Returns:
-            Post vectors in shared space [batch, shared_dim]
+            Post vectors for dot product scoring.
+                - use_post_encoder=True: [batch, shared_dim]
+                - otherwise: [batch, post_embedding_dim] (identity)
         """
         return self.post_tower(post_embeddings)
 
@@ -385,11 +394,7 @@ class TwoTowerModel(nn.Module):
             Raw engagement scores [batch] (logits before sigmoid)
         """
         user_emb = self.encode_user(history_embeddings, history_mask)
-
-        if self.use_post_encoder:
-            post_emb = self.encode_post(post_embeddings)
-        else:
-            post_emb = post_embeddings
+        post_emb = self.encode_post(post_embeddings)
         
         # Dot product: element-wise multiply then sum over shared_dim
         return (user_emb * post_emb).sum(dim=-1)
