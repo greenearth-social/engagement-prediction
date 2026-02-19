@@ -104,6 +104,7 @@ class ClearMLExperimentTracker:
             tags=list(tags) if tags else None,
             reuse_last_task_id=False,
             auto_connect_frameworks=True, # for auto-logging from PyTorch, matplotlib, etc
+            output_uri=True,
         )
         self._logger = self._task.get_logger()
 
