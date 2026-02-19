@@ -212,7 +212,7 @@ class _SummarizedUserTower(nn.Module):
     def forward(
         self,
         history_embeddings: torch.Tensor,
-        history_mask: Optional[torch.Tensor] = None,
+        history_mask: torch.Tensor,
     ) -> torch.Tensor:
         if history_embeddings.ndim != 3:
             raise ValueError(
@@ -345,7 +345,7 @@ class TwoTowerModel(nn.Module):
             self.post_tower = nn.Identity()
 
 
-    def encode_user(self, history_embeddings: torch.Tensor, history_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def encode_user(self, history_embeddings: torch.Tensor, history_mask: torch.Tensor) -> torch.Tensor:
         """Encode user engagement history into shared space representation.
         
         Args:
@@ -373,7 +373,7 @@ class TwoTowerModel(nn.Module):
     def forward(
         self,
         history_embeddings: torch.Tensor,
-        history_mask: Optional[torch.Tensor],
+        history_mask: torch.Tensor,
         post_embeddings: torch.Tensor,
     ) -> torch.Tensor:
         """Compute engagement scores via dot product in shared space.
@@ -842,7 +842,12 @@ def run(context: Context, args) -> Dict[str, Any]:
             model_path,
         )
         logger.info(f"Model saved to: {model_path}")
-        context.tracker.log_artifact(name="trained_model_two_tower", path=model_path)
+
+        # save TorchScript file, which is the format needed for ClearML serving
+        torchscript_name = f"torchscript_two_tower_model_{timestamp}"
+        torchscript_path = checkpoints_dir / f"{torchscript_name}.pt"
+        torch.jit.script(trained_model).save(torchscript_path)
+        context.tracker.log_artifact(name=f"{torchscript_name}", path=torchscript_path)
 
     # --- holdout evaluation ---
     holdout_metrics: Dict[str, Any] = {}

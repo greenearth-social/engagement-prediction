@@ -3,8 +3,11 @@ set -euo pipefail
 
 service_name="clearml triton server"
 model_id=""
-endpoint="mlp"
-preprocess_path="serving/preprocess_mlp.py"
+model_type=""
+endpoint=""
+preprocess_path=""
+only_model_add="0"
+serving_id_arg=""
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
@@ -20,9 +23,12 @@ usage() {
 Usage: $(basename "$0") --model-id <model_id> [options]
 
 Options:
+  --model-type <type>     Model type: "mlp" or "two-tower" (required)
+  --only-model-add        Only run 'clearml-serving --id ... model add' (no create, no docker compose)
+  --serving-id <id>       Existing serving service id (optional; otherwise read from serving/docker.env)
   --service-name <name>   ClearML Serving service name (default: "$service_name")
-  --endpoint <endpoint>   Endpoint name (default: "$endpoint")
-  --preprocess <path>     Preprocess script path (default: "$preprocess_path")
+  --endpoint <endpoint>   Endpoint name (default: <model-type>)
+  --preprocess <path>     Preprocess script path (default: based on --model-type)
   -h, --help              Show this help
 EOF
 }
@@ -31,6 +37,18 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --model-id)
       model_id="${2:-}"
+      shift 2
+      ;;
+    --model-type)
+      model_type="${2:-}"
+      shift 2
+      ;;
+    --only-model-add)
+      only_model_add="1"
+      shift 1
+      ;;
+    --serving-id)
+      serving_id_arg="${2:-}"
       shift 2
       ;;
     --service-name)
@@ -63,9 +81,120 @@ if [[ -z "$model_id" ]]; then
   exit 2
 fi
 
+if [[ -z "$model_type" ]]; then
+  echo "error: --model-type is required" >&2
+  usage >&2
+  exit 2
+fi
+
+case "$model_type" in
+  mlp|two-tower)
+    ;;
+  *)
+    echo "error: invalid --model-type: $model_type (must be \"mlp\" or \"two-tower\")" >&2
+    exit 2
+    ;;
+esac
+
+if [[ -z "$endpoint" ]]; then
+  endpoint="$model_type"
+fi
+
 if ! command -v clearml-serving >/dev/null 2>&1; then
   echo "error: clearml-serving not found in PATH" >&2
   exit 1
+fi
+
+if [[ -z "$preprocess_path" ]]; then
+  if [[ "$model_type" == "mlp" ]]; then
+    preprocess_path="serving/preprocess_mlp.py"
+  else
+    preprocess_path="serving/preprocess_two_tower.py"
+  fi
+fi
+
+if [[ "$preprocess_path" != /* ]]; then
+  preprocess_path="${repo_root}/${preprocess_path}"
+fi
+if [[ ! -f "$preprocess_path" ]]; then
+  echo "error: preprocess script not found: $preprocess_path" >&2
+  exit 1
+fi
+
+run_model_add() {
+  local serving_id="$1"
+
+  log "Registering model on service"
+  log "Service id: $serving_id"
+  log "Model type: $model_type"
+  log "Endpoint: $endpoint"
+  log "Model id: $model_id"
+  log "Preprocess: $preprocess_path"
+
+  if [[ "$model_type" == "mlp" ]]; then
+    log "+ clearml-serving --id \"$serving_id\" model add --engine triton --endpoint \"$endpoint\" --model-id \"$model_id\" ..."
+    clearml-serving --id "$serving_id" model add \
+      --engine triton \
+      --endpoint "$endpoint" \
+      --model-id "$model_id" \
+      --input-size "[-1,768]" \
+      --input-name features \
+      --input-type float32 \
+      --output-size "[-1]" \
+      --output-type float32 \
+      --output-name probs \
+      --preprocess "$preprocess_path"
+  else
+    log "+ clearml-serving --id \"$serving_id\" model add --engine triton --endpoint \"$endpoint\" --model-id \"$model_id\" ..."
+    clearml-serving --id "$serving_id" model add \
+      --engine triton \
+      --endpoint "$endpoint" \
+      --model-id "$model_id" \
+      --input-size "[-1,20,384]" "[-1,20]" "[-1,384]" \
+      --input-name history_embeddings history_mask post_embeddings\
+      --input-type float32 int32 float32 \
+      --output-size "[-1]" \
+      --output-type float32 \
+      --output-name probs \
+      --preprocess "$preprocess_path"
+  fi
+}
+
+serving_id_from_env_file() {
+  if [[ ! -f "$env_file" ]]; then
+    echo "error: env file not found: $env_file" >&2
+    return 1
+  fi
+
+  local raw
+  raw="$(
+    sed -n -E 's/^(export[[:space:]]+)?CLEARML_SERVING_TASK_ID=//p' "$env_file" | tail -n 1
+  )"
+
+  raw="${raw#"${raw%%[![:space:]]*}"}"
+  raw="${raw%"${raw##*[![:space:]]}"}"
+
+  raw="${raw%\"}"
+  raw="${raw#\"}"
+  raw="${raw%\'}"
+  raw="${raw#\'}"
+
+  if [[ -z "$raw" ]]; then
+    echo "error: CLEARML_SERVING_TASK_ID not found in $env_file" >&2
+    return 1
+  fi
+
+  echo "$raw"
+}
+
+if [[ "$only_model_add" == "1" ]]; then
+  if [[ -z "$serving_id_arg" ]]; then
+    log "No --serving-id provided; reading from $env_file"
+    serving_id_arg="$(serving_id_from_env_file)"
+  fi
+  log "Mode: only model add (no service create, no docker compose)"
+  run_model_add "$serving_id_arg"
+  exit 0
 fi
 
 if [[ ! -f "$env_file" ]]; then
@@ -75,14 +204,6 @@ fi
 
 if [[ ! -f "$compose_file" ]]; then
   echo "error: docker compose file not found: $compose_file" >&2
-  exit 1
-fi
-
-if [[ "$preprocess_path" != /* ]]; then
-  preprocess_path="${repo_root}/${preprocess_path}"
-fi
-if [[ ! -f "$preprocess_path" ]]; then
-  echo "error: preprocess script not found: $preprocess_path" >&2
   exit 1
 fi
 
@@ -143,19 +264,7 @@ if ! wait_for_container_running "clearml-serving-triton" 180; then
   log "warning: clearml-serving-triton not running after 180s; continuing anyway"
 fi
 
-log "Registering model on service"
-log "+ clearml-serving --id \"$serving_id\" model add --engine triton --endpoint \"$endpoint\" --model-id \"$model_id\" ..."
-clearml-serving --id "$serving_id" model add \
-  --engine triton \
-  --endpoint "$endpoint" \
-  --model-id "$model_id" \
-  --input-size "[-1,768]" \
-  --input-name features \
-  --input-type float32 \
-  --output-size "[-1]" \
-  --output-type float32 \
-  --output-name probs \
-  --preprocess "$preprocess_path"
+run_model_add "$serving_id"
 
 log "Streaming docker logs (Ctrl+C to stop logs; containers keep running)"
 log "+ sudo docker compose --env-file \"$env_file\" -f \"$compose_file\" logs -f"
