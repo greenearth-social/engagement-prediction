@@ -789,6 +789,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     config = {
         "model_type": "two_tower",
         "user_encoder_type": user_encoder_type,
+        "use_post_encoder": use_post_encoder,
         "post_embedding_dim": embed_dim,
         "shared_dim": shared_dim,
         "user_hidden_dim": user_hidden_dim,
