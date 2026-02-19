@@ -198,6 +198,30 @@ class PostTower(nn.Module):
 # Two-Tower Engagement Model
 # =============================================================================
 
+class _SummarizedUserTower(nn.Module):
+    """User "tower" for summarized mode.
+
+    Serving/training convention: represent the summarized user vector as a
+    (possibly padded) length-T sequence where the summary lives at position 0:
+
+        history_embeddings[:, 0, :] == user_summary
+
+    This makes the model's `forward()` signature consistent across encoder types.
+    """
+
+    def forward(
+        self,
+        history_embeddings: torch.Tensor,
+        history_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if history_embeddings.ndim != 3:
+            raise ValueError(
+                f"Expected history_embeddings with shape [B, T, D] (or [B, D] for legacy), got {tuple(history_embeddings.shape)}"
+            )
+        # Summary lives in the first (unmasked) slot by convention.
+        return history_embeddings[:, 0, :]
+
+
 class TwoTowerModel(nn.Module):
     """Two-tower engagement prediction model with pluggable user encoders.
     
@@ -285,10 +309,9 @@ class TwoTowerModel(nn.Module):
         elif user_encoder_type == "summarized":
             # In "summarized" mode, the dataset provides the user vector directly
             # (e.g., mean/EMA/linear-recency summary). The model treats the
-            # history input as an already-encoded user embedding.
-            def _dummy_user_tower(history_embeddings: torch.Tensor, history_mask: Optional[torch.Tensor] = None):
-                return history_embeddings
-            self.user_tower = _dummy_user_tower
+            # history input as an already-encoded user embedding (placed at
+            # position 0 in a padded sequence for a consistent forward() signature).
+            self.user_tower = _SummarizedUserTower()
 
             # If we still learn a post projection (use_post_encoder=True), its output
             # dimension must match the dataset-provided user embedding dimension.
@@ -352,18 +375,16 @@ class TwoTowerModel(nn.Module):
         
         Args:
             history_embeddings: User history input.
-                - summarized: user vectors [batch, embed_dim]
-                - otherwise: padded history sequences [batch, seq_len, input_dim]
-            history_mask: History validity mask [batch, seq_len] (None in summarized mode)
+                - all modes: padded history sequences [batch, seq_len, input_dim]
+                  In "summarized" mode, the user summary is expected to be placed
+                  at position 0 (and optionally padded to seq_len > 1).
+            history_mask: History validity mask [batch, seq_len] (optional in summarized mode)
             post_embeddings: Target post embeddings [batch, input_dim]
         
         Returns:
             Raw engagement scores [batch] (logits before sigmoid)
         """
-        if self.user_encoder_type == "summarized":
-            user_emb = history_embeddings
-        else:
-            user_emb = self.encode_user(history_embeddings, history_mask)
+        user_emb = self.encode_user(history_embeddings, history_mask)
 
         if self.use_post_encoder:
             post_emb = self.encode_post(post_embeddings)
@@ -405,10 +426,14 @@ class TwoTowerModel(nn.Module):
         # unpack inputs
         if self.user_encoder_type == "summarized":
             features = batch["features"].to(device) # [B, embed_dim*2]
-            history_embeddings = features[:, :embed_dim]
+            history_embeddings = features[:, :embed_dim].unsqueeze(1)  # [B, 1, D] (summary token at position 0)
             post_embeddings = features[:, embed_dim:]
-            history_mask = None
-            assert history_embeddings.shape[1] == post_embeddings.shape[1]
+            history_mask = torch.ones(
+                (history_embeddings.shape[0], history_embeddings.shape[1]),
+                dtype=torch.bool,
+                device=device,
+            )
+            assert history_embeddings.shape[-1] == post_embeddings.shape[-1]
         else:
             history_embeddings = batch["history_embeddings"].to(device)
             history_mask = batch["history_mask"].to(device)
