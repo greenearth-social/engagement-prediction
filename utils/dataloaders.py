@@ -120,7 +120,7 @@ from utils.helpers import (
     load_parquet_from_prior,
     log_operation_start,
 )
-from utils.model_serving.input_data_helpers import get_padded_vector_and_mask
+from model_serving.input_data_helpers import get_padded_vector_and_mask
 
 
 # ---------------------------------------------------------------------------
