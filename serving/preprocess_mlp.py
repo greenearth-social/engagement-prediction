@@ -13,9 +13,8 @@ class Preprocess(object):
         post_embed = np.asarray(body["post"], dtype=np.float32)
 
         # create a batch dimension (of size 1) if it doesn't exist
-        if user_embed.ndim == 1:
+        if (user_embed.ndim == 1) and (post_embed.ndim == 1):
             user_embed = user_embed[None, ...]
-        if post_embed.ndim == 1:
             post_embed = post_embed[None, ...]
         if user_embed.shape[1] != post_embed.shape[1]:
             raise ValueError(f"User input and post input are not of the same size ({user_embed.shape[1]} vs {post_embed.shape[1]})")

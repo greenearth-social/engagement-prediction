@@ -120,6 +120,7 @@ from utils.helpers import (
     load_parquet_from_prior,
     log_operation_start,
 )
+from utils.model_serving.input_data_helpers import get_padded_vector_and_mask
 
 
 # ---------------------------------------------------------------------------
@@ -1270,17 +1271,8 @@ class SequenceEngagementDataset(Dataset):
         # This is the key difference from SummarizedEngagementDataset: we load
         # the raw sequence here rather than using a pre-computed summary
         hist_indices = self.prior_emb_indices[row_idx]
-        seq_len = min(len(hist_indices), self.max_history_len)
-
-        # Initialize padded arrays
-        padded = np.zeros((self.max_history_len, self.embed_dim), dtype=np.float32)
-        mask = np.zeros(self.max_history_len, dtype=bool)
-
-        if seq_len > 0:
-            # Truncate to max_history_len if needed, load from memmap
-            used_indices = hist_indices[: self.max_history_len]
-            padded[:seq_len] = self.embeddings[used_indices]
-            mask[:seq_len] = True
+        hist_embeddings = self.embeddings[hist_indices]
+        padded, mask = get_padded_vector_and_mask(hist_embeddings, self.max_history_len, self.embed_dim)
 
         # --- Select target post embedding (pre-computed) ---
         if is_positive:
