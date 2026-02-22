@@ -557,6 +557,12 @@ def build_parser() -> argparse.ArgumentParser:
     # Stage 5 (train) model selection
     _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower"],
                           default=argparse.SUPPRESS, help_text="Model architecture: mlp or two-tower")
+    # ============================================================================
+    # FIT IMPLEMENTATION SECTION 12: Add --use-fit CLI argument
+    # ============================================================================
+    _add_arg_with_default(p_all, "--use-fit", type=bool, default=argparse.SUPPRESS,
+                          help_text="Enable Fully Interacted Two-Tower (FIT) architecture")
+    # ============================================================================
     # Two-tower specific options
     _add_arg_with_default(p_all, "--shared-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower shared embedding dimension")

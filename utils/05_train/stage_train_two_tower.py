@@ -41,6 +41,72 @@ from utils.helpers import get_stage_logger, log_operation_start, get_device
 
 
 # =============================================================================
+# Meta Query Module (MQM) for FIT
+# =============================================================================
+# ================================================================================
+# FIT IMPLEMENTATION: MetaQueryModule
+# ================================================================================
+
+class MetaQueryModule(nn.Module):
+    """
+    Meta Query Module (MQM) for FIT architecture.
+    
+    Maintains a learnable meta matrix M ∈ R^{K x Dq} where K = num_queries.
+    For each candidate post, maps it to a query index and computes either:
+    - Hard query: M[q_idx] (inference)
+    - Soft query: attention-weighted combination of meta vectors (training)
+    """
+    
+    def __init__(self, item_dim: int, query_dim: int, num_queries: int):
+        super().__init__()
+        self.num_queries = num_queries
+        # Learnable meta matrix: [K, query_dim]
+        self.meta_matrix = nn.Parameter(torch.randn(num_queries, query_dim) * 0.02)
+        # Project item embedding to query space
+        self.item_proj = nn.Linear(item_dim, query_dim)
+        self._init_weights()
+    
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.item_proj.weight)
+        if self.item_proj.bias is not None:
+            nn.init.zeros_(self.item_proj.bias)
+    
+    def forward(self, item_emb: torch.Tensor, tau: float, hard: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            item_emb: [B, item_dim] Candidate post embeddings
+            tau: Temperature for soft query (training)
+            hard: If True, use hard query (inference); else use soft query (training)
+        
+        Returns:
+            q: [B, query_dim] Meta query vector
+            q_idx: [B] Query index (hard assignment)
+        """
+        # Project item to query space
+        z = self.item_proj(item_emb)  # [B, query_dim]
+        
+        # Compute logits: similarity to each meta query
+        logits = z @ self.meta_matrix.T  # [B, K]
+        
+        # Get hard assignment
+        q_idx = logits.argmax(dim=-1)  # [B]
+        
+        if hard:
+            # Hard query: use the selected meta vector directly
+            q = self.meta_matrix[q_idx]  # [B, query_dim]
+        else:
+            # Soft query: attention-weighted combination
+            w = F.softmax(logits / tau, dim=-1)  # [B, K]
+            q = w @ self.meta_matrix  # [B, query_dim]
+        
+        return q, q_idx
+
+# ================================================================================
+# END FIT IMPLEMENTATION: MetaQueryModule
+# ================================================================================
+
+
+# =============================================================================
 # User History Encoder
 # =============================================================================
 
@@ -123,11 +189,25 @@ class UserHistoryEncoder(nn.Module):
         self,
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
         history_mask: Optional[torch.Tensor] = None,  # [B, seq_len] True = valid
+        # ================================================================================
+        # FIT IMPLEMENTATION: meta_query_vec parameter
+        # ================================================================================
+        meta_query_vec: Optional[torch.Tensor] = None,  # [B, hidden_dim] Meta query vector from MQM
+        # ================================================================================
+        # END FIT IMPLEMENTATION: meta_query_vec parameter
+        # ================================================================================
     ) -> torch.Tensor:
         """
         Args:
             history_embeddings: Batch of user history embeddings [B, seq_len, input_dim]
             history_mask: Boolean mask where True indicates valid positions [B, seq_len]
+            # ================================================================================
+            # FIT IMPLEMENTATION: meta_query_vec docstring
+            # ================================================================================
+            meta_query_vec: (FIT) Meta query vector [B, hidden_dim] from MQM
+            # ================================================================================
+            # END FIT IMPLEMENTATION: meta_query_vec docstring
+            # ================================================================================
         
         Returns:
             User embeddings [B, output_dim]
@@ -156,9 +236,20 @@ class UserHistoryEncoder(nn.Module):
         # Apply self-attention
         x = self.transformer_encoder(x, src_key_padding_mask=attn_mask)  # [B, seq_len, hidden_dim]
         
+        # ================================================================================
+        # FIT IMPLEMENTATION: Select attention query (meta_query_vec from MQM or learned query)
+        # ================================================================================
+        # Select attention query: use meta_query_vec if provided (FIT), else use learned query
+        if meta_query_vec is not None:
+            query = meta_query_vec.unsqueeze(1)  # [B, 1, hidden_dim]
+        else:
+            query = self.attention_query.expand(B, -1, -1)  # [B, 1, hidden_dim]
+        # ================================================================================
+        # END FIT IMPLEMENTATION: Attention query selection
+        # ================================================================================
+        
         # Attention-weighted pooling
-        # Expand query for batch
-        query = self.attention_query.expand(B, -1, -1)  # [B, 1, hidden_dim]
+        
         attn_scores = torch.bmm(query, x.transpose(1, 2))  # [B, 1, seq_len]
         
         # Mask invalid positions with large negative value
@@ -259,10 +350,62 @@ class TwoTowerEngagement(nn.Module):
         num_attention_layers: int = 2,
         max_history_len: int = 50,
         dropout_rate: float = 0.1,
+        # ================================================================================
+        # FIT IMPLEMENTATION: FIT hyperparameters
+        # ================================================================================
+        use_fit: bool = False,
+        fit_num_queries: int = 64,
+        fit_tau_init: float = 1.0,
+        fit_tau_min: float = 0.1,
+        fit_tau_decay: float = 0.9995,
+        fit_use_lss: bool = False,
+        # ================================================================================
+        # END FIT IMPLEMENTATION: FIT hyperparameters
+        # ================================================================================
     ):
         super().__init__()
         self.shared_dim = shared_dim
         self.post_embedding_dim = post_embedding_dim
+        # ================================================================================
+        # FIT IMPLEMENTATION: Store FIT flags
+        # ================================================================================
+        self.use_fit = use_fit
+        self.fit_use_lss = fit_use_lss
+        # ================================================================================
+        # END FIT IMPLEMENTATION: Store FIT flags
+        # ================================================================================
+        
+        # ================================================================================
+        # FIT IMPLEMENTATION: Hyperparameters and MQM initialization
+        # ================================================================================
+        if self.use_fit:
+            self.fit_num_queries = fit_num_queries
+            self.fit_tau_init = fit_tau_init
+            self.fit_tau_min = fit_tau_min
+            self.fit_tau_decay = fit_tau_decay
+            # Register tau as buffer for state persistence
+            self.register_buffer('fit_tau', torch.tensor(fit_tau_init))
+            # Meta Query Module
+            self.mqm = MetaQueryModule(
+                item_dim=post_embedding_dim,
+                query_dim=user_hidden_dim,
+                num_queries=fit_num_queries
+            )
+            # LSS (Lightweight Similarity Scorer) - optional
+            if fit_use_lss:
+                self.lss = nn.Sequential(
+                    nn.Linear(shared_dim, shared_dim),
+                    nn.ReLU(),
+                    nn.Linear(shared_dim, 1)
+                )
+            else:
+                self.lss = None
+        else:
+            self.mqm = None
+            self.lss = None
+        # ================================================================================
+        # END FIT IMPLEMENTATION: Hyperparameters and MQM initialization
+        # ================================================================================
         
         # User tower (history encoder)
         self.user_tower = UserHistoryEncoder(
@@ -287,9 +430,43 @@ class TwoTowerEngagement(nn.Module):
         self,
         history_embeddings: torch.Tensor,
         history_mask: Optional[torch.Tensor] = None,
+        # ================================================================================
+        # FIT IMPLEMENTATION: meta_query parameter
+        # ================================================================================
+        meta_query: Optional[torch.Tensor] = None,  # [B, post_embedding_dim] Candidate post embedding
+        # ================================================================================
+        # END FIT IMPLEMENTATION: meta_query parameter
+        # ================================================================================
     ) -> torch.Tensor:
         """Encode user from their liked post history."""
-        return self.user_tower(history_embeddings, history_mask)
+        # ================================================================================
+        # FIT IMPLEMENTATION: Use MQM to get meta query vector
+        # ================================================================================
+        if self.use_fit and meta_query is not None:
+            # Use MQM to get meta query vector
+            hard = not self.training
+            q_vec, q_idx = self.mqm(meta_query, tau=self.fit_tau.item(), hard=hard)
+            return self.user_tower(history_embeddings, history_mask, meta_query_vec=q_vec)
+        else:
+            return self.user_tower(history_embeddings, history_mask)
+        # ================================================================================
+        # END FIT IMPLEMENTATION: Use MQM to get meta query vector
+        # ================================================================================
+    
+    # ================================================================================
+    # FIT IMPLEMENTATION: Tau update for soft query temperature decay
+    # ================================================================================
+    def _update_tau(self):
+        """Update temperature for soft query (called during training)."""
+        if self.use_fit:
+            new_tau = self.fit_tau.item() * self.fit_tau_decay
+            self.fit_tau.data = torch.clamp(
+                torch.tensor(new_tau, device=self.fit_tau.device),
+                min=self.fit_tau_min
+            )
+    # ================================================================================
+    # END FIT IMPLEMENTATION: Tau update
+    # ================================================================================
     
     def encode_post(self, post_embeddings: torch.Tensor) -> torch.Tensor:
         """Encode post to shared space."""
@@ -305,13 +482,35 @@ class TwoTowerEngagement(nn.Module):
         Compute engagement scores for user-post pairs.
         
         Returns:
-            Scores [B] (dot product similarity)
+            Scores [B] (dot product similarity or LSS score)
         """
-        user_emb = self.encode_user(history_embeddings, history_mask)  # [B, D]
-        post_emb = self.encode_post(post_embeddings)  # [B, D]
+        # ================================================================================
+        # FIT IMPLEMENTATION: Forward pass with MQM and optional LSS
+        # ================================================================================
+        if self.use_fit:
+            # FIT mode: use MQM to get meta query, then encode user
+            post_emb = self.encode_post(post_embeddings)  # [B, shared_dim]
+            user_emb = self.encode_user(
+                history_embeddings,
+                history_mask,
+                meta_query=post_embeddings  # [B, post_embedding_dim] - RAW post embedding
+            )  # [B, shared_dim]
+            
+            # Compute score: LSS or dot product
+            if self.fit_use_lss and self.lss is not None:
+                sim = user_emb * post_emb  # [B, shared_dim]
+                scores = self.lss(sim).squeeze(-1)  # [B]
+            else:
+                scores = (user_emb * post_emb).sum(dim=-1)  # [B]
+        else:
+            # Standard two-tower
+            user_emb = self.encode_user(history_embeddings, history_mask)  # [B, shared_dim]
+            post_emb = self.encode_post(post_embeddings)  # [B, shared_dim]
+            scores = (user_emb * post_emb).sum(dim=-1)  # [B]
+        # ================================================================================
+        # END FIT IMPLEMENTATION: Forward pass
+        # ================================================================================
         
-        # Dot product scores
-        scores = (user_emb * post_emb).sum(dim=-1)  # [B]
         return scores
     
     def train_forward(
@@ -327,15 +526,18 @@ class TwoTowerEngagement(nn.Module):
         Returns:
             (loss, scores)
         """
-        user_emb = self.encode_user(history_embeddings, history_mask)
-        post_emb = self.encode_post(post_embeddings)
-        
-        # Dot product scores
-        scores = (user_emb * post_emb).sum(dim=-1)
+        scores = self.forward(history_embeddings, history_mask, post_embeddings)
         probs = torch.sigmoid(scores)
-        
-        # BCE loss
         loss = F.binary_cross_entropy(probs, labels.float())
+        
+        # ================================================================================
+        # FIT IMPLEMENTATION: Update tau for soft query (temperature decay)
+        # ================================================================================
+        if self.use_fit and self.training:
+            self._update_tau()
+        # ================================================================================
+        # END FIT IMPLEMENTATION: Tau update in training
+        # ================================================================================
         
         return loss, scores
 
@@ -1027,6 +1229,18 @@ def run_two_tower_pipeline(
     random_seed: int = 42,
     output_dir: Optional[Path] = None,
     disable_progress: bool = False,
+    # ================================================================================
+    # FIT IMPLEMENTATION: Pipeline parameters
+    # ================================================================================
+    use_fit: bool = False,
+    fit_num_queries: int = 64,
+    fit_tau_init: float = 1.0,
+    fit_tau_min: float = 0.1,
+    fit_tau_decay: float = 0.9995,
+    fit_use_lss: bool = False,
+    # ================================================================================
+    # END FIT IMPLEMENTATION: Pipeline parameters
+    # ================================================================================
 ) -> Dict[str, Any]:
     """
     Run the two-tower training pipeline with BCE loss.
@@ -1135,6 +1349,9 @@ def run_two_tower_pipeline(
     
     # Create model
     log_operation_start('Create two-tower model', 'STAGE_05_TRAIN_TWO_TOWER', logger)
+    # ================================================================================
+    # FIT IMPLEMENTATION: Model initialization with FIT parameters
+    # ================================================================================
     model = TwoTowerEngagement(
         post_embedding_dim=post_embedding_dim,
         shared_dim=shared_dim,
@@ -1144,7 +1361,16 @@ def run_two_tower_pipeline(
         num_attention_layers=num_attention_layers,
         max_history_len=max_history_len,
         dropout_rate=dropout_rate,
+        use_fit=use_fit,
+        fit_num_queries=fit_num_queries,
+        fit_tau_init=fit_tau_init,
+        fit_tau_min=fit_tau_min,
+        fit_tau_decay=fit_tau_decay,
+        fit_use_lss=fit_use_lss,
     )
+    # ================================================================================
+    # END FIT IMPLEMENTATION: Model initialization
+    # ================================================================================
     
     # Train
     log_operation_start(f'Train two-tower model (epochs={epochs}, batch_size={batch_size})', 'STAGE_05_TRAIN_TWO_TOWER', logger)
@@ -1191,7 +1417,22 @@ def run_two_tower_pipeline(
         'num_attention_layers': num_attention_layers,
         'max_history_len': max_history_len,
         'dropout_rate': dropout_rate,
+        # ================================================================================
+        # FIT IMPLEMENTATION: Save FIT config
+        # ================================================================================
+        'use_fit': use_fit,
     }
+    if use_fit:
+        config.update({
+            'fit_num_queries': fit_num_queries,
+            'fit_tau_init': fit_tau_init,
+            'fit_tau_min': fit_tau_min,
+            'fit_tau_decay': fit_tau_decay,
+            'fit_use_lss': fit_use_lss,
+        })
+    # ================================================================================
+    # END FIT IMPLEMENTATION: Save FIT config
+    # ================================================================================
     torch.save({
         'model_state_dict': model.state_dict(),
         'config': config,
@@ -1276,8 +1517,23 @@ def run_two_tower_pipeline(
         'train_users': len(train_users),
         'val_users': len(val_users),
         'holdout_users': len(holdout_users),
+        'use_fit': use_fit,
         'results': results,
     }
+    # ================================================================================
+    # FIT IMPLEMENTATION: Save FIT training config
+    # ================================================================================
+    if use_fit:
+        training_config.update({
+            'fit_num_queries': fit_num_queries,
+            'fit_tau_init': fit_tau_init,
+            'fit_tau_min': fit_tau_min,
+            'fit_tau_decay': fit_tau_decay,
+            'fit_use_lss': fit_use_lss,
+        })
+    # ================================================================================
+    # END FIT IMPLEMENTATION: Save FIT training config
+    # ================================================================================
     
     with open(base_dir / 'training_config.json', 'w') as f:
         json.dump(training_config, f, indent=2)
@@ -1361,6 +1617,13 @@ def run(context, args) -> Dict[str, Any]:
     log_operation_start('Call run_two_tower_pipeline', 'STAGE_05_TRAIN_TWO_TOWER', entry_logger)
     t0 = time.time()
     device = get_device(args.device)
+    # ================================================================================
+    # FIT IMPLEMENTATION: Extract use_fit from args
+    # ================================================================================
+    use_fit = getattr(args, 'use_fit', False)
+    # ================================================================================
+    # END FIT IMPLEMENTATION: Extract use_fit from args
+    # ================================================================================
     results = run_two_tower_pipeline(
         embedding_bundle=str(bundle_path.resolve()),
         user_splits=str(splits_path.resolve()),
@@ -1381,6 +1644,18 @@ def run(context, args) -> Dict[str, Any]:
         random_seed=int(args.random_seed),
         output_dir=run_dir,
         disable_progress=bool(getattr(args, 'disable_progress', False)),
+        # ================================================================================
+        # FIT IMPLEMENTATION: Pass FIT parameters to pipeline
+        # ================================================================================
+        use_fit=use_fit,
+        fit_num_queries=getattr(args, 'fit_num_queries', 64),
+        fit_tau_init=getattr(args, 'fit_tau_init', 1.0),
+        fit_tau_min=getattr(args, 'fit_tau_min', 0.1),
+        fit_tau_decay=getattr(args, 'fit_tau_decay', 0.9995),
+        fit_use_lss=getattr(args, 'fit_use_lss', False),
+        # ================================================================================
+        # END FIT IMPLEMENTATION: Pass FIT parameters
+        # ================================================================================
     )
     
     training_dir = results['output_dir']
@@ -1413,26 +1688,72 @@ def run(context, args) -> Dict[str, Any]:
 
 
 if __name__ == '__main__':
-    # Simple CLI for standalone testing
-    import argparse
+    # ================================================================================
+    # FIT IMPLEMENTATION: Sanity tests
+    # ================================================================================
+    # Sanity test for FIT implementation
+    print("Running sanity tests...")
     
-    parser = argparse.ArgumentParser(description='Two-Tower Training')
-    parser.add_argument('--embedding-bundle', required=True)
-    parser.add_argument('--user-splits', required=True)
-    parser.add_argument('--output-dir', default=None)
-    parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch-size', type=int, default=256)
-    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
+    # Test 1: Standard two-tower (use_fit=False)
+    print("\nTest 1: Standard two-tower (use_fit=False)")
+    model_std = TwoTowerEngagement(
+        post_embedding_dim=128,
+        shared_dim=64,
+        use_fit=False,
+    )
+    B, seq_len = 4, 10
+    history_emb = torch.randn(B, seq_len, 128)
+    history_mask = torch.ones(B, seq_len, dtype=torch.bool)
+    post_emb = torch.randn(B, 128)
     
-    args = parser.parse_args()
+    model_std.eval()
+    with torch.no_grad():
+        scores_std = model_std(history_emb, history_mask, post_emb)
+    assert scores_std.shape == (B,), f"Expected scores shape [B], got {scores_std.shape}"
+    print(f"✓ Standard model: scores shape {scores_std.shape}")
     
-    results = run_two_tower_pipeline(
-        embedding_bundle=args.embedding_bundle,
-        user_splits=args.user_splits,
-        output_dir=Path(args.output_dir) if args.output_dir else None,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        device=args.device,
+    # Test 2: FIT model (use_fit=True)
+    print("\nTest 2: FIT model (use_fit=True)")
+    model_fit = TwoTowerEngagement(
+        post_embedding_dim=128,
+        shared_dim=64,
+        use_fit=True,
+        fit_num_queries=32,
     )
     
-    print(f"\nResults: {json.dumps(results['training_config'], indent=2)}")
+    model_fit.eval()
+    with torch.no_grad():
+        scores_fit = model_fit(history_emb, history_mask, post_emb)
+    assert scores_fit.shape == (B,), f"Expected scores shape [B], got {scores_fit.shape}"
+    print(f"✓ FIT model: scores shape {scores_fit.shape}")
+    
+    # Test 3: FIT with LSS
+    print("\nTest 3: FIT model with LSS (fit_use_lss=True)")
+    model_fit_lss = TwoTowerEngagement(
+        post_embedding_dim=128,
+        shared_dim=64,
+        use_fit=True,
+        fit_num_queries=32,
+        fit_use_lss=True,
+    )
+    
+    model_fit_lss.eval()
+    with torch.no_grad():
+        scores_fit_lss = model_fit_lss(history_emb, history_mask, post_emb)
+    assert scores_fit_lss.shape == (B,), f"Expected scores shape [B], got {scores_fit_lss.shape}"
+    print(f"✓ FIT+LSS model: scores shape {scores_fit_lss.shape}")
+    
+    # Test 4: Training mode (tau update)
+    print("\nTest 4: Training mode tau update")
+    model_fit.train()
+    initial_tau = model_fit.fit_tau.item()
+    labels = torch.randint(0, 2, (B,)).float()
+    loss, scores = model_fit.train_forward(history_emb, history_mask, post_emb, labels)
+    updated_tau = model_fit.fit_tau.item()
+    assert updated_tau <= initial_tau, f"Tau should decay: {initial_tau} -> {updated_tau}"
+    print(f"✓ Tau update: {initial_tau:.4f} -> {updated_tau:.4f}")
+    
+    print("\n✓ All sanity tests passed!")
+    # ================================================================================
+    # END FIT IMPLEMENTATION: Sanity tests
+    # ================================================================================
