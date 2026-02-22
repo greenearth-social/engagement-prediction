@@ -12,7 +12,6 @@ def test_merge_args_with_config_prioritizes_cli_over_config(tmp_path):
         textwrap.dedent(
             """
             epochs: 5
-            data_source: digitalocean
             embedding_model: all_MiniLM_L12_v2
             """
         ).strip()
@@ -26,18 +25,17 @@ def test_merge_args_with_config_prioritizes_cli_over_config(tmp_path):
             "run-all",
             "--epochs",
             "7",
-            "--relevel-method",
-            "simple",
+            "--batch-size",
+            "512",
         ]
     )
 
     merged = cli._merge_args_with_config(args)
 
     assert merged.epochs == 7  # CLI overrides config
-    assert merged.data_source == "digitalocean"  # Config overrides defaults
-    assert merged.embedding_model == "all_MiniLM_L12_v2"
-    assert merged.relevel_method == "simple"
-    assert merged.batch_size == cli.DEFAULTS["batch_size"]
+    assert merged.embedding_model == "all_MiniLM_L12_v2"  # Config overrides defaults
+    assert merged.batch_size == 512  # CLI overrides default
+    assert merged.learning_rate == cli.DEFAULTS["learning_rate"]
 
 
 def test_merge_args_with_config_rejects_unknown_keys(tmp_path):

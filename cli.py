@@ -5,11 +5,11 @@ Unified CLI for Engagement Prediction Pipeline
 =============================================
 
 Subcommands:
-- run-all: Run the 6-stage pipeline end-to-end (ingest → featurize → relevel → split → train → evaluate)
+- run-all: Run the 5-stage pipeline end-to-end (get_data → target_posts → user_history → train → evaluate)
 
 Usage examples:
-    python cli.py run-all --epochs 150 --embedding-model all_MiniLM_L12_v2
-    python cli.py run-all --config configs/pipeline.yml --foreground
+    python cli.py run-all --user-encoder summarized --epochs 150 --embedding-model all_MiniLM_L12_v2
+    python cli.py run-all --user-encoder full_transformer --model-type two-tower --config config.yml --foreground
 """
 
 import argparse
@@ -34,40 +34,47 @@ RESULTS_DIR = OUTPUTS_DIR / "holdout_evaluation_results"
 
 # Central default map for all run-all parameters
 DEFAULTS: Dict[str, Any] = {
-    # Stage 1
-    "data_source": "greenearth",
+    # Stage 1: Data filtering
     "gcs_bucket": 'greenearth-471522-ingex-extract-stage',
     "posts_start": None,
     "posts_end": None,
     "likes_start": None,
     "likes_end": None,
-    "max_files_per_table": 5,
-    "image_mode": "auto",
-    "max_posts_per_author": 3,
-    "max_liked_posts_per_user": 100,
+    "max_liking_users": None,  # None = no limit; sample this many unique liking users
+    "max_likes_per_user": 100,  # Stage 1: random cap on likes per user (NOT recency-based)
+    "min_likes_per_user": 2,  # Stage 1: minimum likes for user inclusion
+    "negative_posts_sample": 100000,  # Stage 1: random posts for negative cases
     "cap_random_seed": 42,
+    "max_memory_gb": None,  # Stage 1: max memory in GB (None = auto based on percentage)
+    "max_memory_pct": 0.75,  # Stage 1: max percentage of available RAM to use
+    "memory_check": "full",  # Stage 1: memory check mode (full/ignore/skip)
     "output_dir": None,
     "run_name": None,
     "debug": False,
-    # Stage 2/3/4
-    "global_topic_k": 20,
-    "relevel_method": "uniform",
-    "relevel_strategy": "uniform_mixture_balanced",
-    "relevel_alpha": 0.35,
-    "relevel_min_users_per_topic": 0,
-    "min_likes_per_user": 10,
-    "val_ratio": 0.2,
-    "holdout_ratio": 0.2,
     "random_seed": 42,
     "embedding_model": "all_MiniLM_L6_v2",
-    # Stage 5 (train)
+    "skip_embeddings": False,
+    # Stage 2 Target posts and Split
+    "max_prior_likes": None,  # Stage 3: cap on prior likes per target for user history (None = no cap)
+    "history_buffer_hours": None,  # Stage 3: buffer in hours between seen_at and prior-like cutoff (None = no buffer)
+    "neg_sample_bucket": "1h",
+    "train_start": None,
+    "val_start": None,
+    "holdout_start": None,
+    # Stage 4 (train) - Model architecture
+    "user_summarization": "mean",  # MLP user-history summarization: mean, ema, linear_recency
+    "ema_alpha": 0.1,  # EMA smoothing factor (only used when user_summarization=ema)
+    "user_encoder": "summarized",  # User encoder type: must be explicitly specified and compatible with model_type
     "model_type": "mlp",
     "shared_dim": 128,
     "user_hidden_dim": 256,
+    "user_output_dim": 128,  # Output dimension for user encoder in AttentionMLP; separate from shared_dim which is used in TwoTower
+    "use_post_encoder": True,  # True means using a transformation on the post embedding (e.g. single layer neural net). False uses the post embedding directly.
     "post_hidden_dim": 256,
     "num_attention_heads": 4,
     "num_attention_layers": 2,
     "max_history_len": 20,
+    "attention_dropout": 0.1,  # Dropout rate for attention-based user encoders
     "epochs": 300,
     "batch_size": 256,
     "learning_rate": 0.001,
@@ -79,20 +86,27 @@ DEFAULTS: Dict[str, Any] = {
     "prediction_posts_per_user": 1,
     "device": None,
     "patience": 50,
+    "run_tag": None,  # Optional tag appended to training output directory name
     "no_plots": False,
     "no_save_model": False,
-    # Stage 6 (eval)
+    "disable_progress": False,  # Disable progress bars during training
+    # Stage 4 (train) - DataLoader settings
+    "num_dataloader_workers": 4,
+    "dataloader_pin_memory": True,
+    "dataloader_persistent_workers": True,
+    "dataloader_prefetch_factor": 2,
+    # Stage 4 (train) - Learning rate scheduler
+    "lr_scheduler_factor": 0.5,
+    "lr_scheduler_patience": 5,
+    # Stage 4 (train) - Training optimization
+    "gradient_clip_max_norm": 1.0,
+    # Stage 5 (eval)
     "eval_batch_size": 8192,
-    "eval_max_users": 0,
+    "eval_max_users": None,
     # Selection/prior behavior
     "use_latest": False,
     "start_from": None,
     "stop_after": None,
-    "prior_get_data": None,
-    "prior_featurize": None,
-    "prior_relevel": None,
-    "prior_split": None,
-    "prior_train": None,
     "pick_prior": False,
     # Execution behavior
     "foreground": False,
@@ -143,6 +157,7 @@ def _build_tracking_params(args: argparse.Namespace, run_dir: Path) -> Dict[str,
     return {
         "meta": {
             "run_dir": str(run_dir),
+            "run_tag": getattr(args, "run_tag", None),
             "start_from": args.start_from,
             "stop_after": args.stop_after,
             "cap_random_seed": args.cap_random_seed,
@@ -150,33 +165,23 @@ def _build_tracking_params(args: argparse.Namespace, run_dir: Path) -> Dict[str,
             "foreground": args.foreground,
         },
         "data": {
-            "data_source": args.data_source,
             "gcs_bucket": args.gcs_bucket,
             "posts_start": args.posts_start,
             "posts_end": args.posts_end,
             "likes_start": args.likes_start,
             "likes_end": args.likes_end,
-            "max_files_per_table": args.max_files_per_table,
-        },
-        "featurize": {
-            "max_posts_per_author": args.max_posts_per_author,
-            "max_liked_posts_per_user": args.max_liked_posts_per_user,
-            "image_mode": args.image_mode,
-            "embedding_model": args.embedding_model,
-            "global_topic_k": args.global_topic_k,
+            "max_liking_users": args.max_liking_users,
+            "max_likes_per_user": args.max_likes_per_user,
             "min_likes_per_user": args.min_likes_per_user,
-        },
-        "relevel": {
-            "relevel_method": args.relevel_method,
-            "relevel_strategy": args.relevel_strategy,
-            "relevel_alpha": args.relevel_alpha,
-            "relevel_min_users_per_topic": args.relevel_min_users_per_topic,
-        },
-        "split": {
-            "val_ratio": 0.2,
-            "holdout_ratio": 0.2,
+            "negative_posts_sample": args.negative_posts_sample,
+            "embedding_model": args.embedding_model,
+            "max_memory_gb": args.max_memory_gb,
+            "max_memory_pct": args.max_memory_pct,
         },
         "train": {
+            "user_summarization": args.user_summarization,
+            "ema_alpha": args.ema_alpha,
+            "user_encoder": args.user_encoder,
             "model_type": args.model_type,
             "shared_dim": args.shared_dim,
             "user_hidden_dim": args.user_hidden_dim,
@@ -195,6 +200,13 @@ def _build_tracking_params(args: argparse.Namespace, run_dir: Path) -> Dict[str,
             "prediction_posts_per_user": args.prediction_posts_per_user,
             "patience": args.patience,
             "device": args.device,
+            "num_dataloader_workers": args.num_dataloader_workers,
+            "dataloader_pin_memory": args.dataloader_pin_memory,
+            "dataloader_persistent_workers": args.dataloader_persistent_workers,
+            "dataloader_prefetch_factor": args.dataloader_prefetch_factor,
+            "lr_scheduler_factor": args.lr_scheduler_factor,
+            "lr_scheduler_patience": args.lr_scheduler_patience,
+            "gradient_clip_max_norm": args.gradient_clip_max_norm,
         },
         "eval": {
             "eval_batch_size": args.eval_batch_size,
@@ -266,12 +278,12 @@ def _generate_run_name(args: argparse.Namespace) -> str:
             else:
                 stages_str += args.stop_after
 
-    stages_str += f"_{args.model_type}_{args.relevel_method}"
+    stages_str += f"_{args.model_type}"
     return stages_str
 
 
 def cmd_run_all(args: argparse.Namespace) -> int:
-    """Run the 4-stage pipeline.
+    """Run the 5-stage pipeline.
 
     Creates a run directory up front and backgrounds itself with nohup unless --foreground.
     """
@@ -290,21 +302,6 @@ def cmd_run_all(args: argparse.Namespace) -> int:
                 run_name = f"{run_name}_{rn}"
         run_dir = outputs_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
-
-    # initialize experiment tracker
-    tracker = build_experiment_tracker(
-        args.experiment_tracker,
-        project_name=args.experiment_project,
-        task_name=args.experiment_task or run_name,
-        tags=args.experiment_tags,
-    )
-    tracking_payload = {
-        "run": _build_tracking_params(args, run_dir),
-        "overrides": _extract_overrides(args),
-    }
-    tracker.log_params(normalize_params(tracking_payload))
-    # In sequential execution, always allow stages to resolve latest artifacts from prior stages
-    ctx = Context(run_dir=run_dir, use_latest=True, tracker=tracker)
 
     # Choose log path inside run_dir
     initial_log = Path(args._initial_log) if args._initial_log else (run_dir / "run-all.log")
@@ -357,80 +354,78 @@ def cmd_run_all(args: argparse.Namespace) -> int:
         print("❌ Failed to start run-all in background")
         return proc.returncode or 1
 
-    # Foreground execution: call the internal exec directly
+    # Foreground execution: initialize experiment tracker and run
+    # Only initialize ClearML here (not before backgrounding) to avoid creating
+    # a task in the parent process that gets "aborted" when the parent exits.
+    tracker = build_experiment_tracker(
+        args.experiment_tracker,
+        project_name=args.experiment_project,
+        task_name=args.experiment_task or run_name,
+        tags=args.experiment_tags,
+    )
+    tracking_payload = {
+        "run": _build_tracking_params(args, run_dir),
+        "overrides": _extract_overrides(args),
+    }
+    tracker.log_params(normalize_params(tracking_payload))
+    # In sequential execution, always allow stages to resolve latest artifacts from prior stages
+    ctx = Context(run_dir=run_dir, use_latest=True, tracker=tracker)
+
     # Ensure args.output_dir is set so subsequent stages use this run_dir
     setattr(args, 'output_dir', str(run_dir.resolve()))
     return cmd__run_all_exec(args, ctx)
 
 
 def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
-    """Execute the 6-stage modular pipeline in the foreground sequentially."""
+    """Execute the modular pipeline stages in the foreground sequentially."""
     # Build Context and invoke stages via registry
     from utils.pipeline import registry as reg
 
     run_dir = Path(args.output_dir).resolve()
     
-    # Helper: map stage keys to enumerated folder names
-    # Override relevel stage key if --relevel-method is specified
-    relevel_method = args.relevel_method
-    relevel_key = 'relevel'  # default
-    if relevel_method == 'gini':
-        relevel_key = 'relevel_gini'
-    elif relevel_method == 'simple':
-        relevel_key = 'relevel_simple'
-    elif relevel_method == 'uniform':
-        relevel_key = 'relevel'
-
     # Override train stage key if --model-type is specified
     # Do not default to MLP if model name is not recognized - raise error instead
     model_type = args.model_type
-    train_key = 'train'  # default MLP
+    train_key = 'train_mlp'  # default MLP
     if model_type == 'mlp':
-        train_key = 'train'
+        train_key = 'train_mlp'
     elif model_type == 'two-tower':
         train_key = 'train_two_tower'
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
+
+    # --- Validation for --user-encoder ---
+    user_encoder = args.user_encoder
+    valid_encoders = {
+        "mlp": ("summarized", "full_transformer"),
+        "two-tower": ("summarized", "full_transformer", "cross_attention"),
+    }
+    allowed = valid_encoders.get(model_type, ())
+    if user_encoder not in allowed:
+        raise ValueError(
+            f"--user-encoder '{user_encoder}' is not valid for --model-type '{model_type}'. "
+            + f"Allowed values: {allowed}"
+        )
     
-    stage_order = ['get_data', 'featurize', relevel_key, 'split', train_key, 'evaluate']
+    stage_order = ['get_data', 'target_posts', 'user_history', train_key, 'evaluate']
     stage_folder = {}
     for key in stage_order:
         _mp, _folder = reg.get_stage_spec(key)
         stage_folder[key] = _folder
 
-    # Respect selective reruns
+    # Respect selective reruns (map the generic "train" alias to the concrete train stage key)
     start_from = args.start_from
-    if start_from and start_from not in stage_order:
-        raise ValueError(f"Unrecognized start_from: {start_from}. Please choose from: {stage_order}")
-    stop_after = args.stop_after
-    if stop_after and stop_after not in stage_order:
-        raise ValueError(f"Unrecognized stop_after: {stop_after}. Please choose from: {stage_order}")
-    # Map 'relevel' to the actual relevel key if specified
-    if start_from == 'relevel':
-        start_from = relevel_key
-    if stop_after == 'relevel':
-        stop_after = relevel_key
-    # Map 'train' to the actual train key (train or train_two_tower)
     if start_from == 'train':
         start_from = train_key
+    stop_after = args.stop_after
     if stop_after == 'train':
         stop_after = train_key
+    if start_from and start_from not in stage_order:
+        raise ValueError(f"Unrecognized start_from: {start_from}. Please choose from: {stage_order}")
+    if stop_after and stop_after not in stage_order:
+        raise ValueError(f"Unrecognized stop_after: {stop_after}. Please choose from: {stage_order}")
     start_idx = stage_order.index(start_from) if start_from in stage_order else 0
     stop_idx = stage_order.index(stop_after) if stop_after in stage_order else (len(stage_order) - 1)
-
-    # Pin prior outputs if provided
-    def _pin_prior(arg_name: str, stage_key: str):
-        path_str = getattr(args, arg_name, None)
-        if path_str:
-            p = Path(path_str)
-            if p.exists():
-                ctx.prior_outputs[stage_folder[stage_key]] = p
-
-    _pin_prior('prior_get_data', 'get_data')
-    _pin_prior('prior_featurize', 'featurize')
-    _pin_prior('prior_relevel', relevel_key)  # Use the selected relevel key
-    _pin_prior('prior_split', 'split')
-    _pin_prior('prior_train', 'train')
 
     # Optional interactive chooser (foreground only)
     def _maybe_choose_prior(stage_key: str):
@@ -471,17 +466,14 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
                     _maybe_choose_prior(prev_key)
             label_map = {
                 'get_data': "Stage 1: Get data…",
-                'featurize': "Stage 2: Featurize…",
-                'relevel': "Stage 3: Relevel (uniform mixture)…",
-                'relevel_gini': "Stage 3: Relevel (Gini-optimized)…",
-                'relevel_simple': "Stage 3: Relevel (simple)…",
-                'split': "Stage 4: Split users…",
-                'train': "Stage 5: Train model (MLP)…",
-                'train_two_tower': "Stage 5: Train model (Two-Tower)…",
-                'evaluate': "Stage 6: Evaluate model…",
+                'target_posts': "Stage 2: Generate target posts…",
+                'user_history': "Stage 3: Generate user history…",
+                'train_mlp': "Stage 4: Train model (MLP)…",
+                'train_two_tower': "Stage 4: Train model (Two-Tower)…",
+                'evaluate': "Stage 5: Evaluate model…",
             }
             label = label_map.get(key, f"Stage {idx+1}: {key}…")
-            print(f"\n[{idx+1}/6] ▶️  {label}")
+            print(f"\n[{idx+1}/5] ▶️  {label}")
             reg.run_stage(key, ctx, args)
     finally:
         ctx.tracker.close()
@@ -502,11 +494,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # run-all (modular 6-stage end-to-end)
-    p_all = subparsers.add_parser("run-all", help="Run all 6 stages end-to-end. Defaults to background with nohup.")
+    # run-all (modular 5-stage end-to-end)
+    p_all = subparsers.add_parser("run-all", help="Run all 5 stages end-to-end. Defaults to background with nohup.")
     # Stage 1 options
-    _add_arg_with_default(p_all, "--data-source", type=str, choices=["greenearth", "digitalocean"],
-                          default=argparse.SUPPRESS, help_text="Source for raw input data - posts and likes")
     _add_arg_with_default(p_all, "--gcs-bucket", type=str, default=argparse.SUPPRESS,
                           help_text="GCS bucket name for ingex data")
     _add_arg_with_default(p_all, "--posts-start", type=str, default=argparse.SUPPRESS,
@@ -517,44 +507,59 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="ISO date string for ingex GCS likes start (inclusive)")
     _add_arg_with_default(p_all, "--likes-end", type=str, default=argparse.SUPPRESS,
                           help_text="ISO date string for ingex GCS likes end (exclusive)")
-    _add_arg_with_default(p_all, "--max-files-per-table", type=int, default=argparse.SUPPRESS,
-                          help_text="Maximum files to read per ingex table")
-    _add_arg_with_default(p_all, "--image-mode", type=str, choices=["auto", "off", "on"],
-                          default=argparse.SUPPRESS, help_text="Control image handling during data pull")
-    _add_arg_with_default(p_all, "--max-posts-per-author", type=int, default=argparse.SUPPRESS,
-                          help_text="Cap on posts per author during ingestion")
-    _add_arg_with_default(p_all, "--max-liked-posts-per-user", type=int, default=argparse.SUPPRESS,
-                          help_text="Cap on liked posts per user during ingestion")
+    _add_arg_with_default(p_all, "--max-liking-users", type=int, default=argparse.SUPPRESS,
+                          help_text="Cap on total liking users to sample (None = no limit)")
+    _add_arg_with_default(p_all, "--max-likes-per-user", type=int, default=argparse.SUPPRESS,
+                          help_text="Random cap on likes per user in Stage 1 (NOT recency-based)")
+    _add_arg_with_default(p_all, "--negative-posts-sample", type=int, default=argparse.SUPPRESS,
+                          help_text="Number of random posts to sample for negative cases in Stage 1")
     _add_arg_with_default(p_all, "--cap-random-seed", type=int, default=argparse.SUPPRESS,
                           help_text="Random seed for ingestion capping")
+    _add_arg_with_default(p_all, "--max-memory-gb", type=float, default=argparse.SUPPRESS,
+                          help_text="Maximum memory to use in GB (None = auto based on available RAM)")
+    _add_arg_with_default(p_all, "--max-memory-pct", type=float, default=argparse.SUPPRESS,
+                          help_text="Maximum percentage of available RAM to use (default: 0.75)")
+    _add_arg_with_default(p_all, "--memory-check", type=str, choices=["full", "ignore", "skip"],
+                          default=argparse.SUPPRESS,
+                          help_text="Memory check mode: full (enforce limits), ignore (log only), skip (no estimation)")
     _add_arg_with_default(p_all, "--output-dir", type=str, default=argparse.SUPPRESS,
                           help_text="Optional explicit run directory root")
     _add_arg_with_default(p_all, "--run-name", type=str, default=argparse.SUPPRESS,
                           help_text="Optional suffix for Stage 1 run dir name")
     _add_arg_with_default(p_all, "--debug", action="store_true", default=argparse.SUPPRESS,
                           help_text="Enable verbose debug logging for Stage 1")
-    # Stage 2 options
-    _add_arg_with_default(p_all, "--global-topic-k", type=int, default=argparse.SUPPRESS,
-                          help_text="Number of global topics")
-    _add_arg_with_default(p_all, "--relevel-method", type=str, choices=["uniform", "gini", "simple"],
-                          default=argparse.SUPPRESS, help_text="Which relevel script to use: uniform, gini, or simple")
-    _add_arg_with_default(p_all, "--relevel-strategy", type=str, choices=["none", "uniform_mixture_balanced"],
-                          default=argparse.SUPPRESS, help_text="Relevel weighting strategy")
-    _add_arg_with_default(p_all, "--relevel-alpha", type=float, default=argparse.SUPPRESS,
-                          help_text="Alpha parameter for relevel weighting")
-    _add_arg_with_default(p_all, "--relevel-min-users-per-topic", type=int, default=argparse.SUPPRESS,
-                          help_text="Minimum users per topic when releveling")
-    _add_arg_with_default(p_all, "--min-likes-per-user", type=int, default=argparse.SUPPRESS,
-                          help_text="Minimum likes per user for inclusion")
-    _add_arg_with_default(p_all, "--val-ratio", type=float, default=argparse.SUPPRESS,
-                          help_text="Validation ratio")
-    _add_arg_with_default(p_all, "--holdout-ratio", type=float, default=argparse.SUPPRESS,
-                          help_text="Holdout ratio")
     _add_arg_with_default(p_all, "--random-seed", type=int, default=argparse.SUPPRESS,
                           help_text="Random seed for splitting")
     _add_arg_with_default(p_all, "--embedding-model", type=str, choices=["all_MiniLM_L6_v2", "all_MiniLM_L12_v2"],
                           default=argparse.SUPPRESS, help_text="SentenceTransformers model for embeddings")
-    # Stage 5 (train) model selection
+    _add_arg_with_default(p_all, "--skip-embeddings", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Skip embedding validation/memmap write in Stage 1 (faster iteration; later stages that need embeddings will fail)")
+    # Stage 2/3 options
+    _add_arg_with_default(p_all, "--max-prior-likes", type=int, default=argparse.SUPPRESS,
+                          help_text="Cap on prior likes per target in Stage 3 user history (None = no cap, keeps all prior likes)")
+    _add_arg_with_default(p_all, "--history-buffer-hours", type=float, default=argparse.SUPPRESS,
+                          help_text="Buffer in hours subtracted from seen_at when determining prior likes for user history (None = no buffer)")
+    _add_arg_with_default(p_all, "--neg-sample-bucket", type=str, default=argparse.SUPPRESS,
+                          help_text="Duration (e.g. 1h) of time buckets for picking negative samples near positive (liked) posts")
+    _add_arg_with_default(p_all, "--train-start", type=str, default=argparse.SUPPRESS,
+                          help_text="ISO date string for start of training dataset window")
+    _add_arg_with_default(p_all, "--val-start", type=str, default=argparse.SUPPRESS,
+                          help_text="ISO date string for start of validation dataset window. Must be >= train-start")
+    _add_arg_with_default(p_all, "--holdout-start", type=str, default=argparse.SUPPRESS,
+                          help_text="ISO date string for start of holdout dataset window (if not supplied, no holdout set)")
+    _add_arg_with_default(p_all, "--global-topic-k", type=int, default=argparse.SUPPRESS,
+                          help_text="Number of global topics")
+    _add_arg_with_default(p_all, "--min-likes-per-user", type=int, default=argparse.SUPPRESS,
+                          help_text="Minimum likes per user for inclusion (used in Stage 1 filtering and later stages)")
+    # Stage 4 (train) user summarization + model selection
+    _add_arg_with_default(p_all, "--user-summarization", type=str, choices=["mean", "ema", "linear_recency"],
+                          default=argparse.SUPPRESS,
+                          help_text="User-history summarization strategy for MLP (mean, ema, linear_recency)")
+    _add_arg_with_default(p_all, "--ema-alpha", type=float, default=argparse.SUPPRESS,
+                          help_text="EMA smoothing factor (0,1]. Higher = more weight on recent likes. Only used when --user-summarization=ema")
+    _add_arg_with_default(p_all, "--user-encoder", type=str, choices=["summarized", "full_transformer", "cross_attention", "attention"],
+                          default=argparse.SUPPRESS, help_text="User encoder type (must match model-type: summarized for mlp; full_transformer/cross_attention for two-tower). "
+                          "Note: 'attention' is a deprecated alias for 'full_transformer'.")
     _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower"],
                           default=argparse.SUPPRESS, help_text="Model architecture: mlp or two-tower")
     # ============================================================================
@@ -567,15 +572,22 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--shared-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower shared embedding dimension")
     _add_arg_with_default(p_all, "--user-hidden-dim", type=int, default=argparse.SUPPRESS,
-                          help_text="Two-tower user encoder hidden dimension")
+                          help_text="User encoder hidden dimension")
+    _add_arg_with_default(p_all, "--user-output-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="User encoder output dimension")
     _add_arg_with_default(p_all, "--post-hidden-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower post encoder hidden dimension")
+    _add_arg_with_default(p_all, "--post-encoder", key="use_post_encoder", dest="use_post_encoder",
+                          action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
+                          help_text="Enable or disable a neural post-tower encoder. Use --post-encoder to enable, --no-post-encoder to disable")
     _add_arg_with_default(p_all, "--num-attention-heads", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower attention heads")
     _add_arg_with_default(p_all, "--num-attention-layers", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower attention layers")
     _add_arg_with_default(p_all, "--max-history-len", type=int, default=argparse.SUPPRESS,
-                          help_text="Two-tower max user history length")
+                          help_text="Max user history length")
+    _add_arg_with_default(p_all, "--attention-dropout", type=float, default=argparse.SUPPRESS,
+                          help_text="Dropout rate for attention-based user encoders")
     # Stage 5 options (shared)
     _add_arg_with_default(p_all, "--epochs", type=int, default=argparse.SUPPRESS,
                           help_text="Training epochs")
@@ -599,35 +611,46 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Device for training")
     _add_arg_with_default(p_all, "--patience", type=int, default=argparse.SUPPRESS,
                           help_text="Early stopping patience")
+    _add_arg_with_default(p_all, "--run-tag", type=str, default=argparse.SUPPRESS,
+                          help_text="Tag appended to training output directory name (e.g. mlp_summarized_mean)")
     _add_arg_with_default(p_all, "--no-plots", action="store_true", default=argparse.SUPPRESS,
                           help_text="Disable training plots")
     _add_arg_with_default(p_all, "--no-save-model", action="store_true", default=argparse.SUPPRESS,
                           help_text="Skip saving model checkpoints")
-    # Stage 4 options (subset)
+    _add_arg_with_default(p_all, "--disable-progress", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Disable progress bars during training")
+    # Stage 4 (train) - DataLoader settings
+    _add_arg_with_default(p_all, "--num-dataloader-workers", type=int, default=argparse.SUPPRESS,
+                          help_text="Number of DataLoader worker processes")
+    _add_arg_with_default(p_all, "--dataloader-pin-memory", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Enable DataLoader pin_memory for faster GPU transfer")
+    _add_arg_with_default(p_all, "--dataloader-persistent-workers", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Keep DataLoader workers alive between epochs")
+    _add_arg_with_default(p_all, "--dataloader-prefetch-factor", type=int, default=argparse.SUPPRESS,
+                          help_text="Number of batches to prefetch per DataLoader worker")
+    # Stage 4 (train) - Learning rate scheduler
+    _add_arg_with_default(p_all, "--lr-scheduler-factor", type=float, default=argparse.SUPPRESS,
+                          help_text="Factor by which to reduce learning rate")
+    _add_arg_with_default(p_all, "--lr-scheduler-patience", type=int, default=argparse.SUPPRESS,
+                          help_text="Number of epochs with no improvement before reducing LR")
+    # Stage 4 (train) - Training optimization
+    _add_arg_with_default(p_all, "--gradient-clip-max-norm", type=float, default=argparse.SUPPRESS,
+                          help_text="Maximum gradient norm for clipping (two-tower only)")
+    # Stage 5 options (subset)
     _add_arg_with_default(p_all, "--eval-batch-size", type=int, default=argparse.SUPPRESS,
                           help_text="Batch size for evaluation")
     _add_arg_with_default(p_all, "--eval-max-users", type=int, default=argparse.SUPPRESS,
-                          help_text="0 = all eligible users for evaluation")
+                          help_text="None = all eligible users for evaluation")
     # Selection behavior
     _add_arg_with_default(p_all, "--use-latest", action="store_true", default=argparse.SUPPRESS,
                           help_text="(Deprecated) Always enabled during sequential run-all")
     # Selective reruns and prior pinning
     _add_arg_with_default(p_all, "--start-from", type=str,
-                          choices=["get_data", "featurize", "relevel", "split", "train", "evaluate"],
+                          choices=["get_data", "target_posts", "user_history", "train", "train_mlp", "train_two_tower", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Begin execution at this stage")
     _add_arg_with_default(p_all, "--stop-after", type=str,
-                          choices=["get_data", "featurize", "relevel", "split", "train", "evaluate"],
+                          choices=["get_data", "target_posts", "user_history", "train", "train_mlp", "train_two_tower", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Stop after this stage completes")
-    _add_arg_with_default(p_all, "--prior-get-data", type=str, default=argparse.SUPPRESS,
-                          help_text="Path to a specific 01_get_data/<ts> directory")
-    _add_arg_with_default(p_all, "--prior-featurize", type=str, default=argparse.SUPPRESS,
-                          help_text="Path to a specific 02_featurize/<ts> directory")
-    _add_arg_with_default(p_all, "--prior-relevel", type=str, default=argparse.SUPPRESS,
-                          help_text="Path to a specific 03_relevel/<ts> directory")
-    _add_arg_with_default(p_all, "--prior-split", type=str, default=argparse.SUPPRESS,
-                          help_text="Path to a specific 04_split/<ts> directory")
-    _add_arg_with_default(p_all, "--prior-train", type=str, default=argparse.SUPPRESS,
-                          help_text="Path to a specific 05_train/<ts> directory")
     _add_arg_with_default(p_all, "--pick-prior", action="store_true", default=argparse.SUPPRESS,
                           help_text="If multiple prior outputs exist, prompt to pick (foreground only)")
     # Execution behavior

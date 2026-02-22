@@ -52,10 +52,24 @@ def stage_base_dir(run_dir: Path, stage_name: str) -> Path:
     return base
 
 
-def new_stage_timestamp_dir(run_dir: Path, stage_name: str) -> Path:
+def new_stage_timestamp_dir(run_dir: Path, stage_name: str, tag: str = "") -> Path:
     base = stage_base_dir(run_dir, stage_name)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out = base / ts
+    dirname = f"{ts}_{tag}" if tag else ts
+    out = base / dirname
+    # Collision-safe: if the dir already exists (parallel jobs at same second),
+    # append an incrementing suffix.
+    if out.exists():
+        for suffix in range(2, 100):
+            candidate = base / f"{dirname}_{suffix}"
+            if not candidate.exists():
+                out = candidate
+                break
+        else:
+            raise RuntimeError(
+                f"Unable to create unique stage output directory under '{base}' "
+                f"for base name '{dirname}' after exhausting suffixes 2-99."
+            )
     out.mkdir(parents=True, exist_ok=True)
     return out
 
@@ -89,11 +103,11 @@ def select_prior_output(run_dir: Path, stage_name: str, *, use_latest: bool = Tr
     else:
         prefix_map = {
             "get_data": "01_get_data",
-            "featurize": "02_featurize",
-            "relevel": "03_relevel",
-            "split": "04_split",
-            "train": "05_train",
-            "evaluate": "06_evaluate",
+            "target_posts": "02_target_posts",
+            "user_history": "03_user_history",
+            "train_mlp": "04_train",
+            "train_two_tower": "04_train",
+            "evaluate": "05_evaluate",
         }
         alt = prefix_map.get(stage_name, stage_name)
     if alt != stage_name:

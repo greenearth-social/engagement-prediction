@@ -5,7 +5,7 @@ Consolidated Helpers for Engagement Prediction Pipeline
 
 This module centralizes the shared helper functions used across pipeline stages.
 Only truly cross-stage utilities live here. Stage-specific helpers should live
-inside their respective stage scripts (e.g., utils/05_train/stage_train.py).
+inside their respective stage scripts (e.g., utils/04_train/stage_train_mlp.py).
 """
 
 from __future__ import annotations
@@ -13,94 +13,31 @@ from __future__ import annotations
 import os
 import sys
 import json
-import time
 import random
-import hashlib
-import tempfile
 import base64
 import struct
 import zlib
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Set, Any
+from typing import Dict, List, Tuple, Optional, Set, Any, TYPE_CHECKING
 from datetime import datetime, timedelta, timezone
-from collections import defaultdict
-from functools import partial
-import warnings
-from io import BytesIO
 import multiprocessing as mp
-from google.cloud import storage
-import re
-import polars as pl
+import subprocess
 
-import numpy as np
-import pandas as pd
+if TYPE_CHECKING:  # pragma: no cover
+    import numpy as np  # type: ignore
+    import pandas as pd  # type: ignore
+    import polars as pl  # type: ignore
 
-# Optional heavy deps: provide stubs/fallbacks to keep imports robust
-try:
-    import boto3  # type: ignore
-    from botocore.exceptions import ClientError, NoCredentialsError  # type: ignore
-except Exception:  # pragma: no cover
-    boto3 = None  # type: ignore
-    class ClientError(Exception):  # type: ignore
-        pass
-    class NoCredentialsError(Exception):  # type: ignore
-        pass
-
-try:
-    from tqdm import tqdm  # type: ignore
-except Exception:  # pragma: no cover
-    def tqdm(iterable=None, *args, **kwargs):
-        return iterable if iterable is not None else range(kwargs.get('total', 0) or 0)
-
-try:
-    import torch  # type: ignore
-    import torch.nn as nn  # type: ignore
-except Exception:  # pragma: no cover
-    torch = None  # type: ignore
-    class nn:  # type: ignore
-        Module = object
-
-try:
-    import torchvision.transforms as transforms  # type: ignore
-    from torchvision.models import resnet18, ResNet18_Weights  # type: ignore
-except Exception:  # pragma: no cover
-    transforms = None  # type: ignore
-    resnet18 = None  # type: ignore
-    ResNet18_Weights = None  # type: ignore
-
-try:
-    from PIL import Image  # type: ignore
-except Exception:  # pragma: no cover
-    Image = None  # type: ignore
-
-try:
-    import requests  # type: ignore
-except Exception:  # pragma: no cover
-    requests = None  # type: ignore
-
-try:
-    from sentence_transformers import SentenceTransformer  # type: ignore
-except Exception:  # pragma: no cover
-    SentenceTransformer = None  # type: ignore
-
-
-# ----------------------------------------
-# Config
-# ----------------------------------------
-SPACES_BUCKET = "parquet-dumps"
-SPACES_REGION = "sfo3"
-SPACES_HOST = f"{SPACES_REGION}.digitaloceanspaces.com"
 
 # Avoid HF tokenizers fork warnings/deadlocks in multiprocessing contexts
 os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
 
 
-# ----------------------------------------
-# Datetime helpers
-# ----------------------------------------
-# For parsing GCS Ingex filenames
-TIMESTAMP_SUFFIX_GCS = "_(\\d{8})_(\\d{6})\\.parquet$"
+TIMESTAMP_COL_NAME = "record_created_at"
 
+# ----------------------------------------
+# Data loading helpers
+# ----------------------------------------
 # For parsing CLI arg strings
 KNOWN_TS_FORMATS = [
     "%Y-%m-%dT%H:%M:%S%z",     # 2024-02-10T13:45:00+0000
@@ -109,10 +46,8 @@ KNOWN_TS_FORMATS = [
     "%Y-%m-%d",                # 2024-02-10
 ]
 
-def parse_one_ts(raw_ts: Optional[str]) -> Optional[datetime]:
-    """Parse a single timestamp string into a timezone-aware datetime (UTC)."""
-    if raw_ts is None:
-        return None
+
+def parse_one_ts_strict(raw_ts: str) -> datetime:
     for fmt in KNOWN_TS_FORMATS:
         try:
             dt = datetime.strptime(raw_ts, fmt)
@@ -124,257 +59,141 @@ def parse_one_ts(raw_ts: Optional[str]) -> Optional[datetime]:
     raise ValueError(f"Unrecognized datetime format: {raw_ts!r}")
 
 
-# ----------------------------------------
-# Data IO helpers (Green Earth Ingex + GCS)
-# ----------------------------------------
-def parse_ts_from_name_ingex_gcs(
-        blob_name: str, 
-        blob_prefix: str
-    ) -> Optional[datetime]:
-    """Parse timestamp from GCS blob name based on Ingex naming convention."""
-    pattern = re.compile(blob_prefix + TIMESTAMP_SUFFIX_GCS)
-    m = pattern.match(blob_name)
-    if not m:
+def parse_one_ts(raw_ts: Optional[str]) -> Optional[datetime]:
+    """Parse a single timestamp string into a timezone-aware datetime (UTC)."""
+    if raw_ts is None:
         return None
-    ymd, hms = m.group(1), m.group(2)
-    return datetime.strptime(ymd + hms, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+    return parse_one_ts_strict(raw_ts)
 
-def list_files_in_range_ingex_gcs(
-        gcs_bucket: str, 
-        blob_prefix: str, 
-        start: Optional[datetime], 
-        end: Optional[datetime],
-        ) -> list[str]:
-    """List GCS blob URIs within specified time range based on Ingex naming convention."""
-    client = storage.Client()
-    blobs = client.list_blobs(gcs_bucket)
-    out = []
-    for b in blobs:
-        ts = parse_ts_from_name_ingex_gcs(blob_name=b.name, blob_prefix=blob_prefix)
-        if ts is None:
-            continue
-        if start is not None and ts < start:
-            continue
-        if end is not None and ts >= end:
-            continue
-        out.append(f"gs://{gcs_bucket}/{b.name}")
-    return out
 
-def load_raw_data_ingex(
-        gcs_bucket: str, 
-        blob_prefix: str,
-        start_str: Optional[str], 
-        end_str: Optional[str], 
-    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Load raw data from GreenEarth Ingex on GCS within specified time ranges."""
+def apply_time_filter(
+    lf: pl.LazyFrame, 
+    start_str: Optional[str], 
+    end_str: Optional[str]
+) -> pl.LazyFrame:
+    """
+    Apply a time filter to a polars lazyframe. 
+    Note that applying the filter using strings instead of converting to datetimes allows for 
+    streaming rather than loading everything into memory.
+    """
+    import polars as pl
+    if 'record_created_at' not in lf.collect_schema().names():
+        raise ValueError("Input LazyFrame does not contain 'record_created_at' column for time filtering")
+    if start_str is not None:
+        lf = lf.filter(pl.col("record_created_at") >= start_str)
+    if end_str is not None:
+        lf = lf.filter(pl.col("record_created_at") < end_str)
+    return lf
+
+
+def save_polars_physical_plan_image(lf: pl.LazyFrame, out_path: str):
+    dot = lf.show_graph(plan_stage='physical', engine='streaming', raw_output=True)
+    if dot is not None:
+        Path("plan.dot").write_text(dot)
+    else:
+        print("\n\nNo DOT output generated!!!\n\n")
+    subprocess.run(["dot", "-Tpng", "-Gdpi=220", "plan.dot", "-o", out_path], check=True) 
+
+
+def load_parquet_from_prior(prior_path: Path, prefix: str) -> pl.LazyFrame:
+    # Load the most recent *.parquet found in the given directory
+    import polars as pl
+    candidates = sorted(prior_path.glob(f"{prefix}*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not candidates:
+        raise FileNotFoundError(f"No {prefix}*.parquet found under {prior_path}")
+    return pl.scan_parquet(candidates[0])
+
+
+# ----------------------------------------
+# Embeddings helpers
+# ----------------------------------------
+
+# Known embedding model dimensions
+EMBEDDING_MODEL_DIMS: Dict[str, int] = {
+    "all_MiniLM_L6_v2": 384,
+    "all_MiniLM_L12_v2": 384,
+    "all-MiniLM-L6-v2": 384,
+    "all-MiniLM-L12-v2": 384,
+    "paraphrase-MiniLM-L6-v2": 384,
+    "multi-qa-MiniLM-L6-cos-v1": 384,
+}
+
+
+def get_embedding_dim_for_model(embedding_model: str) -> int:
+    """
+    Get the embedding dimension for a known model name.
     
-    start_dt: Optional[datetime] = parse_one_ts(start_str)
-    end_dt: Optional[datetime] = parse_one_ts(end_str)
-    
-    paths = list_files_in_range_ingex_gcs(
-        gcs_bucket = gcs_bucket,
-        blob_prefix = blob_prefix,
-        start = start_dt,
-        end = end_dt,
-    )
-
-    # LazyFrame (from polars)
-    lf = (
-        pl
-        .scan_parquet(paths)
-        .with_columns(
-            pl.col("inserted_at").str.to_datetime(time_zone="UTC").alias("inserted_at_dt")
+    Args:
+        embedding_model: Name of the embedding model
+        
+    Returns:
+        Embedding dimension (e.g., 384 for MiniLM models)
+        
+    Raises:
+        ValueError: If model name is not in EMBEDDING_MODEL_DIMS
+    """
+    if embedding_model not in EMBEDDING_MODEL_DIMS:
+        known_models = ", ".join(sorted(EMBEDDING_MODEL_DIMS.keys()))
+        raise ValueError(
+            f"Unknown embedding model '{embedding_model}'. "
+            f"Known models: {known_models}. "
+            f"Add new models to EMBEDDING_MODEL_DIMS in helpers.py."
         )
+    return EMBEDDING_MODEL_DIMS[embedding_model]
+
+
+def get_embeddings_list_col(lf: pl.LazyFrame, embedding_model: str) -> pl.LazyFrame:
+    import polars as pl
+    emb_str = (
+        pl.col("embeddings")
+        .list.eval(
+            pl.when(pl.element().struct.field("key") == embedding_model)
+              .then(pl.element().struct.field("value"))
+        )
+        .list.drop_nulls()
+        .list.get(0)
     )
-    if start_dt is not None:
-        lf = lf.filter(pl.col("inserted_at_dt") >= start_dt)
-    if end_dt is not None:
-        lf = lf.filter(pl.col("inserted_at_dt") < end_dt)
-    pandas_df = lf.collect().to_pandas()
-
-    return pandas_df
-
-
-# ----------------------------------------
-# Data IO helpers (Digital Ocean Spaces/S3 + parquet)
-# ----------------------------------------
-def list_recent_objects_digital_ocean(bucket: str, prefix: str, days: int) -> Tuple[List[str], List[dict]]:
-    """List S3 object keys from the last `days` days within `prefix`."""
-    if boto3 is None:
-        return [], []
-    s3 = boto3.client(
-        "s3",
-        region_name=SPACES_REGION,
-        endpoint_url=f"https://{SPACES_HOST}",
-        aws_access_key_id=os.getenv("SPACES_KEY"),
-        aws_secret_access_key=os.getenv("SPACES_SECRET"),
+    emb_vec = emb_str.map_elements(
+        lambda s: _embedding_loads(s, decompress=True) if s is not None else None,
+        return_dtype=pl.List(pl.Float32),
     )
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    paginator = s3.get_paginator("list_objects_v2")
-
-    keys: List[str] = []
-    file_info: List[dict] = []
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            if obj["LastModified"] >= cutoff:
-                keys.append(obj["Key"])
-                file_info.append(
-                    {
-                        "key": obj["Key"],
-                        "size": obj["Size"],
-                        "modified": obj["LastModified"],
-                    }
-                )
-    return keys, file_info
+    return lf.with_columns(emb_vec.alias("_emb_vec"))
 
 
-def list_all_objects_digital_ocean(bucket: str, prefix: str) -> Tuple[List[str], List[dict]]:
-    """List all S3 object keys for a prefix (no time filter)."""
-    if boto3 is None:
-        return [], []
-    s3 = boto3.client(
-        "s3",
-        region_name=SPACES_REGION,
-        endpoint_url=f"https://{SPACES_HOST}",
-        aws_access_key_id=os.getenv("SPACES_KEY"),
-        aws_secret_access_key=os.getenv("SPACES_SECRET"),
+def get_embed_dim(lf: pl.LazyFrame, embedding_model: str) -> int:
+    import polars as pl
+    lf_with_emb = get_embeddings_list_col(lf, embedding_model)
+    return (
+        lf_with_emb
+        .select(pl.col("_emb_vec").list.len().alias("dim"))
+        .filter(pl.col("dim").is_not_null())
+        .head(1)
+        .collect(engine="streaming")
+        .item()
     )
-    paginator = s3.get_paginator("list_objects_v2")
-
-    keys: List[str] = []
-    file_info: List[dict] = []
-    for page in tqdm(paginator.paginate(Bucket=bucket, Prefix=prefix), desc="Scanning S3 pages"):
-        for obj in page.get("Contents", []):
-            keys.append(obj["Key"])
-            file_info.append({
-                "key": obj["Key"],
-                "size": obj["Size"],
-                "modified": obj["LastModified"],
-            })
-    return keys, file_info
 
 
-def download_parquet_files_digital_ocean(keys: List[str], bucket: str, dest_dir: Path) -> List[Path]:
-    """Download parquet files from Spaces/S3 to dest_dir; skip existing."""
-    if boto3 is None:
-        return []
-    s3 = boto3.client(
-        "s3",
-        region_name=SPACES_REGION,
-        endpoint_url=f"https://{SPACES_HOST}",
-        aws_access_key_id=os.getenv("SPACES_KEY"),
-        aws_secret_access_key=os.getenv("SPACES_SECRET"),
+def expand_embeddings_polars(
+    lf: pl.LazyFrame,
+    embedding_model: str,
+    embed_dim: int
+) -> pl.LazyFrame:
+    import polars as pl
+    lf = get_embeddings_list_col(lf, embedding_model)
+    return (
+        lf
+        .with_columns(
+            [pl.col("_emb_vec").list.get(i).alias(f"post_emb_{i}") for i in range(embed_dim)]
+        ).drop(["embeddings", "_emb_vec"])
     )
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    downloaded: List[Path] = []
-    for key in tqdm(keys, desc="Downloading files"):
-        local_path = dest_dir / Path(key).name
-        if not local_path.exists():
-            s3.download_file(bucket, key, str(local_path))
-        downloaded.append(local_path)
-    return downloaded
 
 
-def load_and_combine_data_digital_ocean(datasets: Dict[str, List[Path]], drop_unliked_posts: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Load parquet dataframes for posts/likes/(optional images metadata) and optionally drop unliked posts."""
-    posts_dfs: List[pd.DataFrame] = []
-    likes_dfs: List[pd.DataFrame] = []
-    metadata_dfs: List[pd.DataFrame] = []
-
-    for f in tqdm(datasets.get("posts", []), desc="Loading posts"):
-        posts_dfs.append(pd.read_parquet(f))
-    for f in tqdm(datasets.get("likes", []), desc="Loading likes"):
-        likes_dfs.append(pd.read_parquet(f))
-    for f in tqdm(datasets.get("images", []), desc="Loading images"):
-        metadata_dfs.append(pd.read_parquet(f))
-
-    metadata_df = (
-        pd.DataFrame(columns=['commit_cid', 'embed_images'])
-        if len(metadata_dfs) == 0 else pd.concat(metadata_dfs, ignore_index=True)
-    )
-    posts_df = pd.concat(posts_dfs, ignore_index=True) if posts_dfs else pd.DataFrame()
-    likes_df = pd.concat(likes_dfs, ignore_index=True) if likes_dfs else pd.DataFrame()
-
-    if drop_unliked_posts and not likes_df.empty and not posts_df.empty:
-        posts_df = posts_df[posts_df.get("did").isin(likes_df.get("did"))]
-
-    return posts_df, likes_df, metadata_df
-
-
-# ----------------------------------------
-# Join/text detection
-# ----------------------------------------
-def find_join_key(posts_df: pd.DataFrame, likes_df: pd.DataFrame) -> Tuple[str, str]:
-    """Find joins between posts and likes with common cases and overlap fallback."""
-    if "subject_cid" in likes_df.columns and "commit_cid" in posts_df.columns:
-        return "subject_cid", "commit_cid"
-    if "subject_uri" in likes_df.columns and "at_uri" in posts_df.columns:
-        return "subject_uri", "at_uri"
-    common = set(posts_df.columns) & set(likes_df.columns)
-    if not common:
-        raise ValueError("No common column names between likes and posts tables")
-    for col in common:
-        if posts_df[col].isin(likes_df[col]).any():
-            return col, col
-    raise ValueError("No obvious join key between likes and posts tables")
-
-
-def find_text_column(posts_df: pd.DataFrame) -> str:
-    """Heuristic to find the text column."""
-    if "record_text" in posts_df.columns:
-        return "record_text"
-    text_cols = [c for c in posts_df.columns if "text" in c.lower()]
-    if not text_cols:
-        raise ValueError("No text column found in posts table for embedding")
-    return text_cols[0]
-
-
-# ----------------------------------------
-# Embeddings (text + image)
-# ----------------------------------------
 def get_embed_col_names(dim: int) -> List[str]:
     """Generate embedding column names for given dimension."""
     return [f"post_emb_{i}" for i in range(dim)]
 
 
-def compute_post_embeddings(posts_df: pd.DataFrame, text_column: str, model_name: str) -> Tuple[pd.DataFrame, int]:
-    """Compute sentence-transformer embeddings for all posts."""
-    import time
-    if SentenceTransformer is None:
-        raise RuntimeError("sentence-transformers not available")
-    
-    print(f"  Loading embedding model: {model_name}...")
-    t0 = time.time()
-    model = SentenceTransformer(model_name)
-    
-    # Check if GPU is available
-    import torch
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    if device == 'cuda':
-        print(f"  Model loaded in {time.time()-t0:.2f}s (using GPU)")
-    else:
-        print(f"  Model loaded in {time.time()-t0:.2f}s (using CPU)")
-    
-    sample_text = posts_df[text_column].fillna("").astype(str).iloc[0] if len(posts_df) else ""
-    emb = model.encode([sample_text])
-    dim = emb.shape[1]
-    
-    texts = posts_df[text_column].fillna("").astype(str).tolist()
-    # Use larger batch size for GPU, smaller for CPU
-    batch_size = 1024 if device == 'cuda' else 256
-    print(f"  Computing embeddings for {len(texts)} posts (dim={dim}, batch_size={batch_size})...")
-    t1 = time.time()
-    all_emb = model.encode(texts, batch_size=batch_size, show_progress_bar=True, device=device)
-    rate = len(texts) / (time.time() - t1) if time.time() - t1 > 0 else 0
-    print(f"  Embeddings computed in {time.time()-t1:.2f}s ({rate:.1f} posts/sec)")
-    
-    emb_cols = get_embed_col_names(dim)
-    emb_df = pd.DataFrame(all_emb, columns=emb_cols)
-    posts_emb_df = pd.concat([posts_df.reset_index(drop=True), emb_df], axis=1)
-    return posts_emb_df, dim
-
-
-def embedding_loads(s: str, decompress: Optional[bool] = None) -> list[float]:
+def _embedding_loads(s: str, decompress: Optional[bool] = None) -> list[float]:
     """
     Convert an embedding from a base85-encoded string to a list of floats.
 
@@ -398,288 +217,9 @@ def embedding_loads(s: str, decompress: Optional[bool] = None) -> list[float]:
     return list(struct.unpack(f'<{int(len(bs) / 4)}f', bs))
 
 
-def extract_encoded_embedding_ingex(emb_list: Optional[list[dict]], model_name: str) -> Optional[str]:
-    """Extract base85-encoded embedding string from Ingex embeddings list for given model name."""
-    if emb_list is None:
-        return None
-    for emb_dict in emb_list:
-        if emb_dict['key'] == model_name:
-            return emb_dict['value']
-    return None
-
-
-def load_embeddings_ingex(posts_df: pd.DataFrame, model_name: str) -> Tuple[pd.DataFrame, int]:
-    """Load precomputed embeddings from GreenEarth Ingex."""
-
-    # get the dimension of the embeddings by finding one example:
-    embed_dim = None
-    for _, row in posts_df.iterrows():
-        emb_list = row['embeddings']
-        if emb_list is None:
-            continue
-        else:
-            emb_str = extract_encoded_embedding_ingex(emb_list, model_name)
-            if emb_str is not None:
-                sample_emb = embedding_loads(emb_str, decompress=True)
-                embed_dim = len(sample_emb)
-                break
-    if embed_dim is None:
-        raise ValueError(f"No embeddings found for model {model_name} in posts data")
-
-    # Now load all embeddings
-    # First get the string out of the list of dicts for the given model
-    embed_str_col = f"embed_{model_name}"
-    posts_df[embed_str_col] = posts_df['embeddings'].map(lambda x: extract_encoded_embedding_ingex(x, model_name))
-
-    # Pre-allocate the numpy array to speed things up
-    n = len(posts_df)
-    arr = np.zeros((n, embed_dim), dtype=float)
-    for i, x in enumerate(posts_df[embed_str_col].to_numpy()):
-        if x is not None and isinstance(x, str):
-            arr[i] = embedding_loads(x, True)
-
-    emb_cols = get_embed_col_names(embed_dim)
-
-    lded_embs_df = pd.DataFrame(arr, index=posts_df.index, columns=emb_cols)
-    posts_emb_df = pd.concat([posts_df, lded_embs_df], axis=1)
-
-    return posts_emb_df, embed_dim
-
-
-def _load_image_tensor(image_url: str, target_size: Tuple[int, int] = (224, 224)):
-    if requests is None or Image is None or transforms is None:
-        return None
-    try:
-        resp = requests.get(image_url, timeout=10)
-        resp.raise_for_status()
-        image = Image.open(BytesIO(resp.content)).convert('RGB')
-        transform = transforms.Compose([
-            transforms.Resize(target_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
-        return transform(image).unsqueeze(0)
-    except Exception:
-        return None
-
-
-def compute_image_embeddings(posts_emb_df: pd.DataFrame, image_column: str, batch_size: int = 32, max_images: Optional[int] = None) -> Tuple[pd.DataFrame, int]:
-    """Compute ResNet18 features for posts that have an image URL in `image_column`."""
-    if resnet18 is None or torch is None:
-        # Fallback: add zero image embeddings
-        zero_dim = 512
-        cols = [f"image_emb_{i}" for i in range(zero_dim)]
-        z = np.zeros((len(posts_emb_df), zero_dim), dtype=float)
-        return pd.concat([posts_emb_df.reset_index(drop=True), pd.DataFrame(z, columns=cols)], axis=1), zero_dim
-
-    model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
-    model = nn.Sequential(*list(model.children())[:-1])
-    model.eval()
-    if torch.cuda.is_available():
-        model = model.cuda()
-    with torch.no_grad():
-        dummy = torch.randn(1, 3, 224, 224)
-        if torch.cuda.is_available():
-            dummy = dummy.cuda()
-        out = model(dummy)
-        emb_dim = int(out.shape[1])
-
-    df = posts_emb_df.copy()
-    has_img = df[image_column].notna() & (df[image_column] != "") if image_column in df.columns else pd.Series(False, index=df.index)
-    idxs = df[has_img].index.tolist()
-    if max_images is not None:
-        idxs = idxs[:max_images]
-    all_embeddings: Dict[int, np.ndarray] = {}
-    for start in tqdm(range(0, len(idxs), batch_size), desc="Processing images"):
-        for idx in idxs[start:start+batch_size]:
-            img_url = df.at[idx, image_column]
-            tensor = _load_image_tensor(img_url)
-            if tensor is None:
-                all_embeddings[idx] = np.zeros((emb_dim,), dtype=float)
-                continue
-            with torch.no_grad():
-                if torch.cuda.is_available():
-                    tensor = tensor.cuda()
-                emb = model(tensor).squeeze().detach().cpu().numpy()
-            all_embeddings[idx] = emb
-    cols = [f"image_emb_{i}" for i in range(emb_dim)]
-    img_emb_df = pd.DataFrame(0.0, index=df.index, columns=cols)
-    if all_embeddings:
-        filled = pd.DataFrame.from_dict(all_embeddings, orient='index')
-        filled.columns = cols
-        img_emb_df.loc[filled.index] = filled.values
-    return pd.concat([df.reset_index(drop=True), img_emb_df.reset_index(drop=True)], axis=1), emb_dim
-
-
 # ----------------------------------------
 # Feature column helpers
 # ----------------------------------------
-def get_actual_feature_columns(posts_emb_df: pd.DataFrame) -> Tuple[List[str], List[str], List[str]]:
-    text_emb_cols = [c for c in posts_emb_df.columns if c.startswith("post_emb_")]
-    image_emb_cols = [c for c in posts_emb_df.columns if c.startswith("image_emb_")]
-    post_cols = text_emb_cols + image_emb_cols
-    user_cols = [f"user_emb_{i}" for i in range(len(post_cols))]
-    all_cols = user_cols + post_cols
-    return user_cols, post_cols, all_cols
-
-
-# ----------------------------------------
-# User feature construction (mean/multi_centroid/topic_mixture)
-# ----------------------------------------
-try:
-    from sklearn.cluster import MiniBatchKMeans as _MBK  # type: ignore
-except Exception:  # pragma: no cover
-    _MBK = None  # type: ignore
-
-
-def build_user_feature_frame(
-    schema: str,
-    likes_df: pd.DataFrame,
-    posts_emb_df: pd.DataFrame,
-    join_like: str,
-    join_post: str,
-    embedding_dim: int,
-    *,
-    selected_users: Optional[List[str]] = None,
-    feature_columns: Optional[List[List[str]]] = None,
-    random_seed: int = 42,
-    topic_model: Optional[Any] = None,
-    pca_model: Optional[Any] = None,
-    global_topic_k: Optional[int] = None,
-    user_k: int = 3,
-    min_cluster_size: int = 3,
-    max_embedding_posts_per_user: int = 20,
-) -> pd.DataFrame:
-    rng = np.random.RandomState(int(random_seed))
-    likes_local = likes_df[likes_df['did'].isin(selected_users)] if selected_users is not None else likes_df.copy()
-    if feature_columns is not None:
-        expected_user_cols, post_cols_expected, _ = feature_columns
-    else:
-        expected_user_cols, post_cols_expected, _ = get_actual_feature_columns(posts_emb_df)
-
-    available_posts = set(posts_emb_df[join_post].astype(str).unique())
-    if join_like not in likes_local.columns:
-        raise KeyError(f"likes_df missing join_like column: {join_like}")
-    likes_local[join_like] = likes_local[join_like].astype(str)
-    likes_local = likes_local[likes_local[join_like].isin(available_posts)]
-    feat_cols = [c for c in posts_emb_df.columns if c.startswith('post_emb_') or c.startswith('image_emb_')]
-
-    if schema == 'topic_mixture':
-        if topic_model is None:
-            raise ValueError("topic_model is required for topic_mixture schema")
-        joined = likes_local.merge(posts_emb_df[[join_post] + feat_cols], left_on=join_like, right_on=join_post, how='inner')
-        if len(joined) == 0:
-            raise ValueError("No joinable likes to compute topic mixtures")
-        X = joined[feat_cols].values.astype(np.float32, copy=False)
-        if pca_model is not None and hasattr(pca_model, 'components_'):
-            try:
-                if X.shape[1] == int(pca_model.components_.shape[1]):
-                    X = pca_model.transform(X)
-            except Exception:
-                pass
-        topics = topic_model.predict(X)
-        joined['_topic'] = topics
-        counts = joined.groupby(['did', '_topic']).size().unstack(fill_value=0)
-        if global_topic_k is None:
-            global_topic_k = int(counts.shape[1])
-        for t in range(int(global_topic_k)):
-            if t not in counts.columns:
-                counts[t] = 0
-        counts = counts[sorted(counts.columns)]
-        probs = counts.div(counts.sum(axis=1).replace(0, 1), axis=0)
-        user_features_df = probs.reset_index()
-        user_features_df.columns = ['did'] + [f'user_topic_{t}' for t in range(int(global_topic_k))]
-        if feature_columns is not None:
-            for c in expected_user_cols:
-                if c not in user_features_df.columns:
-                    user_features_df[c] = 0.0
-            return user_features_df[['did'] + expected_user_cols].copy()
-        return user_features_df
-
-    if schema == 'multi_centroid':
-        if _MBK is None:
-            raise RuntimeError("scikit-learn is required for multi_centroid user features")
-        if feature_columns is not None:
-            # infer K and D
-            import re
-            k_indices: List[int] = []
-            d_indices: List[int] = []
-            for c in expected_user_cols:
-                m_d = re.match(r'user_k(\d+)_d(\d+)$', c)
-                if m_d:
-                    k_indices.append(int(m_d.group(1)))
-                    d_indices.append(int(m_d.group(2)))
-                    continue
-                m_w = re.match(r'user_k(\d+)_weight$', c)
-                if m_w:
-                    k_indices.append(int(m_w.group(1)))
-                    continue
-            K = (max(k_indices) + 1) if k_indices else int(user_k)
-            D = (max(d_indices) + 1) if d_indices else None
-        else:
-            K, D = int(user_k), None
-        joined = likes_local.merge(posts_emb_df[[join_post] + feat_cols], left_on=join_like, right_on=join_post, how='inner')
-        rows: List[Dict[str, Any]] = []
-        for user_id, g in joined.groupby('did'):
-            Xg = g[feat_cols].values.astype(np.float32, copy=False)
-            if len(Xg) == 0:
-                continue
-            cap = min(int(max_embedding_posts_per_user), len(Xg))
-            if len(Xg) > cap:
-                idx = rng.choice(len(Xg), size=cap, replace=False)
-                Xg = Xg[idx]
-            k_eff = int(K)
-            if len(Xg) < k_eff:
-                k_eff = max(1, len(Xg) // max(1, int(min_cluster_size)))
-            if k_eff < 1:
-                continue
-            mbk = _MBK(n_clusters=k_eff, batch_size=min(256, max(16, len(Xg))), random_state=int(random_seed), n_init=5)
-            labels = mbk.fit_predict(Xg)
-            centroids = mbk.cluster_centers_
-            counts = np.bincount(labels, minlength=k_eff).astype(np.float32)
-            weights = counts / (counts.sum() if counts.sum() > 0 else 1.0)
-            norms = np.linalg.norm(centroids, axis=1)
-            order = np.lexsort((-norms, -weights))
-            centroids = centroids[order]
-            weights = weights[order]
-            if D is None:
-                D = centroids.shape[1]
-            pad_centroids = np.zeros((int(K), int(D)), dtype=np.float32)
-            pad_weights = np.zeros((int(K),), dtype=np.float32)
-            pad_centroids[:k_eff, :min(int(D), centroids.shape[1])] = centroids[:, :min(int(D), centroids.shape[1])]
-            pad_weights[:k_eff] = weights
-            row: Dict[str, Any] = {'did': user_id, 'user_k_effective': int(k_eff)}
-            for i in range(int(K)):
-                for d in range(int(D)):
-                    row[f'user_k{i}_d{d}'] = float(pad_centroids[i, d])
-                row[f'user_k{i}_weight'] = float(pad_weights[i])
-            rows.append(row)
-        if not rows:
-            raise ValueError("No users had sufficient embedding posts to compute multi-centroid features")
-        user_df = pd.DataFrame(rows)
-        if feature_columns is not None:
-            for c in expected_user_cols:
-                if c not in user_df.columns:
-                    user_df[c] = 0.0
-            return user_df[['did'] + expected_user_cols].copy()
-        return user_df
-
-    # mean embedding fallback (compat with older paths)
-    text_emb_cols = [col for col in posts_emb_df.columns if col.startswith("post_emb_")]
-    image_emb_cols = [col for col in posts_emb_df.columns if col.startswith("image_emb_")]
-    feat_cols = text_emb_cols + image_emb_cols
-    joined = likes_local.merge(posts_emb_df[[join_post] + feat_cols], left_on=join_like, right_on=join_post, how='inner')
-    user_embeddings = joined.groupby("did")[feat_cols].mean().reset_index()
-    user_emb_cols = [f"user_emb_{i}" for i in range(len(feat_cols))]
-    user_embeddings.columns = ["did"] + user_emb_cols
-    if feature_columns is not None:
-        missing = [c for c in expected_user_cols if c not in user_embeddings.columns]
-        if missing:
-            raise ValueError("Computed mean user embeddings do not match expected schema")
-        return user_embeddings[['did'] + expected_user_cols].copy()
-    return user_embeddings
-
-
 # ----------------------------------------
 # Pairs dataset construction (shared by train/evaluate)
 # ----------------------------------------
@@ -711,6 +251,13 @@ def create_pairs_dataset(
     random_seed: int = 42,
     use_parallel: bool = True,
 ) -> pd.DataFrame:
+    import numpy as np
+    import pandas as pd
+    try:
+        from tqdm import tqdm  # type: ignore
+    except Exception:  # pragma: no cover
+        def tqdm(iterable=None, *args, **kwargs):
+            return iterable if iterable is not None else range(kwargs.get('total', 0) or 0)
     random.seed(int(random_seed))
     text_emb_cols = [col for col in posts_emb_df.columns if col.startswith("post_emb_")]
     image_emb_cols = [col for col in posts_emb_df.columns if col.startswith("image_emb_")]
@@ -784,6 +331,9 @@ def validate_dataframe_schema(
     column name -> dtype spec, where dtype spec can be a Python type (e.g., int,
     float, str), a pandas/numpy dtype, a dtype string, or an iterable of specs.
     """
+    import numpy as np
+    import pandas as pd
+    import polars as pl
     if not isinstance(expected_schema, dict) or not expected_schema:
         raise ValueError("expected_schema must be a non-empty dict")
 
@@ -843,12 +393,12 @@ def validate_dataframe_schema(
                     return dtype in polars_string or dtype == pl.Object
 
             if isinstance(expected, type):
+                if issubclass(expected, (bool, np.bool_)):
+                    return dtype == pl.Boolean
                 if issubclass(expected, (int, np.integer)):
                     return dtype in polars_integer
                 if issubclass(expected, (float, np.floating)):
                     return dtype in polars_float
-                if issubclass(expected, (bool, np.bool_)):
-                    return dtype == pl.Boolean
                 if issubclass(expected, str):
                     return dtype in polars_string
                 if issubclass(expected, (np.datetime64, datetime)):
@@ -977,18 +527,28 @@ def validate_data_integrity(data_dict: Dict) -> bool:
 # ----------------------------------------
 # Visualization helpers (shared)
 # ----------------------------------------
-import matplotlib.pyplot as plt  # type: ignore
-try:
-    import seaborn as sns  # type: ignore
-except Exception:  # pragma: no cover
-    sns = None  # type: ignore
-import matplotlib.patches as mpatches  # type: ignore
 
 FIGURE_SIZE = (10, 6)
 DPI = 300
 
 
+def _configure_matplotlib_backend():
+    """Configure matplotlib to use non-interactive Agg backend.
+    
+    This should be called before any matplotlib.pyplot imports to avoid
+    display issues in headless environments. Checks if matplotlib has already
+    been imported and only sets the backend if it hasn't, avoiding warnings
+    about changing backends after initialization.
+    """
+    import sys
+    if 'matplotlib' not in sys.modules:
+        import matplotlib
+        matplotlib.use("Agg")
+
+
 def plot_training_history(history: Dict[str, List[float]], save_path: Optional[Path] = None, best_epoch: Optional[int] = None):
+    _configure_matplotlib_backend()
+    import matplotlib.pyplot as plt  # type: ignore
     required_keys = ['train_loss', 'val_loss', 'train_auc', 'val_auc']
     if any(k not in history for k in required_keys) or len(history.get('train_loss', [])) == 0:
         return
@@ -1017,10 +577,22 @@ def plot_training_history(history: Dict[str, List[float]], save_path: Optional[P
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
-    plt.show()
+    plt.close(fig)
 
 
-def plot_model_performance(y_true: np.ndarray, y_pred_proba: np.ndarray, save_path: Optional[Path] = None):
+def plot_model_performance(
+    y_true: np.ndarray,
+    y_pred_proba: np.ndarray,
+    save_path: Optional[Path] = None,
+    title_suffix: str = "",
+):
+    import numpy as np
+    _configure_matplotlib_backend()
+    import matplotlib.pyplot as plt  # type: ignore
+    try:
+        import seaborn as sns  # type: ignore
+    except Exception:  # pragma: no cover
+        sns = None  # type: ignore
     from sklearn.metrics import roc_curve, roc_auc_score, precision_recall_curve, confusion_matrix  # type: ignore
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
     fpr, tpr, _ = roc_curve(y_true, y_pred_proba)
@@ -1029,14 +601,14 @@ def plot_model_performance(y_true: np.ndarray, y_pred_proba: np.ndarray, save_pa
     axes[0, 0].plot([0, 1], [0, 1], 'k--', alpha=0.5)
     axes[0, 0].set_xlabel('False Positive Rate')
     axes[0, 0].set_ylabel('True Positive Rate')
-    axes[0, 0].set_title('ROC Curve')
+    axes[0, 0].set_title(f'ROC Curve {title_suffix}'.strip())
     axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
     precision, recall, _ = precision_recall_curve(y_true, y_pred_proba)
     axes[0, 1].plot(recall, precision)
     axes[0, 1].set_xlabel('Recall')
     axes[0, 1].set_ylabel('Precision')
-    axes[0, 1].set_title('Precision-Recall Curve')
+    axes[0, 1].set_title(f'Precision-Recall Curve {title_suffix}'.strip())
     axes[0, 1].grid(True, alpha=0.3)
     y_pred_binary = (y_pred_proba > 0.5).astype(int)
     cm = confusion_matrix(y_true, y_pred_binary)
@@ -1046,20 +618,20 @@ def plot_model_performance(y_true: np.ndarray, y_pred_proba: np.ndarray, save_pa
         axes[1, 0].imshow(cm, cmap='Blues')
         for (i, j), val in np.ndenumerate(np.array(cm)):
             axes[1, 0].text(j, i, int(val), ha='center', va='center')
-    axes[1, 0].set_title('Confusion Matrix')
+    axes[1, 0].set_title(f'Confusion Matrix {title_suffix}'.strip())
     axes[1, 0].set_xlabel('Predicted')
     axes[1, 0].set_ylabel('Actual')
     axes[1, 1].hist(y_pred_proba[y_true == 0], bins=50, alpha=0.7, label='Not Liked')
     axes[1, 1].hist(y_pred_proba[y_true == 1], bins=50, alpha=0.7, label='Liked')
     axes[1, 1].set_xlabel('Predicted Probability')
     axes[1, 1].set_ylabel('Frequency')
-    axes[1, 1].set_title('Prediction Distribution')
+    axes[1, 1].set_title(f'Prediction Distribution {title_suffix}'.strip())
     axes[1, 1].legend()
     axes[1, 1].grid(True, alpha=0.3)
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=DPI, bbox_inches='tight')
-    plt.show()
+    plt.close()
 
 
 def create_user_visualization(user_tracking_results: Dict[str, Any], timestamp: str, save_dir: Path) -> None:
@@ -1389,7 +961,6 @@ def relevel_uniform_mixture(
 # Logging utilities
 # ----------------------------------------
 import logging
-from datetime import datetime
 
 # Global logger instances per stage (initialized on first use)
 _stage_loggers: Dict[str, logging.Logger] = {}
@@ -1416,7 +987,7 @@ def get_stage_logger(stage_name: str, log_file: Optional[Path] = None) -> loggin
     
     # Create formatter with timestamp
     formatter = logging.Formatter(
-        '[%(asctime)s.%(msecs)03d] [%(name)s] %(message)s',
+        '[%(asctime)s] [%(name)s] %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
@@ -1454,6 +1025,7 @@ def log_operation_start(operation_name: str, stage_name: str, logger: Optional[l
     """
     if logger is None:
         logger = get_stage_logger(stage_name)
+    logger.info("=" * 60)
     logger.info(f"Starting: {operation_name}")
     return logger
 
@@ -1465,3 +1037,43 @@ def get_device(arg_device: Optional[str]) -> str:
         return device
     else:
         return arg_device
+
+
+# ----------------------------------------
+# PyTorch utilities
+# ----------------------------------------
+
+def clear_cuda_memory():
+    """Aggressively clear CUDA cache and run garbage collection.
+    
+    Useful for freeing GPU memory between model creation, particularly when
+    experimenting with different model sizes or batch sizes.
+    """
+    import gc
+    import torch
+    gc.collect()
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
+def set_random_seeds(seed: int):
+    """Set random seeds for reproducibility across Python, NumPy, and PyTorch.
+    
+    Args:
+        seed: Random seed value
+        
+    Note:
+        This ensures deterministic behavior for model initialization, data
+        shuffling, and stochastic operations like dropout. However, some
+        CUDA operations may still have non-deterministic behavior.
+    """
+    import random as _random
+    import numpy as np
+    import torch
+    _random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)

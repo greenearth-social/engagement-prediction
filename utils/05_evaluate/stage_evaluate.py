@@ -31,7 +31,6 @@ from utils.pipeline.core import new_stage_timestamp_dir, select_prior_output, Co
 
 # Shared helpers
 from utils.helpers import (
-    get_actual_feature_columns,
     create_pairs_dataset,
     get_stage_logger,
     log_operation_start,
@@ -188,8 +187,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # Build disjoint sets per user similar to training and construct pairs (pairs/matrix helper reuse)
     import time
-    from utils.helpers import build_user_feature_frame as build_user_features_shared
-    from utils.helpers import get_actual_feature_columns, create_pairs_dataset
+    from utils.helpers import create_pairs_dataset
 
     # Eligibility computation (joinable likes vs embedded posts)
     log_operation_start('Compute eligible holdout users', 'STAGE_06_EVALUATE', logger)
@@ -279,7 +277,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             text_emb_cols = [c for c in posts_emb_df.columns if c.startswith('post_emb_')]
             image_emb_cols = [c for c in posts_emb_df.columns if c.startswith('image_emb_')]
             post_emb_cols = text_emb_cols + image_emb_cols
-            from utils.helpers import build_user_feature_frame, get_actual_feature_columns
+            from utils.helpers import build_user_feature_frame, get_actual_feature_columns  # type: ignore[attr-defined]  # TODO: remove with train/eval refactor
             feature_columns = checkpoint.get('feature_columns') if isinstance(checkpoint, dict) else None
             if feature_columns is None:
                 feature_columns = get_actual_feature_columns(posts_emb_df)
@@ -475,7 +473,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
         # Ensure feature_columns available for pairs mode
         if feature_columns is None:
-            from utils.helpers import get_actual_feature_columns as _get_cols
+            from utils.helpers import get_actual_feature_columns as _get_cols  # type: ignore[attr-defined]  # TODO: remove with train/eval refactor
             feature_columns = _get_cols(posts_emb_df)
         # Score pairs
         user_emb_cols, post_emb_cols, feature_cols = feature_columns
