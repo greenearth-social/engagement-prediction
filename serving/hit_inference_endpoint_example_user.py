@@ -2,7 +2,7 @@ import requests
 import numpy as np
 
 def main():
-    url = "http://127.0.0.1:8080/serve/two-tower"
+    url = "http://127.0.0.1:8080/serve/user"
     
     # input dimensions
     batch_size = 3
