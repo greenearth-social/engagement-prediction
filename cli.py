@@ -372,6 +372,9 @@ def cmd_run_all(args: argparse.Namespace) -> int:
         task_name=args.experiment_task or run_name,
         tags=args.experiment_tags,
     )
+    # ClearML remote execution can override parameters on the server/UI.
+    # Connect args and rehydrate a Namespace so downstream code sees the updated values.
+    args = tracker.connect_args(args)
     tracking_payload = {
         "run": _build_tracking_params(args, run_dir),
         "overrides": _extract_overrides(args),
