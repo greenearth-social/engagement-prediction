@@ -4,446 +4,553 @@
 Cold Start Curves Evaluation Module
 
 This module analyzes how model performance varies with the amount of user
-history available for featurization (the "cold start" problem).
+history available at the time each prediction was made (the "cold start" problem).
 
-Users are binned by the number of likes used to create their user embeddings,
-and performance metrics are computed for each bin to understand:
-- How much history is needed for reliable predictions?
-- Do users with more history receive better predictions?
-- Where does performance plateau?
+Each row in predictions_df has its own ``num_embedding_likes`` value representing
+how many prior likes were in the user embedding when that specific prediction was
+made.  Predictions are binned by that per-row value so the analysis operates at
+the post level, not the user level.
+
+For each performance metric one plot is produced showing:
+- A thin gray curve per user (that user's binned metric values)
+- One bold aggregate curve computed across all predictions in each bin
 
 Outputs:
 - cold_start_summary.json: Summary statistics and bin-level metrics
-- precision_vs_likes.png: Precision curve as function of embedding likes
-- recall_vs_likes.png: Recall curve as function of embedding likes
-- auc_vs_likes.png: AUC-ROC curve as function of embedding likes
-- combined_cold_start.png: All metrics on one plot
-- binned_metrics.csv: Full per-bin metrics table
+- <metric>_cold_start.png: One cold-start curve plot per metric
+- binned_metrics.csv: Full per-bin aggregate metrics table
+- user_distribution_by_bin.png: Distribution of predictions across bins
 """
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 
 from . import (
     EvalContext,
     EvalModule,
-    compute_per_user_metrics,
 )
 
 
 class ColdStartCurvesModule(EvalModule):
     """
-    Evaluation module for analyzing cold start behavior.
-    
-    Bins users by the number of embedding likes and computes performance
-    metrics for each bin to understand how model quality varies with
-    available user history.
+    Evaluation module for analyzing cold start behavior at the post level.
+
+    Each prediction carries its own ``num_embedding_likes`` value (the history
+    length at the time that specific prediction was made).  Predictions are
+    binned by that value and performance metrics are computed per bin to
+    understand how model quality varies with available user history.
     """
-    
+
     name = "cold_start_curves"
-    description = "Analyzes model performance as a function of user history length (embedding likes count)"
-    
-    # Default bin edges for number of embedding likes
-    # Users are grouped into bins: [1-2], [3-5], [6-10], [11-20], [21-50], [51+]
-    DEFAULT_BIN_EDGES = [0, 2, 5, 10, 20, 50, 100, 500, float('inf')]
-    
-    # Metrics to plot
-    METRICS = ['precision', 'recall', 'auc_roc', 'accuracy', 'f1']
-    
+    description = "Analyzes model performance as a function of per-prediction history length (embedding likes count)"
+
+    # Default bin edges for number of embedding likes.
+    # Half-integer boundaries from -0.5 through 10.5 ensure that each
+    # integer value 0–10 falls cleanly in its own bin.  After 10 the
+    # edges are whole integers so subsequent bins cover ranges like 11-20.
+    DEFAULT_BIN_EDGES = [
+        -0.5, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5,
+        20, 50, 100, 500, float('inf'),
+    ]
+
+    # Metrics to plot (one plot each)
+    METRICS = ['auc_roc', 'accuracy', 'precision', 'recall', 'f1']
+
     # Plot styling
     FIGURE_SIZE = (10, 6)
     DPI = 150
-    
+
+    # Color for the bold aggregate curve, one per metric
+    METRIC_COLORS = {
+        'auc_roc':   '#1f77b4',
+        'accuracy':  '#d62728',
+        'precision': '#2ca02c',
+        'recall':    '#ff7f0e',
+        'f1':        '#9467bd',
+    }
+
     def run(self, ctx: EvalContext) -> Dict[str, Any]:
         """
         Run cold start analysis.
-        
+
         Args:
-            ctx: EvalContext with predictions, user metadata, and output directory.
-        
+            ctx: EvalContext with predictions (must include ``num_embedding_likes``
+                 column from stage_evaluate enrichment) and output directory.
+
         Returns:
             Dict with binned metrics and artifact paths.
         """
         out_dir = self.get_output_dir(ctx)
-        
-        # Get bin edges from config or use defaults
+
+        # --- hyperparams ---
         bin_edges = ctx.config.get('cold_start_bin_edges', self.DEFAULT_BIN_EDGES)
-        
-        # Step 1: Compute per-user metrics
-        print(f"    Computing per-user metrics for {ctx.num_holdout_users} users...")
-        per_user_df = compute_per_user_metrics(ctx.predictions_df)
-        
-        # Step 2: Merge with user metadata (num_embedding_likes)
-        if 'num_embedding_likes' not in ctx.user_metadata_df.columns:
-            print("    Warning: num_embedding_likes not in user_metadata_df, skipping cold start analysis")
+
+        # Require per-prediction history length
+        if 'num_embedding_likes' not in ctx.predictions_df.columns:
+            print("    Warning: num_embedding_likes not in predictions_df, skipping cold start analysis")
             return {
                 'status': 'skipped',
-                'reason': 'num_embedding_likes not available in user metadata',
+                'reason': 'num_embedding_likes not available in predictions_df',
             }
-        
-        merged_df = per_user_df.merge(
-            ctx.user_metadata_df[['did', 'num_embedding_likes', 'num_total_likes']],
-            on='did',
-            how='left',
-        )
-        
-        # Drop users without metadata
-        merged_df = merged_df.dropna(subset=['num_embedding_likes'])
-        if len(merged_df) == 0:
-            print("    Warning: No users with embedding likes metadata")
-            return {
-                'status': 'skipped',
-                'reason': 'No users with embedding likes metadata',
-            }
-        
-        print(f"    Analyzing {len(merged_df)} users with embedding likes metadata...")
-        
-        # Step 3: Bin users by num_embedding_likes
-        merged_df['likes_bin'] = pd.cut(
-            merged_df['num_embedding_likes'],
+
+        predictions_df = ctx.predictions_df.copy()
+        predictions_df['num_embedding_likes'] = predictions_df['num_embedding_likes'].fillna(0).astype(int)
+
+        n_posts = len(predictions_df)
+        n_users = predictions_df['did'].nunique()
+        print(f"    Cold start analysis: {n_posts} predictions across {n_users} users...")
+
+        # Assign bin labels to each prediction row
+        bin_labels = self._make_bin_labels(bin_edges)
+        predictions_df['likes_bin'] = pd.cut(
+            predictions_df['num_embedding_likes'],
             bins=bin_edges,
-            labels=self._make_bin_labels(bin_edges),
+            labels=bin_labels,
             include_lowest=True,
         )
-        
-        # Step 4: Compute metrics per bin
-        print("    Computing metrics per bin...")
-        binned_metrics = self._compute_binned_metrics(merged_df, bin_edges)
-        
-        # Save binned metrics
+
+        # Diagnostics
+        self._log_data_health(predictions_df)
+        self._log_bin_summary(predictions_df)
+
+        # Aggregate metrics across all predictions per bin
+        print("    Computing post-level binned metrics...")
+        binned_metrics = self._compute_binned_metrics_post_level(predictions_df, bin_edges)
+
         binned_path = out_dir / "binned_metrics.csv"
         binned_metrics.to_csv(binned_path, index=False)
-        
-        # Step 5: Generate plots
-        print("    Generating cold start curve plots...")
+
+        # Per-user metrics per bin
+        print(f"    Computing per-user binned metrics for {n_users} users...")
+        per_user_binned = self._compute_per_user_binned_metrics(predictions_df, bin_edges)
+
+        # One plot per metric
+        print("    Generating cold start curve plots (one per metric)...")
         plot_paths = {}
-        
-        # Individual metric plots
-        for metric in self.METRICS:
-            if metric in binned_metrics.columns:
-                plot_path = out_dir / f"{metric}_vs_likes.png"
-                self._plot_metric_vs_likes(
-                    binned_metrics=binned_metrics,
-                    metric=metric,
-                    save_path=plot_path,
-                )
-                plot_paths[f"{metric}_plot_path"] = str(plot_path)
-        
-        # Combined plot
-        combined_path = out_dir / "combined_cold_start.png"
-        self._plot_combined(binned_metrics, combined_path)
-        plot_paths['combined_plot_path'] = str(combined_path)
-        
-        # User distribution by bin
-        dist_path = out_dir / "user_distribution_by_bin.png"
-        self._plot_user_distribution(merged_df, dist_path)
-        plot_paths['distribution_plot_path'] = str(dist_path)
-        
-        # Scatter plot of metric vs likes (raw, not binned)
-        scatter_path = out_dir / "scatter_performance_vs_likes.png"
-        self._plot_scatter(merged_df, scatter_path)
-        plot_paths['scatter_plot_path'] = str(scatter_path)
-        
-        # Step 6: Compute summary statistics
-        summary = self._compute_summary(merged_df, binned_metrics)
-        summary.update(plot_paths)
-        summary['binned_metrics_path'] = str(binned_path)
-        summary['bin_edges'] = [float(e) if e != float('inf') else 'inf' for e in bin_edges]
-        
-        # Save summary
-        summary_path = out_dir / "cold_start_summary.json"
-        self.save_json(summary, summary_path)
-        
-        return summary
-    
-    def _make_bin_labels(self, bin_edges: List[float]) -> List[str]:
-        """Create human-readable bin labels."""
-        labels = []
-        for i in range(len(bin_edges) - 1):
-            low = int(bin_edges[i]) + 1 if i > 0 else int(bin_edges[i])
-            high = bin_edges[i + 1]
-            if high == float('inf'):
-                labels.append(f"{low}+")
-            else:
-                labels.append(f"{low}-{int(high)}")
-        return labels
-    
-    def _compute_binned_metrics(
-        self,
-        merged_df: pd.DataFrame,
-        bin_edges: List[float],
-    ) -> pd.DataFrame:
-        """Compute aggregate metrics for each bin."""
-        rows = []
-        
-        for bin_label in merged_df['likes_bin'].cat.categories:
-            bin_data = merged_df[merged_df['likes_bin'] == bin_label]
-            
-            if len(bin_data) == 0:
-                continue
-            
-            row = {
-                'bin': str(bin_label),
-                'n_users': len(bin_data),
-                'mean_embedding_likes': float(bin_data['num_embedding_likes'].mean()),
-                'median_embedding_likes': float(bin_data['num_embedding_likes'].median()),
-            }
-            
-            # Compute mean and std for each metric
-            for metric in self.METRICS:
-                if metric in bin_data.columns:
-                    values = bin_data[metric].dropna()
-                    if len(values) > 0:
-                        row[metric] = float(values.mean())
-                        row[f'{metric}_std'] = float(values.std())
-                        row[f'{metric}_median'] = float(values.median())
-                        row[f'{metric}_n'] = len(values)
-                    else:
-                        row[metric] = float('nan')
-                        row[f'{metric}_std'] = float('nan')
-                        row[f'{metric}_median'] = float('nan')
-                        row[f'{metric}_n'] = 0
-            
-            rows.append(row)
-        
-        return pd.DataFrame(rows)
-    
-    def _plot_metric_vs_likes(
-        self,
-        binned_metrics: pd.DataFrame,
-        metric: str,
-        save_path: Path,
-    ) -> None:
-        """Plot a single metric vs. embedding likes bins."""
-        fig, ax = plt.subplots(figsize=self.FIGURE_SIZE)
-        
-        # Filter to bins with data
-        plot_df = binned_metrics[binned_metrics[f'{metric}_n'] > 0].copy()
-        if len(plot_df) == 0:
-            plt.close(fig)
-            return
-        
-        x = range(len(plot_df))
-        y = plot_df[metric].values
-        yerr = plot_df[f'{metric}_std'].values
-        
-        # Plot with error bars
-        ax.errorbar(x, y, yerr=yerr, fmt='o-', linewidth=2, markersize=8,
-                   capsize=5, capthick=2, color='steelblue')
-        
-        # Add user counts as secondary info
-        for i, (xi, yi, n) in enumerate(zip(x, y, plot_df['n_users'].values)):
-            ax.annotate(f'n={n}', (xi, yi), textcoords="offset points",
-                       xytext=(0, 10), ha='center', fontsize=9, alpha=0.7)
-        
-        ax.set_xticks(x)
-        ax.set_xticklabels(plot_df['bin'].values, rotation=45, ha='right')
-        ax.set_xlabel('Number of Embedding Likes (User History)', fontsize=12)
-        ax.set_ylabel(f'{metric.replace("_", " ").title()}', fontsize=12)
-        ax.set_title(f'Cold Start Analysis: {metric.replace("_", " ").title()} vs. User History Length',
-                    fontsize=13)
-        ax.grid(True, alpha=0.3)
-        
-        # Set y-axis limits based on metric type
-        if metric in ['precision', 'recall', 'accuracy', 'f1', 'auc_roc']:
-            ax.set_ylim(0, 1.05)
-        
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=self.DPI, bbox_inches='tight')
-        plt.close(fig)
-    
-    def _plot_combined(
-        self,
-        binned_metrics: pd.DataFrame,
-        save_path: Path,
-    ) -> None:
-        """Plot all metrics on a single combined plot."""
-        fig, ax = plt.subplots(figsize=(12, 7))
-        
-        colors = {
-            'precision': '#1f77b4',
-            'recall': '#ff7f0e',
-            'auc_roc': '#2ca02c',
-            'accuracy': '#d62728',
-            'f1': '#9467bd',
-        }
-        
-        markers = {
-            'precision': 'o',
-            'recall': 's',
-            'auc_roc': '^',
-            'accuracy': 'D',
-            'f1': 'v',
-        }
-        
-        x = range(len(binned_metrics))
-        
         for metric in self.METRICS:
             if metric not in binned_metrics.columns:
                 continue
             if binned_metrics[f'{metric}_n'].sum() == 0:
                 continue
-            
-            y = binned_metrics[metric].values
-            yerr = binned_metrics[f'{metric}_std'].values
-            
-            # Replace NaN with None for plotting
-            mask = ~np.isnan(y)
-            if mask.sum() == 0:
-                continue
-            
-            color = colors.get(metric, '#333333')
-            marker = markers.get(metric, 'o')
-            
-            ax.errorbar(
-                np.array(x)[mask], y[mask], yerr=yerr[mask],
-                fmt=f'{marker}-', linewidth=2, markersize=8,
-                capsize=4, capthick=1.5, color=color,
-                label=metric.replace("_", " ").title(),
+
+            plot_path = out_dir / f"{metric}_cold_start.png"
+            self._plot_cold_start_per_metric(
+                metric=metric,
+                binned_metrics=binned_metrics,
+                per_user_binned=per_user_binned,
+                save_path=plot_path,
             )
-        
-        ax.set_xticks(x)
-        ax.set_xticklabels(binned_metrics['bin'].values, rotation=45, ha='right')
-        ax.set_xlabel('Number of Embedding Likes (User History)', fontsize=12)
-        ax.set_ylabel('Metric Value', fontsize=12)
-        ax.set_title('Cold Start Analysis: All Metrics vs. User History Length', fontsize=14)
-        ax.legend(loc='lower right', fontsize=10)
-        ax.grid(True, alpha=0.3)
-        ax.set_ylim(0, 1.05)
-        
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=self.DPI, bbox_inches='tight')
-        plt.close(fig)
-    
-    def _plot_user_distribution(
+            plot_paths[f"{metric}_plot_path"] = str(plot_path)
+
+        # User/prediction distribution by bin
+        dist_path = out_dir / "user_distribution_by_bin.png"
+        self._plot_distribution(predictions_df, dist_path)
+        plot_paths['distribution_plot_path'] = str(dist_path)
+
+        # Summary statistics
+        summary = self._compute_summary(predictions_df, binned_metrics)
+        summary.update(plot_paths)
+        summary['binned_metrics_path'] = str(binned_path)
+        summary['bin_edges'] = [float(e) if e != float('inf') else 'inf' for e in bin_edges]
+
+        summary_path = out_dir / "cold_start_summary.json"
+        self.save_json(summary, summary_path)
+
+        return summary
+
+    # ------------------------------------------------------------------
+    # Bin helpers
+    # ------------------------------------------------------------------
+
+    def _make_bin_labels(self, bin_edges: List[float]) -> List[str]:
+        """Create human-readable bin labels.
+
+        Works correctly with non-integer edge values (e.g. -0.5, 0.5, 1.5 …)
+        by deriving the lowest and highest integers that fall inside each
+        half-open interval (low, high], with the first interval treated as
+        closed on both sides when include_lowest=True.
+        """
+        import math
+        labels = []
+        for i, (low_edge, high_edge) in enumerate(
+            zip(bin_edges[:-1], bin_edges[1:])
+        ):
+            if high_edge == float('inf'):
+                low_int = math.ceil(low_edge) if i > 0 else math.ceil(low_edge)
+                labels.append(f"{low_int}+")
+                continue
+
+            high_int = math.floor(high_edge)
+            if i == 0:
+                # First bin is closed on the left: [low_edge, high_edge]
+                low_int = math.ceil(low_edge)
+            else:
+                # Subsequent bins are left-open: (low_edge, high_edge]
+                low_int = math.floor(low_edge) + 1
+
+            if low_int == high_int:
+                labels.append(str(low_int))
+            else:
+                labels.append(f"{low_int}-{high_int}")
+        return labels
+
+    # ------------------------------------------------------------------
+    # Validation / logging
+    # ------------------------------------------------------------------
+
+    def _log_data_health(self, predictions_df: pd.DataFrame) -> None:
+        """Print diagnostic checks so anomalies are immediately visible."""
+        n = len(predictions_df)
+        n_users = predictions_df['did'].nunique()
+        n_pos = int((predictions_df['y_true'] == 1).sum())
+        n_neg = n - n_pos
+
+        print(f"    [data health] {n} predictions ({n_pos} pos, {n_neg} neg) "
+              f"across {n_users} users")
+
+        # Pair parity: every bin should have an even count because each
+        # target row produces one positive and one negative with the same
+        # history length.
+        bin_counts = predictions_df['likes_bin'].value_counts()
+        odd_bins = [str(b) for b, c in bin_counts.items() if c % 2 != 0]
+        if odd_bins:
+            print(f"    [data health] WARNING: odd prediction counts in bins "
+                  f"{odd_bins} — pos/neg pairing may be broken")
+        else:
+            print(f"    [data health] All bin counts are even (pos/neg pairing OK)")
+
+        # Zero-history breakdown
+        zero_mask = predictions_df['num_embedding_likes'] == 0
+        n_zero = int(zero_mask.sum())
+        if n_zero > 0:
+            z_pos = int((predictions_df.loc[zero_mask, 'y_true'] == 1).sum())
+            z_neg = n_zero - z_pos
+            print(f"    [data health] {n_zero} zero-history predictions "
+                  f"({z_pos} pos, {z_neg} neg)")
+        else:
+            print(f"    [data health] No zero-history predictions")
+
+        # Coverage
+        combos = predictions_df.groupby('did')['num_embedding_likes'].nunique()
+        print(f"    [data health] Users span a median of "
+              f"{combos.median():.0f} distinct history-length bins "
+              f"(min {combos.min()}, max {combos.max()})")
+        print(f"    [data health] Note: not all users span all bins — "
+              f"low-history moments may fall in train/val splits")
+
+    def _log_bin_summary(self, predictions_df: pd.DataFrame) -> None:
+        """Print a compact per-bin summary table."""
+        header = (f"    {'bin':>8s}  {'n_pred':>7s}  {'n_user':>7s}  "
+                  f"{'n_pos':>6s}  {'n_neg':>6s}  {'frac_pos':>8s}")
+        print(header)
+        print(f"    {'—' * len(header.strip())}")
+        for bin_label in predictions_df['likes_bin'].cat.categories:
+            bdf = predictions_df[predictions_df['likes_bin'] == bin_label]
+            if len(bdf) == 0:
+                continue
+            n_pred = len(bdf)
+            n_user = bdf['did'].nunique()
+            n_pos = int((bdf['y_true'] == 1).sum())
+            n_neg = n_pred - n_pos
+            frac = n_pos / n_pred if n_pred else 0
+            print(f"    {str(bin_label):>8s}  {n_pred:>7d}  {n_user:>7d}  "
+                  f"{n_pos:>6d}  {n_neg:>6d}  {frac:>8.3f}")
+
+    # ------------------------------------------------------------------
+    # Metric computation
+    # ------------------------------------------------------------------
+
+    def _compute_metrics_for_group(
         self,
-        merged_df: pd.DataFrame,
+        y_true: np.ndarray,
+        y_pred_proba: np.ndarray,
+    ) -> Dict[str, float]:
+        """Compute all metrics for a set of predictions. Returns NaN when not computable."""
+        y_pred_binary = (y_pred_proba > 0.5).astype(int)
+        n = len(y_true)
+        result: Dict[str, float] = {}
+
+        result['accuracy'] = float(accuracy_score(y_true, y_pred_binary)) if n > 0 else float('nan')
+
+        try:
+            result['precision'] = float(precision_score(y_true, y_pred_binary, zero_division=0))
+        except Exception:
+            result['precision'] = float('nan')
+
+        try:
+            result['recall'] = float(recall_score(y_true, y_pred_binary, zero_division=0))
+        except Exception:
+            result['recall'] = float('nan')
+
+        try:
+            result['f1'] = float(f1_score(y_true, y_pred_binary, zero_division=0))
+        except Exception:
+            result['f1'] = float('nan')
+
+        if len(set(y_true)) > 1:
+            try:
+                result['auc_roc'] = float(roc_auc_score(y_true, y_pred_proba))
+            except Exception:
+                result['auc_roc'] = float('nan')
+        else:
+            result['auc_roc'] = float('nan')
+
+        return result
+
+    def _compute_binned_metrics_post_level(
+        self,
+        predictions_df: pd.DataFrame,
+        bin_edges: List[float],
+    ) -> pd.DataFrame:
+        """
+        Compute aggregate metrics per bin pooling ALL predictions in that bin
+        (post-level aggregation, not user-level).
+        """
+        rows = []
+        bin_labels = self._make_bin_labels(bin_edges)
+
+        for bin_label in bin_labels:
+            bin_data = predictions_df[predictions_df['likes_bin'] == bin_label]
+            if len(bin_data) == 0:
+                continue
+
+            y_true = bin_data['y_true'].values
+            y_pred_proba = bin_data['y_pred_proba'].values
+
+            metrics = self._compute_metrics_for_group(y_true, y_pred_proba)
+
+            row: Dict[str, Any] = {
+                'bin': str(bin_label),
+                'n_predictions': len(bin_data),
+                'n_users': bin_data['did'].nunique(),
+                'n_positive': int(y_true.sum()),
+                'mean_embedding_likes': float(bin_data['num_embedding_likes'].mean()),
+            }
+            for metric, value in metrics.items():
+                row[metric] = value
+                # Store sample count for each metric (NaN-aware)
+                valid = ~np.isnan(np.array([value]))
+                row[f'{metric}_n'] = int(len(y_true)) if valid.all() else 0
+
+            rows.append(row)
+
+        return pd.DataFrame(rows)
+
+    def _compute_per_user_binned_metrics(
+        self,
+        predictions_df: pd.DataFrame,
+        bin_edges: List[float],
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        For each user compute the same metrics per bin (only for bins where
+        they have predictions).
+
+        Returns:
+            Dict mapping did -> DataFrame with columns [bin, <metric>, ...]
+            using the same bin ordering as the aggregate table.
+        """
+        bin_labels = self._make_bin_labels(bin_edges)
+        result: Dict[str, pd.DataFrame] = {}
+
+        for did, user_df in predictions_df.groupby('did'):
+            rows = []
+            for bin_label in bin_labels:
+                bin_data = user_df[user_df['likes_bin'] == bin_label]
+                if len(bin_data) == 0:
+                    continue
+
+                y_true = bin_data['y_true'].values
+                y_pred_proba = bin_data['y_pred_proba'].values
+                metrics = self._compute_metrics_for_group(y_true, y_pred_proba)
+
+                row: Dict[str, Any] = {'bin': str(bin_label), 'n_predictions': len(bin_data)}
+                row.update(metrics)
+                rows.append(row)
+
+            if rows:
+                result[str(did)] = pd.DataFrame(rows)
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Plots
+    # ------------------------------------------------------------------
+
+    def _plot_cold_start_per_metric(
+        self,
+        metric: str,
+        binned_metrics: pd.DataFrame,
+        per_user_binned: Dict[str, pd.DataFrame],
         save_path: Path,
     ) -> None:
-        """Plot distribution of users across bins."""
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-        
-        # Bar chart of users per bin
-        bin_counts = merged_df['likes_bin'].value_counts().sort_index()
-        ax1.bar(range(len(bin_counts)), bin_counts.values, color='steelblue', edgecolor='black')
-        ax1.set_xticks(range(len(bin_counts)))
-        ax1.set_xticklabels(bin_counts.index, rotation=45, ha='right')
-        ax1.set_xlabel('Embedding Likes Bin', fontsize=11)
-        ax1.set_ylabel('Number of Users', fontsize=11)
-        ax1.set_title('User Distribution Across History Length Bins', fontsize=12)
-        ax1.grid(True, alpha=0.3, axis='y')
-        
-        # Add count labels on bars
-        for i, v in enumerate(bin_counts.values):
-            ax1.text(i, v + 0.5, str(v), ha='center', fontsize=9)
-        
-        # Histogram of raw embedding likes
-        ax2.hist(merged_df['num_embedding_likes'], bins=50, color='steelblue',
-                edgecolor='black', alpha=0.7)
-        ax2.set_xlabel('Number of Embedding Likes', fontsize=11)
-        ax2.set_ylabel('Number of Users', fontsize=11)
-        ax2.set_title('Distribution of User History Lengths', fontsize=12)
-        ax2.grid(True, alpha=0.3)
-        
-        # Add median line
-        median_likes = merged_df['num_embedding_likes'].median()
-        ax2.axvline(median_likes, color='red', linestyle='--', linewidth=2,
-                   label=f'Median: {median_likes:.0f}')
-        ax2.legend()
-        
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=self.DPI, bbox_inches='tight')
-        plt.close(fig)
-    
-    def _plot_scatter(
-        self,
-        merged_df: pd.DataFrame,
-        save_path: Path,
-    ) -> None:
-        """Plot scatter of performance vs embedding likes (raw, not binned)."""
-        # Select a metric to show (prefer AUC, fallback to accuracy)
-        metric = 'auc_roc' if 'auc_roc' in merged_df.columns else 'accuracy'
-        
-        fig, ax = plt.subplots(figsize=self.FIGURE_SIZE)
-        
-        valid_df = merged_df.dropna(subset=[metric, 'num_embedding_likes'])
-        if len(valid_df) == 0:
-            plt.close(fig)
+        """
+        Plot one cold-start curve for a single metric.
+
+        - Thin gray lines: per-user curves (only bins where the user has data)
+        - Bold colored line with markers: post-level aggregate across all users
+        """
+        # Filter aggregate to bins that have data for this metric
+        agg_df = binned_metrics[binned_metrics[f'{metric}_n'] > 0].copy()
+        if len(agg_df) == 0:
             return
-        
-        # Scatter plot with some transparency
-        ax.scatter(
-            valid_df['num_embedding_likes'],
-            valid_df[metric],
-            alpha=0.3,
-            s=20,
-            color='steelblue',
+
+        # Map bin label -> x position from the aggregate ordering
+        bin_order = list(agg_df['bin'])
+        bin_to_x = {b: i for i, b in enumerate(bin_order)}
+
+        fig, ax = plt.subplots(figsize=self.FIGURE_SIZE)
+
+        # --- per-user gray curves ---
+        for did, user_df in per_user_binned.items():
+            if metric not in user_df.columns:
+                continue
+            # Keep only bins present in the aggregate ordering
+            user_plot = user_df[user_df['bin'].isin(bin_to_x)].copy()
+            user_plot = user_plot.dropna(subset=metric)
+            if len(user_plot) < 2:
+                continue
+            xs = [bin_to_x[b] for b in user_plot['bin']]
+            ys = user_plot[metric].values
+            ax.plot(xs, ys, color='gray', linewidth=0.7, alpha=0.35, zorder=1)
+
+        # --- aggregate bold curve ---
+        agg_x = list(range(len(agg_df)))
+        agg_y = agg_df[metric].values
+        color = self.METRIC_COLORS.get(metric, '#333333')
+
+        ax.plot(
+            agg_x, agg_y,
+            color=color, linewidth=2.5, marker='o', markersize=7,
+            zorder=3, label='Aggregate (all posts)',
         )
-        
-        # Add trend line (rolling mean)
-        sorted_df = valid_df.sort_values('num_embedding_likes')
-        window = max(len(sorted_df) // 20, 5)  # 5% window or at least 5 users
-        if len(sorted_df) > window:
-            rolling_mean = sorted_df[metric].rolling(window=window, center=True).mean()
-            ax.plot(sorted_df['num_embedding_likes'], rolling_mean,
-                   color='red', linewidth=2, label=f'Rolling Mean (window={window})')
-            ax.legend()
-        
-        ax.set_xlabel('Number of Embedding Likes', fontsize=12)
-        ax.set_ylabel(f'{metric.replace("_", " ").title()}', fontsize=12)
-        ax.set_title(f'{metric.replace("_", " ").title()} vs. User History Length (Raw)', fontsize=13)
+
+        # Annotate with prediction counts
+        for xi, yi, n in zip(agg_x, agg_y, agg_df['n_predictions'].values):
+            if not np.isnan(yi):
+                ax.annotate(
+                    f'n={n}', (xi, yi),
+                    textcoords="offset points", xytext=(0, 10),
+                    ha='center', fontsize=8, alpha=0.75,
+                )
+
+        ax.set_xticks(agg_x)
+        ax.set_xticklabels(bin_order, rotation=45, ha='right')
+        ax.set_xlabel('Number of Embedding Likes at Prediction Time', fontsize=12)
+        ax.set_ylabel(metric.replace('_', ' ').title(), fontsize=12)
+        ax.set_title(
+            f'Cold Start: {metric.replace("_", " ").title()} vs. History Length',
+            fontsize=13,
+        )
+
+        n_users_shown = sum(
+            1 for df in per_user_binned.values()
+            if metric in df.columns and df.dropna(subset=[metric])['bin'].isin(bin_to_x).sum() >= 2
+        )
+        ax.legend(
+            loc='lower right', fontsize=10,
+            title=f'{n_users_shown} user curves shown',
+            title_fontsize=8,
+        )
+
         ax.grid(True, alpha=0.3)
-        
-        # Log scale for x-axis if range is large
-        if valid_df['num_embedding_likes'].max() > 100:
-            ax.set_xscale('log')
-        
+        if metric in ('precision', 'recall', 'accuracy', 'f1', 'auc_roc'):
+            ax.set_ylim(0, 1.05)
+
         plt.tight_layout()
         plt.savefig(save_path, dpi=self.DPI, bbox_inches='tight')
         plt.close(fig)
-    
+
+    def _plot_distribution(
+        self,
+        predictions_df: pd.DataFrame,
+        save_path: Path,
+    ) -> None:
+        """Plot distribution of predictions and users across bins."""
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+        bin_pred_counts = predictions_df['likes_bin'].value_counts().sort_index()
+        bin_user_counts = (
+            predictions_df.groupby('likes_bin')['did']
+            .nunique()
+            .reindex(bin_pred_counts.index)
+        )
+
+        ax1.bar(range(len(bin_pred_counts)), bin_pred_counts.values,
+                color='steelblue', edgecolor='black')
+        ax1.set_xticks(range(len(bin_pred_counts)))
+        ax1.set_xticklabels(bin_pred_counts.index, rotation=45, ha='right')
+        ax1.set_xlabel('Embedding Likes Bin', fontsize=11)
+        ax1.set_ylabel('Number of Predictions', fontsize=11)
+        ax1.set_title('Predictions Distribution Across History Length Bins', fontsize=12)
+        ax1.grid(True, alpha=0.3, axis='y')
+        for i, v in enumerate(bin_pred_counts.values):
+            ax1.text(i, v + 0.5, str(v), ha='center', fontsize=9)
+
+        ax2.bar(range(len(bin_user_counts)), bin_user_counts.values,
+                color='darkorange', edgecolor='black')
+        ax2.set_xticks(range(len(bin_user_counts)))
+        ax2.set_xticklabels(bin_user_counts.index, rotation=45, ha='right')
+        ax2.set_xlabel('Embedding Likes Bin', fontsize=11)
+        ax2.set_ylabel('Number of Users', fontsize=11)
+        ax2.set_title('Unique Users per History Length Bin', fontsize=12)
+        ax2.grid(True, alpha=0.3, axis='y')
+        for i, v in enumerate(bin_user_counts.values):
+            ax2.text(i, v + 0.5, str(v), ha='center', fontsize=9)
+
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=self.DPI, bbox_inches='tight')
+        plt.close(fig)
+
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
+
     def _compute_summary(
         self,
-        merged_df: pd.DataFrame,
+        predictions_df: pd.DataFrame,
         binned_metrics: pd.DataFrame,
     ) -> Dict[str, Any]:
         """Compute summary statistics for the cold start analysis."""
-        summary = {
-            'total_users_analyzed': len(merged_df),
+        summary: Dict[str, Any] = {
+            'total_predictions_analyzed': len(predictions_df),
+            'total_users_analyzed': int(predictions_df['did'].nunique()),
             'num_bins': len(binned_metrics),
             'embedding_likes_stats': {
-                'mean': float(merged_df['num_embedding_likes'].mean()),
-                'median': float(merged_df['num_embedding_likes'].median()),
-                'std': float(merged_df['num_embedding_likes'].std()),
-                'min': int(merged_df['num_embedding_likes'].min()),
-                'max': int(merged_df['num_embedding_likes'].max()),
+                'mean': float(predictions_df['num_embedding_likes'].mean()),
+                'median': float(predictions_df['num_embedding_likes'].median()),
+                'std': float(predictions_df['num_embedding_likes'].std()),
+                'min': int(predictions_df['num_embedding_likes'].min()),
+                'max': int(predictions_df['num_embedding_likes'].max()),
             },
         }
-        
-        # For each metric, find the "cold start threshold" - bin where performance stabilizes
+
         for metric in self.METRICS:
             if metric not in binned_metrics.columns:
                 continue
-            
+
             values = binned_metrics[metric].dropna().values
             if len(values) < 2:
                 continue
-            
-            # Find the bin where performance is >= 90% of max
+
             max_val = values.max()
-            threshold_idx = np.argmax(values >= 0.9 * max_val)
-            
+            threshold_idx = int(np.argmax(values >= 0.9 * max_val))
             summary[f'{metric}_cold_start_threshold_bin'] = str(binned_metrics['bin'].iloc[threshold_idx])
-            summary[f'{metric}_max_bin'] = str(binned_metrics['bin'].iloc[values.argmax()])
-            summary[f'{metric}_improvement_first_to_last'] = float(values[-1] - values[0]) if len(values) > 1 else 0.0
-        
+            summary[f'{metric}_max_bin'] = str(binned_metrics['bin'].iloc[int(values.argmax())])
+            summary[f'{metric}_improvement_first_to_last'] = float(values[-1] - values[0])
+
         return summary
 
 

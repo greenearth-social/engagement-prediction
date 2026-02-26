@@ -156,6 +156,65 @@ def load_holdout_predictions(
 
 
 # ---------------------------------------------------------------------------
+# Per-prediction history length enrichment
+# ---------------------------------------------------------------------------
+
+def enrich_predictions_with_history_len(
+    predictions_df: pd.DataFrame,
+    target_posts_df: pl.DataFrame,
+    history_df: pl.DataFrame,
+) -> pd.DataFrame:
+    """
+    Add a per-row ``num_embedding_likes`` column to ``predictions_df``.
+
+    Uses **positional assignment**: predictions are emitted in strict
+    alternating order ``[pos_0, neg_0, pos_1, neg_1, …]`` by the training
+    stage's ``_collect_predictions``, so ``predictions_df[i]`` always
+    belongs to holdout target row ``i // 2``.  Both the positive and
+    negative sample from the same target row therefore receive the same
+    history length.
+
+    A join-based approach cannot be used because ``post_id`` is
+    ``like_uri`` for positives but ``neg_uri`` for negatives, and
+    collisions between the two sets make a key-based merge ambiguous.
+
+    Raises:
+        ValueError: If the number of predictions is not exactly twice the
+            number of holdout target rows (which would indicate the
+            positional assumption is violated).
+
+    Returns:
+        Copy of ``predictions_df`` with ``num_embedding_likes`` column added.
+    """
+    holdout_targets = target_posts_df.filter(pl.col("split") == "holdout")
+
+    joined = holdout_targets.join(
+        history_df.select(["target_did", "like_uri", "prior_emb_indices"]),
+        on=["target_did", "like_uri"],
+        how="left",
+    ).with_columns(
+        pl.col("prior_emb_indices").list.len().alias("num_embedding_likes")
+    )
+
+    hist_per_row = joined["num_embedding_likes"].fill_null(0).to_list()
+    n_target_rows = len(hist_per_row)
+    n_predictions = len(predictions_df)
+
+    if n_predictions != 2 * n_target_rows:
+        raise ValueError(
+            f"predictions_df has {n_predictions} rows but holdout targets "
+            f"have {n_target_rows} rows (expected 2x). "
+            f"Cannot assign history by position."
+        )
+
+    enriched = predictions_df.copy()
+    enriched["num_embedding_likes"] = [
+        hist_per_row[i // 2] for i in range(n_predictions)
+    ]
+    return enriched
+
+
+# ---------------------------------------------------------------------------
 # User metadata
 # ---------------------------------------------------------------------------
 
@@ -300,6 +359,15 @@ def run(context: Context, args) -> Dict[str, Any]:
         raise RuntimeError("No holdout predictions available")
 
     logger.info(f"Loaded {len(predictions_df)} predictions for {predictions_df['did'].nunique()} users")
+
+    # Step 2b: Enrich predictions with per-row history length
+    log_operation_start('Enrich predictions with per-row history length', STAGE_LOG_NAME, logger)
+    predictions_df = enrich_predictions_with_history_len(
+        predictions_df=predictions_df,
+        target_posts_df=target_posts_df,
+        history_df=history_df,
+    )
+    logger.info(f"Enriched predictions with num_embedding_likes (post-level history length)")
 
     # Step 3: Compute user metadata
     log_operation_start('Compute user metadata', STAGE_LOG_NAME, logger)
