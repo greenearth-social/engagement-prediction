@@ -312,7 +312,8 @@ def _resolve_run_dir(args: argparse.Namespace, *, outputs_dir: Path, run_name: s
         if not p.is_absolute():
             p = (TINKERING_DIR / p)
         return p.resolve()
-    return (Path(outputs_dir) / run_name).resolve()
+    # Default: write directly under ./outputs (no per-run subdirectory).
+    return Path(outputs_dir).resolve()
 
 
 def cmd_run_all(args: argparse.Namespace) -> int:
@@ -322,13 +323,14 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     """
     outputs_dir = OUTPUTS_DIR
     outputs_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = getattr(args, "output_dir", None)
 
     # Store the single timestamp in Context; for background runs we pass it via env.
     run_timestamp = (os.environ.get("ENGAGEMENT_RUN_TIMESTAMP") or "").strip() or generate_run_timestamp()
 
     # Create run_dir deterministically up front
-    run_name = f"{run_timestamp}_{_generate_run_name(args)}"
-    if (not getattr(args, "output_dir", None)) and args.run_name:
+    run_name = _generate_run_name(args)
+    if (not output_dir) and args.run_name:
         rn = str(args.run_name).strip().replace(' ', '_')
         if rn:
             run_name = f"{run_name}_{rn}"
@@ -336,7 +338,11 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # Choose log path inside run_dir
-    initial_log = Path(args._initial_log) if args._initial_log else (run_dir / "run-all.log")
+    if args._initial_log:
+        initial_log = Path(args._initial_log)
+    else:
+        # If we're writing directly into ./outputs, avoid collisions between runs.
+        initial_log = (run_dir / f"run-all_{run_timestamp}.log") if (not output_dir) else (run_dir / "run-all.log")
     try:
         initial_log.parent.mkdir(parents=True, exist_ok=True)
         with open(initial_log, 'a') as f:
@@ -350,7 +356,11 @@ def cmd_run_all(args: argparse.Namespace) -> int:
         effective_config = _build_effective_config_for_background_run(
             args, run_dir=run_dir, initial_log=initial_log
         )
-        effective_config_path = run_dir / "run-all.effective-config.json"
+        effective_config_path = (
+            run_dir / f"run-all_{run_timestamp}.effective-config.json"
+            if (not output_dir)
+            else (run_dir / "run-all.effective-config.json")
+        )
         effective_config_path.write_text(json.dumps(effective_config, indent=2, sort_keys=True) + "\n")
         cli_args = ["--config", str(effective_config_path)]
 
@@ -365,7 +375,7 @@ def cmd_run_all(args: argparse.Namespace) -> int:
         proc = sp.run(["bash", "-lc", cmd], stdout=sp.PIPE, stderr=sp.PIPE, text=True)
         if proc.returncode == 0:
             pid_str = (proc.stdout or "").strip().splitlines()[-1] if (proc.stdout or "").strip() else None
-            pid_file = run_dir / "run-all.pid"
+            pid_file = (run_dir / f"run-all_{run_timestamp}.pid") if (not output_dir) else (run_dir / "run-all.pid")
             if pid_str and pid_str.isdigit():
                 try:
                     with open(pid_file, "w") as f:
