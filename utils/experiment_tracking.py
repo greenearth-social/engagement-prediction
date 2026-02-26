@@ -22,10 +22,10 @@ class ExperimentTracker(Protocol):
     def log_artifact(self, name: str, path: Path) -> None:
         ...
 
-    def log_params(self, params: Dict[str, Any]) -> None:
+    def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
         ...
 
-    def connect_args(self, args: argparse.Namespace) -> argparse.Namespace:
+    def connect_args(self, args: argparse.Namespace, name: Optional[str] = None) -> argparse.Namespace:
         ...
 
     def log_single_value(self, name: str, value: float) -> None:
@@ -63,10 +63,10 @@ class NoOpExperimentTracker:
     def log_artifact(self, name: str, path: Path) -> None:
         return None
 
-    def log_params(self, params: Dict[str, Any]) -> None:
+    def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
         return None
 
-    def connect_args(self, args: argparse.Namespace) -> argparse.Namespace:
+    def connect_args(self, args: argparse.Namespace, name: Optional[str] = None) -> argparse.Namespace:
         return args
 
     def log_single_value(self, name: str, value: float) -> None:
@@ -197,10 +197,10 @@ class ClearMLExperimentTracker:
             return
         OutputModel(task=self._task, name=name).update_weights(str(p))
 
-    def log_params(self, params: Dict[str, Any]) -> None:
-        self._task.connect(params)
+    def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
+        self._task.connect(params, name=name)
 
-    def connect_args(self, args: argparse.Namespace) -> argparse.Namespace:
+    def connect_args(self, args: argparse.Namespace, name: Optional[str]) -> argparse.Namespace:
         """Connect an argparse.Namespace to ClearML and return the (possibly) updated args.
 
         This is useful for ClearML remote execution where parameter values might be overridden
@@ -212,7 +212,7 @@ class ClearMLExperimentTracker:
         if callable(original.get("func")):
             original.pop("func", None)
 
-        connected = self._task.connect(original)
+        connected = self._task.connect(original, name=name)
         connected_dict: Dict[str, Any]
         if connected is None:
             connected_dict = original

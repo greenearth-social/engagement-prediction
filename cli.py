@@ -387,7 +387,7 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     )
     # ClearML remote execution can override parameters on the server/UI.
     # Connect args and rehydrate a Namespace so downstream code sees the updated values.
-    args = tracker.connect_args(args)
+    args = tracker.connect_args(args, "Args")
     # Re-resolve run_dir after ClearML connects args, since output_dir might have been overridden.
     run_dir = _resolve_run_dir(args, outputs_dir=outputs_dir, run_name=run_name)
     run_dir.mkdir(parents=True, exist_ok=True)
