@@ -14,15 +14,15 @@ Usage examples:
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Optional, Dict, Any
 import json
-import time
 import copy
 
 from utils.experiment_tracking import build_experiment_tracker, normalize_params
-from utils.pipeline.core import Context
+from utils.pipeline.core import Context, generate_run_timestamp
 
 
 # Avoid heavy imports at module import time; import lazily inside handlers
@@ -158,7 +158,7 @@ def _build_tracking_params(args: argparse.Namespace, run_dir: Path) -> Dict[str,
     return {
         "meta": {
             "run_dir": str(run_dir),
-            "run_tag": getattr(args, "run_tag", None),
+            "run_tag": args.run_tag,
             "start_from": args.start_from,
             "stop_after": args.stop_after,
             "cap_random_seed": args.cap_random_seed,
@@ -322,10 +322,12 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     """
     outputs_dir = OUTPUTS_DIR
     outputs_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+    # Store the single timestamp in Context; for background runs we pass it via env.
+    run_timestamp = (os.environ.get("ENGAGEMENT_RUN_TIMESTAMP") or "").strip() or generate_run_timestamp()
 
     # Create run_dir deterministically up front
-    run_name = f"{timestamp}_{_generate_run_name(args)}"
+    run_name = f"{run_timestamp}_{_generate_run_name(args)}"
     if (not getattr(args, "output_dir", None)) and args.run_name:
         rn = str(args.run_name).strip().replace(' ', '_')
         if rn:
@@ -338,7 +340,7 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     try:
         initial_log.parent.mkdir(parents=True, exist_ok=True)
         with open(initial_log, 'a') as f:
-            f.write(f"run-all started at {timestamp}\n")
+            f.write(f"run-all started at {run_timestamp}\n")
     except Exception:
         pass
 
@@ -356,7 +358,8 @@ def cmd_run_all(args: argparse.Namespace) -> int:
         script = shlex.quote(str(Path(__file__).resolve()))
         args_str = ' '.join(shlex.quote(a) for a in cli_args)
         redir = shlex.quote(str(initial_log))
-        cmd = f"nohup {py} {script} {args_str} > {redir} 2>&1 & echo $!"
+        env_prefix = f"ENGAGEMENT_RUN_TIMESTAMP={shlex.quote(run_timestamp)}"
+        cmd = f"{env_prefix} nohup {py} {script} {args_str} > {redir} 2>&1 & echo $!"
         print(f"▶️  Backgrounding run-all with nohup. Log: {initial_log}")
         import subprocess as sp
         proc = sp.run(["bash", "-lc", cmd], stdout=sp.PIPE, stderr=sp.PIPE, text=True)
@@ -399,7 +402,7 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     }
     tracker.log_params(normalize_params(tracking_payload))
     # In sequential execution, always allow stages to resolve latest artifacts from prior stages
-    ctx = Context(run_dir=run_dir, use_latest=True, tracker=tracker)
+    ctx = Context(run_dir=run_dir, run_timestamp=run_timestamp, use_latest=True, tracker=tracker)
     return cmd__run_all_exec(args, ctx)
 
 
