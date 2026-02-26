@@ -632,7 +632,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                 prefetch_factor=prefetch_factor,
             )
         loader = DataLoader(ds, **loader_kw_)
-        ys, ps = [], []
+        ys, ps, uids, pids = [], [], [], []
         trained_model.eval()
         with torch.inference_mode():
             for batch in loader:
@@ -640,10 +640,14 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                 if preds.ndim == 0:
                     ps.append(float(preds.cpu()))
                     ys.append(float(batch["label"].cpu()))
+                    uids.append(batch["user_id"])
+                    pids.append(batch["post_id"])
                 else:
                     ps.extend(preds.cpu().numpy().tolist())
                     ys.extend(batch["label"].numpy().tolist())
-        return np.asarray(ys), np.asarray(ps)
+                    uids.extend(batch["user_id"])
+                    pids.extend(batch["post_id"])
+        return np.asarray(ys), np.asarray(ps), uids, pids
 
     def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, Any]:
         m: Dict[str, Any] = {"total_samples": len(y_true), "positive_samples": int(y_true.sum())}
@@ -652,8 +656,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         m["accuracy@0.5"] = float(accuracy_score(y_true, (y_pred > 0.5).astype(int)))
         return m
 
-    y_train, p_train = _collect_predictions(train_dataset)
-    y_val, p_val = _collect_predictions(val_dataset)
+    y_train, p_train, _, _ = _collect_predictions(train_dataset)
+    y_val, p_val, _, _ = _collect_predictions(val_dataset)
     train_metrics = _compute_metrics(y_train, p_train)
     val_metrics = _compute_metrics(y_val, p_val)
     logger.info(f"Train metrics: {train_metrics}")
@@ -720,12 +724,22 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             )
         if len(holdout_dataset) > 0:
             log_operation_start("Holdout evaluation", STAGE_LOG_NAME, logger)
-            y_holdout, p_holdout = _collect_predictions(holdout_dataset)
+            y_holdout, p_holdout, holdout_uids, holdout_pids = _collect_predictions(holdout_dataset)
             holdout_metrics = _compute_metrics(y_holdout, p_holdout)
             logger.info(f"Holdout metrics: {holdout_metrics}")
 
             he_dir = out_dir / "holdout_eval"
             he_dir.mkdir(parents=True, exist_ok=True)
+
+            import pandas as pd
+            pred_df = pd.DataFrame({
+                "did": holdout_uids,
+                "post_id": holdout_pids,
+                "y_true": y_holdout,
+                "y_pred_proba": p_holdout,
+            })
+            pred_df.to_parquet(he_dir / "predictions.parquet", index=False)
+
             with open(he_dir / "metrics_overall.json", "w") as f:
                 json.dump(holdout_metrics, f, indent=2)
 
