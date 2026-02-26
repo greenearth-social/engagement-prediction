@@ -392,11 +392,20 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     # Foreground execution: initialize experiment tracker and run
     # Only initialize ClearML here (not before backgrounding) to avoid creating
     # a task in the parent process that gets "aborted" when the parent exits.
+    tags = args.experiment_tags
+    if tags is None:
+        tags_list = []
+    elif isinstance(tags, str):
+        tags_list = [tags]
+    else:
+        tags_list = list(tags)
+    tags_list.append(f"run_ts:{run_timestamp}")
+    
     tracker = build_experiment_tracker(
         args.experiment_tracker,
         project_name=args.experiment_project,
         task_name=args.experiment_task or run_name,
-        tags=args.experiment_tags,
+        tags=tags_list,
     )
     # ClearML remote execution can override parameters on the server/UI.
     # Connect args and rehydrate a Namespace so downstream code sees the updated values.
