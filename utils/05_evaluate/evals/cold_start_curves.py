@@ -15,6 +15,13 @@ For each performance metric one plot is produced showing:
 - A thin gray curve per user (that user's binned metric values)
 - One bold aggregate curve computed across all predictions in each bin
 
+Only precision, recall, and F1 are plotted.  Accuracy and AUC-ROC are
+excluded because our negative samples are imperfect (we don't know for
+certain that the user wouldn't have liked the negative post), which
+makes metrics that treat the negative class as ground truth unreliable.
+Precision, recall, and F1 depend only on real likes (positives) and are
+robust to noisy negatives.
+
 Outputs:
 - cold_start_summary.json: Summary statistics and bin-level metrics
 - <metric>_cold_start.png: One cold-start curve plot per metric
@@ -31,11 +38,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.metrics import (
-    accuracy_score,
     f1_score,
     precision_score,
     recall_score,
-    roc_auc_score,
 )
 
 from . import (
@@ -66,17 +71,16 @@ class ColdStartCurvesModule(EvalModule):
         20, 50, 100, 500, float('inf'),
     ]
 
-    # Metrics to plot (one plot each)
-    METRICS = ['auc_roc', 'accuracy', 'precision', 'recall', 'f1']
+    # Metrics to plot (one plot each).  Only metrics robust to noisy
+    # negatives: precision, recall, F1.  AUC-ROC and accuracy are excluded
+    # because our negative samples are imperfect.
+    METRICS = ['precision', 'recall', 'f1']
 
     # Plot styling
     FIGURE_SIZE = (10, 6)
     DPI = 150
 
-    # Color for the bold aggregate curve, one per metric
     METRIC_COLORS = {
-        'auc_roc':   '#1f77b4',
-        'accuracy':  '#d62728',
         'precision': '#2ca02c',
         'recall':    '#ff7f0e',
         'f1':        '#9467bd',
@@ -278,12 +282,9 @@ class ColdStartCurvesModule(EvalModule):
         y_true: np.ndarray,
         y_pred_proba: np.ndarray,
     ) -> Dict[str, float]:
-        """Compute all metrics for a set of predictions. Returns NaN when not computable."""
+        """Compute metrics robust to noisy negatives. Returns NaN when not computable."""
         y_pred_binary = (y_pred_proba > 0.5).astype(int)
-        n = len(y_true)
         result: Dict[str, float] = {}
-
-        result['accuracy'] = float(accuracy_score(y_true, y_pred_binary)) if n > 0 else float('nan')
 
         try:
             result['precision'] = float(precision_score(y_true, y_pred_binary, zero_division=0))
@@ -299,14 +300,6 @@ class ColdStartCurvesModule(EvalModule):
             result['f1'] = float(f1_score(y_true, y_pred_binary, zero_division=0))
         except Exception:
             result['f1'] = float('nan')
-
-        if len(set(y_true)) > 1:
-            try:
-                result['auc_roc'] = float(roc_auc_score(y_true, y_pred_proba))
-            except Exception:
-                result['auc_roc'] = float('nan')
-        else:
-            result['auc_roc'] = float('nan')
 
         return result
 
@@ -466,7 +459,7 @@ class ColdStartCurvesModule(EvalModule):
         )
 
         ax.grid(True, alpha=0.3)
-        if metric in ('precision', 'recall', 'accuracy', 'f1', 'auc_roc'):
+        if metric in ('precision', 'recall', 'f1'):
             ax.set_ylim(0, 1.05)
 
         plt.tight_layout()
