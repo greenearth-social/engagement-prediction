@@ -138,12 +138,12 @@ def _get_embedding_value_for_model(embeddings: Any, embedding_model: str) -> Opt
 
 
 def get_embeddings_list_col(lf: pl.LazyFrame, embedding_model: str) -> pl.LazyFrame:
-    emb_str = pl.col("embeddings").map_elements(
-        lambda embeddings: _get_embedding_value_for_model(embeddings, embedding_model),
-        return_dtype=pl.Utf8,
-    )
-    emb_vec = emb_str.map_elements(
-        lambda s: _decompress_and_unpack_embedding(s, decompress=True) if s is not None else None,
+    emb_vec = pl.col("embeddings").map_elements(
+        lambda embeddings: (
+            _decompress_and_unpack_embedding(s, decompress=True)
+            if (s := _get_embedding_value_for_model(embeddings, embedding_model)) is not None
+            else None
+        ),
         return_dtype=pl.List(pl.Float32),
     )
     return lf.with_columns(emb_vec.alias("_emb_vec"))
