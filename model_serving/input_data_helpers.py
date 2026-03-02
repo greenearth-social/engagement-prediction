@@ -105,15 +105,42 @@ def get_embedding_dim_for_model(embedding_model: str) -> int:
     return EMBEDDING_MODEL_DIMS[embedding_model]
 
 
+def _get_embedding_value_for_model(embeddings: Any, embedding_model: str) -> Optional[str]:
+    """
+    Extract the base85-encoded embedding string for a given model from a single row's
+    `embeddings` value.
+
+    This is intentionally pure-Python (non-Polars) so it can be used inside
+    `map_elements()` without relying on Polars struct/list expressions.
+    """
+    if embeddings is None:
+        return None
+
+    for item in embeddings:
+        if item is None:
+            continue
+
+        if isinstance(item, dict):
+            if item.get("key") == embedding_model:
+                return item.get("value")
+            continue
+
+        if isinstance(item, (tuple, list)) and len(item) >= 2:
+            if item[0] == embedding_model:
+                return item[1]
+            continue
+
+        key = getattr(item, "key", None)
+        if key == embedding_model:
+            return getattr(item, "value", None)
+
+    return None
+
+
 def get_embeddings_list_col(lf: pl.LazyFrame, embedding_model: str) -> pl.LazyFrame:
-    emb_str = (
-        pl.col("embeddings")
-        .list.eval(
-            pl.when(pl.element().struct.field("key") == embedding_model)
-              .then(pl.element().struct.field("value"))
-        )
-        .list.drop_nulls()
-        .list.get(0)
+    emb_str = pl.col("embeddings").map_elements(
+        lambda embeddings: _get_embedding_value_for_model(embeddings, embedding_model),
+        return_dtype=pl.Utf8,
     )
     emb_vec = emb_str.map_elements(
         lambda s: _decompress_and_unpack_embedding(s, decompress=True) if s is not None else None,
