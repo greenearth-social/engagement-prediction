@@ -312,10 +312,10 @@ def run(context: Context, args) -> Dict[str, Any]:
     eval_batch_size = int(args.eval_batch_size)
     eval_holdout_type = str(args.eval_holdout_type)
     holdout_split = f"holdout_{eval_holdout_type}"
-    skip_modules = getattr(args, 'skip_modules', None)
+    skip_modules = args.skip_modules
     if skip_modules and isinstance(skip_modules, str):
         skip_modules = [m.strip() for m in skip_modules.split(',')]
-    cold_start_bin_edges = getattr(args, 'cold_start_bin_edges', None)
+    cold_start_bin_edges = args.cold_start_bin_edges
 
     # Resolve training output first so we can nest eval outputs inside it
     train_dir = resolve_train_output(run_dir, context)
