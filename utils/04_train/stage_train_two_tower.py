@@ -652,7 +652,6 @@ def run(context: Context, args) -> Dict[str, Any]:
     lr_scheduler_patience = int(args.lr_scheduler_patience)
     gradient_clip_max_norm = float(args.gradient_clip_max_norm)
     eval_holdout_type = str(args.eval_holdout_type)
-    holdout_split = f"holdout_{eval_holdout_type}"
 
     # Worker settings
     num_workers = int(args.num_dataloader_workers)
