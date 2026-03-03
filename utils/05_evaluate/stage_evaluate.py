@@ -45,7 +45,6 @@ from utils.dataloaders import load_training_data
 # numeric directory name (05_evaluate is not a valid Python identifier).
 import sys
 import importlib.util
-from pathlib import Path as _Path
 
 
 def _import_evals_module():
@@ -55,7 +54,7 @@ def _import_evals_module():
     (cold_start_curves, performance_inequality, …) can use relative imports
     like ``from . import EvalContext``.
     """
-    evals_dir = _Path(__file__).parent / 'evals'
+    evals_dir = Path(__file__).parent / 'evals'
     evals_init = evals_dir / '__init__.py'
     spec = importlib.util.spec_from_file_location(
         'utils._evals',
@@ -156,17 +155,34 @@ def load_holdout_predictions(
 
 
 # ---------------------------------------------------------------------------
+# Shared holdout join (used by both enrichment and user-metadata)
+# ---------------------------------------------------------------------------
+
+def _join_holdout_with_history(
+    target_posts_df: pl.DataFrame,
+    history_df: pl.DataFrame,
+    holdout_split: str,
+) -> pl.DataFrame:
+    """Join holdout target rows with history and compute per-row history length."""
+    holdout_targets = target_posts_df.filter(pl.col("split") == holdout_split)
+    return holdout_targets.join(
+        history_df.select(["target_did", "like_uri", "prior_emb_indices"]),
+        on=["target_did", "like_uri"],
+        how="left",
+    ).with_columns(
+        pl.col("prior_emb_indices").list.len().alias("num_embedding_likes")
+    )
+
+
+# ---------------------------------------------------------------------------
 # Per-prediction history length enrichment
 # ---------------------------------------------------------------------------
 
 def enrich_predictions_with_history_len(
     predictions_df: pd.DataFrame,
-    target_posts_df: pl.DataFrame,
-    history_df: pl.DataFrame,
-    holdout_split: str = "holdout_unseen_users",
+    holdout_joined: pl.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Add a per-row ``num_embedding_likes`` column to ``predictions_df``.
+    """Add a per-row ``num_embedding_likes`` column to ``predictions_df``.
 
     Uses **positional assignment**: predictions are emitted in strict
     alternating order ``[pos_0, neg_0, pos_1, neg_1, …]`` by the training
@@ -187,17 +203,7 @@ def enrich_predictions_with_history_len(
     Returns:
         Copy of ``predictions_df`` with ``num_embedding_likes`` column added.
     """
-    holdout_targets = target_posts_df.filter(pl.col("split") == holdout_split)
-
-    joined = holdout_targets.join(
-        history_df.select(["target_did", "like_uri", "prior_emb_indices"]),
-        on=["target_did", "like_uri"],
-        how="left",
-    ).with_columns(
-        pl.col("prior_emb_indices").list.len().alias("num_embedding_likes")
-    )
-
-    hist_per_row = joined["num_embedding_likes"].fill_null(0).to_list()
+    hist_per_row = holdout_joined["num_embedding_likes"].fill_null(0).to_list()
     n_target_rows = len(hist_per_row)
     n_predictions = len(predictions_df)
 
@@ -222,11 +228,9 @@ def enrich_predictions_with_history_len(
 def compute_user_metadata(
     predictions_df: pd.DataFrame,
     target_posts_df: pl.DataFrame,
-    history_df: pl.DataFrame,
-    holdout_split: str = "holdout_unseen_users",
+    holdout_joined: pl.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Compute per-user metadata including number of embedding likes.
+    """Compute per-user metadata including number of embedding likes.
 
     The number of embedding likes is derived from the user history: for each
     holdout (user, like_event) pair, it is the count of prior embedding indices.
@@ -235,34 +239,17 @@ def compute_user_metadata(
     Returns:
         DataFrame with columns [did, num_embedding_likes, num_total_likes]
     """
-    # Get holdout users from predictions
     holdout_user_ids = set(predictions_df['did'].astype(str).unique())
 
-    # Get holdout target rows
-    holdout_targets = target_posts_df.filter(pl.col("split") == holdout_split)
-
-    # Join with history to get prior_emb_indices
-    joined = holdout_targets.join(
-        history_df.select(["target_did", "like_uri", "prior_emb_indices"]),
-        on=["target_did", "like_uri"],
-        how="left",
-    )
-
-    # Compute per-user history length (max across their holdout rows)
     user_history_lens = (
-        joined
-        .with_columns(
-            pl.col("prior_emb_indices").list.len().alias("history_len")
-        )
+        holdout_joined
         .group_by("target_did")
-        .agg([
-            pl.col("history_len").max().alias("num_embedding_likes"),
-            pl.col("like_uri").n_unique().alias("num_holdout_targets"),
-        ])
+        .agg(
+            pl.col("num_embedding_likes").max().alias("num_embedding_likes"),
+        )
         .rename({"target_did": "did"})
     )
 
-    # Also count total likes per user from all splits
     total_likes = (
         target_posts_df
         .filter(pl.col("target_did").is_in(list(holdout_user_ids)))
@@ -271,17 +258,14 @@ def compute_user_metadata(
         .rename({"target_did": "did"})
     )
 
-    # Merge
     metadata_pl = user_history_lens.join(total_likes, on="did", how="left")
     metadata_df = metadata_pl.to_pandas()
     metadata_df['did'] = metadata_df['did'].astype(str)
     metadata_df['num_embedding_likes'] = metadata_df['num_embedding_likes'].fillna(0).astype(int)
     metadata_df['num_total_likes'] = metadata_df['num_total_likes'].fillna(0).astype(int)
 
-    # Add any users from predictions that are missing from metadata
-    pred_users = set(predictions_df['did'].astype(str).unique())
-    existing_users = set(metadata_df['did'].astype(str).unique())
-    missing_users = pred_users - existing_users
+    existing_users = set(metadata_df['did'])
+    missing_users = holdout_user_ids - existing_users
 
     if missing_users:
         missing_df = pd.DataFrame({
@@ -364,24 +348,18 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     logger.info(f"Loaded {len(predictions_df)} predictions for {predictions_df['did'].nunique()} users")
 
-    # Step 2b: Enrich predictions with per-row history length
+    # Step 2b: Join holdout targets with history (shared by enrichment + metadata)
+    log_operation_start('Join holdout targets with history', STAGE_LOG_NAME, logger)
+    holdout_joined = _join_holdout_with_history(target_posts_df, history_df, holdout_split)
+
+    # Step 2c: Enrich predictions with per-row history length
     log_operation_start('Enrich predictions with per-row history length', STAGE_LOG_NAME, logger)
-    predictions_df = enrich_predictions_with_history_len(
-        predictions_df=predictions_df,
-        target_posts_df=target_posts_df,
-        history_df=history_df,
-        holdout_split=holdout_split,
-    )
+    predictions_df = enrich_predictions_with_history_len(predictions_df, holdout_joined)
     logger.info(f"Enriched predictions with num_embedding_likes (post-level history length)")
 
     # Step 3: Compute user metadata
     log_operation_start('Compute user metadata', STAGE_LOG_NAME, logger)
-    user_metadata_df = compute_user_metadata(
-        predictions_df=predictions_df,
-        target_posts_df=target_posts_df,
-        history_df=history_df,
-        holdout_split=holdout_split,
-    )
+    user_metadata_df = compute_user_metadata(predictions_df, target_posts_df, holdout_joined)
     logger.info(f"Computed metadata for {len(user_metadata_df)} users")
 
     # Step 4: Create EvalContext
@@ -395,7 +373,6 @@ def run(context: Context, args) -> Dict[str, Any]:
     ctx = EvalContext(
         predictions_df=predictions_df,
         user_metadata_df=user_metadata_df,
-        bundle={},
         output_dir=out_dir,
         timestamp=timestamp,
         config=eval_config,

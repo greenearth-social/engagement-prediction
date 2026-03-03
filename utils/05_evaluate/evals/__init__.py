@@ -51,27 +51,20 @@ class EvalContext:
                        Contains holdout predictions from training stage.
         user_metadata_df: DataFrame with columns [did, num_embedding_likes, num_total_likes]
                          Contains per-user metadata computed from the bundle.
-        bundle: Original embedding bundle dict with keys like 'posts_emb_df', 'likes_df', etc.
         output_dir: Base output directory for all evaluation artifacts.
         timestamp: Timestamp string for artifact naming.
         config: Optional configuration dict for evaluation parameters.
     """
     predictions_df: pd.DataFrame
     user_metadata_df: pd.DataFrame
-    bundle: Dict[str, Any]
     output_dir: Path
     timestamp: str
     config: Dict[str, Any] = field(default_factory=dict)
     
     @property
-    def holdout_users(self) -> List[str]:
-        """Get list of unique holdout user IDs."""
-        return self.predictions_df['did'].astype(str).unique().tolist()
-    
-    @property
     def num_holdout_users(self) -> int:
         """Get count of holdout users."""
-        return len(self.holdout_users)
+        return int(self.predictions_df['did'].nunique())
     
     @property
     def num_predictions(self) -> int:
@@ -219,75 +212,64 @@ def run_all_modules(
 
 # Utility functions for common metric computations
 
-def compute_per_user_metrics(predictions_df: pd.DataFrame) -> pd.DataFrame:
+def compute_classification_metrics(
+    y_true: np.ndarray,
+    y_pred_proba: np.ndarray,
+) -> Dict[str, float]:
+    """Compute precision, recall, and F1 from binary labels and predicted probabilities.
+
+    These three metrics are robust to noisy negatives, unlike accuracy and
+    AUC-ROC which treat the negative class as ground truth.
+
+    Returns:
+        Dict with keys ``precision``, ``recall``, ``f1``.
     """
-    Compute per-user classification metrics from predictions.
-    
+    from sklearn.metrics import f1_score, precision_score, recall_score
+
+    y_pred_binary = (y_pred_proba > 0.5).astype(int)
+    return {
+        'precision': float(precision_score(y_true, y_pred_binary, zero_division=0)),
+        'recall':    float(recall_score(y_true, y_pred_binary, zero_division=0)),
+        'f1':        float(f1_score(y_true, y_pred_binary, zero_division=0)),
+    }
+
+
+def compute_per_user_metrics(predictions_df: pd.DataFrame) -> pd.DataFrame:
+    """Compute per-user classification metrics from predictions.
+
     Args:
         predictions_df: DataFrame with columns [did, post_id, y_true, y_pred_proba]
-    
+
     Returns:
         DataFrame with columns [did, num_samples, num_positive, num_negative,
                                precision, recall, f1, accuracy, auc_roc]
     """
-    from sklearn.metrics import (
-        accuracy_score,
-        precision_score,
-        recall_score,
-        f1_score,
-        roc_auc_score,
-    )
-    
+    from sklearn.metrics import accuracy_score, roc_auc_score
+
     rows = []
     for user_id, group in predictions_df.groupby('did'):
         y_true = group['y_true'].values
         y_pred_proba = group['y_pred_proba'].values
         y_pred_binary = (y_pred_proba > 0.5).astype(int)
-        
+
         num_samples = len(y_true)
         num_positive = int(y_true.sum())
-        num_negative = num_samples - num_positive
-        
-        # Compute metrics (handle edge cases)
+
         row = {
             'did': str(user_id),
             'num_samples': num_samples,
             'num_positive': num_positive,
-            'num_negative': num_negative,
+            'num_negative': num_samples - num_positive,
+            'accuracy': float(accuracy_score(y_true, y_pred_binary)) if num_samples > 0 else float('nan'),
+            **compute_classification_metrics(y_true, y_pred_proba),
+            'auc_roc': (
+                float(roc_auc_score(y_true, y_pred_proba))
+                if len(set(y_true)) > 1
+                else float('nan')
+            ),
         }
-        
-        # Accuracy
-        row['accuracy'] = float(accuracy_score(y_true, y_pred_binary)) if num_samples > 0 else float('nan')
-        
-        # Precision (handle no predicted positives)
-        try:
-            row['precision'] = float(precision_score(y_true, y_pred_binary, zero_division=0))
-        except Exception:
-            row['precision'] = float('nan')
-        
-        # Recall (handle no actual positives)
-        try:
-            row['recall'] = float(recall_score(y_true, y_pred_binary, zero_division=0))
-        except Exception:
-            row['recall'] = float('nan')
-        
-        # F1
-        try:
-            row['f1'] = float(f1_score(y_true, y_pred_binary, zero_division=0))
-        except Exception:
-            row['f1'] = float('nan')
-        
-        # AUC-ROC (requires both classes present)
-        if len(set(y_true)) > 1:
-            try:
-                row['auc_roc'] = float(roc_auc_score(y_true, y_pred_proba))
-            except Exception:
-                row['auc_roc'] = float('nan')
-        else:
-            row['auc_roc'] = float('nan')
-        
         rows.append(row)
-    
+
     return pd.DataFrame(rows)
 
 
@@ -362,6 +344,7 @@ __all__ = [
     'EvalModule',
     'discover_modules',
     'run_all_modules',
+    'compute_classification_metrics',
     'compute_per_user_metrics',
     'compute_gini_coefficient',
     'compute_lorenz_curve',

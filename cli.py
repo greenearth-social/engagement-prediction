@@ -216,6 +216,8 @@ def _build_tracking_params(args: argparse.Namespace, run_dir: Path) -> Dict[str,
         "eval": {
             "eval_batch_size": args.eval_batch_size,
             "eval_max_users": args.eval_max_users,
+            "eval_holdout_type": args.eval_holdout_type,
+            "skip_modules": args.skip_modules,
         },
     }
 

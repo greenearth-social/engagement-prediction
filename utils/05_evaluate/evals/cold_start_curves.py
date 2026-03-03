@@ -19,7 +19,7 @@ excluded because our negative samples are imperfect (we don't know for
 certain that the user wouldn't have liked the negative post), which
 makes metrics that treat the negative class as ground truth unreliable.
 Precision, recall, and F1 depend only on real likes (positives) and are
-robust to noisy negatives.
+robust to noisy negatives. Arguably, only recall is cleanly interpretable in this context.
 
 Outputs:
 - cold_start_summary.json: Summary statistics and bin-level metrics
@@ -36,15 +36,11 @@ from typing import Any, Dict, List
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from sklearn.metrics import (
-    f1_score,
-    precision_score,
-    recall_score,
-)
 
 from . import (
     EvalContext,
     EvalModule,
+    compute_classification_metrics,
 )
 
 
@@ -131,7 +127,7 @@ class ColdStartCurvesModule(EvalModule):
 
         # Aggregate metrics across all predictions per bin
         print("    Computing post-level binned metrics...")
-        binned_metrics = self._compute_binned_metrics_post_level(predictions_df, bin_edges)
+        binned_metrics = self._compute_binned_metrics_post_level(predictions_df, bin_labels)
 
         binned_path = out_dir / "binned_metrics.csv"
         binned_metrics.to_csv(binned_path, index=False)
@@ -187,7 +183,7 @@ class ColdStartCurvesModule(EvalModule):
             zip(bin_edges[:-1], bin_edges[1:])
         ):
             if high_edge == float('inf'):
-                low_int = math.ceil(low_edge) if i > 0 else math.ceil(low_edge)
+                low_int = math.ceil(low_edge)
                 labels.append(f"{low_int}+")
                 continue
 
@@ -271,44 +267,15 @@ class ColdStartCurvesModule(EvalModule):
     # Metric computation
     # ------------------------------------------------------------------
 
-    def _compute_metrics_for_group(
-        self,
-        y_true: np.ndarray,
-        y_pred_proba: np.ndarray,
-    ) -> Dict[str, float]:
-        """Compute metrics robust to noisy negatives. Returns NaN when not computable."""
-        y_pred_binary = (y_pred_proba > 0.5).astype(int)
-        result: Dict[str, float] = {}
-
-        try:
-            result['precision'] = float(precision_score(y_true, y_pred_binary, zero_division=0))
-        except Exception:
-            result['precision'] = float('nan')
-
-        try:
-            result['recall'] = float(recall_score(y_true, y_pred_binary, zero_division=0))
-        except Exception:
-            result['recall'] = float('nan')
-
-        try:
-            result['f1'] = float(f1_score(y_true, y_pred_binary, zero_division=0))
-        except Exception:
-            result['f1'] = float('nan')
-
-        return result
-
     def _compute_binned_metrics_post_level(
         self,
         predictions_df: pd.DataFrame,
-        bin_edges: List[float],
+        bin_labels: List[str],
     ) -> pd.DataFrame:
-        """
-        Compute aggregate metrics per bin pooling ALL predictions in that bin
+        """Compute aggregate metrics per bin pooling ALL predictions in that bin
         (post-level aggregation, not user-level).
         """
         rows = []
-        bin_labels = self._make_bin_labels(bin_edges)
-
         for bin_label in bin_labels:
             bin_data = predictions_df[predictions_df['likes_bin'] == bin_label]
             if len(bin_data) == 0:
@@ -316,8 +283,7 @@ class ColdStartCurvesModule(EvalModule):
 
             y_true = bin_data['y_true'].values
             y_pred_proba = bin_data['y_pred_proba'].values
-
-            metrics = self._compute_metrics_for_group(y_true, y_pred_proba)
+            metrics = compute_classification_metrics(y_true, y_pred_proba)
 
             row: Dict[str, Any] = {
                 'bin': str(bin_label),
@@ -328,9 +294,7 @@ class ColdStartCurvesModule(EvalModule):
             }
             for metric, value in metrics.items():
                 row[metric] = value
-                # Store sample count for each metric (NaN-aware)
-                valid = ~np.isnan(np.array([value]))
-                row[f'{metric}_n'] = int(len(y_true)) if valid.all() else 0
+                row[f'{metric}_n'] = 0 if np.isnan(value) else len(y_true)
 
             rows.append(row)
 
@@ -382,8 +346,7 @@ class ColdStartCurvesModule(EvalModule):
         )
         ax.legend(loc='lower right', fontsize=10)
         ax.grid(True, alpha=0.3)
-        if metric in ('precision', 'recall', 'f1'):
-            ax.set_ylim(0, 1.05)
+        ax.set_ylim(0, 1.05)
 
         plt.tight_layout()
         plt.savefig(save_path, dpi=self.DPI, bbox_inches='tight')
