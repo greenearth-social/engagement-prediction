@@ -105,7 +105,6 @@ DEFAULTS: Dict[str, Any] = {
     "gradient_clip_max_norm": 1.0,
     # Stage 5 (eval)
     "eval_batch_size": 8192,
-    "eval_max_users": None,
     "eval_holdout_type": "unseen_users",
     "skip_modules": None,  # Comma-separated eval module names to skip (None = run all)
     # Selection/prior behavior
@@ -215,7 +214,6 @@ def _build_tracking_params(args: argparse.Namespace, run_dir: Path) -> Dict[str,
         },
         "eval": {
             "eval_batch_size": args.eval_batch_size,
-            "eval_max_users": args.eval_max_users,
             "eval_holdout_type": args.eval_holdout_type,
             "skip_modules": args.skip_modules,
         },
@@ -654,8 +652,6 @@ def build_parser() -> argparse.ArgumentParser:
     # Stage 5 options (subset)
     _add_arg_with_default(p_all, "--eval-batch-size", type=int, default=argparse.SUPPRESS,
                           help_text="Batch size for evaluation")
-    _add_arg_with_default(p_all, "--eval-max-users", type=int, default=argparse.SUPPRESS,
-                          help_text="None = all eligible users for evaluation")
     _add_arg_with_default(p_all, "--eval-holdout-type", type=str, default=argparse.SUPPRESS,
                           choices=["unseen_users", "seen_users"],
                           help_text="Which holdout set to use for evaluation: unseen_users (user-split) or seen_users (temporal after val period)")
