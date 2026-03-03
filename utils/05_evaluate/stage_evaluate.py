@@ -15,7 +15,7 @@ produces its own set of artifacts (plots, CSVs, JSON summaries).
 Inputs (from prior pipeline stages):
 - target_posts_*.parquet from 02_target_posts  (includes train/val/holdout split column)
 - history_posts_*.parquet from 03_user_history
-- holdout_eval/predictions.parquet from 04_train
+- predictions/holdout_<type>.parquet from 04_train  (e.g. holdout_unseen_users.parquet)
 
 Outputs under <train_dir>/evals/<timestamp>/
 - eval_summary.json: Combined results from all modules
@@ -118,15 +118,21 @@ def resolve_train_output(
 # ---------------------------------------------------------------------------
 
 def load_holdout_predictions(
-    holdout_eval_dir: Optional[Path],
+    predictions_dir: Optional[Path],
+    holdout_type: str,
     logger=None,
 ) -> pd.DataFrame:
     """
     Load pre-computed holdout predictions from the training stage.
 
     Both MLP and Two-Tower training stages save predictions to
-    ``holdout_eval/predictions.parquet`` with columns
+    ``predictions/holdout_<holdout_type>.parquet`` with columns
     [did, post_id, y_true, y_pred_proba].
+
+    Args:
+        predictions_dir: Path to the ``predictions/`` directory inside the
+            04_train output directory.
+        holdout_type: One of ``"unseen_users"`` or ``"seen_users"``.
 
     Returns:
         DataFrame with columns [did, post_id, y_true, y_pred_proba]
@@ -134,21 +140,15 @@ def load_holdout_predictions(
     Raises:
         FileNotFoundError: If no predictions file can be found.
     """
-    if holdout_eval_dir is not None:
-        pred_parquet = holdout_eval_dir / 'predictions.parquet'
-        pred_csv = holdout_eval_dir / 'predictions.csv'
-
+    if predictions_dir is not None:
+        pred_parquet = predictions_dir / f'holdout_{holdout_type}.parquet'
         if pred_parquet.exists():
             if logger:
                 logger.info(f"Loading pre-computed predictions from {pred_parquet}")
             return pd.read_parquet(pred_parquet)
-        elif pred_csv.exists():
-            if logger:
-                logger.info(f"Loading pre-computed predictions from {pred_csv}")
-            return pd.read_csv(pred_csv)
 
     raise FileNotFoundError(
-        "No holdout predictions found (expected holdout_eval/predictions.parquet "
+        f"No holdout predictions found (expected predictions/holdout_{holdout_type}.parquet "
         "in the 04_train output directory). Please ensure Stage 4 (train) "
         "completed successfully with holdout evaluation enabled."
     )
@@ -302,7 +302,7 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # Resolve training output first so we can nest eval outputs inside it
     train_dir = resolve_train_output(run_dir, context)
-    holdout_eval_dir = train_dir / 'holdout_eval'
+    predictions_dir = train_dir / 'predictions'
 
     # Create output directory inside the training directory
     evals_base = train_dir / 'evals'
@@ -339,7 +339,8 @@ def run(context: Context, args) -> Dict[str, Any]:
     # Step 2: Load holdout predictions
     log_operation_start('Load holdout predictions', STAGE_LOG_NAME, logger)
     predictions_df = load_holdout_predictions(
-        holdout_eval_dir=holdout_eval_dir if holdout_eval_dir.exists() else None,
+        predictions_dir=predictions_dir if predictions_dir.exists() else None,
+        holdout_type=eval_holdout_type,
         logger=logger,
     )
 

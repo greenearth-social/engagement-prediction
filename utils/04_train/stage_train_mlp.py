@@ -53,7 +53,10 @@ Outputs under <run_dir>/04_train/<timestamp>/:
     - logs/ (training logs)
     - training_config.json (hyperparameters and configuration)
     - stage_info.txt (pipeline metadata)
-    - holdout_eval/metrics_overall.json (final test set metrics)
+    - predictions/train.parquet (per-row predictions on the training set)
+    - predictions/val.parquet (per-row predictions on the validation set)
+    - predictions/holdout_unseen_users.parquet (predictions for user-split holdout)
+    - predictions/holdout_seen_users.parquet (predictions for temporal holdout, if configured)
 """
 
 from __future__ import annotations
@@ -658,8 +661,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         m["accuracy@0.5"] = float(accuracy_score(y_true, (y_pred > 0.5).astype(int)))
         return m
 
-    y_train, p_train, _, _ = _collect_predictions(train_dataset)
-    y_val, p_val, _, _ = _collect_predictions(val_dataset)
+    y_train, p_train, train_uids, train_pids = _collect_predictions(train_dataset)
+    y_val, p_val, val_uids, val_pids = _collect_predictions(val_dataset)
     train_metrics = _compute_metrics(y_train, p_train)
     val_metrics = _compute_metrics(y_val, p_val)
     logger.info(f"Train metrics: {train_metrics}")
@@ -711,41 +714,52 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         logger.info(f"Model saved to: {model_path}")
         context.tracker.log_artifact(name="trained_model_mlp", path=model_path)
 
+    # --- save predictions ---
+    import pandas as pd
+    predictions_dir = out_dir / "predictions"
+    predictions_dir.mkdir(parents=True, exist_ok=True)
+
+    pd.DataFrame({
+        "did": train_uids, "post_id": train_pids,
+        "y_true": y_train, "y_pred_proba": p_train,
+    }).to_parquet(predictions_dir / "train.parquet", index=False)
+
+    pd.DataFrame({
+        "did": val_uids, "post_id": val_pids,
+        "y_true": y_val, "y_pred_proba": p_val,
+    }).to_parquet(predictions_dir / "val.parquet", index=False)
+
     # --- holdout eval ---
     holdout_metrics: Dict[str, Any] = {}
-    try:
-        if user_encoder == "summarized":
-            holdout_dataset = SummarizedEngagementDataset(
-                embeddings_mmap, target_posts_df, history_df, split=holdout_split,
-                summarizer=summarizer, embed_dim=embed_dim, logger=logger,
-            )
-        else:
-            holdout_dataset = SequenceEngagementDataset(
-                embeddings_mmap, target_posts_df, history_df, split=holdout_split,
-                max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
-            )
-        if len(holdout_dataset) > 0:
-            log_operation_start("Holdout evaluation", STAGE_LOG_NAME, logger)
+    for holdout_type in ["unseen_users", "seen_users"]:
+        split_name = f"holdout_{holdout_type}"
+        try:
+            if user_encoder == "summarized":
+                holdout_dataset = SummarizedEngagementDataset(
+                    embeddings_mmap, target_posts_df, history_df, split=split_name,
+                    summarizer=summarizer, embed_dim=embed_dim, logger=logger,
+                )
+            else:
+                holdout_dataset = SequenceEngagementDataset(
+                    embeddings_mmap, target_posts_df, history_df, split=split_name,
+                    max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
+                )
+            if len(holdout_dataset) == 0:
+                logger.info(f"No rows for split '{split_name}', skipping.")
+                continue
+            log_operation_start(f"Holdout evaluation ({holdout_type})", STAGE_LOG_NAME, logger)
             y_holdout, p_holdout, holdout_uids, holdout_pids = _collect_predictions(holdout_dataset)
-            holdout_metrics = _compute_metrics(y_holdout, p_holdout)
-            logger.info(f"Holdout metrics: {holdout_metrics}")
+            split_metrics = _compute_metrics(y_holdout, p_holdout)
+            logger.info(f"Holdout metrics ({holdout_type}): {split_metrics}")
+            if holdout_type == eval_holdout_type:
+                holdout_metrics = split_metrics
 
-            he_dir = out_dir / "holdout_eval"
-            he_dir.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame({
+                "did": holdout_uids, "post_id": holdout_pids,
+                "y_true": y_holdout, "y_pred_proba": p_holdout,
+            }).to_parquet(predictions_dir / f"{split_name}.parquet", index=False)
 
-            import pandas as pd
-            pred_df = pd.DataFrame({
-                "did": holdout_uids,
-                "post_id": holdout_pids,
-                "y_true": y_holdout,
-                "y_pred_proba": p_holdout,
-            })
-            pred_df.to_parquet(he_dir / "predictions.parquet", index=False)
-
-            with open(he_dir / "metrics_overall.json", "w") as f:
-                json.dump(holdout_metrics, f, indent=2)
-
-            if generate_plots:
+            if generate_plots and holdout_type == eval_holdout_type:
                 try:
                     plot_model_performance(
                         y_holdout, p_holdout,
@@ -754,8 +768,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                     )
                 except Exception as e:
                     logger.warning(f"Holdout performance plotting failed: {e}")
-    except Exception as exc:
-        logger.warning(f"Holdout evaluation failed (non-fatal): {exc}")
+        except Exception as exc:
+            logger.warning(f"Holdout evaluation ({holdout_type}) failed (non-fatal): {exc}")
 
     # --- training config ---
     training_config = {
