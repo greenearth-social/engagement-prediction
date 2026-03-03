@@ -164,7 +164,9 @@ def _join_holdout_with_history(
     holdout_split: str,
 ) -> pl.DataFrame:
     """Join holdout target rows with history and compute per-row history length."""
-    holdout_targets = target_posts_df.filter(pl.col("split") == holdout_split)
+    holdout_targets = target_posts_df.filter(
+        (pl.col("split") == holdout_split) & pl.col("neg_emb_idx").is_not_null()
+    )
     return holdout_targets.join(
         history_df.select(["target_did", "like_uri", "prior_emb_indices"]),
         on=["target_did", "like_uri"],
