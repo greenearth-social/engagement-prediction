@@ -290,8 +290,13 @@ def compute_gini_coefficient(values: np.ndarray) -> float:
     values = np.asarray(values, dtype=np.float64)
     values = values[~np.isnan(values)]
     
-    if len(values) == 0 or values.sum() == 0:
+    # If there are no valid values, Gini is undefined
+    if len(values) == 0:
         return float('nan')
+    
+    # If all (non-NaN) values sum to zero, this is perfect equality
+    if values.sum() == 0:
+        return 0.0
     
     # Sort values
     sorted_values = np.sort(values)
