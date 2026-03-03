@@ -100,6 +100,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import polars as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -819,23 +820,22 @@ def run(context: Context, args) -> Dict[str, Any]:
         context.tracker.log_artifact(name="trained_model_two_tower", path=model_path)
 
     # --- save predictions ---
-    import pandas as pd
     predictions_dir = out_dir / "predictions"
     predictions_dir.mkdir(parents=True, exist_ok=True)
 
-    pd.DataFrame({
+    pl.DataFrame({
         "did": train_eval["predictions"]["user_id"],
         "post_id": train_eval["predictions"]["post_id"],
         "y_true": train_eval["predictions"]["y_true"],
         "y_pred_proba": train_eval["predictions"]["y_pred"],
-    }).to_parquet(predictions_dir / "train.parquet", index=False)
+    }).write_parquet(predictions_dir / "train.parquet")
 
-    pd.DataFrame({
+    pl.DataFrame({
         "did": val_eval["predictions"]["user_id"],
         "post_id": val_eval["predictions"]["post_id"],
         "y_true": val_eval["predictions"]["y_true"],
         "y_pred_proba": val_eval["predictions"]["y_pred"],
-    }).to_parquet(predictions_dir / "val.parquet", index=False)
+    }).write_parquet(predictions_dir / "val.parquet")
 
     # --- holdout evaluation ---
     holdout_metrics: Dict[str, Any] = {}
@@ -870,12 +870,12 @@ def run(context: Context, args) -> Dict[str, Any]:
             if holdout_type == eval_holdout_type:
                 holdout_metrics = split_metrics
 
-            pd.DataFrame({
+            pl.DataFrame({
                 "did": holdout_eval["predictions"]["user_id"],
                 "post_id": holdout_eval["predictions"]["post_id"],
                 "y_true": holdout_eval["predictions"]["y_true"],
                 "y_pred_proba": holdout_eval["predictions"]["y_pred"],
-            }).to_parquet(predictions_dir / f"{split_name}.parquet", index=False)
+            }).write_parquet(predictions_dir / f"{split_name}.parquet")
 
             if generate_plots and holdout_type == eval_holdout_type:
                 try:
