@@ -645,8 +645,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                 if preds.ndim == 0:
                     ps.append(float(preds.cpu()))
                     ys.append(float(batch["label"].cpu()))
-                    uids.append(batch["user_id"])
-                    pids.append(batch["post_id"])
+                    uids.append(batch["user_id"][0])
+                    pids.append(batch["post_id"][0])
                 else:
                     ps.extend(preds.cpu().numpy().tolist())
                     ys.extend(batch["label"].numpy().tolist())
