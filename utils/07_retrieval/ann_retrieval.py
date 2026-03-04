@@ -13,7 +13,7 @@ Key concepts:
 - Use cosine similarity (normalized embeddings + inner product)
 """
 
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 import numpy as np
 import pandas as pd
 
@@ -91,6 +91,8 @@ class FAISSIndex(ANNIndex):
     def __init__(self, embeddings: np.ndarray, use_gpu: bool = False):
         super().__init__(embeddings, index_type='faiss')
         self.use_gpu = use_gpu
+        self._normalized_embeddings: Optional[np.ndarray] = None
+        self._fallback_mode = False
         
     def build(self, index_type: str = 'hnsw'):
         """
@@ -99,47 +101,38 @@ class FAISSIndex(ANNIndex):
         Args:
             index_type: 'flat' (exact), 'ivf' (fast), or 'hnsw' (balanced)
         """
-        # TODO: Import FAISS library
-        # try:
-        #     import faiss
-        # except ImportError:
-        #     raise ImportError("FAISS not installed. Run: pip install faiss-cpu (or faiss-gpu)")
-        
-        # TODO: Normalize embeddings for cosine similarity
-        # Cosine similarity = inner product of normalized vectors
-        # normalized_embs = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
-        # normalized_embs = normalized_embs.astype('float32')
-        
-        # TODO: Build index based on type
-        if index_type == 'flat':
-            # Exact search (good for < 1M vectors)
-            # self.index = faiss.IndexFlatIP(self.dim)  # Inner Product
-            # self.index.add(normalized_embs)
-            pass
-            
-        elif index_type == 'ivf':
-            # Inverted file index (good for 10M+ vectors)
-            # nlist = 100  # Number of Voronoi cells (sqrt(N) is a good heuristic)
-            # quantizer = faiss.IndexFlatIP(self.dim)
-            # self.index = faiss.IndexIVFFlat(quantizer, self.dim, nlist, faiss.METRIC_INNER_PRODUCT)
-            # self.index.train(normalized_embs)  # Training required for IVF
-            # self.index.add(normalized_embs)
-            # self.index.nprobe = 10  # Search in top-10 cells (tradeoff: accuracy vs speed)
-            pass
-            
-        elif index_type == 'hnsw':
-            # Hierarchical Navigable Small World graph (best quality/speed)
-            # M = 32  # Number of connections per layer (higher = better accuracy, more memory)
-            # self.index = faiss.IndexHNSWFlat(self.dim, M, faiss.METRIC_INNER_PRODUCT)
-            # self.index.add(normalized_embs)
-            pass
-        else:
-            raise ValueError(f"Unknown FAISS index type: {index_type}")
-        
-        # TODO: Move to GPU if available
-        # if self.use_gpu and torch.cuda.is_available():
-        #     res = faiss.StandardGpuResources()
-        #     self.index = faiss.index_cpu_to_gpu(res, 0, self.index)
+        embeddings = self.embeddings.astype(np.float32, copy=False)
+        denom = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        denom = np.clip(denom, a_min=1e-12, a_max=None)
+        normalized_embs = embeddings / denom
+        self._normalized_embeddings = normalized_embs
+        try:
+            import faiss  # type: ignore
+            if index_type == 'flat':
+                self.index = faiss.IndexFlatIP(self.dim)
+                self.index.add(normalized_embs)
+            elif index_type == 'ivf':
+                nlist = max(1, int(np.sqrt(self.n_posts)))
+                quantizer = faiss.IndexFlatIP(self.dim)
+                self.index = faiss.IndexIVFFlat(quantizer, self.dim, nlist, faiss.METRIC_INNER_PRODUCT)
+                self.index.train(normalized_embs)
+                self.index.add(normalized_embs)
+                self.index.nprobe = min(32, nlist)
+            elif index_type == 'hnsw':
+                self.index = faiss.IndexHNSWFlat(self.dim, 32, faiss.METRIC_INNER_PRODUCT)
+                self.index.add(normalized_embs)
+            else:
+                raise ValueError(f"Unknown FAISS index type: {index_type}")
+            if self.use_gpu:
+                try:
+                    res = faiss.StandardGpuResources()
+                    self.index = faiss.index_cpu_to_gpu(res, 0, self.index)
+                except Exception:
+                    pass
+        except ImportError:
+            # Fallback: exact cosine search with numpy
+            self.index = "numpy_exact"
+            self._fallback_mode = True
         
         print(f"Built FAISS {index_type} index with {self.n_posts} posts, dim={self.dim}")
         
@@ -158,17 +151,21 @@ class FAISSIndex(ANNIndex):
         if self.index is None:
             raise RuntimeError("Index not built. Call build() first.")
         
-        # TODO: Normalize query
-        # query_normalized = query / np.linalg.norm(query, axis=1, keepdims=True)
-        # query_normalized = query_normalized.astype('float32')
-        
-        # TODO: Search
-        # distances, indices = self.index.search(query_normalized, k)
-        # return indices, distances
-        
-        # Placeholder
-        indices = np.random.randint(0, self.n_posts, size=(1, k))
-        distances = np.random.rand(1, k)
+        query = query.astype(np.float32, copy=False)
+        q_denom = np.linalg.norm(query, axis=1, keepdims=True)
+        q_denom = np.clip(q_denom, a_min=1e-12, a_max=None)
+        query_normalized = query / q_denom
+        k = min(k, self.n_posts)
+        if self._fallback_mode:
+            assert self._normalized_embeddings is not None
+            sims = query_normalized @ self._normalized_embeddings.T
+            idx_part = np.argpartition(-sims, kth=k - 1, axis=1)[:, :k]
+            part_vals = np.take_along_axis(sims, idx_part, axis=1)
+            order = np.argsort(-part_vals, axis=1)
+            indices = np.take_along_axis(idx_part, order, axis=1)
+            distances = np.take_along_axis(part_vals, order, axis=1)
+            return indices, distances
+        distances, indices = self.index.search(query_normalized, k)
         return indices, distances
     
     def save(self, path: str):
@@ -203,6 +200,11 @@ class AnnoyIndex(ANNIndex):
     - Good for medium-scale datasets (1M-10M vectors)
     """
     
+    def __init__(self, embeddings: np.ndarray):
+        super().__init__(embeddings, index_type='annoy')
+        self._fallback_mode = False
+        self._normalized_embeddings: Optional[np.ndarray] = None
+
     def build(self, n_trees: int = 50):
         """
         Build Annoy index.
@@ -211,21 +213,20 @@ class AnnoyIndex(ANNIndex):
             n_trees: Number of trees (more = higher accuracy, slower build)
                      Spotify recommends: 10 for speed, 100+ for precision
         """
-        # TODO: Import Annoy
-        # try:
-        #     from annoy import AnnoyIndex
-        # except ImportError:
-        #     raise ImportError("Annoy not installed. Run: pip install annoy")
-        
-        # TODO: Build index with angular distance (equivalent to cosine similarity)
-        # self.index = AnnoyIndex(self.dim, 'angular')  # 'angular' = 1 - cosine similarity
-        
-        # TODO: Add all embeddings
-        # for i, emb in enumerate(self.embeddings):
-        #     self.index.add_item(i, emb)
-        
-        # TODO: Build trees
-        # self.index.build(n_trees)
+        embeddings = self.embeddings.astype(np.float32, copy=False)
+        denom = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        denom = np.clip(denom, a_min=1e-12, a_max=None)
+        normalized_embs = embeddings / denom
+        self._normalized_embeddings = normalized_embs
+        try:
+            from annoy import AnnoyIndex as _AnnoyIndex  # type: ignore
+            self.index = _AnnoyIndex(self.dim, 'angular')
+            for i, emb in enumerate(normalized_embs):
+                self.index.add_item(i, emb)
+            self.index.build(n_trees)
+        except ImportError:
+            self.index = "numpy_exact"
+            self._fallback_mode = True
         
         print(f"Built Annoy index with {self.n_posts} posts, {n_trees} trees, dim={self.dim}")
         
@@ -244,20 +245,27 @@ class AnnoyIndex(ANNIndex):
         if self.index is None:
             raise RuntimeError("Index not built. Call build() first.")
         
-        # TODO: Search (query is 1D array for Annoy)
-        # indices, angular_distances = self.index.get_nns_by_vector(
-        #     query[0],  # Annoy expects 1D
-        #     k,
-        #     include_distances=True
-        # )
-        # # Convert angular distance to similarity score
-        # similarities = 1.0 - np.array(angular_distances)
-        # return np.array([indices]), np.array([similarities])
-        
-        # Placeholder
-        indices = np.random.randint(0, self.n_posts, size=(1, k))
-        distances = np.random.rand(1, k)
-        return indices, distances
+        query = query.astype(np.float32, copy=False)
+        q_denom = np.linalg.norm(query, axis=1, keepdims=True)
+        q_denom = np.clip(q_denom, a_min=1e-12, a_max=None)
+        query_normalized = query / q_denom
+        k = min(k, self.n_posts)
+        if self._fallback_mode:
+            assert self._normalized_embeddings is not None
+            sims = query_normalized @ self._normalized_embeddings.T
+            idx_part = np.argpartition(-sims, kth=k - 1, axis=1)[:, :k]
+            part_vals = np.take_along_axis(sims, idx_part, axis=1)
+            order = np.argsort(-part_vals, axis=1)
+            indices = np.take_along_axis(idx_part, order, axis=1)
+            distances = np.take_along_axis(part_vals, order, axis=1)
+            return indices, distances
+        indices, angular_distances = self.index.get_nns_by_vector(
+            query_normalized[0],
+            k,
+            include_distances=True,
+        )
+        similarities = 1.0 - np.array(angular_distances, dtype=np.float32)
+        return np.array([indices]), np.array([similarities])
     
     def save(self, path: str):
         """Save Annoy index to disk."""
@@ -300,6 +308,7 @@ def build_ann_index(
     Returns:
         Built ANN index ready for search
     """
+    _ = kwargs.get('shared_dim', None)
     if index_type == 'faiss':
         index = FAISSIndex(embeddings, use_gpu=kwargs.get('use_gpu', False))
         index.build(index_type=kwargs.get('faiss_index_type', 'hnsw'))
@@ -367,6 +376,55 @@ def encode_all_posts(
     
     print(f"Encoded {len(post_ids)} posts: {encoded_embeddings.shape}")
     return post_ids, encoded_embeddings
+
+
+def encode_all_posts_fit_sharded(
+    model,
+    posts_emb_df: pd.DataFrame,
+    join_post: str,
+    embedding_dim: int,
+    device: str,
+    batch_size: int = 1024,
+) -> Dict[int, Dict[str, Any]]:
+    """
+    Encode posts and shard by FIT hard-query index.
+
+    Returns:
+        Dict[q_idx, {"post_ids": List[str], "embeddings": np.ndarray}]
+    """
+    import torch
+
+    if not getattr(model, "use_fit", False):
+        raise ValueError("FIT sharded encoding requires a model with use_fit=True")
+
+    emb_cols = [f"post_emb_{i}" for i in range(embedding_dim)]
+    shards_post_ids: Dict[int, List[str]] = {}
+    shards_embeddings: Dict[int, List[np.ndarray]] = {}
+
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, len(posts_emb_df), batch_size):
+            batch_df = posts_emb_df.iloc[start:start + batch_size]
+            batch_post_ids = batch_df[join_post].astype(str).tolist()
+            batch_embs = batch_df[emb_cols].values.astype(np.float32, copy=False)
+            batch_tensor = torch.tensor(batch_embs, dtype=torch.float32, device=device)
+
+            post_encoded = model.encode_post(batch_tensor).cpu().numpy()
+            _, q_idx = model.mqm(batch_tensor, tau=float(getattr(model, "fit_tau_min", 0.1)), hard=True)
+            q_idx_np = q_idx.detach().cpu().numpy().astype(np.int64, copy=False)
+
+            for idx, shard in enumerate(q_idx_np):
+                shard = int(shard)
+                shards_post_ids.setdefault(shard, []).append(batch_post_ids[idx])
+                shards_embeddings.setdefault(shard, []).append(post_encoded[idx])
+
+    shard_map: Dict[int, Dict[str, Any]] = {}
+    for shard, emb_list in shards_embeddings.items():
+        shard_map[shard] = {
+            "post_ids": shards_post_ids[shard],
+            "embeddings": np.vstack(emb_list).astype(np.float32, copy=False),
+        }
+    return shard_map
 
 
 # =============================================================================

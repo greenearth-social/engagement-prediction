@@ -100,6 +100,13 @@ DEFAULTS: Dict[str, Any] = {
     "lr_scheduler_patience": 5,
     # Stage 4 (train) - Training optimization
     "gradient_clip_max_norm": 1.0,
+    # Stage 4 (train) - FIT parameters (defaults to disabled)
+    "use_fit": False,
+    "fit_num_queries": 64,
+    "fit_tau_init": 1.0,
+    "fit_tau_min": 0.1,
+    "fit_tau_decay": 0.9995,
+    "fit_use_lss": False,
     # Stage 5 (eval)
     "eval_batch_size": 8192,
     "eval_max_users": None,
@@ -562,12 +569,6 @@ def build_parser() -> argparse.ArgumentParser:
                           "Note: 'attention' is a deprecated alias for 'full_transformer'.")
     _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower"],
                           default=argparse.SUPPRESS, help_text="Model architecture: mlp or two-tower")
-    # ============================================================================
-    # FIT IMPLEMENTATION SECTION 12: Add --use-fit CLI argument
-    # ============================================================================
-    _add_arg_with_default(p_all, "--use-fit", type=bool, default=argparse.SUPPRESS,
-                          help_text="Enable Fully Interacted Two-Tower (FIT) architecture")
-    # ============================================================================
     # Two-tower specific options
     _add_arg_with_default(p_all, "--shared-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower shared embedding dimension")
@@ -636,6 +637,19 @@ def build_parser() -> argparse.ArgumentParser:
     # Stage 4 (train) - Training optimization
     _add_arg_with_default(p_all, "--gradient-clip-max-norm", type=float, default=argparse.SUPPRESS,
                           help_text="Maximum gradient norm for clipping (two-tower only)")
+    # Stage 4 (train) - FIT (Fast Item-User Interaction Transformer) parameters
+    _add_arg_with_default(p_all, "--use-fit", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Enable FIT (Fast Item-User Interaction Transformer) mode for two-tower model")
+    _add_arg_with_default(p_all, "--fit-num-queries", type=int, default=argparse.SUPPRESS,
+                          help_text="Number of meta queries in FIT MQM (only used if --use-fit)")
+    _add_arg_with_default(p_all, "--fit-tau-init", type=float, default=argparse.SUPPRESS,
+                          help_text="Initial temperature for FIT soft query (only used if --use-fit)")
+    _add_arg_with_default(p_all, "--fit-tau-min", type=float, default=argparse.SUPPRESS,
+                          help_text="Minimum temperature for FIT soft query (only used if --use-fit)")
+    _add_arg_with_default(p_all, "--fit-tau-decay", type=float, default=argparse.SUPPRESS,
+                          help_text="Temperature decay factor for FIT soft query (only used if --use-fit)")
+    _add_arg_with_default(p_all, "--fit-use-lss", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Use Lightweight Similarity Scorer instead of dot product in FIT mode")
     # Stage 5 options (subset)
     _add_arg_with_default(p_all, "--eval-batch-size", type=int, default=argparse.SUPPRESS,
                           help_text="Batch size for evaluation")

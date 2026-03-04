@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Configuration ──────────────────────────────────────────────────────
-DATA_DIR="outputs/20260213_005409_all_mlp"
+DATA_DIR="/mnt/data/maxrod/engagement-prediction/outputs/20260224_051127_start_to_train_two_tower_two-tower" # "outputs/20260213_005409_all_mlp" # change to my own data dir
 
 EPOCHS=300
 BATCH_SIZE=2048
@@ -29,11 +29,11 @@ MAX_PARALLEL=4   # max concurrent MLP jobs
 # Each entry is "user_encoder:user_summarization" (summarization ignored when encoder != summarized)
 #
 # MLP experiments (parallelisable -- tiny GPU footprint)
-MLP_EXPERIMENTS=(
-  "summarized:mean"
-  "summarized:ema"
-  "summarized:linear_recency"
-  "full_transformer:"
+MLP_EXPERIMENTS=( # could comment these out and test
+  # "summarized:mean"
+  # "summarized:ema"
+  # "summarized:linear_recency"
+  # "full_transformer:"
 )
 
 # Two-tower experiments (sequential -- heavy GPU/memory usage)

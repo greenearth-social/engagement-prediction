@@ -83,30 +83,56 @@ def run(context: Context, args) -> Dict[str, Any]:
     # Step 3: Build ANN index for all post embeddings
     # =========================================================================
     log_operation_start(f'Build ANN index ({ann_index_type}) for {len(posts_emb_df)} posts', 'STAGE_07_RETRIEVAL', logger)
-    from .ann_retrieval import build_ann_index, encode_all_posts
-    
-    # Encode all posts through post tower
-    post_ids, post_embeddings_encoded = encode_all_posts(
-        model=model,
-        posts_emb_df=posts_emb_df,
-        join_post=join_post,
-        embedding_dim=embedding_dim,
-        device=device,
-        batch_size=1024,
+    from .ann_retrieval import build_ann_index, encode_all_posts, encode_all_posts_fit_sharded
+    fit_conditioned_retrieval = bool(
+        getattr(args, 'fit_conditioned_retrieval', False)
+        or (
+            bool(getattr(model, 'use_fit', False))
+            and str(getattr(model, 'user_encoder_type', '')) in ('full_transformer', 'cross_attention')
+        )
     )
-    
-    # Build ANN index
-    ann_index = build_ann_index(
-        embeddings=post_embeddings_encoded,
-        index_type=ann_index_type,
-        shared_dim=model.shared_dim,
-    )
-    
-    # Save ANN index
     ann_index_dir = out_dir / 'ann_index'
     ann_index_dir.mkdir(exist_ok=True)
-    ann_index.save(str(ann_index_dir / f'{ann_index_type}_index'))
-    np.save(ann_index_dir / 'post_ids.npy', post_ids)
+    post_ids: List[str] = []
+    ann_index = None
+    shard_ann_indices: Dict[int, Any] = {}
+    shard_post_ids: Dict[int, List[str]] = {}
+    if fit_conditioned_retrieval:
+        shard_data = encode_all_posts_fit_sharded(
+            model=model,
+            posts_emb_df=posts_emb_df,
+            join_post=join_post,
+            embedding_dim=embedding_dim,
+            device=device,
+            batch_size=1024,
+        )
+        for q_idx, payload in shard_data.items():
+            shard_post_ids[q_idx] = payload['post_ids']
+            shard_ann_indices[q_idx] = build_ann_index(
+                embeddings=payload['embeddings'],
+                index_type=ann_index_type,
+                shared_dim=model.shared_dim,
+            )
+            shard_ann_indices[q_idx].save(str(ann_index_dir / f'{ann_index_type}_index_q{q_idx}'))
+        np.save(ann_index_dir / 'fit_shard_ids.npy', np.array(sorted(shard_post_ids.keys()), dtype=np.int64))
+    else:
+        # Encode all posts through post tower
+        post_ids, post_embeddings_encoded = encode_all_posts(
+            model=model,
+            posts_emb_df=posts_emb_df,
+            join_post=join_post,
+            embedding_dim=embedding_dim,
+            device=device,
+            batch_size=1024,
+        )
+        # Build ANN index
+        ann_index = build_ann_index(
+            embeddings=post_embeddings_encoded,
+            index_type=ann_index_type,
+            shared_dim=model.shared_dim,
+        )
+        ann_index.save(str(ann_index_dir / f'{ann_index_type}_index'))
+        np.save(ann_index_dir / 'post_ids.npy', post_ids)
     
     # =========================================================================
     # Step 4: Load user splits and build user histories
@@ -148,21 +174,29 @@ def run(context: Context, args) -> Dict[str, Any]:
     recommendations = []
     
     for user_id, history_data in user_histories.items():
-        # Step 5a: Encode user from history
-        user_emb = _encode_user(
-            model=model,
-            history_embeddings=history_data['history_embeddings'],
-            device=device,
-        )
-        
-        # Step 5b: ANN search for top-N candidates
-        candidate_post_ids, candidate_scores = ann_index.search(
-            query=user_emb,
-            k=top_n_candidates,
-        )
-        
-        # Map indices back to post IDs
-        candidate_post_ids = [post_ids[idx] for idx in candidate_post_ids[0]]
+        if fit_conditioned_retrieval:
+            candidate_post_ids, candidate_scores = _retrieve_fit_conditioned_candidates(
+                model=model,
+                history_embeddings=history_data['history_embeddings'],
+                shard_ann_indices=shard_ann_indices,
+                shard_post_ids=shard_post_ids,
+                top_n_candidates=top_n_candidates,
+                device=device,
+            )
+        else:
+            # Step 5a: Encode user from history
+            user_emb = _encode_user(
+                model=model,
+                history_embeddings=history_data['history_embeddings'],
+                device=device,
+            )
+            # Step 5b: ANN search for top-N candidates
+            candidate_idx, candidate_scores_np = ann_index.search(
+                query=user_emb,
+                k=top_n_candidates,
+            )
+            candidate_post_ids = [post_ids[idx] for idx in candidate_idx[0]]
+            candidate_scores = candidate_scores_np[0].astype(np.float32, copy=False)
         
         # Step 5c: Cross-encoder reranking (if enabled)
         if use_cross_encoder and top_k_final < top_n_candidates:
@@ -183,7 +217,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         else:
             # No reranking: use ANN scores directly
             final_post_ids = candidate_post_ids[:top_k_final]
-            final_scores = candidate_scores[0][:top_k_final]
+            final_scores = candidate_scores[:top_k_final]
         
         recommendations.append({
             'user_id': user_id,
@@ -235,7 +269,8 @@ def run(context: Context, args) -> Dict[str, Any]:
         f"runtime_seconds: {runtime:.2f}",
         f"settings: top_n_candidates={top_n_candidates}, top_k_final={top_k_final}, use_cross_encoder={use_cross_encoder}",
         f"ann_index_type: {ann_index_type}",
-        f"num_posts_indexed: {len(post_ids)}",
+        f"fit_conditioned_retrieval: {fit_conditioned_retrieval}",
+        f"num_posts_indexed: {sum(len(v) for v in shard_post_ids.values()) if fit_conditioned_retrieval else len(post_ids)}",
         f"num_users: {len(user_histories)}",
         f"avg_recommendations_per_user: {len(recs_df) / len(user_histories) if len(user_histories) > 0 else 0:.1f}",
     ]
@@ -259,15 +294,22 @@ def run(context: Context, args) -> Dict[str, Any]:
 
 def _resolve_assets(run_dir: Path, context: Context, args) -> tuple[str, str, str]:
     """Locate model checkpoint, embedding bundle, and user splits."""
-    # Find model checkpoint from Stage 5
+    # Find model checkpoint (prefer current pipeline naming, then legacy)
     prior_train = select_prior_output(
-        run_dir, 
-        '05_train_two_tower',  # or '05_train' for MLP
+        run_dir,
+        '04_train',
         use_latest=context.use_latest,
-        prior_path=context.prior_outputs.get('05_train_two_tower')
+        prior_path=context.prior_outputs.get('04_train')
     )
     if prior_train is None:
-        raise FileNotFoundError("Training output not found (Stage 5).")
+        prior_train = select_prior_output(
+            run_dir,
+            '05_train_two_tower',
+            use_latest=context.use_latest,
+            prior_path=context.prior_outputs.get('05_train_two_tower')
+        )
+    if prior_train is None:
+        raise FileNotFoundError("Training output not found.")
     
     checkpoint_candidates = list(prior_train.glob('checkpoints/two_tower_best.pth'))
     if not checkpoint_candidates:
@@ -277,7 +319,9 @@ def _resolve_assets(run_dir: Path, context: Context, args) -> tuple[str, str, st
     model_path = str(checkpoint_candidates[0])
     
     # Find embedding bundle from Stage 2
-    prior_featurize = select_prior_output(run_dir, '02_featurize', use_latest=context.use_latest)
+    prior_featurize = select_prior_output(run_dir, '02_target_posts', use_latest=context.use_latest)
+    if prior_featurize is None:
+        prior_featurize = select_prior_output(run_dir, '02_featurize', use_latest=context.use_latest)
     if prior_featurize is None:
         raise FileNotFoundError("Featurize output not found (Stage 2).")
     bundle_candidates = sorted(prior_featurize.glob('embedding_bundle_*.pkl'), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -285,8 +329,10 @@ def _resolve_assets(run_dir: Path, context: Context, args) -> tuple[str, str, st
         raise FileNotFoundError(f"No embedding bundle found in {prior_featurize}")
     bundle_path = str(bundle_candidates[0])
     
-    # Find user splits from Stage 4
-    prior_split = select_prior_output(run_dir, '04_split', use_latest=context.use_latest)
+    # Find user splits (legacy stage name fallback)
+    prior_split = select_prior_output(run_dir, '02_target_posts', use_latest=context.use_latest)
+    if prior_split is None:
+        prior_split = select_prior_output(run_dir, '04_split', use_latest=context.use_latest)
     if prior_split is None:
         raise FileNotFoundError("Split output not found (Stage 4).")
     splits_path = prior_split / 'user_splits.json'
@@ -299,23 +345,35 @@ def _resolve_assets(run_dir: Path, context: Context, args) -> tuple[str, str, st
 def _load_model(model_path: str, device: str):
     """Load trained two-tower model from checkpoint."""
     import torch
-    from utils.05_train.stage_train_two_tower import TwoTowerEngagement
-    
+    import importlib
+
     checkpoint = torch.load(model_path, map_location=device)
-    
-    # Extract model hyperparameters from checkpoint
-    model = TwoTowerEngagement(
-        post_embedding_dim=checkpoint.get('post_embedding_dim', 384),
-        shared_dim=checkpoint.get('shared_dim', 128),
-        user_hidden_dim=checkpoint.get('user_hidden_dim', 256),
-        post_hidden_dim=checkpoint.get('post_hidden_dim', 256),
-        num_attention_heads=checkpoint.get('num_attention_heads', 4),
-        num_attention_layers=checkpoint.get('num_attention_layers', 2),
-        max_history_len=checkpoint.get('max_history_len', 50),
-        dropout_rate=checkpoint.get('dropout_rate', 0.1),
+    stage_train_two_tower = importlib.import_module("utils.04_train.stage_train_two_tower")
+    TwoTowerModel = stage_train_two_tower.TwoTowerModel
+    cfg = checkpoint.get('config', {}) if isinstance(checkpoint, dict) else {}
+    state_dict = checkpoint['model_state_dict'] if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint else checkpoint
+    fit_in_state = any(k.startswith('mqm.') for k in state_dict.keys())
+
+    model = TwoTowerModel(
+        post_embedding_dim=int(cfg.get('post_embedding_dim', checkpoint.get('post_embedding_dim', 384))),
+        shared_dim=int(cfg.get('shared_dim', checkpoint.get('shared_dim', 128))),
+        user_hidden_dim=int(cfg.get('user_hidden_dim', checkpoint.get('user_hidden_dim', 256))),
+        post_hidden_dim=int(cfg.get('post_hidden_dim', checkpoint.get('post_hidden_dim', 256))),
+        num_attention_heads=int(cfg.get('num_attention_heads', checkpoint.get('num_attention_heads', 4))),
+        num_attention_layers=int(cfg.get('num_attention_layers', checkpoint.get('num_attention_layers', 2))),
+        max_history_len=int(cfg.get('max_history_len', checkpoint.get('max_history_len', 50))),
+        dropout_rate=float(cfg.get('dropout_rate', checkpoint.get('dropout_rate', 0.1))),
+        user_encoder_type=str(cfg.get('user_encoder_type', checkpoint.get('user_encoder_type', 'full_transformer'))),
+        use_post_encoder=bool(cfg.get('use_post_encoder', checkpoint.get('use_post_encoder', True))),
+        use_fit=bool(cfg.get('use_fit', fit_in_state)),
+        fit_num_queries=int(cfg.get('fit_num_queries', checkpoint.get('fit_num_queries', 64))),
+        fit_tau_init=float(cfg.get('fit_tau_init', checkpoint.get('fit_tau_init', 1.0))),
+        fit_tau_min=float(cfg.get('fit_tau_min', checkpoint.get('fit_tau_min', 0.1))),
+        fit_tau_decay=float(cfg.get('fit_tau_decay', checkpoint.get('fit_tau_decay', 0.9995))),
+        fit_use_lss=bool(cfg.get('fit_use_lss', checkpoint.get('fit_use_lss', False))),
     )
     
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
     
@@ -386,6 +444,53 @@ def _encode_user(model, history_embeddings: np.ndarray, device: str) -> np.ndarr
         user_emb = model.encode_user(history_tensor, history_mask)  # [1, shared_dim]
     
     return user_emb.cpu().numpy()  # [1, shared_dim]
+
+
+def _encode_user_fit_query(model, history_embeddings: np.ndarray, q_idx: int, device: str) -> np.ndarray:
+    """Encode user conditioned on a specific FIT hard query index."""
+    import torch
+
+    history_tensor = torch.tensor(history_embeddings, dtype=torch.float32, device=device).unsqueeze(0)
+    history_mask = torch.ones(1, history_embeddings.shape[0], dtype=torch.bool, device=device)
+    with torch.no_grad():
+        query_group = (model.mqm.meta_matrix @ model.mqm.meta_matrix.T) @ model.mqm.meta_matrix
+        q_vec = query_group[int(q_idx)].unsqueeze(0)  # [1, hidden_dim]
+        user_emb = model.user_tower(history_tensor, history_mask, meta_query_vec=q_vec)
+    return user_emb.cpu().numpy()
+
+
+def _retrieve_fit_conditioned_candidates(
+    model,
+    history_embeddings: np.ndarray,
+    shard_ann_indices: Dict[int, Any],
+    shard_post_ids: Dict[int, List[str]],
+    top_n_candidates: int,
+    device: str,
+) -> tuple[List[str], np.ndarray]:
+    """Retrieve candidates by querying each FIT shard with its conditioned user embedding."""
+    all_candidates: Dict[str, float] = {}
+    num_shards = max(len(shard_ann_indices), 1)
+    per_shard_k = max(1, int(np.ceil(top_n_candidates / num_shards)))
+
+    for q_idx, ann_index in shard_ann_indices.items():
+        if not shard_post_ids.get(q_idx):
+            continue
+        user_emb = _encode_user_fit_query(model, history_embeddings, q_idx=q_idx, device=device)
+        idx, scores = ann_index.search(query=user_emb, k=per_shard_k)
+        local_post_ids = shard_post_ids[q_idx]
+        for local_idx, score in zip(idx[0], scores[0]):
+            post_id = local_post_ids[int(local_idx)]
+            prev = all_candidates.get(post_id)
+            score_float = float(score)
+            if prev is None or score_float > prev:
+                all_candidates[post_id] = score_float
+
+    if not all_candidates:
+        return [], np.array([], dtype=np.float32)
+    sorted_items = sorted(all_candidates.items(), key=lambda x: x[1], reverse=True)[:top_n_candidates]
+    candidate_post_ids = [pid for pid, _ in sorted_items]
+    candidate_scores = np.array([score for _, score in sorted_items], dtype=np.float32)
+    return candidate_post_ids, candidate_scores
 
 
 def _compute_retrieval_metrics(

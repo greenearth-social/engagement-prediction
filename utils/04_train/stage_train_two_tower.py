@@ -128,6 +128,69 @@ STAGE_LOG_NAME = "STAGE_04_TRAIN_TWO_TOWER"
 
 
 # =============================================================================
+# Meta Query Module (MQM) for FIT
+# =============================================================================
+
+class MetaQueryModule(nn.Module):
+    """
+    Meta Query Module (MQM) for FIT architecture.
+    
+    Maintains a learnable meta matrix M ∈ R^{K x Dq} where K = num_queries.
+    For each candidate post, maps it to a query index and computes either:
+    - Hard query: M[q_idx] (inference)
+    - Soft query: attention-weighted combination of meta vectors (training)
+    """
+    
+    def __init__(self, item_dim: int, query_dim: int, num_queries: int):
+        super().__init__()
+        self.num_queries = num_queries
+        # Learnable meta matrix: [K, query_dim]
+        self.meta_matrix = nn.Parameter(torch.empty(num_queries, query_dim))
+        # Project item embedding to query space
+        self.item_proj = nn.Linear(item_dim, query_dim)
+        self._init_weights()
+    
+    def _init_weights(self):
+        nn.init.kaiming_uniform_(self.meta_matrix, a=np.sqrt(5))
+        nn.init.xavier_uniform_(self.item_proj.weight)
+        if self.item_proj.bias is not None:
+            nn.init.zeros_(self.item_proj.bias)
+    
+    def forward(self, item_emb: torch.Tensor, tau: float, hard: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            item_emb: [B, item_dim] Candidate post embeddings
+            tau: Temperature for soft query (training)
+            hard: If True, use hard query (inference); else use soft query (training)
+        
+        Returns:
+            q: [B, query_dim] Meta query vector
+            q_idx: [B] Query index (hard assignment)
+        """
+        # Project item to query space
+        z = self.item_proj(item_emb)  # [B, query_dim]
+        
+        # Parameter-free self-attention over meta matrix to build query group Q*.
+        query_group = (self.meta_matrix @ self.meta_matrix.T) @ self.meta_matrix  # [K, query_dim]
+
+        # Similarity scores use original meta matrix rows (paper Eq. 9).
+        logits = z @ self.meta_matrix.T  # [B, K]
+        
+        # Get hard assignment
+        q_idx = logits.argmax(dim=-1)  # [B]
+        
+        if hard:
+            # Hard query: select row from query group Q*
+            q = query_group[q_idx]  # [B, query_dim]
+        else:
+            # Soft query: attention-weighted combination
+            w = F.softmax(logits / max(tau, 1e-6), dim=-1)  # [B, K]
+            q = w @ query_group  # [B, query_dim]
+        
+        return q, q_idx
+
+
+# =============================================================================
 # Post Tower
 # =============================================================================
 
@@ -256,12 +319,50 @@ class TwoTowerModel(nn.Module):
         dropout_rate: float,
         user_encoder_type: str,
         use_post_encoder: bool,
+        # FIT parameters (optional, defaults to disabled)
+        use_fit: bool = False,
+        fit_num_queries: int = 64,
+        fit_tau_init: float = 1.0,
+        fit_tau_min: float = 0.1,
+        fit_tau_decay: float = 0.9995,
+        fit_use_lss: bool = False,
     ):
         super().__init__()
         self.shared_dim = shared_dim
         self.post_embedding_dim = post_embedding_dim
         self.user_encoder_type = user_encoder_type
         self.use_post_encoder = use_post_encoder
+        self.use_fit = use_fit
+        self.fit_use_lss = fit_use_lss
+        
+        # FIT initialization (only if use_fit=True)
+        if self.use_fit:
+            self.fit_num_queries = fit_num_queries
+            self.fit_tau_init = fit_tau_init
+            self.fit_tau_min = fit_tau_min
+            self.fit_tau_decay = fit_tau_decay
+            # Register tau as buffer for state persistence
+            self.register_buffer('fit_tau', torch.tensor(fit_tau_init))
+            self.register_buffer('fit_global_step', torch.tensor(0, dtype=torch.long))
+            self.fit_tau_threshold = 1
+            # Meta Query Module
+            self.mqm = MetaQueryModule(
+                item_dim=post_embedding_dim,
+                query_dim=user_hidden_dim,
+                num_queries=fit_num_queries
+            )
+            # LSS (Lightweight Similarity Scorer) - optional
+            if fit_use_lss:
+                self.lss = nn.Sequential(
+                    nn.Linear(shared_dim, shared_dim),
+                    nn.ReLU(),
+                    nn.Linear(shared_dim, 1)
+                )
+            else:
+                self.lss = None
+        else:
+            self.mqm = None
+            self.lss = None
 
         # Instantiate user tower based on encoder type
         if user_encoder_type == "cross_attention":
@@ -315,17 +416,34 @@ class TwoTowerModel(nn.Module):
             self.post_tower = _dummy_post_tower
 
 
-    def encode_user(self, history_embeddings: torch.Tensor, history_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def encode_user(
+        self, 
+        history_embeddings: torch.Tensor, 
+        history_mask: Optional[torch.Tensor] = None,
+        meta_query: Optional[torch.Tensor] = None,  # [B, post_embedding_dim] Candidate post embedding for FIT
+    ) -> torch.Tensor:
         """Encode user engagement history into shared space representation.
         
         Args:
             history_embeddings: Padded history sequences [batch, seq_len, input_dim]
             history_mask: Boolean mask [batch, seq_len], True = valid position
+            meta_query: Optional [B, post_embedding_dim] candidate post embedding for FIT MQM
         
         Returns:
             User vectors in shared space [batch, shared_dim]
         """
-        return self.user_tower(history_embeddings, history_mask)
+        # FIT mode: use MQM to get meta query vector
+        if self.use_fit and meta_query is not None:
+            hard = not self.training
+            q_vec, q_idx = self.mqm(meta_query, tau=self.fit_tau.item(), hard=hard)
+            # Pass meta_query_vec to encoder (only works for transformer/cross_attention encoders)
+            if self.user_encoder_type in ("full_transformer", "cross_attention"):
+                return self.user_tower(history_embeddings, history_mask, meta_query_vec=q_vec)
+            else:
+                # For summarized mode, FIT doesn't apply (user vector is pre-computed)
+                return self.user_tower(history_embeddings, history_mask)
+        else:
+            return self.user_tower(history_embeddings, history_mask)
 
     def encode_post(self, post_embeddings: torch.Tensor) -> torch.Tensor:
         """Encode post embeddings into shared space representation.
@@ -360,18 +478,36 @@ class TwoTowerModel(nn.Module):
         Returns:
             Raw engagement scores [batch] (logits before sigmoid)
         """
-        if self.user_encoder_type == "summarized":
-            user_emb = history_embeddings
+        if self.use_fit and self.user_encoder_type in ("full_transformer", "cross_attention"):
+            # FIT mode: use MQM to get meta query, then encode user
+            post_emb = self.encode_post(post_embeddings) if self.use_post_encoder else post_embeddings
+            user_emb = self.encode_user(
+                history_embeddings,
+                history_mask,
+                meta_query=post_embeddings  # [B, post_embedding_dim] - RAW post embedding
+            )
+            
+            # Compute score: LSS or dot product
+            if self.fit_use_lss and self.lss is not None:
+                sim = user_emb * post_emb  # [B, shared_dim]
+                scores = self.lss(sim).squeeze(-1)  # [B]
+            else:
+                scores = (user_emb * post_emb).sum(dim=-1)  # [B]
+            return scores
         else:
-            user_emb = self.encode_user(history_embeddings, history_mask)
+            # Standard two-tower mode
+            if self.user_encoder_type == "summarized":
+                user_emb = history_embeddings
+            else:
+                user_emb = self.encode_user(history_embeddings, history_mask)
 
-        if self.use_post_encoder:
-            post_emb = self.encode_post(post_embeddings)
-        else:
-            post_emb = post_embeddings
-        
-        # Dot product: element-wise multiply then sum over shared_dim
-        return (user_emb * post_emb).sum(dim=-1)
+            if self.use_post_encoder:
+                post_emb = self.encode_post(post_embeddings)
+            else:
+                post_emb = post_embeddings
+            
+            # Dot product: element-wise multiply then sum over shared_dim
+            return (user_emb * post_emb).sum(dim=-1)
 
     def compute_loss_and_preds(
         self,
@@ -416,8 +552,24 @@ class TwoTowerModel(nn.Module):
         labels = batch["label"].to(device)
 
         scores = self.forward(history_embeddings, history_mask, post_embeddings)
-        probs = torch.sigmoid(scores)
-        loss = F.binary_cross_entropy(probs, labels.float())
+
+        # more numerically stable loss with logits:
+
+        loss = F.binary_cross_entropy_with_logits(scores, labels.float())
+        # probs = torch.sigmoid(scores)
+        # loss = F.binary_cross_entropy(probs, labels.float())
+        
+        # FIT: Update tau for soft query (linear decay by global step)
+        if self.use_fit and self.training:
+            self.fit_global_step += 1
+            threshold = max(int(getattr(self, "fit_tau_threshold", 1)), 1)
+            progress = min(float(self.fit_global_step.item()) / float(threshold), 1.0)
+            new_tau = self.fit_tau_init * (1.0 - progress)
+            self.fit_tau.data = torch.tensor(
+                max(self.fit_tau_min, min(self.fit_tau_init, new_tau)),
+                device=self.fit_tau.device
+            )
+        
         return loss, scores
 
 
@@ -444,6 +596,8 @@ def train_two_tower_model(
     from tqdm import tqdm
 
     model = model.to(device)
+    if getattr(model, "use_fit", False):
+        model.fit_tau_threshold = max(len(train_loader), 1)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", factor=lr_scheduler_factor, patience=lr_scheduler_patience
@@ -693,8 +847,16 @@ def run(context: Context, args) -> Dict[str, Any]:
     logger.info(f"Post embedding dim: {embed_dim}")
     logger.info(f"Train items: {len(train_dataset)}, Val items: {len(val_dataset)}")
 
+    # --- FIT parameters (extract with defaults) ---
+    use_fit = bool(getattr(args, 'use_fit', False))
+    fit_num_queries = int(getattr(args, 'fit_num_queries', 64))
+    fit_tau_init = float(getattr(args, 'fit_tau_init', 1.0))
+    fit_tau_min = float(getattr(args, 'fit_tau_min', 0.1))
+    fit_tau_decay = float(getattr(args, 'fit_tau_decay', 0.9995))
+    fit_use_lss = bool(getattr(args, 'fit_use_lss', False))
+    
     # --- create model ---
-    log_operation_start(f"Create two-tower model (user_encoder={user_encoder_type})", STAGE_LOG_NAME, logger)
+    log_operation_start(f"Create two-tower model (user_encoder={user_encoder_type}, use_fit={use_fit})", STAGE_LOG_NAME, logger)
     model = TwoTowerModel(
         post_embedding_dim=embed_dim,
         shared_dim=shared_dim,
@@ -706,6 +868,12 @@ def run(context: Context, args) -> Dict[str, Any]:
         dropout_rate=dropout_rate,
         user_encoder_type=user_encoder_type,
         use_post_encoder=use_post_encoder,
+        use_fit=use_fit,
+        fit_num_queries=fit_num_queries,
+        fit_tau_init=fit_tau_init,
+        fit_tau_min=fit_tau_min,
+        fit_tau_decay=fit_tau_decay,
+        fit_use_lss=fit_use_lss,
     )
 
     if (not use_post_encoder) and (user_encoder_type == "summarized"):
@@ -886,7 +1054,16 @@ def run(context: Context, args) -> Dict[str, Any]:
         "val_metrics": val_eval["metrics"],
         "holdout_metrics": holdout_metrics,
         "best_val_auc": best_val_auc,
+        "use_fit": use_fit,
     }
+    if use_fit:
+        training_config.update({
+            "fit_num_queries": fit_num_queries,
+            "fit_tau_init": fit_tau_init,
+            "fit_tau_min": fit_tau_min,
+            "fit_tau_decay": fit_tau_decay,
+            "fit_use_lss": fit_use_lss,
+        })
     with open(out_dir / "training_config.json", "w") as f:
         json.dump(training_config, f, indent=2)
 
