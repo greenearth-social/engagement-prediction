@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Configuration ──────────────────────────────────────────────────────
-DATA_DIR="outputs/20260227_005801_start_to_user_history_mlp"
+DATA_DIR="outputs/20260303_011201_all_mlp"
 
 EPOCHS=300
 BATCH_SIZE=2048
