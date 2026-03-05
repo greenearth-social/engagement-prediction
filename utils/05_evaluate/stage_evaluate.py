@@ -31,8 +31,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import numpy as np
 import pandas as pd
-import polars as pl
 
 from utils.pipeline.core import select_prior_output, Context
 from utils.helpers import get_stage_logger, log_operation_start
@@ -159,21 +159,25 @@ def load_holdout_predictions(
 # ---------------------------------------------------------------------------
 
 def _join_holdout_with_history(
-    target_posts_df: pl.DataFrame,
-    history_df: pl.DataFrame,
+    target_posts_df: pd.DataFrame,
+    history_df: pd.DataFrame,
     holdout_split: str,
-) -> pl.DataFrame:
+) -> pd.DataFrame:
     """Join holdout target rows with history and compute per-row history length."""
-    holdout_targets = target_posts_df.filter(
-        (pl.col("split") == holdout_split) & pl.col("neg_emb_idx").is_not_null()
-    )
-    return holdout_targets.join(
-        history_df.select(["target_did", "like_uri", "prior_emb_indices"]),
+    holdout_targets = target_posts_df[
+        (target_posts_df["split"] == holdout_split)
+        & target_posts_df["neg_emb_idx"].notna()
+    ].copy()
+    history_sub = history_df[["target_did", "like_uri", "prior_emb_indices"]]
+    joined = holdout_targets.merge(
+        history_sub,
         on=["target_did", "like_uri"],
         how="left",
-    ).with_columns(
-        pl.col("prior_emb_indices").list.len().alias("num_embedding_likes")
     )
+    joined["num_embedding_likes"] = joined["prior_emb_indices"].apply(
+        lambda x: len(x) if isinstance(x, (list, np.ndarray)) else 0
+    )
+    return joined
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +186,7 @@ def _join_holdout_with_history(
 
 def enrich_predictions_with_history_len(
     predictions_df: pd.DataFrame,
-    holdout_joined: pl.DataFrame,
+    holdout_joined: pd.DataFrame,
 ) -> pd.DataFrame:
     """Add a per-row ``num_embedding_likes`` column to ``predictions_df``.
 
@@ -205,7 +209,7 @@ def enrich_predictions_with_history_len(
     Returns:
         Copy of ``predictions_df`` with ``num_embedding_likes`` column added.
     """
-    hist_per_row = holdout_joined["num_embedding_likes"].fill_null(0).to_list()
+    hist_per_row = holdout_joined["num_embedding_likes"].fillna(0).tolist()
     n_target_rows = len(hist_per_row)
     n_predictions = len(predictions_df)
 
@@ -229,8 +233,8 @@ def enrich_predictions_with_history_len(
 
 def compute_user_metadata(
     predictions_df: pd.DataFrame,
-    target_posts_df: pl.DataFrame,
-    holdout_joined: pl.DataFrame,
+    target_posts_df: pd.DataFrame,
+    holdout_joined: pd.DataFrame,
 ) -> pd.DataFrame:
     """Compute per-user metadata including number of embedding likes.
 
@@ -241,28 +245,25 @@ def compute_user_metadata(
     Returns:
         DataFrame with columns [did, num_embedding_likes, num_total_likes]
     """
-    holdout_user_ids = set(predictions_df['did'].astype(str).unique())
+    holdout_user_ids = set(predictions_df["did"].astype(str).unique())
 
     user_history_lens = (
-        holdout_joined
-        .group_by("target_did")
-        .agg(
-            pl.col("num_embedding_likes").max().alias("num_embedding_likes"),
-        )
-        .rename({"target_did": "did"})
+        holdout_joined.groupby("target_did")["num_embedding_likes"]
+        .max()
+        .reset_index()
+        .rename(columns={"target_did": "did"})
     )
 
     total_likes = (
-        target_posts_df
-        .filter(pl.col("target_did").is_in(list(holdout_user_ids)))
-        .group_by("target_did")
-        .agg(pl.col("like_uri").n_unique().alias("num_total_likes"))
-        .rename({"target_did": "did"})
+        target_posts_df[target_posts_df["target_did"].astype(str).isin(holdout_user_ids)]
+        .groupby("target_did")["like_uri"]
+        .nunique()
+        .reset_index()
+        .rename(columns={"target_did": "did", "like_uri": "num_total_likes"})
     )
 
-    metadata_pl = user_history_lens.join(total_likes, on="did", how="left")
-    metadata_df = metadata_pl.to_pandas()
-    metadata_df['did'] = metadata_df['did'].astype(str)
+    metadata_df = user_history_lens.merge(total_likes, on="did", how="left")
+    metadata_df["did"] = metadata_df["did"].astype(str)
     metadata_df['num_embedding_likes'] = metadata_df['num_embedding_likes'].fillna(0).astype(int)
     metadata_df['num_total_likes'] = metadata_df['num_total_likes'].fillna(0).astype(int)
 
@@ -321,13 +322,14 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # Step 1: Load training data from prior stages (target_posts + history for metadata)
     log_operation_start('Load training data from prior stages', STAGE_LOG_NAME, logger)
-    _, target_posts_df, history_df, embed_dim = load_training_data(
+    _, target_posts_pl, history_pl, embed_dim = load_training_data(
         run_dir, context, logger=logger,
     )
+    target_posts_df = target_posts_pl.to_pandas()
+    history_df = history_pl.to_pandas()
 
-    holdout_target_rows = target_posts_df.filter(pl.col("split") == holdout_split)
-    holdout_users = holdout_target_rows["target_did"].unique().to_list()
-    holdout_users = [str(u) for u in holdout_users]
+    holdout_target_rows = target_posts_df[target_posts_df["split"] == holdout_split]
+    holdout_users = [str(u) for u in holdout_target_rows["target_did"].unique().tolist()]
 
     if not holdout_users:
         raise RuntimeError(
