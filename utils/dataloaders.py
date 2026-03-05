@@ -1001,7 +1001,7 @@ def _prepare_split_data(
     logger.info(f"  Split '{split}': {tp.height:,} target rows (after dropping null neg_emb_idx)")
 
     history_sub = history_df.select("target_did", "like_uri", "prior_emb_indices")
-    joined = tp.join(history_sub, on=["target_did", "like_uri"], how="left")
+    joined = tp.join(history_sub, on=["target_did", "like_uri"], how="left", maintain_order="left")
 
     like_emb_idx = joined["like_emb_idx"].to_numpy().astype(np.int64)
     neg_emb_idx = joined["neg_emb_idx"].to_numpy().astype(np.int64)
