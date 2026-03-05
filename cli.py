@@ -316,13 +316,19 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     if not args.foreground:
         # Background via nohup by re-invoking with --foreground and pinned --output-dir
         import shlex
+        parser = build_parser()
+        dest_to_flag = {}
+        for action in parser._actions:
+            if action.option_strings:
+                dest_to_flag[action.dest] = action.option_strings[0]
+
         cli_args = []
         for k, v in vars(args).items():
             if k in ("foreground", "_initial_log", "output_dir", "func"):
                 continue
             if v is None or v is False:
                 continue
-            opt = f"--{k.replace('_','-')}"
+            opt = dest_to_flag.get(k, f"--{k.replace('_', '-')}")
             if isinstance(v, bool):
                 cli_args.append(opt)
             elif isinstance(v, list):
