@@ -108,7 +108,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import pandas as pd
 import polars as pl
 import torch
 import torch.nn as nn
@@ -842,53 +841,39 @@ def load_training_data(
     run_dir: Path,
     context: Context,
     logger: Optional[logging.Logger] = None,
-) -> Tuple[np.ndarray, pd.DataFrame, pd.DataFrame, int]:
+) -> Tuple[np.ndarray, pl.DataFrame, pl.DataFrame, int]:
     """Locate and load the three upstream pipeline artifacts needed for training.
-    
-    This function abstracts away the complexity of finding prior stage outputs,
-    supporting both same-session pipeline runs (via context.artifacts) and
-    multi-session workflows (via filesystem scanning).
-    
+
     Resolution order for each artifact:
         1. context.artifacts - Set by pipeline when stages run in same session
         2. select_prior_output() - Filesystem scan for standalone training runs
         3. Fallback folders - Legacy compatibility (e.g., 02_featurize for history)
-    
+
     The three required artifacts:
         1. embeddings_*.npy   : Memmap array of post embeddings from Stage 1
         2. target_posts_*.parquet : Train/val/holdout split assignments from Stage 2
         3. history_posts_*.parquet: User engagement history from Stage 3
-    
+
     Args:
         run_dir: Root directory of the pipeline run
         context: Pipeline context with artifact tracking and configuration
         logger: Optional logger for progress reporting
-    
+
     Returns:
         Tuple of (embeddings_mmap, target_posts_df, history_df, embed_dim):
             - embeddings_mmap: Read-only numpy memmap [n_posts, D]
-            - target_posts_df: Pandas DataFrame with split, like_emb_idx, neg_emb_idx
-            - history_df: Pandas DataFrame with target_did, like_uri, prior_emb_indices
+            - target_posts_df: Polars DataFrame with split, like_emb_idx, neg_emb_idx
+            - history_df: Polars DataFrame with target_did, like_uri, prior_emb_indices
             - embed_dim: Integer embedding dimensionality D
-    
+
     Raises:
         FileNotFoundError: If any required artifact cannot be located
-        
-    Example:
-        >>> embeddings, targets, history, dim = load_training_data(
-        ...     run_dir=Path("/runs/experiment_001"),
-        ...     context=context,
-        ...     logger=logger
-        ... )
-        >>> print(f"Loaded {len(targets):,} target posts with {dim}-d embeddings")
     """
     if logger is None:
         logger = get_stage_logger("DATALOADERS")
     run_dir = Path(run_dir).resolve()
 
     # --- 1. Embeddings memmap from 01_get_data ---
-    # This is a read-only memory-mapped array that allows accessing post
-    # embeddings without loading the entire matrix into RAM
     log_operation_start("Locate embeddings memmap", "DATALOADERS", logger)
     get_data_dir = _resolve_prior(run_dir, context, stage_key="get_data", folder="01_get_data")
     emb_candidates = sorted(get_data_dir.glob("embeddings_*.npy"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -900,14 +885,12 @@ def load_training_data(
     logger.info(f"Loaded embeddings memmap: shape={embeddings_mmap.shape}, path={embeddings_path}")
 
     # --- 2. Target posts from 02_target_posts ---
-    # Contains the train/val/holdout split assignments and negative sampling results
     log_operation_start("Locate target_posts", "DATALOADERS", logger)
     target_posts_dir = _resolve_prior(run_dir, context, stage_key="target_posts", folder="02_target_posts")
-    target_posts_df = pd.read_parquet(get_latest_parquet_path(target_posts_dir, "target_posts_"))
-    logger.info(f"Loaded target_posts: {len(target_posts_df):,} rows")
+    target_posts_df = pl.read_parquet(get_latest_parquet_path(target_posts_dir, "target_posts_"))
+    logger.info(f"Loaded target_posts: {target_posts_df.height:,} rows")
 
     # --- 3. User history from 03_user_history (or legacy 02_featurize) ---
-    # Contains the (most-recent-first-ordered) list of post indices each user engaged with
     log_operation_start("Locate user_history", "DATALOADERS", logger)
     history_dir = _resolve_prior(
         run_dir, context,
@@ -915,8 +898,8 @@ def load_training_data(
         folder="03_user_history",
         fallback_folder="02_featurize",  # Legacy compatibility
     )
-    history_df = pd.read_parquet(get_latest_parquet_path(history_dir, "history_posts_"))
-    logger.info(f"Loaded user_history: {len(history_df):,} rows")
+    history_df = pl.read_parquet(get_latest_parquet_path(history_dir, "history_posts_"))
+    logger.info(f"Loaded user_history: {history_df.height:,} rows")
 
     return embeddings_mmap, target_posts_df, history_df, embed_dim
 
@@ -984,8 +967,8 @@ def _prepare_split_data(
     __getitem__ to efficiently construct training samples.
 
     Args:
-        target_posts_df: Full target posts DataFrame (polars or pandas) with all splits.
-        history_df: User engagement history DataFrame (polars or pandas).
+        target_posts_df: Full target posts Polars DataFrame with all splits.
+        history_df: User engagement history Polars DataFrame.
         split: Split name to filter to ("train", "val", "holdout_unseen_users", or "holdout_seen_users")
         logger: Optional logger for progress reporting
 
@@ -1011,12 +994,6 @@ def _prepare_split_data(
     """
     if logger is None:
         logger = get_stage_logger("DATALOADERS")
-
-    # Normalize to polars (load_training_data returns pandas; tests pass polars)
-    if not isinstance(target_posts_df, pl.DataFrame):
-        target_posts_df = pl.from_pandas(target_posts_df)
-    if not isinstance(history_df, pl.DataFrame):
-        history_df = pl.from_pandas(history_df)
 
     tp = target_posts_df.filter(
         (pl.col("split") == split) & pl.col("neg_emb_idx").is_not_null()

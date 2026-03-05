@@ -306,22 +306,17 @@ def run(context: Context, args) -> Dict[str, Any]:
     logger.info(f"Holdout type for evaluation: {eval_holdout_type} (split={holdout_split})")
 
     # Step 1: Load training data from prior stages.
-    # load_training_data returns pandas; we convert to polars immediately.
     log_operation_start('Load training data from prior stages', STAGE_LOG_NAME, logger)
-    _, target_posts_pd, history_pd, embed_dim = load_training_data(
+    _, target_posts, history_raw, embed_dim = load_training_data(
         run_dir, context, logger=logger,
     )
 
-    target_posts = pl.from_pandas(target_posts_pd)
-    history = (
-        pl.from_pandas(history_pd)
-        .select(
-            "target_did",
-            "like_uri",
-            pl.col("prior_emb_indices").list.len().fill_null(0).alias("num_embedding_likes"),
-        )
+    history = history_raw.select(
+        "target_did",
+        "like_uri",
+        pl.col("prior_emb_indices").list.len().fill_null(0).alias("num_embedding_likes"),
     )
-    del target_posts_pd, history_pd
+    del history_raw
 
     holdout_target_rows = target_posts.filter(pl.col("split") == holdout_split)
     holdout_users = (
