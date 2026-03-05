@@ -133,14 +133,45 @@ from utils.helpers import (
     parse_one_ts,
     validate_dataframe_schema,
     apply_time_filter,
-    get_embed_dim,
-    get_embedding_dim_for_model,
-    get_embeddings_list_col,
 )
 from utils.memory_helpers import (
     check_data_load_safe,
     MemoryTracker,
 )
+from shared.input_data_helpers import (
+    get_embedding_dim_for_known_model,
+    get_expanded_embedding_vector,
+)
+
+
+# ----------------------------------------
+# Embeddings helpers
+# ----------------------------------------
+
+def get_embeddings_list_col_polars(lf: pl.LazyFrame, embedding_model: str) -> pl.LazyFrame:
+    """
+    Adds a column with a list of floats representing the embedding vector for the given model, 
+    extracted from the raw `embeddings` struct/list column.
+    """
+    return lf.with_columns(
+        pl.col("embeddings").map_elements(
+            lambda x: get_expanded_embedding_vector(x, embedding_model),
+            return_dtype=pl.List(pl.Float32)
+        ).cast(pl.List(pl.Float32)).alias("_emb_vec")
+    )
+
+
+def _infer_embed_dim_from_first_row_polars(lf: pl.LazyFrame, embedding_model: str) -> int:
+    lf_with_emb = get_embeddings_list_col_polars(lf, embedding_model)
+    return (
+        lf_with_emb
+        .select(pl.col("_emb_vec").list.len().alias("dim"))
+        .filter(pl.col("dim").is_not_null())
+        .head(1)
+        .collect(engine="streaming")
+        .item()
+    )
+
 
 # ----------------------------------------
 # Data IO helpers (Green Earth Ingex + GCS)
@@ -538,7 +569,7 @@ def _load_posts_core_polars(
     random_seed: int,
     logger: logging.Logger,
     # the below inputs are for testing
-    get_embed_dim_fn: Callable[[pl.LazyFrame, str], int] = get_embed_dim,
+    get_embed_dim_fn: Callable[[pl.LazyFrame, str], int] = _infer_embed_dim_from_first_row_polars,
     embed_dim_override: Optional[int] = None,
 ) -> Tuple[pl.DataFrame, Dict[str, Any], int]:
     """
@@ -936,7 +967,7 @@ def _write_embeddings_memmap(
             posts_lf = posts_lf.select(["at_uri", "embeddings"]).filter(
                 pl.col("at_uri").is_in(candidate_uris)
             )
-            posts_lf = get_embeddings_list_col(posts_lf, embedding_model)
+            posts_lf = get_embeddings_list_col_polars(posts_lf, embedding_model)
             df = posts_lf.select(["at_uri", "_emb_vec"]).collect(engine="streaming")
             for row in df.iter_rows(named=True):
                 row_pbar.update(1)
@@ -1108,7 +1139,7 @@ def _run_greenearth_pipeline(
     elif memory_check in ("full", "ignore"):
         # Smart memory check that accounts for filtering parameters
         log_operation_start('Check data load safety', '01_GET_DATA', logger)
-        embedding_dim_for_estimate = 0 if skip_embeddings else get_embedding_dim_for_model(embedding_model)
+        embedding_dim_for_estimate = 0 if skip_embeddings else get_embedding_dim_for_known_model(embedding_model)
         memory_estimate = check_data_load_safe(
             likes_paths=likes_paths,
             posts_paths=posts_paths,
@@ -1159,7 +1190,7 @@ def _run_greenearth_pipeline(
     
     # Load posts metadata (NO embeddings - those are handled at the end)
     log_operation_start('Load posts metadata (no embeddings)', '01_GET_DATA', logger)
-    embed_dim_override = get_embedding_dim_for_model(embedding_model) if skip_embeddings else None
+    embed_dim_override = get_embedding_dim_for_known_model(embedding_model) if skip_embeddings else None
     posts_core_df, posts_stats, embed_dim = _load_posts_core_polars(
         start_str=posts_start,
         end_str=posts_end,

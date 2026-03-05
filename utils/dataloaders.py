@@ -120,7 +120,7 @@ from utils.helpers import (
     load_parquet_from_prior,
     log_operation_start,
 )
-from model_serving.input_data_helpers import get_padded_vector_and_mask
+from shared.input_data_helpers import get_padded_embedding_history_and_mask
 
 
 # ---------------------------------------------------------------------------
@@ -906,7 +906,7 @@ def load_training_data(
     logger.info(f"Loaded target_posts: {len(target_posts_df):,} rows")
 
     # --- 3. User history from 03_user_history (or legacy 02_featurize) ---
-    # Contains the chronologically-ordered list of post indices each user engaged with
+    # Contains the (most-recent-first-ordered) list of post indices each user engaged with
     log_operation_start("Locate user_history", "DATALOADERS", logger)
     history_dir = _resolve_prior(
         run_dir, context,
@@ -1370,7 +1370,7 @@ class SequenceEngagementDataset(Dataset):
         # the raw sequence here rather than using a pre-computed summary
         hist_indices = self.prior_emb_indices[row_idx]
         hist_embeddings = self.embeddings[hist_indices]
-        padded, mask = get_padded_vector_and_mask(hist_embeddings, self.max_history_len, self.embed_dim)
+        padded, mask = get_padded_embedding_history_and_mask(hist_embeddings, self.max_history_len, self.embed_dim)
 
         # --- Select target post embedding (pre-computed) ---
         if is_positive:
