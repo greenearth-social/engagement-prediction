@@ -312,15 +312,22 @@ def cmd_run_all(args: argparse.Namespace) -> int:
         import shlex
         parser = build_parser()
         dest_to_flag = {}
+        dest_to_neg_flag = {}
         for action in parser._actions:
             if action.option_strings:
                 dest_to_flag[action.dest] = action.option_strings[0]
+                if isinstance(action, argparse.BooleanOptionalAction) and len(action.option_strings) > 1:
+                    dest_to_neg_flag[action.dest] = action.option_strings[1]
 
         cli_args = []
         for k, v in vars(args).items():
             if k in ("background", "_initial_log", "output_dir", "func"):
                 continue
-            if v is None or v is False:
+            if v is None:
+                continue
+            if v is False:
+                if k in dest_to_neg_flag:
+                    cli_args.append(dest_to_neg_flag[k])
                 continue
             opt = dest_to_flag.get(k, f"--{k.replace('_', '-')}")
             if isinstance(v, bool):
