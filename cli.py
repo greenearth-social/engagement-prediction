@@ -48,7 +48,6 @@ DEFAULTS: Dict[str, Any] = {
     "max_memory_pct": 0.75,  # Stage 1: max percentage of available RAM to use
     "memory_check": "full",  # Stage 1: memory check mode (full/ignore/skip)
     "output_dir": None,
-    "run_name": None,
     "debug": False,
     "random_seed": 42,
     "embedding_model": "all_MiniLM_L6_v2",
@@ -293,15 +292,10 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     timestamp = time.strftime("%Y%m%d_%H%M%S")
 
     # Create run_dir deterministically up front
-    run_name = f"{timestamp}_{_generate_run_name(args)}"
     if args.output_dir:
         run_dir = Path(args.output_dir)
     else:
-        if args.run_name:
-            rn = str(args.run_name).strip().replace(' ', '_')
-            if rn:
-                run_name = f"{run_name}_{rn}"
-        run_dir = outputs_dir / run_name
+        run_dir = outputs_dir / timestamp
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # Choose log path inside run_dir
@@ -375,7 +369,7 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     tracker = build_experiment_tracker(
         args.experiment_tracker,
         project_name=args.experiment_project,
-        task_name=args.experiment_task or run_name,
+        task_name=args.experiment_task or _generate_run_name(args),
         tags=args.experiment_tags,
     )
     tracking_payload = {
@@ -536,8 +530,6 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Memory check mode: full (enforce limits), ignore (log only), skip (no estimation)")
     _add_arg_with_default(p_all, "--output-dir", type=str, default=argparse.SUPPRESS,
                           help_text="Optional explicit run directory root")
-    _add_arg_with_default(p_all, "--run-name", type=str, default=argparse.SUPPRESS,
-                          help_text="Optional suffix for Stage 1 run dir name")
     _add_arg_with_default(p_all, "--debug", action="store_true", default=argparse.SUPPRESS,
                           help_text="Enable verbose debug logging for Stage 1")
     _add_arg_with_default(p_all, "--random-seed", type=int, default=argparse.SUPPRESS,
