@@ -8,7 +8,7 @@ Runs the 5-stage pipeline end-to-end (get_data → target_posts → user_history
 
 Usage examples:
     python cli.py --user-encoder summarized --epochs 150 --embedding-model all_MiniLM_L12_v2
-    python cli.py --user-encoder full_transformer --model-type two-tower --config config.yml --foreground
+    python cli.py --user-encoder full_transformer --model-type two-tower --config config.yml
 """
 
 import argparse
@@ -111,7 +111,7 @@ DEFAULTS: Dict[str, Any] = {
     "stop_after": None,
     "pick_prior": False,
     # Execution behavior
-    "foreground": False,
+    "background": False,
     "_initial_log": None,
     # Experiment tracking
     "experiment_tracker": "clearml",
@@ -164,7 +164,7 @@ def _build_tracking_params(args: argparse.Namespace, run_dir: Path) -> Dict[str,
             "stop_after": args.stop_after,
             "cap_random_seed": args.cap_random_seed,
             "random_seed": args.random_seed,
-            "foreground": args.foreground,
+            "background": args.background,
         },
         "data": {
             "gcs_bucket": args.gcs_bucket,
@@ -285,7 +285,7 @@ def _generate_run_name(args: argparse.Namespace) -> str:
 def cmd_run_all(args: argparse.Namespace) -> int:
     """Run the 5-stage pipeline.
 
-    Creates a run directory up front and backgrounds itself with nohup unless --foreground.
+    Creates a run directory up front and backgrounds itself with nohup if --background.
     """
     outputs_dir = OUTPUTS_DIR
     outputs_dir.mkdir(parents=True, exist_ok=True)
@@ -307,8 +307,8 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     except Exception:
         pass
 
-    if not args.foreground:
-        # Background via nohup by re-invoking with --foreground and pinned --output-dir
+    if bool(args.background):
+        # Background via nohup by re-invoking in foreground (background disabled) with pinned --output-dir
         import shlex
         parser = build_parser()
         dest_to_flag = {}
@@ -318,7 +318,7 @@ def cmd_run_all(args: argparse.Namespace) -> int:
 
         cli_args = []
         for k, v in vars(args).items():
-            if k in ("foreground", "_initial_log", "output_dir", "func"):
+            if k in ("background", "_initial_log", "output_dir", "func"):
                 continue
             if v is None or v is False:
                 continue
@@ -329,7 +329,7 @@ def cmd_run_all(args: argparse.Namespace) -> int:
                 cli_args.extend([opt] + [str(x) for x in v])
             else:
                 cli_args.extend([opt, str(v)])
-        cli_args.extend(["--foreground", "--_initial-log", str(initial_log), "--output-dir", str(run_dir.resolve())])
+        cli_args.extend(["--_initial-log", str(initial_log), "--output-dir", str(run_dir.resolve())])
 
         py = shlex.quote(sys.executable)
         script = shlex.quote(str(Path(__file__).resolve()))
@@ -448,7 +448,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
         if len(subdirs) <= 1:
             return
         # Prompt only in foreground mode
-        if not bool(args.foreground):
+        if bool(args.background):
             return
         subdirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         print(f"\nPick prior output for stage '{stage_key}' under {base}:")
@@ -661,8 +661,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--pick-prior", action="store_true", default=argparse.SUPPRESS,
                           help_text="If multiple prior outputs exist, prompt to pick (foreground only)")
     # Execution behavior
-    _add_arg_with_default(p_all, "--foreground", action="store_true", default=argparse.SUPPRESS,
-                          help_text="Run in foreground (default: background with nohup)")
+    _add_arg_with_default(p_all, "--background", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Run in background with nohup (default: foreground)")
     p_all.add_argument("--_initial-log", type=str, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     # Experiment tracking
     _add_arg_with_default(p_all, "--experiment-tracker", type=str, choices=["none", "clearml"], default=argparse.SUPPRESS,

@@ -194,7 +194,7 @@ Feature schema parity is enforced at evaluation via `feature_columns` saved in t
 
 1) Stage 1 — Get data:
 ```bash
-python wills_tinkering_folder/cli.py --foreground --use-latest --max-files-per-table 5 --image-mode auto
+python wills_tinkering_folder/cli.py --use-latest --max-files-per-table 5 --image-mode auto
 ```
 Subsequent stages are orchestrated automatically.
 
