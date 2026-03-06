@@ -1026,6 +1026,7 @@ def _prepare_split_data(
         history_df.select(["target_did", "like_uri", "prior_emb_indices"]),
         on=["target_did", "like_uri"],
         how="left",
+        maintain_order="left",
     )
 
     # Extract embedding indices for positive and negative posts

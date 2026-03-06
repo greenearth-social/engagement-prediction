@@ -171,6 +171,7 @@ def _join_holdout_with_history(
         history_df.select(["target_did", "like_uri", "prior_emb_indices"]),
         on=["target_did", "like_uri"],
         how="left",
+        maintain_order="left",
     ).with_columns(
         pl.col("prior_emb_indices").list.len().alias("num_embedding_likes")
     )
