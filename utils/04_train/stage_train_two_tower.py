@@ -130,7 +130,7 @@ STAGE_LOG_NAME = "STAGE_04_TRAIN_TWO_TOWER"
 # =============================================================================
 # Meta Query Module (MQM) for FIT
 # =============================================================================
-
+# use class Module as this, in essence, is its own torch model layer
 class MetaQueryModule(nn.Module):
     """
     Meta Query Module (MQM) for FIT architecture.
@@ -145,14 +145,19 @@ class MetaQueryModule(nn.Module):
         super().__init__()
         self.num_queries = num_queries
         # Learnable meta matrix: [K, query_dim]
-        self.meta_matrix = nn.Parameter(torch.empty(num_queries, query_dim))
+        self.meta_matrix = nn.Parameter(torch.empty(num_queries, query_dim)) ############## check query dim #######################
         # Project item embedding to query space
         self.item_proj = nn.Linear(item_dim, query_dim)
         self._init_weights()
     
     def _init_weights(self):
+        # meta matrix is initialized to have low variance and larger vector values (compared to xavier uniform)
         nn.init.kaiming_uniform_(self.meta_matrix, a=np.sqrt(5))
+
+        # init item proj matrix to be xavier uniform
         nn.init.xavier_uniform_(self.item_proj.weight)
+
+        # currently default bias=True so just a safegaurd
         if self.item_proj.bias is not None:
             nn.init.zeros_(self.item_proj.bias)
     
@@ -179,9 +184,13 @@ class MetaQueryModule(nn.Module):
         # Get hard assignment
         q_idx = logits.argmax(dim=-1)  # [B]
         
+
+        # hard is for inference
         if hard:
             # Hard query: select row from query group Q*
             q = query_group[q_idx]  # [B, query_dim]
+
+        # soft is for training
         else:
             # Soft query: attention-weighted combination
             w = F.softmax(logits / max(tau, 1e-6), dim=-1)  # [B, K]
@@ -334,7 +343,7 @@ class TwoTowerModel(nn.Module):
         self.use_fit = use_fit
         self.fit_use_lss = fit_use_lss
         
-        # FIT initialization (only if use_fit=True)
+        ######################### FIT initialization (only if use_fit=True) #################################
         if self.use_fit:
             self.fit_num_queries = fit_num_queries
             self.fit_tau_init = fit_tau_init
