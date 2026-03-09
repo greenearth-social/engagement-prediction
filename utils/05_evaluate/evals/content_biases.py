@@ -67,31 +67,48 @@ def _unnest_text_inferences(df: pl.DataFrame) -> tuple[pl.DataFrame, list[str]]:
 def _correlations_for_group(
     y_pred: np.ndarray,
     group_df: pl.DataFrame,
-) -> Dict[str, float]:
-    """Spearman correlation between y_pred and each column in group_df."""
-    corrs: Dict[str, float] = {}
+    alpha: float = 0.05,
+) -> Dict[str, tuple[float, float, float]]:
+    """Spearman correlation + Fisher-z CI between y_pred and each column.
+
+    Returns {label: (rho, ci_lo, ci_hi)} for each column with enough data.
+    """
+    from scipy.stats import norm
+
+    z_crit = norm.ppf(1 - alpha / 2)
+    corrs: Dict[str, tuple[float, float, float]] = {}
     for col in group_df.columns:
         vals = group_df[col].to_numpy()
         mask = np.isfinite(vals)
-        if mask.sum() < 10:
+        n = int(mask.sum())
+        if n < 10:
             continue
         rho, _ = spearmanr(y_pred[mask], vals[mask])
-        corrs[col] = float(rho)
+        se = 1.0 / np.sqrt(n - 3)
+        z = np.arctanh(rho)
+        ci_lo = float(np.tanh(z - z_crit * se))
+        ci_hi = float(np.tanh(z + z_crit * se))
+        corrs[col] = (float(rho), ci_lo, ci_hi)
     return corrs
 
 
 def _plot_group(
     group_name: str,
-    corrs: Dict[str, float],
+    corrs: Dict[str, tuple[float, float, float]],
     out_dir: Path,
 ) -> Path:
-    labels = sorted(corrs, key=lambda k: abs(corrs[k]), reverse=True)
-    values = [corrs[k] for k in labels]
-    colors = ["#4878CF" if v >= 0 else "#D65F5F" for v in values]
+    labels = sorted(corrs, key=lambda k: abs(corrs[k][0]), reverse=True)
+    rhos = [corrs[k][0] for k in labels]
+    ci_lo = [corrs[k][1] for k in labels]
+    ci_hi = [corrs[k][2] for k in labels]
+    xerr_neg = [r - lo for r, lo in zip(rhos, ci_lo)]
+    xerr_pos = [hi - r for r, hi in zip(rhos, ci_hi)]
+    colors = ["#4878CF" if v >= 0 else "#D65F5F" for v in rhos]
 
     fig, ax = plt.subplots(figsize=(7, max(2.5, 0.35 * len(labels))))
     y_pos = np.arange(len(labels))
-    ax.barh(y_pos, values, color=colors, edgecolor="white", linewidth=0.5)
+    ax.barh(y_pos, rhos, color=colors, edgecolor="white", linewidth=0.5,
+            xerr=[xerr_neg, xerr_pos], error_kw=dict(ecolor="#333333", capsize=2, linewidth=0.8))
     ax.set_yticks(y_pos)
     ax.set_yticklabels(labels, fontsize=8)
     ax.invert_yaxis()
@@ -146,7 +163,7 @@ class ContentBiasesModule(EvalModule):
         flat, group_names = _unnest_text_inferences(joined)
         y_pred = flat["y_pred_proba"].to_numpy()
 
-        all_corrs: Dict[str, Dict[str, float]] = {}
+        all_corrs: Dict[str, Dict[str, tuple[float, float, float]]] = {}
         plot_paths: list[str] = []
 
         for gname in group_names:
@@ -158,12 +175,18 @@ class ContentBiasesModule(EvalModule):
             path = _plot_group(gname, corrs, out_dir)
             plot_paths.append(str(path))
 
+        # Flatten tuples for JSON: {group: {label: {rho, ci_lo, ci_hi}}}
+        corrs_for_json = {
+            g: {label: {"rho": r, "ci_lo": lo, "ci_hi": hi}
+                for label, (r, lo, hi) in labels.items()}
+            for g, labels in all_corrs.items()
+        }
         summary = {
             "n_negatives": n_negatives,
             "n_matched": n_matched,
             "coverage_pct": round(100.0 * n_matched / n_negatives, 2) if n_negatives else 0,
             "groups": list(all_corrs.keys()),
-            "correlations": all_corrs,
+            "correlations": corrs_for_json,
         }
         self.save_json(summary, out_dir / "content_biases_summary.json")
 
