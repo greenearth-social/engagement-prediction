@@ -366,6 +366,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     eval_config: Dict[str, Any] = {
         'batch_size': eval_batch_size,
         'embed_dim': embed_dim,
+        'run_dir': run_dir,
     }
 
     ctx = EvalContext(
