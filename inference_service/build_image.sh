@@ -2,6 +2,18 @@
 set -euo pipefail
 
 IMAGE_NAME="inference-service"
+DOCKERFILE_PATH="inference_service/Dockerfile"
+
+if [[ "${1:-}" == "--gpu" ]]; then
+  DOCKERFILE_PATH="inference_service/Dockerfile.gpu"
+  IMAGE_NAME=${IMAGE_NAME}-gpu
+  shift
+fi
+
+if [[ "${1:-}" == "--help" ]]; then
+  echo "Usage: $0 [--gpu]"
+  exit 0
+fi
 
 # 1. Get git commit SHA
 GIT_SHA=$(git rev-parse HEAD)
@@ -12,6 +24,7 @@ echo "Git SHA: $GIT_SHA"
 # 2. Build docker image
 docker build \
   --build-arg GIT_SHA="$GIT_SHA" \
+  -f "$DOCKERFILE_PATH" \
   -t "${IMAGE_NAME}:git-${SHORT_SHA}" \
   inference_service
 

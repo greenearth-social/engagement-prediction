@@ -1,4 +1,4 @@
-FROM ubuntu:22.04
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
 ARG GIT_SHA=""
 LABEL org.opencontainers.image.revision=$GIT_SHA
@@ -35,7 +35,10 @@ COPY requirements.txt .
 RUN python3 -m pip install --no-cache-dir -r requirements.txt
 
 ARG TORCH_VERSION=2.5.1
-RUN python3 -m pip install --no-cache-dir "torch==${TORCH_VERSION}"
+ARG TORCH_CUDA_TAG=cu121
+RUN python3 -m pip install --no-cache-dir \
+    "torch==${TORCH_VERSION}+${TORCH_CUDA_TAG}" \
+    --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_TAG}"
 
 COPY app.py .
 

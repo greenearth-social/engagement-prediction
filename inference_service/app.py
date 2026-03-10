@@ -3,7 +3,9 @@ import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from hashlib import sha256
 from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urlparse
 import logging
 
 import torch
@@ -82,7 +84,42 @@ def _choose_device() -> torch.device:
 def _find_model_file(path: str) -> str:
     if os.path.isfile(path):
         return path
-    raise RuntimeError(f"ClearML local copy path is not a file: {path}")
+    raise RuntimeError(f"Model path is not a file: {path}")
+
+
+def _download_gcs_uri_to_local(gs_uri: str) -> str:
+    """
+    Download a single GCS object (gs://bucket/path) to a local cache and return its path.
+    Uses Application Default Credentials.
+    """
+    parsed = urlparse(gs_uri)
+    if parsed.scheme != "gs":
+        raise ValueError(f"Expected gs:// URI, got: {gs_uri}")
+
+    bucket_name = parsed.netloc
+    blob_name = parsed.path.lstrip("/")
+    if not bucket_name or not blob_name:
+        raise ValueError(f"Invalid gs:// URI (missing bucket or object): {gs_uri}")
+
+    model_cache_dir = os.getenv("MODEL_CACHE_DIR", "/tmp/model_cache")
+    os.makedirs(model_cache_dir, exist_ok=True)
+
+    blob_basename = os.path.basename(blob_name) or "model"
+    key = sha256(gs_uri.encode("utf-8")).hexdigest()[:16]
+    local_path = os.path.join(model_cache_dir, f"{key}-{blob_basename}")
+
+    if os.path.exists(local_path):
+        return local_path
+
+    # Import lazily so non-GCS paths don't require this dependency at import time.
+    from google.cloud import storage  # type: ignore[import-not-found]
+
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.download_to_filename(local_path)
+
+    return local_path
 
 
 def _coerce_inputs_to_batched_tensor(
@@ -156,13 +193,21 @@ def _load_model_inner() -> None:
 
     model_id = None
     model_path_env = os.getenv("MODEL_PATH")
+    model_uri_env = os.getenv("MODEL_URI")
 
     if model_path_env:
         model_file = _find_model_file(model_path_env)
+    elif model_uri_env:
+        parsed = urlparse(model_uri_env)
+        if parsed.scheme == "gs":
+            model_file = _find_model_file(_download_gcs_uri_to_local(model_uri_env))
+        else:
+            # Treat as local path (supports relative paths too).
+            model_file = _find_model_file(model_uri_env)
     else:
         model_id = os.getenv("CLEARML_MODEL_ID")
         if not model_id:
-            raise RuntimeError("Either MODEL_PATH or CLEARML_MODEL_ID env var is required")
+            raise RuntimeError("Either MODEL_PATH, MODEL_URI, or CLEARML_MODEL_ID env var is required")
 
         cm = Model(model_id=model_id)
         local_copy = cm.get_local_copy()
@@ -246,6 +291,12 @@ def readyz():
         "load_error": _load_error,
         "load_started_at": _load_started_at,
         "load_finished_at": _load_finished_at,
+        "torch_version": torch.__version__,
+        "torch_cuda_version": torch.version.cuda,
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        "cuda_device_name_0": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES"),
     }
 
     status = 200 if ready else 503
