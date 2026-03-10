@@ -14,10 +14,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 WORKDIR /app
 
-# OS deps + Python
+# OS deps + Python 3.11
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 python3-pip python3-venv \
       ca-certificates curl git \
+      software-properties-common \
+      gnupg dirmngr \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+      python3.11 python3.11-venv \
     && rm -rf /var/lib/apt/lists/*
 
 # Run as non-root (Cloud Run-friendly).
@@ -28,14 +32,18 @@ RUN mkdir -p /tmp/.cache /tmp/torch /tmp/clearml \
     && chown -R appuser:appuser /tmp/.cache /tmp/torch /tmp/clearml
 
 # Upgrade pip
-RUN python3 -m pip install --no-cache-dir --upgrade pip
+RUN python3.11 -m ensurepip --upgrade \
+    && python3.11 -m pip install --no-cache-dir --upgrade pip
 
 # Install Python deps (FastAPI/ClearML/etc.)
 COPY requirements.txt .
-RUN python3 -m pip install --no-cache-dir -r requirements.txt
+RUN python3.11 -m pip install --no-cache-dir -r requirements.txt
 
 ARG TORCH_VERSION=2.5.1
-RUN python3 -m pip install --no-cache-dir "torch==${TORCH_VERSION}"
+# CPU-only PyTorch wheel (so this image can't accidentally use CUDA even if run with --gpus).
+RUN python3.11 -m pip install --no-cache-dir \
+    --index-url "https://download.pytorch.org/whl/cpu" \
+    "torch==${TORCH_VERSION}+cpu"
 
 COPY app.py .
 
@@ -45,4 +53,4 @@ USER appuser
 HEALTHCHECK --interval=30s --timeout=2s --start-period=15s --retries=3 \
   CMD curl -fsS "http://127.0.0.1:${PORT}/healthz" > /dev/null || exit 1
 
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT} --workers ${UVICORN_WORKERS} --proxy-headers --timeout-keep-alive 75 ${UVICORN_RELOAD:+--reload}"]
+CMD ["sh", "-c", "python3.11 -m uvicorn app:app --host 0.0.0.0 --port ${PORT} --workers ${UVICORN_WORKERS} --proxy-headers --timeout-keep-alive 75 ${UVICORN_RELOAD:+--reload}"]

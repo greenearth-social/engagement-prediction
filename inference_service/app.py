@@ -1,4 +1,5 @@
 import os
+import sys
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -291,6 +292,8 @@ def readyz():
         "load_error": _load_error,
         "load_started_at": _load_started_at,
         "load_finished_at": _load_finished_at,
+        "python_version": sys.version,
+        "python_executable": sys.executable,
         "torch_version": torch.__version__,
         "torch_cuda_version": torch.version.cuda,
         "cuda_available": torch.cuda.is_available(),
