@@ -136,7 +136,9 @@ def _download_gcs_uri_to_local(gs_uri: str) -> str:
     return local_path
 
 
-def _normalize_model_type(model_type: str) -> str:
+def _normalize_model_type(model_type: Optional[str]) -> str:
+    if model_type is None:
+        raise HTTPException(status_code=400, detail="MODEL_TYPE env var is required")
     mt = (model_type or "").strip().lower()
     if mt in {"post", "post_tower", "post-tower"}:
         return "post_tower"
