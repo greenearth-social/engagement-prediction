@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 
 """
-Content Biases Evaluation Module
+Trait Correlations Evaluation Module
 
-Measures whether the model's predicted engagement probability is correlated
-with NLP content features (topic, sentiment, toxicity, etc.) on holdout
-*negative* samples.  A strong correlation on negatives indicates the model
-has learned a content bias independent of actual user preference.
+Measures Spearman rank correlations between the model's predicted engagement
+probability and NLP content traits (topic, sentiment, toxicity, etc.) on
+holdout samples.  Separate analyses are run for negatives (y_true == 0) and
+positives (y_true == 1) to keep interpretation clean.
 
 For each inference group (e.g. emotion_sentiment, topic, moderation) a
-horizontal bar chart of Spearman rank correlations is saved, plus a JSON
+horizontal bar chart of correlations is saved for each subset, plus a JSON
 summary.
 
-Outputs (under content_biases/):
-- <group>_bias.png: one bar chart per inference group
-- content_biases_summary.json: all correlations and metadata
+Outputs (under trait_corrs/):
+- <group>_corr_neg.png: bar chart per group, negative samples
+- <group>_corr_pos.png: bar chart per group, positive samples
+- trait_corrs_summary.json: all correlations and metadata for both subsets
 """
 
 from __future__ import annotations
@@ -32,6 +33,8 @@ from scipy.stats import spearmanr
 from . import EvalContext, EvalModule
 
 STRUCT_PREFIX = "message.commit.record.text"
+
+_SUBSET_LABELS = {"neg": "negatives", "pos": "positives"}
 
 
 def _load_inferences(run_dir: Path) -> pl.LazyFrame:
@@ -96,6 +99,7 @@ def _plot_group(
     group_name: str,
     corrs: Dict[str, tuple[float, float, float]],
     out_dir: Path,
+    suffix: str,
 ) -> Path:
     labels = sorted(corrs, key=lambda k: abs(corrs[k][0]), reverse=True)
     rhos = [corrs[k][0] for k in labels]
@@ -113,19 +117,20 @@ def _plot_group(
     ax.set_yticklabels(labels, fontsize=8)
     ax.invert_yaxis()
     ax.set_xlabel("Spearman ρ with predicted P(engagement)")
-    ax.set_title(group_name.replace("_", " ").title())
+    title = group_name.replace("_", " ").title()
+    ax.set_title(f"{title}  ({_SUBSET_LABELS[suffix]})")
     ax.axvline(0, color="black", linewidth=0.5)
     plt.tight_layout()
 
-    path = out_dir / f"{group_name}_bias.png"
+    path = out_dir / f"{group_name}_corr_{suffix}.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return path
 
 
-class ContentBiasesModule(EvalModule):
-    name = "content_biases"
-    description = "Correlation between predicted engagement and NLP content features"
+class TraitCorrsModule(EvalModule):
+    name = "trait_corrs"
+    description = "Spearman correlations between predicted engagement and NLP traits (pos & neg subsets)"
 
     def run(self, ctx: EvalContext) -> Dict[str, Any]:
         out_dir = self.get_output_dir(ctx)
@@ -138,61 +143,68 @@ class ContentBiasesModule(EvalModule):
         except FileNotFoundError as e:
             return {"skipped": True, "reason": str(e)}
 
-        # Predictions -> Polars, negatives only
-        preds = (
-            pl.from_pandas(ctx.predictions_df)
-            .filter(pl.col("y_true") == 0)
-            .select("post_id", "y_pred_proba")
-        )
-        n_negatives = len(preds)
+        all_preds = pl.from_pandas(ctx.predictions_df)
+        subsets = [("neg", 0), ("pos", 1)]
+        subset_summaries: Dict[str, Any] = {}
+        plot_paths: list[str] = []
+        total_groups_plotted = 0
 
-        # Join predictions to inferences on post_id == at_uri
-        joined = (
-            inferences_lf
-            .join(preds.lazy(), left_on="at_uri", right_on="post_id", how="inner")
-            .collect()
-        )
-        n_matched = len(joined)
-        if n_matched < 30:
-            return {
-                "skipped": True,
-                "reason": f"only {n_matched} negatives matched inferences",
+        for suffix, label_val in subsets:
+            preds = (
+                all_preds
+                .filter(pl.col("y_true") == label_val)
+                .select("post_id", "y_pred_proba")
+            )
+            n_samples = len(preds)
+
+            joined = (
+                inferences_lf
+                .join(preds.lazy(), left_on="at_uri", right_on="post_id", how="inner")
+                .collect()
+            )
+            n_matched = len(joined)
+            if n_matched < 30:
+                subset_summaries[suffix] = {
+                    "skipped": True,
+                    "reason": f"only {n_matched} {_SUBSET_LABELS[suffix]} matched inferences",
+                    "n_samples": n_samples,
+                    "n_matched": n_matched,
+                }
+                continue
+
+            flat, group_names = _unnest_text_inferences(joined)
+            y_pred = flat["y_pred_proba"].to_numpy()
+
+            all_corrs: Dict[str, Dict[str, tuple[float, float, float]]] = {}
+
+            for gname in group_names:
+                group_df = flat.select(gname).unnest(gname)
+                corrs = _correlations_for_group(y_pred, group_df)
+                if not corrs:
+                    continue
+                all_corrs[gname] = corrs
+                path = _plot_group(gname, corrs, out_dir, suffix=suffix)
+                plot_paths.append(str(path))
+
+            total_groups_plotted += len(all_corrs)
+
+            corrs_for_json = {
+                g: {label: {"rho": r, "ci_lo": lo, "ci_hi": hi}
+                    for label, (r, lo, hi) in labels.items()}
+                for g, labels in all_corrs.items()
+            }
+            subset_summaries[suffix] = {
+                "n_samples": n_samples,
+                "n_matched": n_matched,
+                "coverage_pct": round(100.0 * n_matched / n_samples, 2) if n_samples else 0,
+                "groups": list(all_corrs.keys()),
+                "correlations": corrs_for_json,
             }
 
-        # Unnest to get inference group structs as top-level columns
-        flat, group_names = _unnest_text_inferences(joined)
-        y_pred = flat["y_pred_proba"].to_numpy()
-
-        all_corrs: Dict[str, Dict[str, tuple[float, float, float]]] = {}
-        plot_paths: list[str] = []
-
-        for gname in group_names:
-            group_df = flat.select(gname).unnest(gname)
-            corrs = _correlations_for_group(y_pred, group_df)
-            if not corrs:
-                continue
-            all_corrs[gname] = corrs
-            path = _plot_group(gname, corrs, out_dir)
-            plot_paths.append(str(path))
-
-        # Flatten tuples for JSON: {group: {label: {rho, ci_lo, ci_hi}}}
-        corrs_for_json = {
-            g: {label: {"rho": r, "ci_lo": lo, "ci_hi": hi}
-                for label, (r, lo, hi) in labels.items()}
-            for g, labels in all_corrs.items()
-        }
-        summary = {
-            "n_negatives": n_negatives,
-            "n_matched": n_matched,
-            "coverage_pct": round(100.0 * n_matched / n_negatives, 2) if n_negatives else 0,
-            "groups": list(all_corrs.keys()),
-            "correlations": corrs_for_json,
-        }
-        self.save_json(summary, out_dir / "content_biases_summary.json")
+        self.save_json(subset_summaries, out_dir / "trait_corrs_summary.json")
 
         return {
-            "n_negatives": n_negatives,
-            "n_matched": n_matched,
-            "groups_plotted": len(all_corrs),
+            "subsets": list(subset_summaries.keys()),
+            "groups_plotted": total_groups_plotted,
             "plot_paths": plot_paths,
         }

@@ -32,7 +32,7 @@ import polars as pl
 from scipy.stats import spearmanr
 
 from . import EvalContext, EvalModule
-from .content_biases import _load_inferences, _unnest_text_inferences
+from .trait_corrs import _load_inferences, _unnest_text_inferences
 
 MIN_USER_POSTS = 20
 N_BOOTSTRAP = 500
