@@ -18,15 +18,7 @@ from pydantic import BaseModel
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    blocking_startup = os.getenv("BLOCKING_STARTUP", "0") == "1"
-    if blocking_startup:
-        # Useful for Cloud Run if you prefer "fail fast" at startup and avoid serving
-        # requests before the model is available.
-        ensure_model_loaded()
-    else:
-        # Start background model download+load immediately.
-        t = threading.Thread(target=_background_startup_load, daemon=True)
-        t.start()
+    ensure_model_loaded()
     yield
 
 
@@ -258,18 +250,6 @@ def ensure_model_loaded() -> None:
             _load_finished_at = time.time()
             if _model is not None:
                 _loaded_event.set()
-
-
-def _background_startup_load() -> None:
-    """
-    Runs once at startup in a thread. If it fails, the service still starts,
-    but /ready remains false and /predict will fail until load succeeds.
-    """
-    try:
-        ensure_model_loaded()
-    except Exception:
-        # Intentionally swallow here; surfaced via /ready.
-        pass
 
 
 # -------------------------
