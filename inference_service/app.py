@@ -1,5 +1,4 @@
 import os
-import sys
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -18,15 +17,7 @@ from pydantic import BaseModel
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    blocking_startup = os.getenv("BLOCKING_STARTUP", "0") == "1"
-    if blocking_startup:
-        # Useful for Cloud Run if you prefer "fail fast" at startup and avoid serving
-        # requests before the model is available.
-        ensure_model_loaded()
-    else:
-        # Start background model download+load immediately.
-        t = threading.Thread(target=_background_startup_load, daemon=True)
-        t.start()
+    ensure_model_loaded()
     yield
 
 
@@ -41,20 +32,20 @@ logger = logging.getLogger(__name__)
 # -------------------------
 # Config
 # -------------------------
-MAX_BATCH = int(os.getenv("MAX_BATCH", "1024"))
-PREFER_CUDA = os.getenv("PREFER_CUDA", "1") == "1"
-WARMUP = os.getenv("WARMUP", "1") == "1"
-WARMUP_SECONDS_BUDGET = float(os.getenv("WARMUP_SECONDS_BUDGET", "5.0"))
+GE_INFERENCE_MAX_BATCH = int(os.getenv("GE_INFERENCE_MAX_BATCH", "1024"))
+GE_INFERENCE_PREFER_CUDA = os.getenv("GE_INFERENCE_PREFER_CUDA", "1") == "1"
+GE_INFERENCE_WARMUP = os.getenv("GE_INFERENCE_WARMUP", "1") == "1"
+GE_INFERENCE_WARMUP_SECONDS_BUDGET = float(os.getenv("GE_INFERENCE_WARMUP_SECONDS_BUDGET", "5.0"))
 
 # Which model signature to serve (required).
 # Supported: post_tower (1 input), user_tower (2 inputs), mlp (3 inputs)
-MODEL_TYPE = os.getenv("MODEL_TYPE")
-if not MODEL_TYPE:
-    raise RuntimeError("MODEL_TYPE env var is required (post_tower | user_tower | mlp).")
+GE_INFERENCE_MODEL_TYPE = os.getenv("GE_INFERENCE_MODEL_TYPE")
+if not GE_INFERENCE_MODEL_TYPE:
+    raise RuntimeError("GE_INFERENCE_MODEL_TYPE env var is required (post_tower | user_tower | mlp).")
 
 # If you know these shapes, set them to validate and to create dummy warmup.
-EMBED_DIM = int(os.getenv("EMBED_DIM", "0")) # 0 means unknown/skip dim validation
-MAX_SEQ_LEN = int(os.getenv("MAX_SEQ_LEN", os.getenv("MAX_HISTORY_LEN", "0")))  # 0 means unknown/skip T validation
+GE_INFERENCE_EMBED_DIM = int(os.getenv("GE_INFERENCE_EMBED_DIM", "0")) # 0 means unknown/skip dim validation
+GE_INFERENCE_MAX_SEQ_LEN = int(os.getenv("GE_INFERENCE_MAX_SEQ_LEN", "0"))  # 0 means unknown/skip T validation
 
 DTYPE = torch.float32
 
@@ -90,7 +81,7 @@ class PredictRequest(BaseModel):
 # Helpers
 # -------------------------
 def _choose_device() -> torch.device:
-    if PREFER_CUDA and torch.cuda.is_available():
+    if GE_INFERENCE_PREFER_CUDA and torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
 
@@ -115,7 +106,7 @@ def _download_gcs_uri_to_local(gs_uri: str) -> str:
     if not bucket_name or not blob_name:
         raise ValueError(f"Invalid gs:// URI (missing bucket or object): {gs_uri}")
 
-    model_cache_dir = os.getenv("MODEL_CACHE_DIR", "/tmp/model_cache")
+    model_cache_dir = os.getenv("GE_INFERENCE_MODEL_CACHE_DIR", "/tmp/model_cache")
     os.makedirs(model_cache_dir, exist_ok=True)
 
     blob_basename = os.path.basename(blob_name) or "model"
@@ -138,7 +129,7 @@ def _download_gcs_uri_to_local(gs_uri: str) -> str:
 
 def _normalize_model_type(model_type: Optional[str]) -> str:
     if model_type is None:
-        raise HTTPException(status_code=400, detail="MODEL_TYPE env var is required")
+        raise HTTPException(status_code=400, detail="GE_INFERENCE_MODEL_TYPE env var is required")
     mt = (model_type or "").strip().lower()
     if mt in {"post", "post_tower", "post-tower"}:
         return "post_tower"
@@ -148,7 +139,7 @@ def _normalize_model_type(model_type: Optional[str]) -> str:
         return "mlp"
     raise HTTPException(
         status_code=400,
-        detail=f"Unknown MODEL_TYPE '{model_type}'. Expected: post_tower, user_tower, mlp",
+        detail=f"Unknown GE_INFERENCE_MODEL_TYPE '{model_type}'. Expected: post_tower, user_tower, mlp",
     )
 
 
@@ -172,12 +163,12 @@ def _coerce_history_embeddings(value: Any, device: torch.device) -> torch.Tensor
         raise HTTPException(status_code=400, detail="history_embeddings must have shape [T, D] or [B, T, D]")
 
     b, seq_len, d = t.shape
-    if b > MAX_BATCH:
-        raise HTTPException(status_code=400, detail=f"batch too large (max={MAX_BATCH})")
-    if MAX_SEQ_LEN and seq_len > MAX_SEQ_LEN:
-        raise HTTPException(status_code=400, detail=f"expected T<= {MAX_SEQ_LEN}, got T={seq_len}")
-    if EMBED_DIM and d != EMBED_DIM:
-        raise HTTPException(status_code=400, detail=f"expected D={EMBED_DIM}, got D={d}")
+    if b > GE_INFERENCE_MAX_BATCH:
+        raise HTTPException(status_code=400, detail=f"batch too large (max={GE_INFERENCE_MAX_BATCH})")
+    if GE_INFERENCE_MAX_SEQ_LEN and seq_len > GE_INFERENCE_MAX_SEQ_LEN:
+        raise HTTPException(status_code=400, detail=f"expected T<= {GE_INFERENCE_MAX_SEQ_LEN}, got T={seq_len}")
+    if GE_INFERENCE_EMBED_DIM and d != GE_INFERENCE_EMBED_DIM:
+        raise HTTPException(status_code=400, detail=f"expected D={GE_INFERENCE_EMBED_DIM}, got D={d}")
     return t
 
 
@@ -217,20 +208,20 @@ def _coerce_post_embedding_from_request(req: PredictRequest, device: torch.devic
     is_batched = isinstance(req.post_embedding[0], list)  # type: ignore[index]
     if is_batched:
         batch: List[List[float]] = req.post_embedding  # type: ignore[assignment]
-        if len(batch) > MAX_BATCH:
-            raise HTTPException(status_code=400, detail=f"batch too large (max={MAX_BATCH})")
+        if len(batch) > GE_INFERENCE_MAX_BATCH:
+            raise HTTPException(status_code=400, detail=f"batch too large (max={GE_INFERENCE_MAX_BATCH})")
         d0 = len(batch[0])
         if d0 == 0:
             raise HTTPException(status_code=400, detail="each input vector must be non-empty")
         if not all(len(v) == d0 for v in batch):
             raise HTTPException(status_code=400, detail="all input vectors must have the same length")
-        if EMBED_DIM and d0 != EMBED_DIM:
-            raise HTTPException(status_code=400, detail=f"expected D={EMBED_DIM}, got D={d0}")
+        if GE_INFERENCE_EMBED_DIM and d0 != GE_INFERENCE_EMBED_DIM:
+            raise HTTPException(status_code=400, detail=f"expected D={GE_INFERENCE_EMBED_DIM}, got D={d0}")
         return torch.tensor(batch, dtype=DTYPE, device=device)
     else:
         vec: List[float] = req.post_embedding # type: ignore[assignment]
-        if EMBED_DIM and len(vec) != EMBED_DIM:
-            raise HTTPException(status_code=400, detail=f"expected D={EMBED_DIM}, got D={len(vec)}")
+        if GE_INFERENCE_EMBED_DIM and len(vec) != GE_INFERENCE_EMBED_DIM:
+            raise HTTPException(status_code=400, detail=f"expected D={GE_INFERENCE_EMBED_DIM}, got D={len(vec)}")
         x = torch.tensor(vec, dtype=DTYPE, device=device)
         return x.unsqueeze(0)  # [1, D]
 
@@ -256,41 +247,41 @@ def _warmup_model(model: torch.jit.ScriptModule, device: torch.device) -> None:
     """
     if device.type != "cuda":
         return
-    if not WARMUP:
+    if not GE_INFERENCE_WARMUP:
         return
-    if EMBED_DIM <= 0:
+    if GE_INFERENCE_EMBED_DIM <= 0:
         # Without knowing D, we can't safely warm up.
         return
 
     start = time.time()
     with torch.inference_mode():
-        mt = _normalize_model_type(MODEL_TYPE)
+        mt = _normalize_model_type(GE_INFERENCE_MODEL_TYPE)
 
         # A couple of warmup passes; keep it short.
         if mt == "post_tower":
-            dummy = torch.zeros((1, EMBED_DIM), dtype=DTYPE, device=device)
+            dummy = torch.zeros((1, GE_INFERENCE_EMBED_DIM), dtype=DTYPE, device=device)
             _ = model(dummy)
-            if time.time() - start < WARMUP_SECONDS_BUDGET:
+            if time.time() - start < GE_INFERENCE_WARMUP_SECONDS_BUDGET:
                 _ = model(dummy)
             return
 
-        if MAX_SEQ_LEN <= 0:
+        if GE_INFERENCE_MAX_SEQ_LEN <= 0:
             # Without knowing T, we can't safely warm up these signatures.
             return
 
-        history_embeddings = torch.zeros((1, MAX_SEQ_LEN, EMBED_DIM), dtype=DTYPE, device=device)
-        history_mask = torch.ones((1, MAX_SEQ_LEN), dtype=torch.bool, device=device)
+        history_embeddings = torch.zeros((1, GE_INFERENCE_MAX_SEQ_LEN, GE_INFERENCE_EMBED_DIM), dtype=DTYPE, device=device)
+        history_mask = torch.ones((1, GE_INFERENCE_MAX_SEQ_LEN), dtype=torch.bool, device=device)
 
         if mt == "user_tower":
             _ = model(history_embeddings, history_mask)
-            if time.time() - start < WARMUP_SECONDS_BUDGET:
+            if time.time() - start < GE_INFERENCE_WARMUP_SECONDS_BUDGET:
                 _ = model(history_embeddings, history_mask)
             return
 
         if mt == "mlp":
-            post_embedding = torch.zeros((1, EMBED_DIM), dtype=DTYPE, device=device)
+            post_embedding = torch.zeros((1, GE_INFERENCE_EMBED_DIM), dtype=DTYPE, device=device)
             _ = model(history_embeddings, history_mask, post_embedding)
-            if time.time() - start < WARMUP_SECONDS_BUDGET:
+            if time.time() - start < GE_INFERENCE_WARMUP_SECONDS_BUDGET:
                 _ = model(history_embeddings, history_mask, post_embedding)
             return
 
@@ -301,8 +292,8 @@ def _load_model_inner() -> None:
     device = _choose_device()
 
     model_id = None
-    model_path_env = os.getenv("MODEL_PATH")
-    model_uri_env = os.getenv("MODEL_URI")
+    model_path_env = os.getenv("GE_INFERENCE_MODEL_PATH")
+    model_uri_env = os.getenv("GE_INFERENCE_MODEL_URI")
 
     if model_path_env:
         model_file = _find_model_file(model_path_env)
@@ -314,7 +305,7 @@ def _load_model_inner() -> None:
             # Treat as local path (supports relative paths too).
             model_file = _find_model_file(model_uri_env)
     else:
-        model_id = os.getenv("CLEARML_MODEL_ID")
+        model_id = os.getenv("GE_INFERENCE_CLEARML_MODEL_ID")
         if not model_id:
             raise RuntimeError("Either MODEL_PATH, MODEL_URI, or CLEARML_MODEL_ID env var is required")
 
@@ -342,7 +333,7 @@ def _load_model_inner() -> None:
 def ensure_model_loaded() -> None:
     """
     Concurrency-safe, idempotent load.
-    Also sets readiness state & captures errors for /readyz.
+    Also sets readiness state & captures errors for /ready.
     """
     global _load_error, _load_started_at, _load_finished_at
 
@@ -368,37 +359,25 @@ def ensure_model_loaded() -> None:
                 _loaded_event.set()
 
 
-def _background_startup_load() -> None:
-    """
-    Runs once at startup in a thread. If it fails, the service still starts,
-    but /readyz remains false and /predict will fail until load succeeds.
-    """
-    try:
-        ensure_model_loaded()
-    except Exception:
-        # Intentionally swallow here; surfaced via /readyz.
-        pass
-
-
 # -------------------------
 # Endpoints
 # -------------------------
-@app.get("/healthz")
-def healthz() -> dict:
+@app.get("/health")
+def health() -> dict:
     # Process is up.
     return {"ok": True}
 
 
-@app.get("/readyz")
-def readyz():
+@app.get("/ready")
+def ready():
     ready = _loaded_event.is_set()
 
     payload = {
         "ready": ready,
         "device": str(_device) if _device else None,
-        "model_type": _normalize_model_type(MODEL_TYPE),
-        "embed_dim": EMBED_DIM if EMBED_DIM > 0 else None,
-        "max_seq_len": MAX_SEQ_LEN if MAX_SEQ_LEN > 0 else None,
+        "model_type": _normalize_model_type(GE_INFERENCE_MODEL_TYPE),
+        "embed_dim": GE_INFERENCE_EMBED_DIM if GE_INFERENCE_EMBED_DIM > 0 else None,
+        "max_seq_len": GE_INFERENCE_MAX_SEQ_LEN if GE_INFERENCE_MAX_SEQ_LEN > 0 else None,
         "load_error": _load_error,
         "load_started_at": _load_started_at,
         "load_finished_at": _load_finished_at
@@ -419,7 +398,7 @@ def predict(req: PredictRequest) -> dict:
 
     assert _model is not None and _device is not None
 
-    mt = _normalize_model_type(MODEL_TYPE)
+    mt = _normalize_model_type(GE_INFERENCE_MODEL_TYPE)
     try:
         with torch.inference_mode():
             if mt == "post_tower":
@@ -456,8 +435,3 @@ def predict(req: PredictRequest) -> dict:
 
     return {"outputs": _to_python(y), "model_type": mt}
 
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", "8080"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
