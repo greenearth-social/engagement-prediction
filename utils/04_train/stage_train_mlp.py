@@ -253,8 +253,8 @@ def train_mlp_model(
     for epoch in _tqdm(range(epochs), desc="Training epochs", disable=disable_progress):
         model.train()
         train_loss = 0.0
-        train_preds: List[float] = []
-        train_labels: List[float] = []
+        train_preds_parts: List[torch.Tensor] = []
+        train_labels_parts: List[torch.Tensor] = []
         for batch in _tqdm(train_loader, desc="Training", leave=False, disable=disable_progress):
             optimizer.zero_grad()
             loss, preds = model.compute_loss_and_preds(batch, device)
@@ -262,22 +262,28 @@ def train_mlp_model(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_max_norm)
             optimizer.step()
             train_loss += loss.item()
-            train_preds.extend(preds.detach().cpu().numpy().tolist())
-            train_labels.extend(batch["label"].numpy().tolist())
+            train_preds_parts.append(preds.detach().cpu())
+            train_labels_parts.append(batch["label"])
+
+        train_preds = torch.cat(train_preds_parts).numpy()
+        train_labels = torch.cat(train_labels_parts).numpy()
 
         val_loss = 0.0
-        val_preds: List[float] = []
-        val_labels: List[float] = []
+        val_preds_parts: List[torch.Tensor] = []
+        val_labels_parts: List[torch.Tensor] = []
         model.eval()
         with torch.inference_mode():
             for batch in _tqdm(val_loader, desc="Validation", leave=False, disable=disable_progress):
                 loss, preds = model.compute_loss_and_preds(batch, device)
                 val_loss += loss.item()
-                val_preds.extend(preds.detach().cpu().numpy().tolist())
-                val_labels.extend(batch["label"].numpy().tolist())
+                val_preds_parts.append(preds.detach().cpu())
+                val_labels_parts.append(batch["label"])
 
-        train_auc = roc_auc_score(train_labels, train_preds) if len(set(train_labels)) > 1 else 0.5
-        val_auc = roc_auc_score(val_labels, val_preds) if len(set(val_labels)) > 1 else 0.5
+        val_preds = torch.cat(val_preds_parts).numpy()
+        val_labels = torch.cat(val_labels_parts).numpy()
+
+        train_auc = roc_auc_score(train_labels, train_preds) if len(np.unique(train_labels)) > 1 else 0.5
+        val_auc = roc_auc_score(val_labels, val_preds) if len(np.unique(val_labels)) > 1 else 0.5
         avg_train_loss = float(train_loss / max(1, len(train_loader)))
         avg_val_loss = float(val_loss / max(1, len(val_loader)))
         history["train_loss"].append(avg_train_loss)
@@ -527,22 +533,25 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                 prefetch_factor=prefetch_factor,
             )
         loader = DataLoader(ds, **loader_kw_)
-        ys, ps, uids, pids = [], [], [], []
+        ys_parts: List[torch.Tensor] = []
+        ps_parts: List[torch.Tensor] = []
+        uids: List = []
+        pids: List = []
         trained_model.eval()
         with torch.inference_mode():
             for batch in loader:
                 _, preds = trained_model.compute_loss_and_preds(batch, device)
                 if preds.ndim == 0:
-                    ps.append(float(preds.cpu()))
-                    ys.append(float(batch["label"].cpu()))
+                    ps_parts.append(preds.cpu().unsqueeze(0))
+                    ys_parts.append(batch["label"].cpu().unsqueeze(0))
                     uids.append(batch["user_id"][0])
                     pids.append(batch["post_id"][0])
                 else:
-                    ps.extend(preds.cpu().numpy().tolist())
-                    ys.extend(batch["label"].numpy().tolist())
+                    ps_parts.append(preds.cpu())
+                    ys_parts.append(batch["label"])
                     uids.extend(batch["user_id"])
                     pids.extend(batch["post_id"])
-        return np.asarray(ys), np.asarray(ps), uids, pids
+        return torch.cat(ys_parts).numpy(), torch.cat(ps_parts).numpy(), uids, pids
 
     def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, Any]:
         m: Dict[str, Any] = {"total_samples": len(y_true), "positive_samples": int(y_true.sum())}

@@ -467,8 +467,8 @@ def train_two_tower_model(
         # --- Training ---
         model.train()
         train_losses: List[float] = []
-        train_preds: List[float] = []
-        train_labels: List[float] = []
+        train_preds_parts: List[torch.Tensor] = []
+        train_labels_parts: List[torch.Tensor] = []
 
         for batch in tqdm(train_loader, desc="Training", leave=False, disable=disable_progress):
             labels = batch["label"].to(device)
@@ -480,14 +480,17 @@ def train_two_tower_model(
             optimizer.step()
 
             train_losses.append(loss.item())
-            train_preds.extend(torch.sigmoid(scores).detach().cpu().numpy().tolist())
-            train_labels.extend(labels.cpu().numpy().tolist())
+            train_preds_parts.append(torch.sigmoid(scores).detach().cpu())
+            train_labels_parts.append(labels.cpu())
+
+        train_preds = torch.cat(train_preds_parts).numpy()
+        train_labels = torch.cat(train_labels_parts).numpy()
 
         # --- Validation ---
         model.eval()
         val_losses: List[float] = []
-        val_preds: List[float] = []
-        val_labels: List[float] = []
+        val_preds_parts: List[torch.Tensor] = []
+        val_labels_parts: List[torch.Tensor] = []
 
         with torch.inference_mode():
             for batch in tqdm(val_loader, desc="Validation", leave=False, disable=disable_progress):
@@ -496,13 +499,16 @@ def train_two_tower_model(
                 loss, scores = model.compute_loss_and_preds(batch, device, embed_dim)
 
                 val_losses.append(loss.item())
-                val_preds.extend(torch.sigmoid(scores).detach().cpu().numpy().tolist())
-                val_labels.extend(labels.cpu().numpy().tolist())
+                val_preds_parts.append(torch.sigmoid(scores).detach().cpu())
+                val_labels_parts.append(labels.cpu())
+
+        val_preds = torch.cat(val_preds_parts).numpy()
+        val_labels = torch.cat(val_labels_parts).numpy()
 
         train_loss = float(np.mean(train_losses))
         val_loss = float(np.mean(val_losses))
-        train_auc = roc_auc_score(train_labels, train_preds) if len(set(train_labels)) > 1 else 0.5
-        val_auc = roc_auc_score(val_labels, val_preds) if len(set(val_labels)) > 1 else 0.5
+        train_auc = roc_auc_score(train_labels, train_preds) if len(np.unique(train_labels)) > 1 else 0.5
+        val_auc = roc_auc_score(val_labels, val_preds) if len(np.unique(val_labels)) > 1 else 0.5
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
@@ -554,25 +560,21 @@ def _evaluate_two_tower_model(
     model = model.to(device)
     model.eval()
 
-    all_preds: List[float] = []
-    all_labels: List[float] = []
+    preds_parts: List[torch.Tensor] = []
+    labels_parts: List[torch.Tensor] = []
     all_user_ids: List[str] = []
     all_post_ids: List[str] = []
 
     with torch.inference_mode():
         for batch in data_loader:
-            labels = batch["label"]
-
             _, scores = model.compute_loss_and_preds(batch, device, embed_dim)
-            probs = torch.sigmoid(scores)
-
-            all_preds.extend(probs.cpu().numpy().tolist())
-            all_labels.extend(labels.numpy().tolist())
+            preds_parts.append(torch.sigmoid(scores).cpu())
+            labels_parts.append(batch["label"])
             all_user_ids.extend(batch["user_id"])
             all_post_ids.extend(batch["post_id"])
 
-    y_true = np.array(all_labels)
-    y_pred = np.array(all_preds)
+    y_true = torch.cat(labels_parts).numpy()
+    y_pred = torch.cat(preds_parts).numpy()
 
     metrics: Dict[str, Any] = {
         "total_samples": len(y_true),

@@ -17,22 +17,22 @@
 set -euo pipefail
 
 # ── Configuration ──────────────────────────────────────────────────────
-DATA_DIR="outputs/20260305_224327"
+DATA_DIR="outputs/20260312_175428"
 
-EPOCHS=300
-BATCH_SIZE=2048
-PATIENCE=50
+EPOCHS=100
+BATCH_SIZE=4096
+PATIENCE=20
 EMA_ALPHA=0.1    # only used when user-summarization=ema
-MAX_PARALLEL=4   # max concurrent MLP jobs
+MAX_PARALLEL=2   # max concurrent MLP jobs
 
 # ── Permutations ───────────────────────────────────────────────────────
 # Each entry is "user_encoder:user_summarization" (summarization ignored when encoder != summarized)
 #
 # MLP experiments (parallelisable -- tiny GPU footprint)
 MLP_EXPERIMENTS=(
-  "summarized:mean"
+  #"summarized:mean"
   "summarized:ema"
-  "summarized:linear_recency"
+  #"summarized:linear_recency"
   "full_transformer:"
 )
 
