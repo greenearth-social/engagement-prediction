@@ -24,8 +24,9 @@ systematic model bias at the individual level.
 Outputs (under trait_ecological/):
 - <group>_ecological.png:           composite KDE plot per inference group
 - <group>_ecological_diff.png:      difference distribution per inference group
-- <group>_ecological_quintiles.png: true-pref rho by like-volume quintile
-- ecological_gap_summary.png:       headline bar chart of ecological gaps
+- <group>_ecological_quintiles.png:      true-pref rho by like-volume quintile
+- <group>_ecological_quintiles_diff.png: model bias by like-volume quintile
+- ecological_gap_summary.png:            headline bar chart of ecological gaps
 - trait_ecological_summary.json
 """
 
@@ -352,6 +353,78 @@ def _plot_group_quintiles(
     return path
 
 
+def _plot_group_quintiles_diff(
+    group_name: str,
+    trait_results: Dict[str, TraitEcoResult],
+    did_to_likes: Dict[Any, int],
+    quintile_edges: np.ndarray,
+    out_dir: Path,
+) -> Path:
+    """Small-multiples: per-user (rho_pred - rho_true) stratified by like-volume quintile."""
+    labels = sorted(trait_results.keys())
+    n = len(labels)
+    ncols = min(3, n)
+    nrows = math.ceil(n / ncols)
+
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(5 * ncols, 3.5 * nrows),
+                             squeeze=False)
+
+    for idx, label in enumerate(labels):
+        row, col = divmod(idx, ncols)
+        ax = axes[row][col]
+        tr = trait_results[label]
+        diff = tr.user_rho_pred - tr.user_rho_true
+
+        likes = np.array([did_to_likes.get(uid, 0) for uid in tr.user_ids])
+        q_assign = np.digitize(likes, quintile_edges[1:-1])
+
+        all_lo, all_hi = float(diff.min()) - 0.05, float(diff.max()) + 0.05
+        grid = np.linspace(all_lo, all_hi, 300)
+
+        for qi in range(5):
+            mask = q_assign == qi
+            if mask.sum() < 5:
+                continue
+            subset = diff[mask]
+            density = _safe_kde(subset, grid)
+            if density is not None:
+                ax.plot(grid, density, color=_QUINTILE_COLORS[qi],
+                        linewidth=1.2,
+                        label=f"{_QUINTILE_LABELS[qi]} (n={mask.sum()})")
+            else:
+                ax.hist(subset, bins=25, density=True, alpha=0.25,
+                        color=_QUINTILE_COLORS[qi],
+                        label=f"{_QUINTILE_LABELS[qi]} (n={mask.sum()})")
+
+        ax.axvline(0, color="black", linestyle="--", linewidth=0.8)
+        mean_d = float(np.mean(diff))
+        ax.axvline(mean_d, color="#e06000", linewidth=0.9,
+                   label=f"overall mean = {mean_d:+.4f}")
+
+        ax.set_title(label, fontsize=8, fontweight="bold")
+        ax.set_xlabel("ρ_pred − ρ_true  (per user)", fontsize=7)
+        ax.set_ylabel("density", fontsize=7)
+        ax.tick_params(labelsize=6)
+        ax.legend(fontsize=5, loc="upper right", framealpha=0.7)
+
+    for idx in range(n, nrows * ncols):
+        row, col = divmod(idx, ncols)
+        axes[row][col].set_visible(False)
+
+    fig.suptitle(
+        f"{group_name.replace('_', ' ').title()}"
+        " — Model Bias (ρ_pred − ρ_true) by Like-Volume Quintile",
+        fontsize=11, fontweight="bold",
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+    path = out_dir / f"{group_name}_ecological_quintiles_diff.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
 def _plot_gap_summary(
     all_gaps: Dict[str, Tuple[str, float]],
     group_color_map: Dict[str, str],
@@ -528,6 +601,10 @@ class TraitEcologicalModule(EvalModule):
                 str(_plot_group_quintiles(gname, group_traits,
                                          did_to_likes, quintile_edges,
                                          out_dir)))
+            plot_paths.append(
+                str(_plot_group_quintiles_diff(gname, group_traits,
+                                              did_to_likes, quintile_edges,
+                                              out_dir)))
 
         if all_gaps:
             plot_paths.insert(
