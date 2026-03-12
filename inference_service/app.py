@@ -234,7 +234,7 @@ def _load_model_inner() -> None:
 def ensure_model_loaded() -> None:
     """
     Concurrency-safe, idempotent load.
-    Also sets readiness state & captures errors for /readyz.
+    Also sets readiness state & captures errors for /ready.
     """
     global _load_error, _load_started_at, _load_finished_at
 
@@ -263,26 +263,26 @@ def ensure_model_loaded() -> None:
 def _background_startup_load() -> None:
     """
     Runs once at startup in a thread. If it fails, the service still starts,
-    but /readyz remains false and /predict will fail until load succeeds.
+    but /ready remains false and /predict will fail until load succeeds.
     """
     try:
         ensure_model_loaded()
     except Exception:
-        # Intentionally swallow here; surfaced via /readyz.
+        # Intentionally swallow here; surfaced via /ready.
         pass
 
 
 # -------------------------
 # Endpoints
 # -------------------------
-@app.get("/healthz")
-def healthz() -> dict:
+@app.get("/health")
+def health() -> dict:
     # Process is up.
     return {"ok": True}
 
 
-@app.get("/readyz")
-def readyz():
+@app.get("/ready")
+def ready():
     ready = _loaded_event.is_set()
 
     payload = {
@@ -316,9 +316,3 @@ def predict(req: PredictRequest) -> dict:
         raise HTTPException(status_code=400, detail=f"Inference failed: {e}")
 
     return {"outputs": _to_python(y)}
-
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", "8080"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
