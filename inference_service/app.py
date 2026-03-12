@@ -1,5 +1,4 @@
 import os
-import sys
 import threading
 import time
 from collections.abc import AsyncIterator
