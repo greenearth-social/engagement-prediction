@@ -133,19 +133,35 @@ STAGE_LOG_NAME = "STAGE_04_TRAIN_TWO_TOWER"
 # =============================================================================
 # FIT Meta Query Module
 # =============================================================================
+# use class Module as this, in essence, is its own torch model layer
 class MetaQueryModule(nn.Module):
-    """Map each candidate post to a learned FIT query representation."""
+    """
+    Meta Query Module (MQM) for FIT architecture.
+    
+    Maintains a learnable meta matrix M ∈ R^{K x Dq} where K = num_queries.
+    For each candidate post, maps it to a query index and computes either:
+    - Hard query: M[q_idx] (inference)
+    - Soft query: attention-weighted combination of meta vectors (training)
+    """
 
     def __init__(self, item_dim: int, query_dim: int, num_queries: int):
         super().__init__()
         self.num_queries = num_queries
+        # Learnable meta matrix: [K, query_dim]
         self.meta_matrix = nn.Parameter(torch.empty(num_queries, query_dim))
+        # Project item embedding to query space
         self.item_proj = nn.Linear(item_dim, query_dim)
         self._init_weights()
 
     def _init_weights(self) -> None:
+        # meta matrix is initialized to have low variance and larger vector values
+        # compared to xavier uniform
         nn.init.kaiming_uniform_(self.meta_matrix, a=np.sqrt(5))
+
+        # init item proj matrix to be xavier uniform
         nn.init.xavier_uniform_(self.item_proj.weight)
+
+        # currently default bias=True so just a safeguard
         if self.item_proj.bias is not None:
             nn.init.zeros_(self.item_proj.bias)
 
@@ -155,15 +171,31 @@ class MetaQueryModule(nn.Module):
         tau: float,
         hard: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return the FIT query vector and its hard assignment index."""
+        """
+        Args:
+            item_emb: [B, item_dim] Candidate post embeddings
+            tau: Temperature for soft query (training)
+            hard: If True, use hard query (inference); else use soft query (training)
+        
+        Returns:
+            q: [B, query_dim] Meta query vector
+            q_idx: [B] Query index (hard assignment)
+        """
+        # Project item to query space
         projected_items = self.item_proj(item_emb)
+
+        # Parameter-free self-attention over meta matrix to build query group Q*.
         query_group = (self.meta_matrix @ self.meta_matrix.T) @ self.meta_matrix
+
+        # Similarity scores use original meta matrix rows (paper Eq. 9).
         logits = projected_items @ self.meta_matrix.T
         query_idx = logits.argmax(dim=-1)
 
         if hard:
+            # Hard query: select row from query group Q*
             query_vec = query_group[query_idx]
         else:
+            # Soft query: attention-weighted combination
             weights = F.softmax(logits / max(tau, 1e-6), dim=-1)
             query_vec = weights @ query_group
 
@@ -313,20 +345,24 @@ class TwoTowerModel(nn.Module):
         self.use_fit = use_fit
         self.fit_use_lss = fit_use_lss
 
+        ######################### FIT initialization (only if use_fit=True) #################################
         if self.use_fit:
             self.fit_num_queries = fit_num_queries
             self.fit_tau_init = fit_tau_init
             self.fit_tau_min = fit_tau_min
             self.fit_tau_decay = fit_tau_decay
+            # Register tau as buffer for state persistence
             self.register_buffer("fit_tau", torch.tensor(float(fit_tau_init), dtype=torch.float32))
             self.register_buffer("fit_global_step", torch.tensor(0, dtype=torch.long))
             self.fit_tau_threshold = 1
+            # Meta Query Module
             self.mqm = MetaQueryModule(
                 item_dim=post_embedding_dim,
                 query_dim=user_hidden_dim,
                 num_queries=fit_num_queries,
             )
             if fit_use_lss:
+                # LSS (Lightweight Similarity Scorer) - optional
                 self.lss = nn.Sequential(
                     nn.Linear(shared_dim, shared_dim),
                     nn.ReLU(),
@@ -400,27 +436,34 @@ class TwoTowerModel(nn.Module):
         self,
         history_embeddings: torch.Tensor,
         history_mask: torch.Tensor,
-        meta_query: Optional[torch.Tensor] = None,
+        meta_query: Optional[torch.Tensor] = None,  # [B, post_embedding_dim] Candidate post embedding for FIT
     ) -> torch.Tensor:
         """Encode user engagement history into shared space representation.
         
         Args:
             history_embeddings: Padded history sequences [batch, seq_len, input_dim]
             history_mask: Boolean mask [batch, seq_len], True = valid position
-            meta_query: Optional candidate post embedding used to condition FIT.
+            meta_query: Optional [B, post_embedding_dim] candidate post embedding for FIT MQM
         
         Returns:
             User vectors in shared space [batch, shared_dim]
         """
+        # FIT mode: use MQM to get meta query vector
         if self.use_fit and meta_query is not None:
+            # use hard only during inference
+            # this sets the correct bool depending on training vs inference
             hard = not self.training
             query_vec, _ = self.mqm(meta_query, tau=float(self.fit_tau.item()), hard=hard)
+            # Pass meta_query_vec to encoder
+            # only works for transformer/cross_attention encoders
             if self.user_encoder_type in ("full_transformer", "cross_attention"):
                 return self.user_tower(
                     history_embeddings,
                     history_mask,
                     meta_query_vec=query_vec,
                 )
+            # For summarized mode, FIT doesn't apply
+            # user vector is pre-computed by the dataset
         return self.user_tower(history_embeddings, history_mask)
 
     def encode_post(self, post_embeddings: torch.Tensor) -> torch.Tensor:
@@ -460,16 +503,20 @@ class TwoTowerModel(nn.Module):
             Raw engagement scores [batch] (logits before sigmoid)
         """
         if self.use_fit and self.user_encoder_type in ("full_transformer", "cross_attention"):
+            # FIT mode: use MQM to get meta query, then encode user
             user_emb = self.encode_user(
                 history_embeddings,
                 history_mask,
-                meta_query=post_embeddings,
+                meta_query=post_embeddings,  # [B, post_embedding_dim] - RAW post embedding
             )
             post_emb = self.encode_post(post_embeddings) if self.use_post_encoder else post_embeddings
             if self.fit_use_lss and self.lss is not None:
+                # Compute score with LSS instead of dot product when requested
                 return self.lss(user_emb * post_emb).squeeze(-1)
+            # no numpy import needed; elementwise multiply and sum is the dot product
             return (user_emb * post_emb).sum(dim=-1)
 
+        # Standard two-tower mode
         user_emb = self.encode_user(history_embeddings, history_mask)
         post_emb = self.encode_post(post_embeddings) if self.use_post_encoder else post_embeddings
         return (user_emb * post_emb).sum(dim=-1)
@@ -521,10 +568,17 @@ class TwoTowerModel(nn.Module):
         labels = batch["label"].to(device)
 
         scores = self.forward(history_embeddings, history_mask, post_embeddings)
-        loss = F.binary_cross_entropy_with_logits(scores, labels.float())
 
+        # more numerically stable loss with logits
+        loss = F.binary_cross_entropy_with_logits(scores, labels.float())
+        # probs = torch.sigmoid(scores)
+        # loss = F.binary_cross_entropy(probs, labels.float())
+
+        # FIT: update tau for soft query (linear decay by global step)
         if self.use_fit and self.training:
             self.fit_global_step += 1
+
+            # set tau to 1.0 with each global step, or greater if threshold set >1
             threshold = max(int(getattr(self, "fit_tau_threshold", 1)), 1)
             progress = min(float(self.fit_global_step.item()) / float(threshold), 1.0)
             new_tau = self.fit_tau_init * (1.0 - progress)
