@@ -28,3 +28,13 @@ def test_select_prior_output_honors_explicit_prior_path(tmp_path):
     chosen = select_prior_output(run_dir, "train", prior_path=explicit)
 
     assert chosen == explicit
+
+
+def test_select_prior_output_maps_collaborative_filter_to_04_train(tmp_path):
+    run_dir = Path(tmp_path)
+    latest_train = run_dir / "04_train" / "20240103_000000"
+    latest_train.mkdir(parents=True)
+
+    chosen = select_prior_output(run_dir, "train_collaborative_filter")
+
+    assert chosen == latest_train

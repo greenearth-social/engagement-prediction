@@ -66,6 +66,7 @@ DEFAULTS: Dict[str, Any] = {
     "ema_alpha": 0.1,  # EMA smoothing factor (only used when user_summarization=ema)
     "user_encoder": "summarized",  # User encoder type: must be explicitly specified and compatible with model_type
     "model_type": "mlp",
+    "cf_latent_dim": 64,
     "shared_dim": 128,
     "user_hidden_dim": 256,
     "user_output_dim": 128,  # Output dim for MLPModel's user encoder in full_transformer mode; separate from shared_dim used in TwoTower
@@ -79,6 +80,7 @@ DEFAULTS: Dict[str, Any] = {
     "batch_size": 256,
     "learning_rate": 0.001,
     "weight_decay_mlp": 0.1,
+    "weight_decay_collaborative_filter": 0.0001,
     "weight_decay_two_tower": 0.01,
     "hidden_dims": [64, 32, 16],
     "dropout_rate_mlp": 0.5,
@@ -380,6 +382,8 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     train_key = 'train_mlp'  # default MLP
     if model_type == 'mlp':
         train_key = 'train_mlp'
+    elif model_type == 'collaborative-filter':
+        train_key = 'train_collaborative_filter'
     elif model_type == 'two-tower':
         train_key = 'train_two_tower'
     else:
@@ -389,6 +393,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     user_encoder = args.user_encoder
     valid_encoders = {
         "mlp": ("summarized", "full_transformer"),
+        "collaborative-filter": ("summarized",),
         "two-tower": ("summarized", "full_transformer", "cross_attention"),
     }
     allowed = valid_encoders.get(model_type, ())
@@ -460,6 +465,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
                 'target_posts': "Stage 2: Generate target posts…",
                 'user_history': "Stage 3: Generate user history…",
                 'train_mlp': "Stage 4: Train model (MLP)…",
+                'train_collaborative_filter': "Stage 4: Train model (Collaborative Filter)…",
                 'train_two_tower': "Stage 4: Train model (Two-Tower)…",
                 'evaluate': "Stage 5: Evaluate model…",
             }
@@ -559,10 +565,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--ema-alpha", type=float, default=argparse.SUPPRESS,
                           help_text="EMA smoothing factor (0,1]. Higher = more weight on recent likes. Only used when --user-summarization=ema")
     _add_arg_with_default(p_all, "--user-encoder", type=str, choices=["summarized", "full_transformer", "cross_attention", "attention"],
-                          default=argparse.SUPPRESS, help_text="User encoder type (must match model-type: summarized for mlp; full_transformer/cross_attention for two-tower). "
+                          default=argparse.SUPPRESS, help_text="User encoder type (must match model-type: summarized/full_transformer for mlp; summarized placeholder for collaborative-filter; full_transformer/cross_attention for two-tower). "
                           "Note: 'attention' is a deprecated alias for 'full_transformer'.")
-    _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower"],
-                          default=argparse.SUPPRESS, help_text="Model architecture: mlp or two-tower")
+    _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "collaborative-filter", "two-tower"],
+                          default=argparse.SUPPRESS, help_text="Model architecture: mlp, collaborative-filter, or two-tower")
+    _add_arg_with_default(p_all, "--cf-latent-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="Latent factor dimension for the collaborative-filter model")
     # Two-tower specific options
     _add_arg_with_default(p_all, "--shared-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower shared embedding dimension")
@@ -592,6 +600,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Learning rate")
     _add_arg_with_default(p_all, "--weight-decay-mlp", type=float, default=argparse.SUPPRESS,
                           help_text="Weight decay for MLP model")
+    _add_arg_with_default(p_all, "--weight-decay-collaborative-filter", type=float, default=argparse.SUPPRESS,
+                          help_text="Weight decay for collaborative-filter model")
     _add_arg_with_default(p_all, "--weight-decay-two-tower", type=float, default=argparse.SUPPRESS,
                           help_text="Weight decay for two tower model")
     _add_arg_with_default(p_all, "--hidden-dims", type=int, nargs="+", default=argparse.SUPPRESS,
@@ -657,10 +667,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="(Deprecated) Always enabled during sequential run-all")
     # Selective reruns and prior pinning
     _add_arg_with_default(p_all, "--start-from", type=str,
-                          choices=["get_data", "target_posts", "user_history", "train", "train_mlp", "train_two_tower", "evaluate"],
+                          choices=["get_data", "target_posts", "user_history", "train", "train_mlp", "train_collaborative_filter", "train_two_tower", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Begin execution at this stage")
     _add_arg_with_default(p_all, "--stop-after", type=str,
-                          choices=["get_data", "target_posts", "user_history", "train", "train_mlp", "train_two_tower", "evaluate"],
+                          choices=["get_data", "target_posts", "user_history", "train", "train_mlp", "train_collaborative_filter", "train_two_tower", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Stop after this stage completes")
     _add_arg_with_default(p_all, "--pick-prior", action="store_true", default=argparse.SUPPRESS,
                           help_text="If multiple prior outputs exist, prompt to pick (foreground only)")

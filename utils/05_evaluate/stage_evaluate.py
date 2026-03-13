@@ -95,7 +95,7 @@ def resolve_train_output(
     Raises:
         FileNotFoundError: If no training output can be found.
     """
-    for stage_key in ("train_mlp", "train_two_tower"):
+    for stage_key in ("train_mlp", "train_collaborative_filter", "train_two_tower"):
         art_dir = context.get_artifact_dir(stage_key)
         if art_dir is not None and Path(art_dir).exists():
             return Path(art_dir)

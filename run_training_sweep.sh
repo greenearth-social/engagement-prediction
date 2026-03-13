@@ -19,19 +19,25 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ./run_training_sweep.sh [--use-fit]
+Usage: ./run_training_sweep.sh [--use-fit] [--add-collaborative-filter-model]
 
 Options:
   --use-fit  Add FIT-enabled two-tower train/eval runs to the standard sweep.
+  --add-collaborative-filter-model  Add one collaborative-filter train/eval run to the sweep.
   -h, --help Show this help text.
 EOF
 }
 
 INCLUDE_FIT_SWEEP="false"
+INCLUDE_COLLAB_FILTER_SWEEP="false"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --use-fit)
       INCLUDE_FIT_SWEEP="true"
+      shift
+      ;;
+    --add-collaborative-filter-model)
+      INCLUDE_COLLAB_FILTER_SWEEP="true"
       shift
       ;;
     -h|--help)
@@ -91,10 +97,16 @@ SWEEP_LOG="$LOG_DIR/sweep_$(date +%Y%m%d_%H%M%S).log"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$SWEEP_LOG"; }
 
-TOTAL=$(( ${#MLP_EXPERIMENTS[@]} + ${#TT_EXPERIMENTS[@]} ))
+CF_EXPERIMENT_COUNT=0
+if [[ "$INCLUDE_COLLAB_FILTER_SWEEP" == "true" ]]; then
+  CF_EXPERIMENT_COUNT=1
+fi
+
+TOTAL=$(( ${#MLP_EXPERIMENTS[@]} + CF_EXPERIMENT_COUNT + ${#TT_EXPERIMENTS[@]} ))
 log "════════════════════════════════════════════════════════════════"
 log "Training sweep: $TOTAL experiments"
 log "  MLP:       ${#MLP_EXPERIMENTS[@]} (parallel, up to $MAX_PARALLEL at a time)"
+log "  Collab:    $CF_EXPERIMENT_COUNT (sequential, optional)"
 log "  Two-tower: ${#TT_EXPERIMENTS[@]} (sequential)"
 log "Data dir: $DATA_DIR_ABS"
 log "Epochs=$EPOCHS  Batch=$BATCH_SIZE  Patience=$PATIENCE  EMA_alpha=$EMA_ALPHA"
@@ -219,10 +231,36 @@ done
 log ""
 log "MLP phase complete: $PASSED passed, $FAILED failed out of ${#MLP_EXPERIMENTS[@]}"
 
-# ── Phase 2: Two-tower experiments (sequential) ───────────────────────
+if [[ "$INCLUDE_COLLAB_FILTER_SWEEP" == "true" ]]; then
+  log ""
+  log "╔══════════════════════════════════════════════════════════════╗"
+  log "║  Phase 2: Collaborative-filter experiment (sequential)      ║"
+  log "╚══════════════════════════════════════════════════════════════╝"
+
+  CF_RUN_TAG="collaborative-filter_baseline"
+  CF_RUN_LABEL="CF 1/1  ${CF_RUN_TAG}"
+  CF_RUN_LOG="$LOG_DIR/run_${CF_RUN_TAG}.log"
+  CF_STATUS_FILE="$LOG_DIR/.status_${CF_RUN_TAG}"
+
+  log ""
+  log "────────────────────────────────────────────────────────────────"
+  log "[$CF_RUN_LABEL] Starting…"
+  log "────────────────────────────────────────────────────────────────"
+
+  run_one "collaborative-filter" "summarized" "" "false" "$CF_RUN_TAG" "$CF_RUN_LABEL" "$CF_RUN_LOG" "$CF_STATUS_FILE"
+
+  if [[ -f "$CF_STATUS_FILE" ]] && [[ "$(cat "$CF_STATUS_FILE")" == "0" ]]; then
+    (( PASSED++ )) || true
+  else
+    (( FAILED++ )) || true
+  fi
+  rm -f "$CF_STATUS_FILE"
+fi
+
+# ── Phase 3: Two-tower experiments (sequential) ───────────────────────
 log ""
 log "╔══════════════════════════════════════════════════════════════╗"
-log "║  Phase 2: Two-tower experiments (sequential)                ║"
+log "║  Phase 3: Two-tower experiments (sequential)                ║"
 log "╚══════════════════════════════════════════════════════════════╝"
 
 for i in "${!TT_EXPERIMENTS[@]}"; do
@@ -264,6 +302,7 @@ log "═════════════════════════
 log "Sweep complete: $PASSED passed, $FAILED failed out of $TOTAL"
 log "Logs: $LOG_DIR"
 log "  MLP logs:       run_mlp_*.log"
+log "  Collab logs:    run_collaborative-filter_*.log"
 log "  Two-tower logs: run_two-tower_*.log"
 log "════════════════════════════════════════════════════════════════"
 

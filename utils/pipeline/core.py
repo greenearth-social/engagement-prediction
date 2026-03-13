@@ -129,6 +129,7 @@ def select_prior_output(run_dir: Path, stage_name: str, *, use_latest: bool = Tr
             "target_posts": "02_target_posts",
             "user_history": "03_user_history",
             "train_mlp": "04_train",
+            "train_collaborative_filter": "04_train",
             "train_two_tower": "04_train",
             "evaluate": "05_evaluate",
         }

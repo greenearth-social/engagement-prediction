@@ -98,3 +98,18 @@ def test_merge_args_with_config_supports_fit_flags():
     assert merged.use_fit is True
     assert merged.fit_num_queries == 32
     assert merged.fit_tau_init == cli.DEFAULTS["fit_tau_init"]
+
+
+def test_merge_args_with_config_supports_collaborative_filter_flags():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "collaborative-filter",
+        "--cf-latent-dim", "24",
+        "--weight-decay-collaborative-filter", "0.02",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.model_type == "collaborative-filter"
+    assert merged.cf_latent_dim == 24
+    assert merged.weight_decay_collaborative_filter == 0.02
+    assert merged.weight_decay_two_tower == cli.DEFAULTS["weight_decay_two_tower"]
