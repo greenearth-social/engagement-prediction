@@ -57,12 +57,14 @@ STAGE_LOG_NAME = "STAGE_04_TRAIN_COLLABORATIVE_FILTER"
 class CollaborativeFilteringModel(nn.Module):
     """Minimal logistic matrix-factorization model for implicit feedback."""
 
-    def __init__(self, num_users: int, num_items: int, latent_dim: int):
+    def __init__(self, num_users: int, num_items: int, latent_dim: int, unknown_user_index: int):
         super().__init__()
         # Store model sizes for checkpoints and debugging.
         self.num_users = num_users
         self.num_items = num_items
         self.latent_dim = latent_dim
+        # Store the unseen-user bucket index for mean-user fallback handling.
+        self.unknown_user_index = unknown_user_index
         # Learn one latent vector per user.
         self.user_factors = nn.Embedding(num_users, latent_dim)
         # Learn one latent vector per item.
@@ -82,33 +84,55 @@ class CollaborativeFilteringModel(nn.Module):
         # Initialize item biases at zero.
         nn.init.zeros_(self.item_bias.weight)
 
-    def logits(self, user_index: torch.Tensor, item_index: torch.Tensor) -> torch.Tensor:
-        # Look up the latent vector for each user in the batch.
+    def _resolve_user_representation(self, user_index: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Look up the latent vector for each requested user.
         user_vec = self.user_factors(user_index)
+        # Look up the user bias for each requested user.
+        user_bias = self.user_bias(user_index)
+        # Identify which positions correspond to the unseen-user fallback bucket.
+        unknown_mask = user_index == self.unknown_user_index
+        # Replace unseen-user rows with the mean seen-user representation when needed.
+        if torch.any(unknown_mask):
+            # Use the mean of all trained user vectors when at least one seen user exists.
+            if self.unknown_user_index > 0:
+                mean_user_vec = self.user_factors.weight[:self.unknown_user_index].mean(dim=0)
+                # Use the mean of all trained user biases for the same fallback.
+                mean_user_bias = self.user_bias.weight[:self.unknown_user_index].mean(dim=0)
+            else:
+                # Fall back to the reserved unknown-user row only if no seen users exist.
+                mean_user_vec = self.user_factors.weight[self.unknown_user_index]
+                # Mirror that fallback for the bias term.
+                mean_user_bias = self.user_bias.weight[self.unknown_user_index]
+            # Swap in the mean-user vector anywhere the batch contains an unseen user.
+            user_vec = torch.where(unknown_mask.unsqueeze(-1), mean_user_vec.unsqueeze(0), user_vec)
+            # Swap in the mean-user bias anywhere the batch contains an unseen user.
+            user_bias = torch.where(unknown_mask.unsqueeze(-1), mean_user_bias.unsqueeze(0), user_bias)
+        # Return the resolved user vectors and biases.
+        return user_vec, user_bias
+
+    def logits(self, user_index: torch.Tensor, item_index: torch.Tensor) -> torch.Tensor:
+        # Resolve user vectors, replacing unseen users with the mean seen-user representation.
+        user_vec, user_bias = self._resolve_user_representation(user_index)
         # Look up the latent vector for each item in the batch.
         item_vec = self.item_factors(item_index)
         # Compute the dot-product interaction term.
         interaction = (user_vec * item_vec).sum(dim=-1)
-        # Look up the user bias terms.
-        user_bias = self.user_bias(user_index).squeeze(-1)
         # Look up the item bias terms.
         item_bias = self.item_bias(item_index).squeeze(-1)
         # Return the unnormalized logit.
-        return interaction + user_bias + item_bias + self.global_bias
+        return interaction + user_bias.squeeze(-1) + item_bias + self.global_bias
 
     def forward(self, user_index: torch.Tensor, item_index: torch.Tensor) -> torch.Tensor:
         # Convert the pairwise logits into probabilities.
         return torch.sigmoid(self.logits(user_index, item_index))
 
     def logits_for_all_items(self, user_index: torch.Tensor, item_count: int) -> torch.Tensor:
-        # Look up the latent vectors for the requested users.
-        user_vec = self.user_factors(user_index)
+        # Resolve user vectors, replacing unseen users with the mean seen-user representation.
+        user_vec, user_bias = self._resolve_user_representation(user_index)
         # Slice the trainable item vectors, excluding the unknown-item bucket.
         item_vec = self.item_factors.weight[:item_count]
         # Compute all user-item dot products at once.
         interaction = user_vec @ item_vec.T
-        # Look up the user bias column.
-        user_bias = self.user_bias(user_index)
         # Slice the item bias row.
         item_bias = self.item_bias.weight[:item_count].T
         # Broadcast biases across the full user-item score matrix.
@@ -207,20 +231,26 @@ def _build_item_index(
     target_posts_df: pl.DataFrame,
     logger,
 ) -> Tuple[Dict[int, int], int]:
-    """Build a compact item vocabulary from all candidate items in target_posts."""
-    # Collect every positive candidate item index across all splits.
-    like_items = target_posts_df.select(pl.col("like_emb_idx").drop_nulls()).get_column("like_emb_idx").to_list()
-    # Collect every negative candidate item index across all splits.
-    neg_items = target_posts_df.select(pl.col("neg_emb_idx").drop_nulls()).get_column("neg_emb_idx").to_list()
-    # Deduplicate and sort the raw embedding indices for stable mapping.
-    raw_item_ids = sorted({int(item_id) for item_id in like_items + neg_items})
+    """Build a compact item vocabulary from train-split positive likes only."""
+    # Collect every observed positive train item index and ignore eval-time items entirely.
+    train_like_items = (
+        target_posts_df
+        .filter((pl.col("split") == "train") & pl.col("like_emb_idx").is_not_null())
+        .select("like_emb_idx")
+        .unique()
+        .sort("like_emb_idx")
+        .get_column("like_emb_idx")
+        .to_list()
+    )
+    # Deduplicate and sort the raw train-positive embedding indices for stable mapping.
+    raw_item_ids = [int(item_id) for item_id in train_like_items]
     # Map every raw Stage 1 ``emb_idx`` into a compact item index.
     item_to_index = {raw_item_id: idx for idx, raw_item_id in enumerate(raw_item_ids)}
     # Reserve one extra item slot for defensive fallback handling.
-    unknown_item_index = len(raw_item_ids)
-    # Log the compact item vocabulary size.
+    unknown_item_index = len(item_to_index)
+    # Log the compact item vocabulary size and the train-only source of truth.
     logger.info(
-        f"Item vocabulary built from target_posts candidates: {len(raw_item_ids):,} known items + 1 unknown-item bucket"
+        f"Item vocabulary built from train positive likes only: {len(raw_item_ids):,} known items + 1 unknown-item bucket"
     )
     # Return the compact mapping and the fallback index.
     return item_to_index, unknown_item_index
@@ -839,6 +869,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         num_users=num_users,
         num_items=num_items,
         latent_dim=cf_latent_dim,
+        unknown_user_index=unknown_user_index,
     )
 
     # --- train ---

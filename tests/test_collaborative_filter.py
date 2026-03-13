@@ -15,7 +15,7 @@ _build_user_index = stage_train_cf._build_user_index
 
 
 def test_collaborative_filter_model_outputs_probabilities():
-    model = CollaborativeFilteringModel(num_users=5, num_items=7, latent_dim=3)
+    model = CollaborativeFilteringModel(num_users=5, num_items=7, latent_dim=3, unknown_user_index=4)
 
     preds = model(
         user_index=torch.tensor([0, 1, 2], dtype=torch.long),
@@ -62,6 +62,61 @@ def test_build_train_positive_lookup_uses_only_observed_likes():
     assert train_user_indices.tolist() == [0]
     assert num_positive_pairs == 2
     assert lookup[0].tolist() == [item_mapping[11], item_mapping[12]]
+
+
+def test_build_item_index_uses_train_positive_likes_only():
+    target_posts_df = pl.DataFrame({
+        "target_did": ["u_train", "u_train", "u_val", "u_holdout"],
+        "like_emb_idx": [11, 12, 13, 14],
+        "neg_emb_idx": [91, 92, 93, 94],
+        "split": ["train", "train", "val", "holdout_seen_users"],
+    })
+
+    item_mapping, unknown_item_index = _build_item_index(target_posts_df, logging.getLogger("cf-test"))
+
+    assert item_mapping == {11: 0, 12: 1}
+    assert unknown_item_index == 2
+
+
+def test_unknown_user_uses_mean_seen_user_representation():
+    model = CollaborativeFilteringModel(num_users=3, num_items=2, latent_dim=2, unknown_user_index=2)
+    with torch.no_grad():
+        model.user_factors.weight.copy_(torch.tensor([
+            [1.0, 2.0],
+            [3.0, 4.0],
+            [9.0, 9.0],
+        ]))
+        model.user_bias.weight.copy_(torch.tensor([
+            [0.1],
+            [0.3],
+            [0.9],
+        ]))
+        model.item_factors.weight.copy_(torch.tensor([
+            [5.0, 7.0],
+            [11.0, 13.0],
+        ]))
+        model.item_bias.weight.copy_(torch.tensor([
+            [0.2],
+            [0.4],
+        ]))
+        model.global_bias.copy_(torch.tensor([0.05]))
+
+    seen_and_unknown_logits = model.logits(
+        user_index=torch.tensor([0, 2], dtype=torch.long),
+        item_index=torch.tensor([0, 0], dtype=torch.long),
+    )
+    all_item_logits = model.logits_for_all_items(
+        user_index=torch.tensor([2], dtype=torch.long),
+        item_count=2,
+    )
+
+    expected_mean_user_vec = torch.tensor([2.0, 3.0])
+    expected_mean_user_bias = 0.2
+    expected_unknown_item0 = (expected_mean_user_vec * torch.tensor([5.0, 7.0])).sum() + expected_mean_user_bias + 0.2 + 0.05
+    expected_unknown_item1 = (expected_mean_user_vec * torch.tensor([11.0, 13.0])).sum() + expected_mean_user_bias + 0.4 + 0.05
+
+    assert torch.isclose(seen_and_unknown_logits[1], expected_unknown_item0)
+    assert torch.allclose(all_item_logits[0], torch.tensor([expected_unknown_item0, expected_unknown_item1]))
 
 
 def test_build_candidate_dataset_maps_unseen_users_to_unknown_bucket():
