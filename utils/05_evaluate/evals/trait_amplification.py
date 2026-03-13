@@ -29,7 +29,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
-from scipy.stats import spearmanr
+from scipy.stats import rankdata, spearmanr
 
 from . import EvalContext, EvalModule
 from .trait_corrs import _load_inferences, _unnest_text_inferences
@@ -92,6 +92,23 @@ def _compute_all_correlations(
     return results
 
 
+def _col_pearson(Xc: np.ndarray, yc: np.ndarray) -> np.ndarray:
+    """Pearson r of each column of centred *Xc* with centred *yc*."""
+    x_norms = np.sqrt((Xc * Xc).sum(axis=0))
+    y_norm = np.sqrt(yc @ yc)
+    denom = x_norms * y_norm
+    denom = np.where(denom < 1e-30, 1.0, denom)
+    return (Xc.T @ yc) / denom
+
+
+def _pearson_1d(x: np.ndarray, y: np.ndarray) -> float:
+    """Pearson r of two 1-D arrays (no NaN handling)."""
+    xc = x - x.mean()
+    yc = y - y.mean()
+    denom = np.sqrt((xc @ xc) * (yc @ yc))
+    return float((xc @ yc) / denom) if denom > 1e-30 else 0.0
+
+
 def _bootstrap_cis(
     user_ids: np.ndarray,
     user_to_rows: Dict[Any, np.ndarray],
@@ -104,38 +121,94 @@ def _bootstrap_cis(
     alpha: float = ALPHA,
     seed: int = 42,
 ) -> Dict[str, Tuple[float, float, float, float, float, float]]:
-    """Single bootstrap pass across ALL traits.
+    """Bootstrap CIs using pre-ranked arrays (Spearman = Pearson-of-ranks).
+
+    Pre-ranking removes the O(n log n) sort from every bootstrap iteration,
+    leaving only O(n) Pearson computations.  Dense (all-finite) traits are
+    batched into a single matrix-vector product per iteration.
 
     Returns {key: (rt_lo, rt_hi, rp_lo, rp_hi, delta_lo, delta_hi)}.
     """
     rng = np.random.default_rng(seed)
     n_users = len(user_ids)
+    keys = sorted(valid_keys)
 
+    dense_keys = [k for k in keys if finite_masks[k].all()]
+    sparse_keys = [k for k in keys if not finite_masks[k].all()]
+
+    # --- pre-rank all arrays once (one-time O(n log n) per array) --------
+    yt_r = rankdata(y_true_c).astype(np.float64)
+    yp_r = rankdata(y_pred_c).astype(np.float64)
+
+    dense_rank_mat: np.ndarray | None = None
+    if dense_keys:
+        dense_rank_mat = np.column_stack(
+            [rankdata(trait_arrays[k]).astype(np.float64) for k in dense_keys]
+        )
+
+    sparse_trait_ranks: Dict[str, np.ndarray] = {}
+    for k in sparse_keys:
+        m = finite_masks[k]
+        ranked = np.full(len(y_true_c), np.nan, dtype=np.float64)
+        ranked[m] = rankdata(trait_arrays[k][m])
+        sparse_trait_ranks[k] = ranked
+
+    # --- pre-build contiguous user-row index for vectorised resampling ---
+    row_arrays = [user_to_rows[u] for u in user_ids]
+    all_rows = np.concatenate(row_arrays)
+    offsets = np.empty(n_users + 1, dtype=np.int64)
+    offsets[0] = 0
+    np.cumsum([len(r) for r in row_arrays], out=offsets[1:])
+
+    # --- accumulators ----------------------------------------------------
     boot_rt: Dict[str, List[float]] = defaultdict(list)
     boot_rp: Dict[str, List[float]] = defaultdict(list)
     boot_d: Dict[str, List[float]] = defaultdict(list)
 
     for _ in range(n_bootstrap):
-        sampled = rng.choice(user_ids, size=n_users, replace=True)
-        idx = np.concatenate([user_to_rows[u] for u in sampled])
-        yt = y_true_c[idx]
-        yp = y_pred_c[idx]
+        sel = rng.integers(0, n_users, size=n_users)
 
-        for key in valid_keys:
-            tv = trait_arrays[key][idx]
-            m = finite_masks[key][idx]
+        sel_starts = offsets[sel]
+        sel_lens = offsets[sel + 1] - sel_starts
+        total = int(sel_lens.sum())
+        rep_starts = np.repeat(sel_starts, sel_lens)
+        cum = np.zeros(n_users + 1, dtype=np.int64)
+        np.cumsum(sel_lens, out=cum[1:])
+        within = np.arange(total, dtype=np.int64) - np.repeat(cum[:-1], sel_lens)
+        idx = all_rows[rep_starts + within]
+
+        yt_b = yt_r[idx]
+        yp_b = yp_r[idx]
+
+        if dense_rank_mat is not None:
+            T_b = dense_rank_mat[idx]
+            T_c = T_b - T_b.mean(axis=0)
+            yt_c = yt_b - yt_b.mean()
+            yp_c = yp_b - yp_b.mean()
+
+            rt_all = _col_pearson(T_c, yt_c)
+            rp_all = _col_pearson(T_c, yp_c)
+
+            for i, k in enumerate(dense_keys):
+                boot_rt[k].append(float(rt_all[i]))
+                boot_rp[k].append(float(rp_all[i]))
+                boot_d[k].append(float(rp_all[i] - rt_all[i]))
+
+        for k in sparse_keys:
+            tv_b = sparse_trait_ranks[k][idx]
+            m = np.isfinite(tv_b)
             if m.sum() < 10:
                 continue
-            rt, _ = spearmanr(yt[m], tv[m])
-            rp, _ = spearmanr(yp[m], tv[m])
-            boot_rt[key].append(rt)
-            boot_rp[key].append(rp)
-            boot_d[key].append(rp - rt)
+            rt = _pearson_1d(yt_b[m], tv_b[m])
+            rp = _pearson_1d(yp_b[m], tv_b[m])
+            boot_rt[k].append(rt)
+            boot_rp[k].append(rp)
+            boot_d[k].append(rp - rt)
 
     lo_q = alpha / 2 * 100
     hi_q = (1 - alpha / 2) * 100
     cis = {}
-    for key in valid_keys:
+    for key in keys:
         if key not in boot_d or len(boot_d[key]) < 10:
             continue
         cis[key] = (
