@@ -88,3 +88,13 @@ def test_background_effective_config_allows_cli_to_override_config_to_default(tm
     )
 
     assert cfg["use_post_encoder"] is True
+
+
+def test_merge_args_with_config_supports_fit_flags():
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--use-fit", "--fit-num-queries", "32"])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.use_fit is True
+    assert merged.fit_num_queries == 32
+    assert merged.fit_tau_init == cli.DEFAULTS["fit_tau_init"]

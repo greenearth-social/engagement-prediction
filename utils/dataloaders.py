@@ -466,13 +466,14 @@ class BaseAttentionEncoder(nn.Module, ABC):
         B: int, 
         x: torch.Tensor, 
         attn_mask_inv: torch.Tensor, 
-        seq_len: int
+        seq_len: int,
+        meta_query_vec: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Pool a sequence into a single vector using learned-query attention.
 
         Conceptually, this performs a single "cross-attention" step where a learned
         query vector attends over the sequence:
-          - query: a trainable vector shared across all examples
+          - query: a trainable vector shared across all examples, or a FIT query
           - keys/values: the sequence representations `x`
 
         This yields a content-aware weighted average of the sequence. The mask is
@@ -484,12 +485,15 @@ class BaseAttentionEncoder(nn.Module, ABC):
             attn_mask_inv: Inverted key-padding mask `[B, seq_len]` where True means
                 "ignore this position" (PyTorch transformer convention).
             seq_len: Sequence length (used for a safe fallback in the all-masked case).
+            meta_query_vec: Optional `[B, hidden_dim]` FIT query override.
 
         Returns:
             Attention-pooled representations `[B, hidden_dim]`.
         """
-        # Expand the shared learned query to one per batch element.
-        query = self.attention_query.expand(B, -1, -1)  # [B, 1, hidden]
+        if meta_query_vec is not None:
+            query = meta_query_vec.unsqueeze(1)  # [B, 1, hidden]
+        else:
+            query = self.attention_query.expand(B, -1, -1)  # [B, 1, hidden]
 
         # Compute raw dot-product scores between the query and each sequence element.
         attn_scores = torch.bmm(query, x.transpose(1, 2))  # [B, 1, seq]
@@ -542,6 +546,7 @@ class BaseAttentionEncoder(nn.Module, ABC):
         self,
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
         history_mask: torch.Tensor,  # [B, seq_len] True = valid
+        meta_query_vec: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Encode a padded history sequence into a fixed-size representation.
 
@@ -718,12 +723,14 @@ class TransformerDualPoolingEncoder(BaseAttentionEncoder):
         self,
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
         history_mask: torch.Tensor,  # [B, seq_len] True = valid
+        meta_query_vec: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Encode user history into fixed-size representation.
         
         Args:
             history_embeddings: Padded history sequences [batch, seq_len, input_dim]
             history_mask: Boolean mask [batch, seq_len], True = valid position
+            meta_query_vec: Optional `[B, hidden_dim]` FIT query override
             
         Returns:
             User representations [batch, output_dim]
@@ -737,8 +744,13 @@ class TransformerDualPoolingEncoder(BaseAttentionEncoder):
             x = layer(x, attn_mask_inv)
 
         # ─── Attention-weighted pooling ───
-        # Use learned query to compute content-aware weights over sequence
-        attention_pooled = self._forward_attention_pooled(B, x, attn_mask_inv, seq_len)
+        attention_pooled = self._forward_attention_pooled(
+            B,
+            x,
+            attn_mask_inv,
+            seq_len,
+            meta_query_vec=meta_query_vec,
+        )
         
         # ─── Mean pooling (masked) ───
         mean_pooled = self._forward_mean_pooled(x, history_mask)
@@ -804,12 +816,14 @@ class CrossAttentionPoolingEncoder(BaseAttentionEncoder):
         self,
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
         history_mask: torch.Tensor,  # [B, seq_len] True = valid
+        meta_query_vec: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Encode user history into fixed-size representation.
         
         Args:
             history_embeddings: Padded history sequences [batch, seq_len, input_dim]
             history_mask: Boolean mask [batch, seq_len], True = valid position
+            meta_query_vec: Optional `[B, hidden_dim]` FIT query override
             
         Returns:
             User representations [batch, output_dim]
@@ -821,9 +835,15 @@ class CrossAttentionPoolingEncoder(BaseAttentionEncoder):
         # relationships. This is the primary source of speedup and parameter reduction.
 
         # ─── Cross-attention pooling ───
-        # Learned query attends directly to the projected, position-encoded history
+        # Learned query, or a FIT query, attends to the projected history.
         attn_mask_inv = ~history_mask  # PyTorch convention: True = ignore
-        attention_pooled = self._forward_attention_pooled(B, x, attn_mask_inv, seq_len)
+        attention_pooled = self._forward_attention_pooled(
+            B,
+            x,
+            attn_mask_inv,
+            seq_len,
+            meta_query_vec=meta_query_vec,
+        )
         
         # ─── Mean pooling (masked) ───
         mean_pooled = self._forward_mean_pooled(x, history_mask)

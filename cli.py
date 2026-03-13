@@ -100,6 +100,13 @@ DEFAULTS: Dict[str, Any] = {
     "lr_scheduler_patience": 5,
     # Stage 4 (train) - Training optimization
     "gradient_clip_max_norm": 1.0,
+    # Stage 4 (train) - FIT parameters
+    "use_fit": False,
+    "fit_num_queries": 64,
+    "fit_tau_init": 1.0,
+    "fit_tau_min": 0.1,
+    "fit_tau_decay": 0.9995,
+    "fit_use_lss": False,
     # Stage 5 (eval)
     "eval_batch_size": 8192,
     "eval_holdout_type": "unseen_users",
@@ -624,6 +631,19 @@ def build_parser() -> argparse.ArgumentParser:
     # Stage 4 (train) - Training optimization
     _add_arg_with_default(p_all, "--gradient-clip-max-norm", type=float, default=argparse.SUPPRESS,
                           help_text="Maximum gradient norm for clipping (two-tower only)")
+    # Stage 4 (train) - FIT (Fast Item-user Transformer) parameters
+    _add_arg_with_default(p_all, "--use-fit", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Enable FIT mode for the two-tower model")
+    _add_arg_with_default(p_all, "--fit-num-queries", type=int, default=argparse.SUPPRESS,
+                          help_text="Number of learned FIT meta queries")
+    _add_arg_with_default(p_all, "--fit-tau-init", type=float, default=argparse.SUPPRESS,
+                          help_text="Initial FIT soft-query temperature")
+    _add_arg_with_default(p_all, "--fit-tau-min", type=float, default=argparse.SUPPRESS,
+                          help_text="Minimum FIT soft-query temperature")
+    _add_arg_with_default(p_all, "--fit-tau-decay", type=float, default=argparse.SUPPRESS,
+                          help_text="FIT temperature decay factor")
+    _add_arg_with_default(p_all, "--fit-use-lss", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Use a lightweight similarity scorer in FIT mode")
     # Stage 5 options (subset)
     _add_arg_with_default(p_all, "--eval-batch-size", type=int, default=argparse.SUPPRESS,
                           help_text="Batch size for evaluation")

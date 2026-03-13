@@ -11,10 +11,40 @@
 #
 # Usage (survives SSH disconnect):
 #   tmux new-session -d -s training-sweep './run_training_sweep.sh'
+#   tmux new-session -d -s training-sweep './run_training_sweep.sh --use-fit'
 #   tmux attach -t training-sweep   # to watch live
 #   # Ctrl-B D to detach; reconnect later with tmux attach -t training-sweep
 #
 set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: ./run_training_sweep.sh [--use-fit]
+
+Options:
+  --use-fit  Add FIT-enabled two-tower train/eval runs to the standard sweep.
+  -h, --help Show this help text.
+EOF
+}
+
+INCLUDE_FIT_SWEEP="false"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --use-fit)
+      INCLUDE_FIT_SWEEP="true"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
 
 # ── Configuration ──────────────────────────────────────────────────────
 DATA_DIR="outputs/20260305_224327"
@@ -38,9 +68,16 @@ MLP_EXPERIMENTS=(
 
 # Two-tower experiments (sequential -- heavy GPU/memory usage)
 TT_EXPERIMENTS=(
-  "full_transformer:"
-  "cross_attention:"
+  "full_transformer::nofit"
+  "cross_attention::nofit"
 )
+
+if [[ "$INCLUDE_FIT_SWEEP" == "true" ]]; then
+  TT_EXPERIMENTS+=(
+    "full_transformer::fit"
+    "cross_attention::fit"
+  )
+fi
 
 # ── Resolve paths ──────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -65,15 +102,16 @@ log "═════════════════════════
 
 # ── Helper: launch one experiment ──────────────────────────────────────
 # Writes exit code to a status file so we can collect results later.
-# Args: MODEL_TYPE  USER_ENCODER  USER_SUMM  RUN_TAG  RUN_LABEL  RUN_LOG  STATUS_FILE
+# Args: MODEL_TYPE  USER_ENCODER  USER_SUMM  USE_FIT  RUN_TAG  RUN_LABEL  RUN_LOG  STATUS_FILE
 run_one() {
   local MODEL_TYPE="$1"
   local USER_ENCODER="$2"
   local USER_SUMM="$3"
-  local RUN_TAG="$4"
-  local RUN_LABEL="$5"
-  local RUN_LOG="$6"
-  local STATUS_FILE="$7"
+  local USE_FIT="$4"
+  local RUN_TAG="$5"
+  local RUN_LABEL="$6"
+  local RUN_LOG="$7"
+  local STATUS_FILE="$8"
 
   local CMD=(
     python3 cli.py
@@ -93,6 +131,10 @@ run_one() {
     if [[ "$USER_SUMM" == "ema" ]]; then
       CMD+=(--ema-alpha "$EMA_ALPHA")
     fi
+  fi
+
+  if [[ "$USE_FIT" == "true" ]]; then
+    CMD+=(--use-fit)
   fi
 
   log "[$RUN_LABEL] Launching: ${CMD[*]}"
@@ -148,7 +190,7 @@ for i in "${!MLP_EXPERIMENTS[@]}"; do
     done
   done
 
-  run_one "mlp" "$USER_ENCODER" "$USER_SUMM" "$RUN_TAG" "$RUN_LABEL" "$RUN_LOG" "$STATUS_FILE" &
+  run_one "mlp" "$USER_ENCODER" "$USER_SUMM" "false" "$RUN_TAG" "$RUN_LABEL" "$RUN_LOG" "$STATUS_FILE" &
   MLP_PIDS+=($!)
   MLP_STATUS_FILES+=("$STATUS_FILE")
   MLP_LABELS+=("$RUN_LABEL")
@@ -186,9 +228,17 @@ log "╚════════════════════════
 for i in "${!TT_EXPERIMENTS[@]}"; do
   SPEC="${TT_EXPERIMENTS[$i]}"
   USER_ENCODER="${SPEC%%:*}"
-  USER_SUMM="${SPEC#*:}"
+  REST="${SPEC#*:}"
+  USER_SUMM="${REST%%:*}"
+  FIT_MODE="${REST#*:}"
   RUN_NUM=$((i + 1))
-  RUN_TAG="two-tower_${USER_ENCODER}"
+  USE_FIT="false"
+  if [[ "$FIT_MODE" == "fit" ]]; then
+    USE_FIT="true"
+    RUN_TAG="two-tower_${USER_ENCODER}_fit"
+  else
+    RUN_TAG="two-tower_${USER_ENCODER}"
+  fi
   RUN_LABEL="TT ${RUN_NUM}/${#TT_EXPERIMENTS[@]}  ${RUN_TAG}"
   RUN_LOG="$LOG_DIR/run_${RUN_TAG}.log"
   STATUS_FILE="$LOG_DIR/.status_${RUN_TAG}"
@@ -198,7 +248,7 @@ for i in "${!TT_EXPERIMENTS[@]}"; do
   log "[$RUN_LABEL] Starting…"
   log "────────────────────────────────────────────────────────────────"
 
-  run_one "two-tower" "$USER_ENCODER" "$USER_SUMM" "$RUN_TAG" "$RUN_LABEL" "$RUN_LOG" "$STATUS_FILE"
+  run_one "two-tower" "$USER_ENCODER" "$USER_SUMM" "$USE_FIT" "$RUN_TAG" "$RUN_LABEL" "$RUN_LOG" "$STATUS_FILE"
 
   if [[ -f "$STATUS_FILE" ]] && [[ "$(cat "$STATUS_FILE")" == "0" ]]; then
     (( PASSED++ )) || true
