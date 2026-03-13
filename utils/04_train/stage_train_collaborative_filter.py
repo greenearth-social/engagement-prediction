@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 
 """
-Stage 4 (Collaborative Filter): train a minimal matrix-factorization recommender.
+Stage 4 (Collaborative Filter): train a minimal implicit-feedback recommender.
 
-This stage intentionally keeps the model small and easy to reason about:
-    - Users are represented by learned latent vectors.
-    - Posts are represented by learned latent vectors keyed by ``emb_idx``.
-    - The score is a dot product plus user/item/global bias terms.
-    - A sigmoid converts the score into ``y_pred_proba`` so the existing
-      evaluation pipeline can consume the outputs without any special cases.
+This implementation now follows a positive-only collaborative-filtering setup:
+    - Training uses only observed train likes as positive interactions.
+    - It does NOT use the pipeline's sampled ``neg_emb_idx`` values for fitting.
+    - Unobserved user-item pairs are treated as unlabeled zeros inside a dense
+      implicit-feedback logistic matrix-factorization objective.
+    - The scoring function is logistic, so the exported score is already a
+      probability-like quantity in ``[0, 1]`` that can be thresholded.
 
-The stage reuses the same Stage 1-3 artifacts as the MLP and two-tower paths,
-but it does not consume post embedding values directly.  Instead, it uses the
-embedding memmap only to determine the size of the item vocabulary so that the
-item IDs stay aligned with the rest of the pipeline.
+The model is intentionally small:
+    - One latent vector per user.
+    - One latent vector per item.
+    - One scalar bias per user.
+    - One scalar bias per item.
+    - One global bias.
 
-The holdout user split includes users that were never seen during training, so
-this implementation reserves a single ``unknown_user`` embedding and maps every
-unseen user to that fallback vector at validation / holdout time.
+At evaluation time, we score the existing candidate pairs from Stage 2
+(``like_uri`` versus sampled ``neg_uri``) so the current Stage 5 evaluator can
+keep operating on the same ``y_pred_proba`` parquet outputs.
 """
 
 from __future__ import annotations
@@ -37,7 +40,7 @@ import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, roc_auc_score
 from torch.utils.data import DataLoader, Dataset
 
-from utils.dataloaders import filter_split_and_join_history, load_training_data
+from utils.dataloaders import load_training_data
 from utils.helpers import (
     clear_cuda_memory,
     get_device,
@@ -52,18 +55,11 @@ STAGE_LOG_NAME = "STAGE_04_TRAIN_COLLABORATIVE_FILTER"
 
 
 class CollaborativeFilteringModel(nn.Module):
-    """Minimal logistic matrix-factorization model.
-
-    The model stays intentionally small:
-        - ``user_factors`` learns one vector per seen user plus one unknown user.
-        - ``item_factors`` learns one vector per post ``emb_idx`` plus one unknown item.
-        - ``user_bias`` and ``item_bias`` capture marginal effects cheaply.
-        - ``global_bias`` lets the model learn the base interaction rate.
-    """
+    """Minimal logistic matrix-factorization model for implicit feedback."""
 
     def __init__(self, num_users: int, num_items: int, latent_dim: int):
         super().__init__()
-        # Store sizes so the saved checkpoint can reconstruct the module later.
+        # Store model sizes for checkpoints and debugging.
         self.num_users = num_users
         self.num_items = num_items
         self.latent_dim = latent_dim
@@ -75,50 +71,66 @@ class CollaborativeFilteringModel(nn.Module):
         self.user_bias = nn.Embedding(num_users, 1)
         # Learn one scalar bias per item.
         self.item_bias = nn.Embedding(num_items, 1)
-        # Learn a single global bias shared by every example.
+        # Learn one scalar bias shared by all interactions.
         self.global_bias = nn.Parameter(torch.zeros(1))
-        # Initialize factor tables with a small normal distribution.
+        # Initialize user factors with a small Gaussian.
         nn.init.normal_(self.user_factors.weight, mean=0.0, std=0.02)
-        # Initialize item factors the same way as user factors.
+        # Initialize item factors with the same small Gaussian.
         nn.init.normal_(self.item_factors.weight, mean=0.0, std=0.02)
-        # Start user biases at zero so the model begins near the global rate.
+        # Initialize user biases at zero.
         nn.init.zeros_(self.user_bias.weight)
-        # Start item biases at zero for the same reason.
+        # Initialize item biases at zero.
         nn.init.zeros_(self.item_bias.weight)
 
-    def forward(self, user_index: torch.Tensor, item_index: torch.Tensor) -> torch.Tensor:
-        # Fetch the latent vector for each user in the batch.
+    def logits(self, user_index: torch.Tensor, item_index: torch.Tensor) -> torch.Tensor:
+        # Look up the latent vector for each user in the batch.
         user_vec = self.user_factors(user_index)
-        # Fetch the latent vector for each item in the batch.
+        # Look up the latent vector for each item in the batch.
         item_vec = self.item_factors(item_index)
-        # Compute the dot-product interaction score for each user-item pair.
+        # Compute the dot-product interaction term.
         interaction = (user_vec * item_vec).sum(dim=-1)
-        # Add user-specific bias terms.
+        # Look up the user bias terms.
         user_bias = self.user_bias(user_index).squeeze(-1)
-        # Add item-specific bias terms.
+        # Look up the item bias terms.
         item_bias = self.item_bias(item_index).squeeze(-1)
-        # Combine interaction and bias terms into one logit.
-        logits = interaction + user_bias + item_bias + self.global_bias
-        # Convert logits into probabilities for the shared evaluation pipeline.
-        return torch.sigmoid(logits)
+        # Return the unnormalized logit.
+        return interaction + user_bias + item_bias + self.global_bias
+
+    def forward(self, user_index: torch.Tensor, item_index: torch.Tensor) -> torch.Tensor:
+        # Convert the pairwise logits into probabilities.
+        return torch.sigmoid(self.logits(user_index, item_index))
+
+    def logits_for_all_items(self, user_index: torch.Tensor, item_count: int) -> torch.Tensor:
+        # Look up the latent vectors for the requested users.
+        user_vec = self.user_factors(user_index)
+        # Slice the trainable item vectors, excluding the unknown-item bucket.
+        item_vec = self.item_factors.weight[:item_count]
+        # Compute all user-item dot products at once.
+        interaction = user_vec @ item_vec.T
+        # Look up the user bias column.
+        user_bias = self.user_bias(user_index)
+        # Slice the item bias row.
+        item_bias = self.item_bias.weight[:item_count].T
+        # Broadcast biases across the full user-item score matrix.
+        return interaction + user_bias + item_bias + self.global_bias
 
     def compute_loss_and_preds(self, batch: Dict[str, Any], device: str) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Move the user indices to the active device.
+        # Move user indices onto the active device.
         user_index = batch["user_index"].to(device)
-        # Move the item indices to the active device.
+        # Move item indices onto the active device.
         item_index = batch["item_index"].to(device)
-        # Move the binary labels to the active device.
+        # Move labels onto the active device.
         labels = batch["label"].to(device)
-        # Run the forward pass and obtain calibrated probabilities.
+        # Score the candidate pairs.
         preds = self(user_index, item_index)
-        # Optimize binary cross-entropy on the predicted probabilities.
+        # Compute the standard BCE loss for exported candidate-pair evaluation.
         loss = F.binary_cross_entropy(preds, labels)
-        # Return both the scalar loss and the probabilities for metrics.
+        # Return both the loss and the probabilities.
         return loss, preds
 
 
-class InteractionDataset(Dataset):
-    """Flat binary interaction dataset shared by train/val/holdout evaluation."""
+class CandidateInteractionDataset(Dataset):
+    """Pairwise candidate dataset used for val/holdout scoring and exports."""
 
     def __init__(
         self,
@@ -128,33 +140,33 @@ class InteractionDataset(Dataset):
         user_ids: List[str],
         post_ids: List[str],
     ):
-        # Cache user indices as a tensor so __getitem__ stays tiny.
+        # Store encoded user indices as a tensor.
         self.user_indices = torch.as_tensor(user_indices, dtype=torch.long)
-        # Cache item indices the same way.
+        # Store encoded item indices as a tensor.
         self.item_indices = torch.as_tensor(item_indices, dtype=torch.long)
-        # Cache labels as float tensors for BCE loss.
+        # Store binary labels as a float tensor.
         self.labels = torch.as_tensor(labels, dtype=torch.float32)
-        # Keep original string user IDs for prediction parquet outputs.
+        # Keep original user IDs for parquet outputs.
         self.user_ids = user_ids
-        # Keep original string post IDs for prediction parquet outputs.
+        # Keep original post IDs for parquet outputs.
         self.post_ids = post_ids
 
     def __len__(self) -> int:
-        # Return the total number of binary interaction rows.
+        # Return the number of candidate rows.
         return len(self.labels)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        # Return the encoded user index used by the model.
+        # Return the encoded user index.
         user_index = self.user_indices[idx]
-        # Return the encoded item index used by the model.
+        # Return the encoded item index.
         item_index = self.item_indices[idx]
-        # Return the binary label for this interaction.
+        # Return the binary candidate label.
         label = self.labels[idx]
-        # Return the original user ID for downstream prediction exports.
+        # Return the original user ID.
         user_id = self.user_ids[idx]
-        # Return the original post ID for downstream prediction exports.
+        # Return the original post ID.
         post_id = self.post_ids[idx]
-        # Bundle everything into the standard batch dictionary shape.
+        # Package everything into the standard batch dict.
         return {
             "user_index": user_index,
             "item_index": item_index,
@@ -168,126 +180,202 @@ def _build_user_index(
     target_posts_df: pl.DataFrame,
     logger,
 ) -> Tuple[Dict[str, int], int]:
-    """Build a train-only user vocabulary plus one unknown-user bucket."""
-    # Keep the vocabulary tied strictly to the train split to avoid leakage.
+    """Build the train-user vocabulary and reserve one unseen-user bucket."""
+    # Restrict the user vocabulary to train rows to avoid leakage.
     train_users = (
         target_posts_df
-        .filter((pl.col("split") == "train") & pl.col("neg_emb_idx").is_not_null())
+        .filter(pl.col("split") == "train")
         .select("target_did")
         .unique()
         .sort("target_did")
         .get_column("target_did")
         .to_list()
     )
-    # Assign a stable integer index to every seen training user.
+    # Map every train user to a compact integer index.
     user_to_index = {did: idx for idx, did in enumerate(train_users)}
-    # Reserve one extra slot for any user that never appeared in training.
+    # Reserve one extra index for any user absent from training.
     unknown_user_index = len(train_users)
-    # Log the vocabulary size so the stage metadata is easy to audit.
+    # Log the final vocabulary size.
     logger.info(
         f"User vocabulary built from train split: {len(train_users):,} seen users + 1 unknown-user bucket"
     )
-    # Return both the mapping and the fallback index.
+    # Return the mapping plus the fallback index.
     return user_to_index, unknown_user_index
+
+
+def _build_item_index(
+    target_posts_df: pl.DataFrame,
+    logger,
+) -> Tuple[Dict[int, int], int]:
+    """Build a compact item vocabulary from all candidate items in target_posts."""
+    # Collect every positive candidate item index across all splits.
+    like_items = target_posts_df.select(pl.col("like_emb_idx").drop_nulls()).get_column("like_emb_idx").to_list()
+    # Collect every negative candidate item index across all splits.
+    neg_items = target_posts_df.select(pl.col("neg_emb_idx").drop_nulls()).get_column("neg_emb_idx").to_list()
+    # Deduplicate and sort the raw embedding indices for stable mapping.
+    raw_item_ids = sorted({int(item_id) for item_id in like_items + neg_items})
+    # Map every raw Stage 1 ``emb_idx`` into a compact item index.
+    item_to_index = {raw_item_id: idx for idx, raw_item_id in enumerate(raw_item_ids)}
+    # Reserve one extra item slot for defensive fallback handling.
+    unknown_item_index = len(raw_item_ids)
+    # Log the compact item vocabulary size.
+    logger.info(
+        f"Item vocabulary built from target_posts candidates: {len(raw_item_ids):,} known items + 1 unknown-item bucket"
+    )
+    # Return the compact mapping and the fallback index.
+    return item_to_index, unknown_item_index
+
+
+def _build_train_positive_lookup(
+    target_posts_df: pl.DataFrame,
+    user_to_index: Dict[str, int],
+    item_to_index: Dict[int, int],
+    logger,
+) -> Tuple[Dict[int, np.ndarray], np.ndarray, int]:
+    """Build the positive-only user -> liked-items lookup from the train split."""
+    # Keep only the positive train interactions.
+    train_pairs = (
+        target_posts_df
+        .filter((pl.col("split") == "train") & pl.col("like_emb_idx").is_not_null())
+        .select(["target_did", "like_emb_idx"])
+        .unique()
+        .sort(["target_did", "like_emb_idx"])
+    )
+    # Initialize the lookup map from compact user index to compact item IDs.
+    user_positive_items: Dict[int, List[int]] = {}
+    # Iterate through every unique train positive interaction.
+    for target_did, like_emb_idx in train_pairs.iter_rows():
+        # Resolve the compact user index.
+        user_index = user_to_index[str(target_did)]
+        # Resolve the compact item index.
+        item_index = item_to_index[int(like_emb_idx)]
+        # Append the positive item to this user's interaction list.
+        user_positive_items.setdefault(user_index, []).append(item_index)
+    # Convert each positive-item list into a compact numpy array.
+    compact_lookup = {
+        user_index: np.asarray(item_indices, dtype=np.int64)
+        for user_index, item_indices in user_positive_items.items()
+    }
+    # Build the ordered array of train-user indices.
+    train_user_indices = np.asarray(sorted(compact_lookup.keys()), dtype=np.int64)
+    # Count how many unique positive user-item pairs exist.
+    num_positive_pairs = int(sum(len(item_indices) for item_indices in compact_lookup.values()))
+    # Log the positive-only interaction count.
+    logger.info(
+        f"Positive-only train matrix built from observed likes: {len(train_user_indices):,} users, "
+        f"{num_positive_pairs:,} unique user-item positives"
+    )
+    # Return the lookup, the ordered train users, and the positive count.
+    return compact_lookup, train_user_indices, num_positive_pairs
+
+
+def _auto_balance_positive_weight(
+    num_users: int,
+    num_items: int,
+    num_positive_pairs: int,
+) -> float:
+    """Choose the implicit positive weight by balancing positives vs unlabeled zeros."""
+    # Count the total number of cells in the implicit user-item matrix.
+    total_pairs = max(num_users * num_items, 1)
+    # Count how many cells are unobserved.
+    num_zero_pairs = max(total_pairs - num_positive_pairs, 1)
+    # Balance the total positive weight against the total zero weight.
+    return float(num_zero_pairs / max(num_positive_pairs, 1))
 
 
 def _sanitize_item_indices(
     raw_item_indices: np.ndarray,
+    item_to_index: Dict[int, int],
     unknown_item_index: int,
 ) -> np.ndarray:
-    """Map out-of-range item IDs to the reserved unknown-item bucket."""
-    # Copy into int64 because PyTorch embedding lookups expect integer indices.
-    item_indices = raw_item_indices.astype(np.int64, copy=True)
-    # Identify any invalid item IDs before indexing the embedding table.
-    invalid_mask = (item_indices < 0) | (item_indices >= unknown_item_index)
-    # Replace invalid IDs with the fallback item index.
-    item_indices[invalid_mask] = unknown_item_index
-    # Return the sanitized array.
-    return item_indices
+    """Map raw Stage 1 ``emb_idx`` values into compact item IDs."""
+    # Convert every raw item ID into its compact vocabulary index when available.
+    mapped = [item_to_index.get(int(raw_item_index), unknown_item_index) for raw_item_index in raw_item_indices.tolist()]
+    # Return the compact item-index array.
+    return np.asarray(mapped, dtype=np.int64)
 
 
-def _interleave_post_ids(
-    like_uris: List[str],
-    neg_uris: List[str],
-) -> List[str]:
+def _interleave_post_ids(like_uris: List[str], neg_uris: List[str]) -> List[str]:
     """Build the alternating [positive, negative, positive, negative, ...] post ID list."""
-    # Pre-allocate the exact output length to avoid repeated list growth.
+    # Pre-allocate the final output length.
     post_ids: List[str] = [""] * (2 * len(like_uris))
-    # Fill the even positions with liked post IDs.
+    # Place positive post IDs in even positions.
     post_ids[0::2] = like_uris
-    # Fill the odd positions with negative post IDs.
+    # Place negative post IDs in odd positions.
     post_ids[1::2] = neg_uris
-    # Return the alternating sequence.
+    # Return the alternating list.
     return post_ids
 
 
-def _build_interaction_dataset(
+def _build_candidate_dataset(
     target_posts_df: pl.DataFrame,
-    history_df: pl.DataFrame,
     split: str,
     user_to_index: Dict[str, int],
     unknown_user_index: int,
+    item_to_index: Dict[int, int],
     unknown_item_index: int,
     logger,
-) -> Tuple[InteractionDataset, Dict[str, int]]:
-    """Convert one split into a flat binary interaction dataset."""
-    # Reuse the canonical target/history join used elsewhere in the pipeline.
-    joined = filter_split_and_join_history(target_posts_df, history_df, split)
-    # Log the number of target rows that survived split + negative filtering.
-    logger.info(f"  Split '{split}': {len(joined):,} target rows (after dropping null neg_emb_idx)")
-    # Extract the per-row user IDs.
-    target_dids = joined["target_did"].to_list()
-    # Extract the positive item IDs.
-    like_item_indices = joined["like_emb_idx"].to_numpy()
-    # Extract the negative item IDs.
-    neg_item_indices = joined["neg_emb_idx"].to_numpy()
-    # Extract the positive post URIs for output exports.
-    like_uris = joined["like_uri"].to_list()
-    # Extract the negative post URIs for output exports.
-    neg_uris = joined["neg_uri"].to_list()
-    # Count how many target rows this split contains.
+) -> Tuple[CandidateInteractionDataset, Dict[str, int]]:
+    """Build the candidate-pair dataset used for validation and holdout scoring."""
+    # Filter to the requested split and keep only rows with a candidate negative.
+    split_rows = target_posts_df.filter(
+        (pl.col("split") == split) & pl.col("neg_emb_idx").is_not_null()
+    )
+    # Log how many target rows survived the split filter.
+    logger.info(f"  Split '{split}': {len(split_rows):,} target rows (candidate scoring set)")
+    # Extract the raw user IDs.
+    target_dids = split_rows["target_did"].to_list()
+    # Extract the raw positive item IDs.
+    like_item_indices = split_rows["like_emb_idx"].to_numpy().astype(np.int64)
+    # Extract the raw negative item IDs.
+    neg_item_indices = split_rows["neg_emb_idx"].to_numpy().astype(np.int64)
+    # Extract the positive post URIs for parquet output.
+    like_uris = split_rows["like_uri"].to_list()
+    # Extract the negative post URIs for parquet output.
+    neg_uris = split_rows["neg_uri"].to_list()
+    # Count the split's target rows.
     n_rows = len(target_dids)
-    # Map every raw user ID into the train vocabulary, falling back when unseen.
-    mapped_users = np.array([user_to_index.get(did, unknown_user_index) for did in target_dids], dtype=np.int64)
-    # Sanitize positive item IDs before building the model inputs.
-    safe_like_items = _sanitize_item_indices(like_item_indices, unknown_item_index)
-    # Sanitize negative item IDs before building the model inputs.
-    safe_neg_items = _sanitize_item_indices(neg_item_indices, unknown_item_index)
-    # Interleave user indices so each target row becomes [positive, negative].
+    # Map raw users into the train vocabulary plus unseen-user fallback.
+    mapped_users = np.asarray([user_to_index.get(did, unknown_user_index) for did in target_dids], dtype=np.int64)
+    # Map raw positive items into the compact item vocabulary.
+    safe_like_items = _sanitize_item_indices(like_item_indices, item_to_index, unknown_item_index)
+    # Map raw negative items into the compact item vocabulary.
+    safe_neg_items = _sanitize_item_indices(neg_item_indices, item_to_index, unknown_item_index)
+    # Interleave user indices so each row yields [positive, negative].
     user_indices = np.empty(2 * n_rows, dtype=np.int64)
-    # Place the user index for every positive sample.
+    # Assign the positive user rows.
     user_indices[0::2] = mapped_users
-    # Reuse the same user index for every negative sample.
+    # Assign the negative user rows.
     user_indices[1::2] = mapped_users
-    # Interleave item indices to match the [positive, negative] row order.
+    # Interleave positive and negative item indices.
     item_indices = np.empty(2 * n_rows, dtype=np.int64)
-    # Fill even positions with the liked item IDs.
+    # Assign the positive item rows.
     item_indices[0::2] = safe_like_items
-    # Fill odd positions with the negative item IDs.
+    # Assign the negative item rows.
     item_indices[1::2] = safe_neg_items
-    # Build balanced binary labels in the same alternating order.
+    # Build the binary candidate labels.
     labels = np.empty(2 * n_rows, dtype=np.float32)
-    # Positive examples go in even positions.
+    # Mark positive candidate rows.
     labels[0::2] = 1.0
-    # Negative examples go in odd positions.
+    # Mark negative candidate rows.
     labels[1::2] = 0.0
-    # Duplicate the user ID strings in the same alternating order for exports.
+    # Duplicate each user ID so the parquet export lines up with the labels.
     user_ids = [did for did in target_dids for _ in (0, 1)]
-    # Interleave the positive and negative post IDs for exports.
+    # Interleave positive and negative post IDs.
     post_ids = _interleave_post_ids(like_uris, neg_uris)
-    # Count how many users fell back to the unknown-user bucket.
+    # Count how many rows use the unseen-user fallback.
     n_unknown_users = int((mapped_users == unknown_user_index).sum())
-    # Count how many items fell back to the unknown-item bucket.
+    # Count how many pairwise rows use the unknown-item fallback.
     n_unknown_items = int((item_indices == unknown_item_index).sum())
-    # Build the PyTorch dataset object.
-    dataset = InteractionDataset(
+    # Materialize the dataset object.
+    dataset = CandidateInteractionDataset(
         user_indices=user_indices,
         item_indices=item_indices,
         labels=labels,
         user_ids=user_ids,
         post_ids=post_ids,
     )
-    # Return the dataset together with small audit stats for logging/config output.
+    # Return both the dataset and the audit stats.
     return dataset, {
         "target_rows": n_rows,
         "samples": len(dataset),
@@ -305,8 +393,8 @@ def _create_loader(
     persistent_workers: bool,
     prefetch_factor: int,
 ) -> DataLoader:
-    """Create one DataLoader using the repo's standard worker settings."""
-    # Start from the arguments that apply to every loader.
+    """Create a DataLoader using the repo's standard worker settings."""
+    # Start from the loader settings shared by every split.
     loader_kwargs: Dict[str, Any] = {
         "batch_size": batch_size,
         "shuffle": shuffle,
@@ -314,30 +402,30 @@ def _create_loader(
         "num_workers": num_workers,
         "pin_memory": pin_memory,
     }
-    # Only pass worker-specific options when worker processes are enabled.
+    # Only pass worker-specific options when workers are enabled.
     if num_workers > 0:
         loader_kwargs.update(
             persistent_workers=persistent_workers,
             prefetch_factor=prefetch_factor,
         )
-    # Return the configured DataLoader instance.
+    # Return the configured DataLoader.
     return DataLoader(dataset, **loader_kwargs)
 
 
 def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, Any]:
-    """Compute the small metric set shared across train/val/holdout outputs."""
-    # Always record how many binary rows were evaluated.
+    """Compute the small metric set shared by train/val/holdout exports."""
+    # Always record the number of evaluated candidate rows.
     metrics: Dict[str, Any] = {"total_samples": int(len(y_true))}
-    # Always record how many positive rows were present.
+    # Always record the number of positive candidate rows.
     metrics["positive_samples"] = int(y_true.sum())
-    # Guard AUC because it requires both classes to be present.
+    # Compute AUC only when both classes are present.
     if len(np.unique(y_true)) > 1:
         metrics["auc_roc"] = float(roc_auc_score(y_true, y_pred))
-    # Record the default 0.5-threshold accuracy for quick debugging.
+    # Compute the default thresholded accuracy used elsewhere in the repo.
     metrics["accuracy@0.5"] = float(accuracy_score(y_true, (y_pred > 0.5).astype(int)))
-    # Record the mean probability so calibration drift is visible in logs.
+    # Record the mean predicted probability for calibration inspection.
     metrics["mean_pred_proba"] = float(np.mean(y_pred))
-    # Return the metric dictionary.
+    # Return the metric bundle.
     return metrics
 
 
@@ -346,36 +434,36 @@ def _evaluate_model(
     loader: DataLoader,
     device: str,
 ) -> Dict[str, Any]:
-    """Run one full evaluation pass and collect metrics plus parquet-ready predictions."""
-    # Switch the module into inference mode.
+    """Run one inference pass over candidate user-item pairs."""
+    # Switch the model into inference mode.
     model.eval()
-    # Accumulate scalar predictions here.
+    # Accumulate predicted probabilities here.
     y_pred: List[float] = []
-    # Accumulate ground-truth labels here.
+    # Accumulate labels here.
     y_true: List[float] = []
-    # Accumulate user IDs here for parquet export.
+    # Accumulate raw user IDs here.
     user_ids: List[str] = []
-    # Accumulate post IDs here for parquet export.
+    # Accumulate raw post IDs here.
     post_ids: List[str] = []
-    # Disable autograd because this pass is evaluation-only.
+    # Disable autograd for evaluation.
     with torch.inference_mode():
-        # Step through the loader batch by batch.
+        # Iterate through candidate batches.
         for batch in loader:
-            # Reuse the model helper so the scoring path stays identical to training.
+            # Reuse the pairwise scoring helper.
             _, preds = model.compute_loss_and_preds(batch, device)
-            # Extend the probability list with CPU values.
+            # Extend the probability list.
             y_pred.extend(preds.cpu().numpy().tolist())
-            # Extend the label list with CPU values.
+            # Extend the label list.
             y_true.extend(batch["label"].cpu().numpy().tolist())
-            # Extend the user ID list with raw strings from the batch.
+            # Extend the raw user ID list.
             user_ids.extend(batch["user_id"])
-            # Extend the post ID list with raw strings from the batch.
+            # Extend the raw post ID list.
             post_ids.extend(batch["post_id"])
-    # Convert labels to one compact numpy array.
+    # Convert labels into one numpy array.
     y_true_arr = np.asarray(y_true, dtype=np.float32)
-    # Convert predictions to one compact numpy array.
+    # Convert predictions into one numpy array.
     y_pred_arr = np.asarray(y_pred, dtype=np.float32)
-    # Compute summary metrics from the full pass.
+    # Compute the summary metrics.
     metrics = _compute_metrics(y_true_arr, y_pred_arr)
     # Return both metrics and parquet-ready prediction columns.
     return {
@@ -389,31 +477,88 @@ def _evaluate_model(
     }
 
 
+def _candidate_bce_loss(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Compute BCE on candidate-pair probabilities for validation monitoring."""
+    # Convert candidate labels into a torch tensor.
+    labels = torch.as_tensor(y_true, dtype=torch.float32)
+    # Convert candidate probabilities into a torch tensor.
+    preds = torch.as_tensor(y_pred, dtype=torch.float32)
+    # Return the scalar BCE value.
+    return float(F.binary_cross_entropy(preds, labels).item())
+
+
+def _implicit_logistic_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    positive_weight: float,
+) -> torch.Tensor:
+    """Logistic MF loss from positive-only implicit data.
+
+    This implements the objective from Logistic Matrix Factorization for
+    implicit feedback (Johnson, 2014):
+
+        (1 + alpha * r_ui) * softplus(s_ui) - alpha * r_ui * s_ui
+
+    where ``r_ui`` is 1 for observed train likes and 0 for unobserved pairs.
+    """
+    # Compute the implicit-feedback logistic loss elementwise.
+    loss_matrix = (1.0 + positive_weight * targets) * F.softplus(logits) - positive_weight * targets * logits
+    # Return the mean loss over the batch's user-item submatrix.
+    return loss_matrix.mean()
+
+
+def _build_batch_target_matrix(
+    batch_user_indices: np.ndarray,
+    user_positive_items: Dict[int, np.ndarray],
+    item_count: int,
+    device: str,
+) -> torch.Tensor:
+    """Build the dense 0/1 implicit target matrix for one user batch."""
+    # Start from an all-zero unlabeled matrix.
+    targets = torch.zeros((len(batch_user_indices), item_count), dtype=torch.float32, device=device)
+    # Mark observed positive items for each user in the batch.
+    for row_index, user_index in enumerate(batch_user_indices.tolist()):
+        # Look up the compact positive-item list for this user.
+        positive_items = user_positive_items.get(int(user_index))
+        # Skip users that somehow have no positives.
+        if positive_items is None or len(positive_items) == 0:
+            continue
+        # Materialize the compact item indices on the active device.
+        positive_tensor = torch.as_tensor(positive_items, dtype=torch.long, device=device)
+        # Mark the observed items as positives in the dense matrix.
+        targets[row_index, positive_tensor] = 1.0
+    # Return the dense target block.
+    return targets
+
+
 def train_collaborative_filter_model(
     model: CollaborativeFilteringModel,
-    train_loader: DataLoader,
+    train_user_indices: np.ndarray,
+    user_positive_items: Dict[int, np.ndarray],
+    num_train_items: int,
     val_loader: DataLoader,
     device: str,
     epochs: int,
+    user_batch_size: int,
     learning_rate: float,
     weight_decay: float,
     patience: int,
     lr_scheduler_factor: float,
     lr_scheduler_patience: int,
     disable_progress: bool,
-    gradient_clip_max_norm: float,
+    positive_weight: float,
 ) -> Dict[str, Any]:
-    """Train the collaborative-filter model with early stopping on validation AUC."""
-    # Import optimizers lazily to mirror the other Stage 4 modules.
+    """Train the implicit logistic MF model on positive-only train interactions."""
+    # Import optimizers lazily to match the other Stage 4 scripts.
     import torch.optim as optim
     # Import the scheduler lazily for the same reason.
     from torch.optim.lr_scheduler import ReduceLROnPlateau
     # Import tqdm lazily to keep module import time small.
     from tqdm import tqdm as _tqdm
 
-    # Move model parameters onto the requested device.
+    # Move the model onto the active device.
     model = model.to(device)
-    # Use AdamW for a small, stable optimization baseline.
+    # Use AdamW for stable optimization and simple weight decay.
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     # Reduce the learning rate when validation AUC plateaus.
     scheduler = ReduceLROnPlateau(
@@ -422,123 +567,105 @@ def train_collaborative_filter_model(
         factor=lr_scheduler_factor,
         patience=lr_scheduler_patience,
     )
-    # Track train/val loss and AUC across epochs.
+    # Track train loss plus candidate-validation loss/AUC over time.
     history: Dict[str, List[float]] = {
         "train_loss": [],
         "val_loss": [],
-        "train_auc": [],
         "val_auc": [],
     }
-    # Start best-AUC tracking at the lowest possible value.
+    # Initialize best validation AUC tracking.
     best_val_auc = float("-inf")
-    # Track the best validation loss as a tie-breaker.
+    # Initialize best validation BCE tracking as a tie-breaker.
     best_val_loss = float("inf")
-    # Start the no-improvement counter at zero.
+    # Initialize the no-improvement counter.
     patience_counter = 0
-    # Keep the best model weights in memory for final evaluation/export.
+    # Hold the best model weights in memory.
     best_state_dict: Optional[Dict[str, torch.Tensor]] = None
 
-    # Iterate over epochs with an optional progress bar.
+    # Iterate through optimization epochs.
     for _epoch in _tqdm(range(epochs), desc="Training epochs", disable=disable_progress):
-        # Switch into training mode so gradients and embeddings update.
+        # Switch into training mode.
         model.train()
-        # Reset the running train loss accumulator.
+        # Shuffle the train-user order for this epoch.
+        shuffled_users = np.random.permutation(train_user_indices)
+        # Reset the epoch train-loss accumulator.
         epoch_train_loss = 0.0
-        # Accumulate train probabilities for AUC.
-        train_preds: List[float] = []
-        # Accumulate train labels for AUC.
-        train_labels: List[float] = []
-        # Loop through the train loader.
-        for batch in _tqdm(train_loader, desc="Training", leave=False, disable=disable_progress):
-            # Clear stale gradients before the next backward pass.
+        # Count how many user batches ran this epoch.
+        num_batches = 0
+
+        # Walk through the shuffled users in mini-batches.
+        for start in _tqdm(range(0, len(shuffled_users), user_batch_size), desc="Training", leave=False, disable=disable_progress):
+            # Slice the current user batch.
+            batch_user_indices = shuffled_users[start:start + user_batch_size]
+            # Skip empty slices defensively.
+            if len(batch_user_indices) == 0:
+                continue
+            # Convert the compact user indices into a device tensor.
+            batch_users = torch.as_tensor(batch_user_indices, dtype=torch.long, device=device)
+            # Clear stale gradients.
             optimizer.zero_grad()
-            # Compute the current batch loss and probabilities.
-            loss, preds = model.compute_loss_and_preds(batch, device)
-            # Backpropagate through the latent factors and bias terms.
+            # Score the current user batch against every trainable item.
+            logits = model.logits_for_all_items(batch_users, item_count=num_train_items)
+            # Build the dense positive-only target block for this batch.
+            targets = _build_batch_target_matrix(
+                batch_user_indices=batch_user_indices,
+                user_positive_items=user_positive_items,
+                item_count=num_train_items,
+                device=device,
+            )
+            # Compute the implicit logistic MF loss.
+            loss = _implicit_logistic_loss(logits, targets, positive_weight=positive_weight)
+            # Backpropagate through user/item factors and biases.
             loss.backward()
-            # Clip gradients to avoid occasional unstable updates.
-            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_max_norm)
-            # Apply the optimizer update.
+            # Apply the optimizer step.
             optimizer.step()
-            # Add this batch loss into the epoch average accumulator.
+            # Accumulate the epoch train loss.
             epoch_train_loss += float(loss.item())
-            # Cache train probabilities for train AUC.
-            train_preds.extend(preds.detach().cpu().numpy().tolist())
-            # Cache labels for train AUC.
-            train_labels.extend(batch["label"].detach().cpu().numpy().tolist())
+            # Count the completed user batch.
+            num_batches += 1
 
-        # Normalize train loss by the number of batches.
-        train_loss = epoch_train_loss / max(len(train_loader), 1)
-        # Convert cached train labels into a numpy array.
-        train_labels_arr = np.asarray(train_labels, dtype=np.float32)
-        # Convert cached train predictions into a numpy array.
-        train_preds_arr = np.asarray(train_preds, dtype=np.float32)
-        # Compute train AUC when both classes are present.
-        train_auc = float(roc_auc_score(train_labels_arr, train_preds_arr)) if len(np.unique(train_labels_arr)) > 1 else 0.0
-
-        # Switch into evaluation mode for validation.
-        model.eval()
-        # Reset the running validation loss accumulator.
-        epoch_val_loss = 0.0
-        # Accumulate validation probabilities for AUC.
-        val_preds: List[float] = []
-        # Accumulate validation labels for AUC.
-        val_labels: List[float] = []
-        # Disable autograd during validation.
-        with torch.inference_mode():
-            # Loop through the validation loader.
-            for batch in _tqdm(val_loader, desc="Validation", leave=False, disable=disable_progress):
-                # Compute validation loss and probabilities with the same scoring path.
-                loss, preds = model.compute_loss_and_preds(batch, device)
-                # Add batch loss into the validation loss accumulator.
-                epoch_val_loss += float(loss.item())
-                # Cache validation probabilities.
-                val_preds.extend(preds.detach().cpu().numpy().tolist())
-                # Cache validation labels.
-                val_labels.extend(batch["label"].detach().cpu().numpy().tolist())
-
-        # Normalize validation loss by the number of batches.
-        val_loss = epoch_val_loss / max(len(val_loader), 1)
-        # Convert cached validation labels into a numpy array.
-        val_labels_arr = np.asarray(val_labels, dtype=np.float32)
-        # Convert cached validation predictions into a numpy array.
-        val_preds_arr = np.asarray(val_preds, dtype=np.float32)
-        # Compute validation AUC when both classes are present.
-        val_auc = float(roc_auc_score(val_labels_arr, val_preds_arr)) if len(np.unique(val_labels_arr)) > 1 else 0.0
-
-        # Append the current epoch statistics into the history object.
+        # Normalize the epoch train loss.
+        train_loss = epoch_train_loss / max(num_batches, 1)
+        # Score the candidate validation pairs for early stopping.
+        val_eval = _evaluate_model(model, val_loader, device)
+        # Read the validation AUC from the candidate evaluation.
+        val_auc = float(val_eval["metrics"].get("auc_roc", 0.0))
+        # Compute BCE on the validation candidate predictions.
+        val_loss = _candidate_bce_loss(
+            val_eval["predictions"]["y_true"],
+            val_eval["predictions"]["y_pred"],
+        )
+        # Append the epoch metrics to the history bundle.
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
-        history["train_auc"].append(train_auc)
         history["val_auc"].append(val_auc)
-
-        # Let the scheduler react to validation AUC.
+        # Let the LR scheduler react to candidate validation AUC.
         scheduler.step(val_auc)
 
-        # Prefer higher AUC, then lower loss when AUC ties.
+        # Prefer higher validation AUC, then lower validation BCE.
         is_better = (val_auc > best_val_auc) or (val_auc == best_val_auc and val_loss < best_val_loss)
-        # Snapshot the model whenever validation improves.
+        # Save the best in-memory weights when validation improves.
         if is_better:
             # Update the best validation AUC.
             best_val_auc = val_auc
-            # Update the best validation loss.
+            # Update the best validation BCE.
             best_val_loss = val_loss
-            # Clone the state dict so later epochs cannot mutate it in place.
+            # Clone the model weights into memory.
             best_state_dict = copy.deepcopy(model.state_dict())
-            # Reset the patience counter after an improvement.
+            # Reset patience because we improved.
             patience_counter = 0
         else:
             # Count one more epoch without improvement.
             patience_counter += 1
-            # Stop early once the patience budget is exhausted.
+            # Stop once the patience budget is exhausted.
             if patience_counter >= patience:
                 break
 
-    # Restore the best model weights before returning.
+    # Restore the best model weights before final scoring/export.
     if best_state_dict is not None:
         model.load_state_dict(best_state_dict)
 
-    # Return the trained model and the tracked history/metrics.
+    # Return the trained model plus the tracked history.
     return {
         "model": model,
         "history": history,
@@ -548,15 +675,15 @@ def train_collaborative_filter_model(
 
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
-    # Resolve the root run directory for prior artifact lookup.
+    # Resolve the root pipeline run directory.
     run_dir = Path(context.run_dir).resolve()
-    # Resolve the training device once at the top of the stage.
+    # Resolve the active device once at the top of the stage.
     device = get_device(args.device)
-    # Reuse the pipeline timestamp for all output file names.
+    # Reuse the pipeline run timestamp for outputs.
     timestamp = context.run_timestamp
 
     # --- output directories ---
-    # Preserve the repo's run-tag convention for sweep outputs.
+    # Preserve the repo's run-tag behavior for sweep outputs.
     run_tag = args.run_tag or ""
     # Create the timestamped Stage 4 directory.
     out_dir = context.new_stage_dir("04_train", tag=run_tag)
@@ -566,62 +693,60 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     plots_dir = out_dir / "plots"
     # Create the logs directory.
     logs_dir = out_dir / "logs"
-    # Materialize all Stage 4 subdirectories eagerly.
+    # Materialize all stage subdirectories.
     for directory in (checkpoints_dir, plots_dir, logs_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
-    # Create the stage logger inside the output directory.
+    # Create the stage logger.
     logger = get_stage_logger(STAGE_LOG_NAME, log_file=out_dir / "stage.log")
     # Emit the standard stage start banner.
     log_operation_start("Stage 4 collaborative-filter training", STAGE_LOG_NAME, logger)
-    # Start a wall-clock timer for stage metadata.
+    # Start the wall-clock timer for stage metadata.
     t0 = time.time()
 
     # --- reproducibility and CUDA housekeeping ---
-    # Clear any stale CUDA allocations before building the model.
+    # Clear stale CUDA allocations before building the model.
     clear_cuda_memory()
-    # Read the stage random seed from the CLI namespace.
+    # Read the stage random seed from args.
     random_seed = int(args.random_seed)
-    # Seed Python / NumPy / Torch deterministically.
+    # Seed Python, NumPy, and Torch deterministically.
     set_random_seeds(random_seed)
 
     # --- load data from prior stages ---
-    # Reuse the shared loader so artifact lookup stays consistent with other models.
+    # Reuse the shared artifact loader to stay aligned with the rest of Stage 4.
     log_operation_start("Load training data from prior stages", STAGE_LOG_NAME, logger)
-    embeddings_mmap, target_posts_df, history_df, embed_dim = load_training_data(
+    _embeddings_mmap, target_posts_df, _history_df, embed_dim = load_training_data(
         run_dir, context, logger=logger,
     )
 
     # --- hyperparams (extract all args once, use locals everywhere below) ---
-    # Keep the placeholder user encoder local for config output clarity.
+    # Keep the placeholder user-encoder argument for config output clarity.
     user_encoder = args.user_encoder
-    # Read the latent factor size for the matrix-factorization model.
+    # Read the latent factor size.
     cf_latent_dim = int(args.cf_latent_dim)
-    # Read the shared batch size.
+    # Read the batch size; here it means users per optimization batch.
     batch_size = int(args.batch_size)
-    # Read the shared epoch count.
+    # Read the epoch count.
     epochs = int(args.epochs)
-    # Read the shared learning rate.
+    # Read the learning rate.
     learning_rate = float(args.learning_rate)
-    # Read the collaborative-filter-specific weight decay.
+    # Read the collaborative-filter weight decay.
     weight_decay = float(args.weight_decay_collaborative_filter)
-    # Read the shared early-stopping patience.
+    # Read the early-stopping patience.
     patience = int(args.patience)
     # Read the progress-bar toggle.
     disable_progress = bool(args.disable_progress)
     # Read the plot toggle.
     generate_plots = not bool(args.no_plots)
-    # Read the model-save toggle.
+    # Read the checkpoint-save toggle.
     save_model = not bool(args.no_save_model)
-    # Read the learning-rate scheduler factor.
+    # Read the LR scheduler factor.
     lr_scheduler_factor = float(args.lr_scheduler_factor)
-    # Read the learning-rate scheduler patience.
+    # Read the LR scheduler patience.
     lr_scheduler_patience = int(args.lr_scheduler_patience)
-    # Read the gradient clipping threshold.
-    gradient_clip_max_norm = float(args.gradient_clip_max_norm)
-    # Read the holdout type that Stage 5 will emphasize.
+    # Read the holdout flavor emphasized in metadata/plots.
     eval_holdout_type = str(args.eval_holdout_type)
-    # Read the shared DataLoader worker count.
+    # Read the shared DataLoader worker count used for candidate scoring.
     num_workers = int(args.num_dataloader_workers)
     # Read the shared pin_memory toggle.
     pin_memory = bool(args.dataloader_pin_memory)
@@ -630,61 +755,76 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # Read the shared prefetch factor.
     prefetch_factor = int(args.dataloader_prefetch_factor)
 
-    # Log the fact that collaborative filtering ignores the user-encoder architecture flag.
-    logger.info(f"Collaborative-filter mode selected (user_encoder={user_encoder!r} is accepted as a placeholder and not used)")
-
-    # --- build vocabularies ---
-    # Build the train-only user vocabulary and unknown-user fallback.
-    user_to_index, unknown_user_index = _build_user_index(target_posts_df, logger)
-    # Count all valid item rows from the Stage 1 memmap.
-    num_known_items = int(embeddings_mmap.shape[0])
-    # Reserve one extra item slot as a defensive unknown-item bucket.
-    unknown_item_index = num_known_items
-    # Derive the total item vocabulary size including the fallback bucket.
-    num_items = num_known_items + 1
-    # Derive the total user vocabulary size including the fallback bucket.
-    num_users = len(user_to_index) + 1
-    # Log the resulting vocabulary sizes.
+    # Log the placeholder nature of user_encoder for this model type.
     logger.info(
-        f"Item vocabulary built from embeddings memmap: {num_known_items:,} known items + 1 unknown-item bucket"
+        f"Collaborative-filter mode selected (user_encoder={user_encoder!r} is accepted as a placeholder and not used architecturally)"
     )
 
-    # --- create datasets ---
-    # Start the dataset construction section in the logs.
-    log_operation_start("Create collaborative-filter datasets", STAGE_LOG_NAME, logger)
-    # Build the train split dataset.
-    train_dataset, train_stats = _build_interaction_dataset(
+    # --- build vocabularies from train positives and candidate items ---
+    # Build the train-user vocabulary plus unseen-user bucket.
+    user_to_index, unknown_user_index = _build_user_index(target_posts_df, logger)
+    # Build the compact item vocabulary from all candidate items.
+    item_to_index, unknown_item_index = _build_item_index(target_posts_df, logger)
+    # Count the trainable items excluding the unknown-item bucket.
+    num_train_items = len(item_to_index)
+    # Count the total items including the unknown-item bucket.
+    num_items = num_train_items + 1
+    # Count the total users including the unseen-user bucket.
+    num_users = len(user_to_index) + 1
+
+    # --- build positive-only train lookup ---
+    # Build the train user -> positive items lookup from observed likes only.
+    user_positive_items, train_user_indices, num_positive_pairs = _build_train_positive_lookup(
         target_posts_df=target_posts_df,
-        history_df=history_df,
+        user_to_index=user_to_index,
+        item_to_index=item_to_index,
+        logger=logger,
+    )
+    # Choose the implicit positive weight by balancing positives and unlabeled zeros.
+    positive_weight = _auto_balance_positive_weight(
+        num_users=len(train_user_indices),
+        num_items=num_train_items,
+        num_positive_pairs=num_positive_pairs,
+    )
+    # Log the auto-balanced positive weight for reproducibility.
+    logger.info(f"Implicit positive weight (auto-balanced): {positive_weight:.2f}")
+
+    # --- build candidate datasets for validation and later exports ---
+    # Start the candidate-dataset construction section in the logs.
+    log_operation_start("Create candidate datasets for scoring/evaluation", STAGE_LOG_NAME, logger)
+    # Build the candidate train dataset.
+    train_candidate_dataset, train_stats = _build_candidate_dataset(
+        target_posts_df=target_posts_df,
         split="train",
         user_to_index=user_to_index,
         unknown_user_index=unknown_user_index,
+        item_to_index=item_to_index,
         unknown_item_index=unknown_item_index,
         logger=logger,
     )
-    # Build the validation split dataset.
-    val_dataset, val_stats = _build_interaction_dataset(
+    # Build the candidate validation dataset.
+    val_candidate_dataset, val_stats = _build_candidate_dataset(
         target_posts_df=target_posts_df,
-        history_df=history_df,
         split="val",
         user_to_index=user_to_index,
         unknown_user_index=unknown_user_index,
+        item_to_index=item_to_index,
         unknown_item_index=unknown_item_index,
         logger=logger,
     )
-    # Build the train DataLoader.
-    train_loader = _create_loader(
-        dataset=train_dataset,
+    # Build the train candidate DataLoader used for final exports.
+    train_candidate_loader = _create_loader(
+        dataset=train_candidate_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
     )
-    # Build the validation DataLoader.
-    val_loader = _create_loader(
-        dataset=val_dataset,
+    # Build the validation candidate DataLoader used for early stopping.
+    val_candidate_loader = _create_loader(
+        dataset=val_candidate_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
@@ -694,7 +834,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     )
 
     # --- build model ---
-    # Instantiate the minimal collaborative-filter model.
+    # Instantiate the minimal implicit collaborative-filter model.
     model = CollaborativeFilteringModel(
         num_users=num_users,
         num_items=num_items,
@@ -702,46 +842,49 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     )
 
     # --- train ---
-    # Start the training section in the logs.
+    # Start the fitting section in the logs.
     log_operation_start(
-        f"Training collaborative-filter model (epochs={epochs}, batch_size={batch_size})",
+        f"Training implicit collaborative-filter model (epochs={epochs}, user_batch_size={batch_size})",
         STAGE_LOG_NAME,
         logger,
     )
-    # Run the training loop and capture the best model state/history.
+    # Run the positive-only implicit training loop.
     training_results = train_collaborative_filter_model(
         model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
+        train_user_indices=train_user_indices,
+        user_positive_items=user_positive_items,
+        num_train_items=num_train_items,
+        val_loader=val_candidate_loader,
         device=device,
         epochs=epochs,
+        user_batch_size=batch_size,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         patience=patience,
         lr_scheduler_factor=lr_scheduler_factor,
         lr_scheduler_patience=lr_scheduler_patience,
         disable_progress=disable_progress,
-        gradient_clip_max_norm=gradient_clip_max_norm,
+        positive_weight=positive_weight,
     )
-    # Pull the trained model out of the result bundle.
+    # Pull the fitted model out of the result bundle.
     trained_model: CollaborativeFilteringModel = training_results["model"]
-    # Read the best validation AUC for config and metadata output.
+    # Read the best validation AUC for config output.
     best_val_auc = float(training_results["best_val_auc"])
 
-    # --- evaluate on train and val ---
-    # Evaluate the fitted model on the train split for plots and exports.
-    train_eval = _evaluate_model(trained_model, train_loader, device)
-    # Evaluate the fitted model on the validation split for plots and exports.
-    val_eval = _evaluate_model(trained_model, val_loader, device)
+    # --- evaluate on candidate train and val pairs ---
+    # Score the train candidate pairs for export and metrics.
+    train_eval = _evaluate_model(trained_model, train_candidate_loader, device)
+    # Score the validation candidate pairs for export and metrics.
+    val_eval = _evaluate_model(trained_model, val_candidate_loader, device)
     # Log the train metric summary.
-    logger.info(f"Train metrics: {train_eval['metrics']}")
+    logger.info(f"Train candidate metrics: {train_eval['metrics']}")
     # Log the validation metric summary.
-    logger.info(f"Validation metrics: {val_eval['metrics']}")
+    logger.info(f"Validation candidate metrics: {val_eval['metrics']}")
 
     # --- plots ---
-    # Optionally create train/val diagnostic plots using the shared helper.
+    # Optionally create ROC/PR diagnostics for candidate-pair scoring.
     if generate_plots:
-        # Plot train ROC/PR diagnostics.
+        # Plot train candidate diagnostics.
         try:
             plot_model_performance(
                 train_eval["predictions"]["y_true"],
@@ -751,7 +894,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             )
         except Exception as exc:
             logger.warning(f"Train performance plotting failed: {exc}")
-        # Plot validation ROC/PR diagnostics.
+        # Plot validation candidate diagnostics.
         try:
             plot_model_performance(
                 val_eval["predictions"]["y_true"],
@@ -763,15 +906,15 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             logger.warning(f"Validation performance plotting failed: {exc}")
 
     # --- save model ---
-    # Initialize the optional model path to None for the artifact dict.
+    # Initialize the optional model path for the artifact dict.
     model_path: Optional[Path] = None
-    # Persist the learned latent-factor model when checkpoint saving is enabled.
+    # Persist the fitted model when checkpoint saving is enabled.
     if save_model:
         # Announce checkpoint writing in the stage log.
         log_operation_start("Save model checkpoint", STAGE_LOG_NAME, logger)
-        # Build the final checkpoint path inside the stage output directory.
+        # Build the final checkpoint path.
         model_path = checkpoints_dir / f"collaborative_filter_{timestamp}.pth"
-        # Save the model weights plus enough config to reload later.
+        # Save weights plus the compact vocab metadata.
         torch.save(
             {
                 "model_state_dict": trained_model.state_dict(),
@@ -782,6 +925,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                 "cf_latent_dim": cf_latent_dim,
                 "unknown_user_index": unknown_user_index,
                 "unknown_item_index": unknown_item_index,
+                "positive_weight": positive_weight,
                 "training_results": {
                     "history": training_results["history"],
                     "best_val_loss": training_results["best_val_loss"],
@@ -797,24 +941,24 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             },
             model_path,
         )
-        # Log the final checkpoint path for debugging.
+        # Log the checkpoint path.
         logger.info(f"Model saved to: {model_path}")
         # Register the checkpoint with the experiment tracker when available.
         context.tracker.log_artifact(name="collaborative_filter_model", path=model_path)
 
     # --- save predictions ---
-    # Create the shared predictions output directory.
+    # Create the standard predictions directory.
     predictions_dir = out_dir / "predictions"
-    # Materialize the predictions directory before writing parquet files.
+    # Materialize the predictions directory.
     predictions_dir.mkdir(parents=True, exist_ok=True)
-    # Write train predictions in the standard schema consumed by evaluation.
+    # Write train candidate predictions in the shared schema.
     pl.DataFrame({
         "did": train_eval["predictions"]["user_id"],
         "post_id": train_eval["predictions"]["post_id"],
         "y_true": train_eval["predictions"]["y_true"],
         "y_pred_proba": train_eval["predictions"]["y_pred"],
     }).write_parquet(predictions_dir / "train.parquet")
-    # Write validation predictions in the same standard schema.
+    # Write validation candidate predictions in the shared schema.
     pl.DataFrame({
         "did": val_eval["predictions"]["user_id"],
         "post_id": val_eval["predictions"]["post_id"],
@@ -823,20 +967,20 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     }).write_parquet(predictions_dir / "val.parquet")
 
     # --- holdout evaluation ---
-    # Initialize the holdout metric bundle with an empty dict.
+    # Initialize the preferred holdout metric bundle.
     holdout_metrics: Dict[str, Any] = {}
-    # Evaluate both holdout flavors so Stage 5 can load either one later.
+    # Evaluate both holdout flavors so Stage 5 can load either one.
     for holdout_type in ["unseen_users", "seen_users"]:
         # Derive the Stage 2 split name from the holdout flavor.
         split_name = f"holdout_{holdout_type}"
         try:
-            # Build the holdout dataset using the same user/item mappings.
-            holdout_dataset, holdout_stats = _build_interaction_dataset(
+            # Build the holdout candidate dataset.
+            holdout_dataset, holdout_stats = _build_candidate_dataset(
                 target_posts_df=target_posts_df,
-                history_df=history_df,
                 split=split_name,
                 user_to_index=user_to_index,
                 unknown_user_index=unknown_user_index,
+                item_to_index=item_to_index,
                 unknown_item_index=unknown_item_index,
                 logger=logger,
             )
@@ -844,7 +988,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             if len(holdout_dataset) == 0:
                 logger.info(f"No rows for split '{split_name}', skipping.")
                 continue
-            # Announce the holdout evaluation run in the stage log.
+            # Announce the holdout evaluation run in the logs.
             log_operation_start(f"Holdout evaluation ({holdout_type})", STAGE_LOG_NAME, logger)
             # Build the holdout DataLoader.
             holdout_loader = _create_loader(
@@ -856,23 +1000,23 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                 persistent_workers=persistent_workers,
                 prefetch_factor=prefetch_factor,
             )
-            # Run the holdout inference pass.
+            # Score the holdout candidate pairs.
             holdout_eval = _evaluate_model(trained_model, holdout_loader, device)
-            # Read the metric summary for this holdout split.
+            # Read the holdout metric bundle.
             split_metrics = holdout_eval["metrics"]
-            # Log the metrics together with unknown-user/item counts.
+            # Log metrics together with fallback usage stats.
             logger.info(f"Holdout metrics ({holdout_type}): {split_metrics} | stats={holdout_stats}")
-            # Keep the preferred holdout metrics in the top-level config bundle.
+            # Keep the preferred holdout metrics for metadata output.
             if holdout_type == eval_holdout_type:
                 holdout_metrics = split_metrics
-            # Write the holdout prediction parquet in the shared schema.
+            # Write the holdout predictions in the shared schema.
             pl.DataFrame({
                 "did": holdout_eval["predictions"]["user_id"],
                 "post_id": holdout_eval["predictions"]["post_id"],
                 "y_true": holdout_eval["predictions"]["y_true"],
                 "y_pred_proba": holdout_eval["predictions"]["y_pred"],
             }).write_parquet(predictions_dir / f"{split_name}.parquet")
-            # Optionally emit the main holdout diagnostic plot.
+            # Optionally create the main holdout ROC/PR plot.
             if generate_plots and holdout_type == eval_holdout_type:
                 try:
                     plot_model_performance(
@@ -888,15 +1032,17 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             logger.warning(f"Holdout evaluation ({holdout_type}) failed (non-fatal): {exc}")
 
     # --- training config ---
-    # Assemble a compact JSON summary for later inspection.
+    # Assemble the compact JSON config summary.
     training_config = {
         "model_type": "collaborative-filter",
+        "training_mode": "positive_only_implicit_logistic_mf",
         "user_encoder": user_encoder,
         "cf_latent_dim": cf_latent_dim,
         "num_users": num_users,
         "num_items": num_items,
         "unknown_user_index": unknown_user_index,
         "unknown_item_index": unknown_item_index,
+        "positive_weight": positive_weight,
         "batch_size": batch_size,
         "learning_rate": learning_rate,
         "weight_decay": weight_decay,
@@ -904,6 +1050,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "patience": patience,
         "random_seed": random_seed,
         "embed_dim": embed_dim,
+        "num_train_positive_pairs": num_positive_pairs,
         "train_stats": train_stats,
         "val_stats": val_stats,
         "train_metrics": train_eval["metrics"],
@@ -911,31 +1058,30 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "holdout_metrics": holdout_metrics,
         "best_val_auc": best_val_auc,
     }
-    # Write the JSON summary into the stage output directory.
+    # Write the config summary.
     with open(out_dir / "training_config.json", "w") as f:
         json.dump(training_config, f, indent=2)
 
     # --- stage info ---
-    # Compute the total stage runtime in seconds.
+    # Compute the total stage runtime.
     runtime = time.time() - t0
-    # Build the human-readable stage metadata file.
+    # Build the human-readable stage metadata lines.
     info_lines = [
         "stage: train_collaborative_filter",
         f"timestamp: {timestamp}",
         f"runtime_seconds: {runtime:.2f}",
         f"settings: batch_size={batch_size}, lr={learning_rate}, epochs={epochs}, cf_latent_dim={cf_latent_dim}",
-        "inputs: embeddings memmap size, target_posts, user_history",
-        f"train_samples: {len(train_dataset)}",
-        f"val_samples: {len(val_dataset)}",
+        "training_mode: positive_only_implicit_logistic_mf",
+        f"train_positive_pairs: {num_positive_pairs}",
         f"best_val_auc: {best_val_auc:.4f}",
     ]
-    # Add holdout AUC when it is available.
+    # Add holdout AUC when present.
     if holdout_metrics.get("auc_roc"):
         info_lines.append(f"holdout_auc: {holdout_metrics['auc_roc']:.4f}")
     # Persist the stage metadata file.
     (out_dir / "stage_info.txt").write_text("\n".join(info_lines) + "\n")
 
-    # Announce stage completion in the log.
+    # Log stage completion.
     logger.info(f"Collaborative-filter training completed in {runtime:.2f}s")
 
     # Return the standard stage result payload.

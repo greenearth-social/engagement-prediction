@@ -8,7 +8,9 @@ import torch
 
 stage_train_cf = importlib.import_module("utils.04_train.stage_train_collaborative_filter")
 CollaborativeFilteringModel = stage_train_cf.CollaborativeFilteringModel
-_build_interaction_dataset = stage_train_cf._build_interaction_dataset
+_build_candidate_dataset = stage_train_cf._build_candidate_dataset
+_build_item_index = stage_train_cf._build_item_index
+_build_train_positive_lookup = stage_train_cf._build_train_positive_lookup
 _build_user_index = stage_train_cf._build_user_index
 
 
@@ -38,7 +40,31 @@ def test_build_user_index_uses_train_split_only():
     assert unknown_index == 1
 
 
-def test_build_interaction_dataset_maps_unseen_users_to_unknown_bucket():
+def test_build_train_positive_lookup_uses_only_observed_likes():
+    target_posts_df = pl.DataFrame({
+        "target_did": ["u_train", "u_train", "u_other"],
+        "like_uri": ["like_a", "like_b", "like_c"],
+        "neg_uri": ["neg_a", "neg_b", "neg_c"],
+        "like_emb_idx": [11, 12, 13],
+        "neg_emb_idx": [99, 98, 97],
+        "split": ["train", "train", "val"],
+    })
+
+    user_mapping, _unknown_user_index = _build_user_index(target_posts_df, logging.getLogger("cf-test"))
+    item_mapping, _unknown_item_index = _build_item_index(target_posts_df, logging.getLogger("cf-test"))
+    lookup, train_user_indices, num_positive_pairs = _build_train_positive_lookup(
+        target_posts_df,
+        user_mapping,
+        item_mapping,
+        logging.getLogger("cf-test"),
+    )
+
+    assert train_user_indices.tolist() == [0]
+    assert num_positive_pairs == 2
+    assert lookup[0].tolist() == [item_mapping[11], item_mapping[12]]
+
+
+def test_build_candidate_dataset_maps_unseen_users_to_unknown_bucket():
     target_posts_df = pl.DataFrame({
         "target_did": ["u_train", "u_holdout"],
         "like_uri": ["like_train", "like_holdout"],
@@ -47,20 +73,16 @@ def test_build_interaction_dataset_maps_unseen_users_to_unknown_bucket():
         "neg_emb_idx": [3, 4],
         "split": ["train", "holdout_unseen_users"],
     })
-    history_df = pl.DataFrame({
-        "target_did": ["u_train", "u_holdout"],
-        "like_uri": ["like_train", "like_holdout"],
-        "prior_emb_indices": [[0], [1]],
-    })
 
     mapping, unknown_index = _build_user_index(target_posts_df, logging.getLogger("cf-test"))
-    dataset, stats = _build_interaction_dataset(
+    item_mapping, unknown_item_index = _build_item_index(target_posts_df, logging.getLogger("cf-test"))
+    dataset, stats = _build_candidate_dataset(
         target_posts_df=target_posts_df,
-        history_df=history_df,
         split="holdout_unseen_users",
         user_to_index=mapping,
         unknown_user_index=unknown_index,
-        unknown_item_index=10,
+        item_to_index=item_mapping,
+        unknown_item_index=unknown_item_index,
         logger=logging.getLogger("cf-test"),
     )
 
