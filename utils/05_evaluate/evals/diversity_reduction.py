@@ -3,43 +3,41 @@
 """
 Diversity Reduction Evaluation Module
 
-Tests whether the model's high-confidence predictions are less
-trait-diverse than a user's actual likes.  For each user and each NLP
-trait, compares:
+For each inference group (topic, emotion_sentiment, sentiment, toxicity, …)
+and each user, computes the Shannon entropy of the mean trait vector across
+two post sets:
 
-- actual diversity:    variance of the trait among liked posts (y_true == 1)
-- predicted diversity: variance of the trait among the user's top-quartile
-                       posts by y_pred_proba
+- actual likes:     posts where y_true == 1
+- model top picks:  top-quartile posts by y_pred_proba
 
-A diversity ratio < 1 means the model narrows the range of that trait the
-user would be exposed to ("homogenisation").
+An entropy ratio H(predicted) / H(actual) < 1 means the model concentrates
+content into fewer categories than the user's organic behaviour.
 
 Outputs (under diversity_reduction/):
-- <group>_diversity.png:       small-multiples KDE of per-user diversity ratios
-- diversity_summary_bars.png:  horizontal bar chart of median ratios across traits
+- <group>_entropy.png:          histogram of per-user entropy ratios
+- <group>_category_shift.png:   grouped bar chart of mean category shares
+                                (actual vs predicted)
+- diversity_summary_bars.png:   one bar per group showing median entropy ratio
 - diversity_reduction_summary.json
 """
 
 from __future__ import annotations
 
-import math
-from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, NamedTuple
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
-from scipy.stats import gaussian_kde
 
 from . import EvalContext, EvalModule
 from .trait_corrs import _load_inferences, _unnest_text_inferences
 from .trait_amplification import MIN_USER_POSTS, _filter_eligible_users
 
-MIN_LIKED_POSTS_PER_TRAIT = 10
-MIN_USERS_PER_TRAIT = 30
+MIN_LIKED_POSTS = 10
+MIN_USERS_PER_GROUP = 30
 
 _GROUP_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
@@ -51,20 +49,49 @@ _GROUP_COLORS = [
 # Computation
 # ---------------------------------------------------------------------------
 
-def _compute_diversity_ratios(
+def _shannon_entropy(p: np.ndarray) -> float:
+    """Shannon entropy of a probability vector (zeros handled safely)."""
+    p = p[p > 0]
+    return -float(np.sum(p * np.log(p)))
+
+
+class GroupEntropyResult(NamedTuple):
+    H_actual: np.ndarray
+    H_predicted: np.ndarray
+    user_ids: np.ndarray
+    mean_share_actual: np.ndarray
+    mean_share_predicted: np.ndarray
+
+
+def _compute_entropy_ratios(
     user_ids: np.ndarray,
     user_to_rows: Dict[Any, np.ndarray],
     y_true: np.ndarray,
     y_pred: np.ndarray,
     trait_arrays: Dict[str, np.ndarray],
     finite_masks: Dict[str, np.ndarray],
-    valid_keys: List[str],
-) -> Dict[str, List[float]]:
-    """Per-user diversity ratio (predicted variance / actual variance) per trait.
+    trait_labels: List[str],
+) -> GroupEntropyResult | None:
+    """Per-user entropy of mean trait vector: actual likes vs model top picks.
 
-    Returns {key: list_of_ratios} with one ratio per eligible user.
+    For each eligible user, builds the mean trait vector across all traits in
+    the group for liked posts and top-quartile predicted posts, normalises each
+    to a probability distribution, and computes Shannon entropy.
+
+    Also accumulates population-level mean share vectors for the category-shift
+    plot.
     """
-    ratios: Dict[str, List[float]] = defaultdict(list)
+    n_traits = len(trait_labels)
+    if n_traits < 2:
+        return None
+
+    keys = [trait_labels[i] for i in range(n_traits)]
+
+    h_actual_list: List[float] = []
+    h_pred_list: List[float] = []
+    uid_list: List[Any] = []
+    share_actual_accum = np.zeros(n_traits, dtype=np.float64)
+    share_pred_accum = np.zeros(n_traits, dtype=np.float64)
 
     for uid in user_ids:
         rows = user_to_rows[uid]
@@ -72,141 +99,192 @@ def _compute_diversity_ratios(
         yp = y_pred[rows]
 
         liked_idx = rows[yt == 1]
-        if len(liked_idx) < MIN_LIKED_POSTS_PER_TRAIT:
+        if len(liked_idx) < MIN_LIKED_POSTS:
             continue
 
         n_top = max(1, len(rows) // 4)
         top_idx = rows[np.argsort(yp)[-n_top:]]
 
-        for key in valid_keys:
-            t_liked = trait_arrays[key][liked_idx]
-            m_liked = finite_masks[key][liked_idx]
-            if m_liked.sum() < MIN_LIKED_POSTS_PER_TRAIT:
-                continue
-            var_actual = float(np.var(t_liked[m_liked]))
-            if var_actual == 0:
-                continue
+        vec_actual = np.empty(n_traits)
+        vec_pred = np.empty(n_traits)
+        valid = True
 
-            t_top = trait_arrays[key][top_idx]
-            m_top = finite_masks[key][top_idx]
-            if m_top.sum() < 3:
-                continue
-            var_pred = float(np.var(t_top[m_top]))
+        for ti, key in enumerate(keys):
+            a_vals = trait_arrays[key][liked_idx]
+            a_mask = finite_masks[key][liked_idx]
+            if a_mask.sum() < 3:
+                valid = False
+                break
+            vec_actual[ti] = float(np.mean(a_vals[a_mask]))
 
-            ratios[key].append(var_pred / var_actual)
+            p_vals = trait_arrays[key][top_idx]
+            p_mask = finite_masks[key][top_idx]
+            if p_mask.sum() < 3:
+                valid = False
+                break
+            vec_pred[ti] = float(np.mean(p_vals[p_mask]))
 
-    return {k: v for k, v in ratios.items() if len(v) >= MIN_USERS_PER_TRAIT}
+        if not valid:
+            continue
+
+        np.clip(vec_actual, 0, None, out=vec_actual)
+        np.clip(vec_pred, 0, None, out=vec_pred)
+
+        s_actual = vec_actual.sum()
+        s_pred = vec_pred.sum()
+        if s_actual == 0 or s_pred == 0:
+            continue
+
+        p_actual = vec_actual / s_actual
+        p_pred = vec_pred / s_pred
+
+        h_a = _shannon_entropy(p_actual)
+        h_p = _shannon_entropy(p_pred)
+        if h_a == 0:
+            continue
+
+        h_actual_list.append(h_a)
+        h_pred_list.append(h_p)
+        uid_list.append(uid)
+        share_actual_accum += p_actual
+        share_pred_accum += p_pred
+
+    if len(h_actual_list) < MIN_USERS_PER_GROUP:
+        return None
+
+    n = len(h_actual_list)
+    mean_share_actual = share_actual_accum / n
+    mean_share_pred = share_pred_accum / n
+
+    return GroupEntropyResult(
+        H_actual=np.array(h_actual_list),
+        H_predicted=np.array(h_pred_list),
+        user_ids=np.array(uid_list),
+        mean_share_actual=mean_share_actual,
+        mean_share_predicted=mean_share_pred,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Plots
 # ---------------------------------------------------------------------------
 
-def _safe_kde(values: np.ndarray, grid: np.ndarray) -> np.ndarray | None:
-    try:
-        return gaussian_kde(values)(grid)
-    except Exception:
-        return None
-
-
-def _plot_group_diversity(
+def _plot_entropy_histogram(
     group_name: str,
-    trait_ratios: Dict[str, np.ndarray],
+    result: GroupEntropyResult,
     out_dir: Path,
 ) -> Path:
-    labels = sorted(trait_ratios.keys())
-    n = len(labels)
-    ncols = min(3, n)
-    nrows = math.ceil(n / ncols)
+    """Histogram of per-user H(predicted) / H(actual) for one group."""
+    ratios = result.H_predicted / result.H_actual
 
-    fig, axes = plt.subplots(nrows, ncols,
-                             figsize=(5 * ncols, 3.5 * nrows),
-                             squeeze=False)
+    x_upper = max(float(np.percentile(ratios, 95)), 1.5)
+    n_bins = 40
+    bins = np.linspace(0, x_upper, n_bins + 1)
+    n_clipped = int((ratios > x_upper).sum())
+    clipped = ratios[ratios <= x_upper]
 
-    for idx, label in enumerate(labels):
-        row, col = divmod(idx, ncols)
-        ax = axes[row][col]
-        vals = trait_ratios[label]
-
-        lo = max(0, float(np.percentile(vals, 1)) - 0.1)
-        hi = float(np.percentile(vals, 99)) + 0.1
-        grid = np.linspace(lo, hi, 300)
-
-        density = _safe_kde(vals, grid)
-        if density is not None:
-            ax.fill_between(grid, density, where=(grid < 1.0),
-                            alpha=0.3, color="#D65F5F")
-            ax.fill_between(grid, density, where=(grid >= 1.0),
-                            alpha=0.15, color="#4878CF")
-            ax.plot(grid, density, color="#333333", linewidth=0.9)
+    fig, ax = plt.subplots(figsize=(7, 4))
+    _, _, patches = ax.hist(clipped, bins=bins, density=True,
+                            edgecolor="white", linewidth=0.4)
+    for patch in patches:
+        center = patch.get_x() + patch.get_width() / 2
+        if center < 1.0:
+            patch.set_facecolor("#D65F5F")
+            patch.set_alpha(0.6)
         else:
-            ax.hist(vals, bins=30, density=True, alpha=0.4, color="#999999")
+            patch.set_facecolor("#4878CF")
+            patch.set_alpha(0.5)
 
-        ax.axvline(1.0, color="black", linestyle="--", linewidth=0.8,
-                   label="no change")
-        med = float(np.median(vals))
-        ax.axvline(med, color="#d62728", linewidth=1.0,
-                   label=f"median = {med:.3f}")
+    ax.axvline(1.0, color="black", linestyle="--", linewidth=0.8,
+               label="no change")
+    med = float(np.median(ratios))
+    ax.axvline(med, color="#d62728", linewidth=1.0,
+               label=f"median = {med:.3f}")
 
-        frac_below = float((vals < 1.0).mean())
-        ax.set_title(f"{label}  ({frac_below:.0%} < 1)",
-                     fontsize=8, fontweight="bold")
-        ax.set_xlabel("diversity ratio (pred / actual)", fontsize=7)
-        ax.set_ylabel("density", fontsize=7)
-        ax.tick_params(labelsize=6)
-        ax.legend(fontsize=6, loc="upper right", framealpha=0.7)
+    frac_below = float((ratios < 1.0).mean())
+    title = (
+        f"{group_name.replace('_', ' ').title()} — Entropy Ratio  "
+        f"({frac_below:.0%} of users narrowed)"
+    )
+    if n_clipped > 0:
+        title += f"  [{n_clipped} clipped]"
+    ax.set_title(title, fontsize=10, fontweight="bold")
+    ax.set_xlabel("H(predicted) / H(actual)", fontsize=9)
+    ax.set_ylabel("density", fontsize=9)
+    ax.set_xlim(0, x_upper)
+    ax.legend(fontsize=8, loc="upper right", framealpha=0.7)
+    plt.tight_layout()
 
-    for idx in range(n, nrows * ncols):
-        row, col = divmod(idx, ncols)
-        axes[row][col].set_visible(False)
+    path = out_dir / f"{group_name}_entropy.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
 
-    fig.suptitle(
-        f"{group_name.replace('_', ' ').title()} — Diversity Ratio "
-        "(top-quartile predicted variance / actual-liked variance)",
+
+def _plot_category_shift(
+    group_name: str,
+    trait_labels: List[str],
+    result: GroupEntropyResult,
+    out_dir: Path,
+) -> Path:
+    """Grouped horizontal bar chart: actual vs predicted mean category share."""
+    actual = result.mean_share_actual
+    predicted = result.mean_share_predicted
+    shift = predicted - actual
+
+    order = np.argsort(shift)
+    labels = [trait_labels[i] for i in order]
+    actual_s = actual[order]
+    predicted_s = predicted[order]
+
+    y = np.arange(len(labels))
+    bar_h = 0.35
+
+    fig, ax = plt.subplots(figsize=(8, max(3, 0.45 * len(labels))))
+    ax.barh(y - bar_h / 2, actual_s, bar_h, label="actual likes",
+            color="#4878CF", edgecolor="white", linewidth=0.4)
+    ax.barh(y + bar_h / 2, predicted_s, bar_h, label="model top picks",
+            color="#D65F5F", edgecolor="white", linewidth=0.4)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=7)
+    ax.invert_yaxis()
+    ax.set_xlabel("mean share (normalised)", fontsize=9)
+    ax.set_title(
+        f"{group_name.replace('_', ' ').title()} — Category Shares: "
+        "Actual Likes vs Model Top Picks",
         fontsize=10, fontweight="bold",
     )
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    ax.legend(fontsize=8, loc="lower right", framealpha=0.7)
+    plt.tight_layout()
 
-    path = out_dir / f"{group_name}_diversity.png"
+    path = out_dir / f"{group_name}_category_shift.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return path
 
 
 def _plot_summary_bars(
-    all_medians: Dict[str, Tuple[str, float]],
+    group_medians: Dict[str, float],
     group_color_map: Dict[str, str],
     out_dir: Path,
 ) -> Path:
-    from matplotlib.patches import Patch
+    """One horizontal bar per group showing median entropy ratio."""
+    sorted_groups = sorted(group_medians, key=group_medians.get)  # type: ignore[arg-type]
+    labels = [g.replace("_", " ") for g in sorted_groups]
+    medians = [group_medians[g] for g in sorted_groups]
+    colors = [group_color_map.get(g, "#999999") for g in sorted_groups]
 
-    sorted_keys = sorted(all_medians,
-                         key=lambda k: all_medians[k][1])
-    labels = [k.split("::")[-1] for k in sorted_keys]
-    medians = [all_medians[k][1] for k in sorted_keys]
-    colors = [group_color_map.get(all_medians[k][0], "#999999")
-              for k in sorted_keys]
-
-    fig, ax = plt.subplots(figsize=(8, max(3, 0.35 * len(labels))))
+    fig, ax = plt.subplots(figsize=(7, max(2, 0.6 * len(labels))))
     y_pos = np.arange(len(labels))
 
     ax.barh(y_pos, medians, color=colors, edgecolor="white", linewidth=0.5)
     ax.set_yticks(y_pos)
-    ax.set_yticklabels(labels, fontsize=7)
+    ax.set_yticklabels(labels, fontsize=9)
     ax.invert_yaxis()
     ax.axvline(1.0, color="black", linestyle="--", linewidth=0.8)
-    ax.set_xlabel("Median diversity ratio (pred / actual)")
-    ax.set_title("Diversity Reduction Summary (< 1 = model narrows diversity)")
-
-    seen: set[str] = set()
-    handles = []
-    for k in sorted_keys:
-        g = all_medians[k][0]
-        if g not in seen:
-            seen.add(g)
-            handles.append(Patch(facecolor=group_color_map.get(g, "#999999"),
-                                 label=g.replace("_", " ")))
-    ax.legend(handles=handles, fontsize=6, loc="lower right", framealpha=0.8)
+    ax.set_xlabel("Median entropy ratio  H(predicted) / H(actual)", fontsize=9)
+    ax.set_title("Diversity Reduction Summary (< 1 = model narrows diversity)",
+                 fontsize=10, fontweight="bold")
     plt.tight_layout()
 
     path = out_dir / "diversity_summary_bars.png"
@@ -237,7 +315,6 @@ class DiversityReductionModule(EvalModule):
         except FileNotFoundError as e:
             return {"skipped": True, "reason": str(e)}
 
-        # --- Full holdout, filter to eligible users ---
         preds = pl.from_pandas(ctx.predictions_df)
         preds = _filter_eligible_users(preds)
         n_users_eligible = preds["did"].n_unique()
@@ -265,71 +342,74 @@ class DiversityReductionModule(EvalModule):
             u: np.where(user_col == u)[0] for u in user_ids
         }
 
-        trait_arrays: Dict[str, np.ndarray] = {}
-        finite_masks: Dict[str, np.ndarray] = {}
+        # --- Per-group trait arrays ---
+        group_trait_arrays: Dict[str, Dict[str, np.ndarray]] = {}
+        group_finite_masks: Dict[str, Dict[str, np.ndarray]] = {}
         group_labels: Dict[str, List[str]] = {}
 
         for gname in group_names:
             gdf = flat.select(gname).unnest(gname)
             cols = gdf.columns
             group_labels[gname] = cols
+            g_arrays: Dict[str, np.ndarray] = {}
+            g_masks: Dict[str, np.ndarray] = {}
             for col in cols:
-                key = f"{gname}::{col}"
                 arr = gdf[col].to_numpy().astype(float)
-                trait_arrays[key] = arr
-                finite_masks[key] = np.isfinite(arr)
+                g_arrays[col] = arr
+                g_masks[col] = np.isfinite(arr)
+            group_trait_arrays[gname] = g_arrays
+            group_finite_masks[gname] = g_masks
 
-        all_keys = list(trait_arrays.keys())
-
-        # --- Diversity ratios ---
-        ratios = _compute_diversity_ratios(
-            user_ids, user_to_rows, y_true, y_pred,
-            trait_arrays, finite_masks, all_keys,
-        )
-
-        # --- Plots ---
+        # --- Entropy computation + plots per group ---
         group_color_map = {
             g: _GROUP_COLORS[i % len(_GROUP_COLORS)]
             for i, g in enumerate(group_names)
         }
-        plot_paths: list[str] = []
-        all_medians: Dict[str, Tuple[str, float]] = {}
-
-        for gname in group_names:
-            group_traits: Dict[str, np.ndarray] = {}
-            for label in group_labels.get(gname, []):
-                key = f"{gname}::{label}"
-                if key not in ratios:
-                    continue
-                arr = np.array(ratios[key])
-                group_traits[label] = arr
-                all_medians[key] = (gname, float(np.median(arr)))
-            if not group_traits:
-                continue
-            plot_paths.append(
-                str(_plot_group_diversity(gname, group_traits, out_dir)))
-
-        if all_medians:
-            plot_paths.insert(
-                0, str(_plot_summary_bars(all_medians, group_color_map, out_dir)))
-
-        # --- Summary JSON ---
+        plot_paths: List[str] = []
+        group_medians: Dict[str, float] = {}
         groups_json: Dict[str, Any] = {}
+
         for gname in group_names:
-            gdict: Dict[str, Any] = {}
-            for label in group_labels.get(gname, []):
-                key = f"{gname}::{label}"
-                if key not in ratios:
-                    continue
-                arr = np.array(ratios[key])
-                gdict[label] = {
-                    "median_ratio": float(np.median(arr)),
-                    "mean_ratio": float(np.mean(arr)),
-                    "frac_below_1": float((arr < 1.0).mean()),
-                    "n_users_computed": len(arr),
-                }
-            if gdict:
-                groups_json[gname] = gdict
+            labels = group_labels[gname]
+            result = _compute_entropy_ratios(
+                user_ids, user_to_rows, y_true, y_pred,
+                group_trait_arrays[gname],
+                group_finite_masks[gname],
+                labels,
+            )
+            if result is None:
+                continue
+
+            ratios = result.H_predicted / result.H_actual
+            med = float(np.median(ratios))
+            group_medians[gname] = med
+
+            plot_paths.append(
+                str(_plot_entropy_histogram(gname, result, out_dir)))
+            plot_paths.append(
+                str(_plot_category_shift(gname, labels, result, out_dir)))
+
+            groups_json[gname] = {
+                "median_entropy_ratio": med,
+                "mean_entropy_ratio": float(np.mean(ratios)),
+                "frac_below_1": float((ratios < 1.0).mean()),
+                "median_H_actual": float(np.median(result.H_actual)),
+                "median_H_predicted": float(np.median(result.H_predicted)),
+                "n_users_computed": len(ratios),
+                "category_shares_actual": {
+                    labels[i]: float(result.mean_share_actual[i])
+                    for i in range(len(labels))
+                },
+                "category_shares_predicted": {
+                    labels[i]: float(result.mean_share_predicted[i])
+                    for i in range(len(labels))
+                },
+            }
+
+        if group_medians:
+            plot_paths.insert(
+                0, str(_plot_summary_bars(group_medians, group_color_map,
+                                          out_dir)))
 
         summary = {
             "n_users_eligible": n_users_eligible,
