@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Configuration ──────────────────────────────────────────────────────
-DATA_DIR="outputs/20260312_175428"
+DATA_DIR="outputs/20260316_012725"
 
 EPOCHS=100
 BATCH_SIZE=4096

@@ -15,6 +15,8 @@ purely within-user variation.  Bootstrap resampling over users provides CIs.
 Outputs (under trait_amplification/):
 - amplification_scatter.png: headline scatter of rho_true vs rho_pred
 - <group>_amplification.png: paired-bar detail per inference group
+- <group>_per_user_scatter.png: small-multiples scatter of per-user rho_pred
+  vs rho_true for each trait in the group
 - trait_amplification_summary.json: all correlations, deltas, CIs
 """
 
@@ -37,6 +39,7 @@ from .trait_corrs import _load_inferences, _unnest_text_inferences
 MIN_USER_POSTS = 20
 N_BOOTSTRAP = 500
 ALPHA = 0.05
+PER_USER_MIN_POSTS = 10
 
 _GROUP_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
@@ -222,6 +225,51 @@ def _bootstrap_cis(
     return cis
 
 
+def _compute_per_user_rhos(
+    user_ids: np.ndarray,
+    user_to_rows: Dict[Any, np.ndarray],
+    y_true_c: np.ndarray,
+    y_pred_c: np.ndarray,
+    trait_arrays: Dict[str, np.ndarray],
+    finite_masks: Dict[str, np.ndarray],
+    valid_keys: set[str],
+) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+    """Per-user Spearman rho for each trait.
+
+    Returns {key: (rho_true_array, rho_pred_array)} where each array has one
+    entry per user that had enough finite trait observations.
+    """
+    results: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+
+    for key in sorted(valid_keys):
+        vals = trait_arrays[key]
+        fmask = finite_masks[key]
+        rho_trues: List[float] = []
+        rho_preds: List[float] = []
+
+        for u in user_ids:
+            rows = user_to_rows[u]
+            row_finite = fmask[rows]
+            vr = rows[row_finite]
+            if len(vr) < PER_USER_MIN_POSTS:
+                continue
+            yt = y_true_c[vr]
+            yp = y_pred_c[vr]
+            tv = vals[vr]
+            if np.std(tv) < 1e-12 or np.std(yt) < 1e-12 or np.std(yp) < 1e-12:
+                continue
+            rt, _ = spearmanr(yt, tv)
+            rp, _ = spearmanr(yp, tv)
+            if np.isfinite(rt) and np.isfinite(rp):
+                rho_trues.append(rt)
+                rho_preds.append(rp)
+
+        if len(rho_trues) >= 5:
+            results[key] = (np.array(rho_trues), np.array(rho_preds))
+
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Plots
 # ---------------------------------------------------------------------------
@@ -336,6 +384,85 @@ def _plot_group_bars(
     return path
 
 
+def _plot_per_trait_scatter(
+    group_name: str,
+    labels: List[str],
+    per_user_rhos: Dict[str, Tuple[np.ndarray, np.ndarray]],
+    pooled_corrs: Dict[str, Tuple[float, float, float]],
+    out_dir: Path,
+) -> Path | None:
+    """Small multiples of per-user rho_true (x) vs rho_pred (y), one subplot per trait."""
+    valid_labels = [
+        l for l in labels if f"{group_name}::{l}" in per_user_rhos
+    ]
+    if not valid_labels:
+        return None
+
+    valid_labels.sort(
+        key=lambda l: abs(pooled_corrs.get(l, (0, 0, 0))[0]),
+        reverse=True,
+    )
+
+    n = len(valid_labels)
+    ncols = min(4, n)
+    nrows = (n + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(3.5 * ncols, 3.5 * nrows),
+        squeeze=False,
+    )
+
+    for i, label in enumerate(valid_labels):
+        ax = axes[i // ncols][i % ncols]
+        key = f"{group_name}::{label}"
+        rho_true, rho_pred = per_user_rhos[key]
+
+        colors = np.where(
+            rho_pred > rho_true, "#2ca02c", "#d62728",
+        )
+        ax.scatter(rho_true, rho_pred, s=5, alpha=0.25, edgecolors="none", c=colors)
+
+        lo = min(ax.get_xlim()[0], ax.get_ylim()[0])
+        hi = max(ax.get_xlim()[1], ax.get_ylim()[1])
+        margin = (hi - lo) * 0.05
+        lo -= margin
+        hi += margin
+        ax.plot([lo, hi], [lo, hi], "k--", linewidth=0.5, alpha=0.4)
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(lo, hi)
+        ax.set_aspect("equal")
+
+        ax.set_xlabel("ρ_true  (user)", fontsize=7)
+        ax.set_ylabel("ρ_pred  (user)", fontsize=7)
+        ax.set_title(label, fontsize=8)
+        ax.tick_params(labelsize=6)
+        ax.axhline(0, color="gray", linewidth=0.3)
+        ax.axvline(0, color="gray", linewidth=0.3)
+
+        r, _ = spearmanr(rho_true, rho_pred)
+        ax.text(
+            0.05, 0.95,
+            f"r={r:.2f}\nn={len(rho_true)}",
+            transform=ax.transAxes, fontsize=6, va="top",
+            bbox=dict(facecolor="white", alpha=0.7, edgecolor="none", pad=1),
+        )
+
+    for i in range(n, nrows * ncols):
+        axes[i // ncols][i % ncols].set_visible(False)
+
+    fig.suptitle(
+        f"{group_name.replace('_', ' ').title()} — Per-User Trait ρ",
+        fontsize=11,
+    )
+    plt.tight_layout()
+
+    path = out_dir / f"{group_name}_per_user_scatter.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
 # ---------------------------------------------------------------------------
 # Module
 # ---------------------------------------------------------------------------
@@ -410,6 +537,13 @@ class TraitAmplificationModule(EvalModule):
             valid_keys=set(all_corrs.keys()),
         )
 
+        # --- Per-user rhos for per-trait scatter plots ---
+        per_user_rhos = _compute_per_user_rhos(
+            user_ids, user_to_rows, y_true_c, y_pred_c,
+            trait_arrays, finite_masks,
+            valid_keys=set(all_corrs.keys()),
+        )
+
         # --- Partition results back by group ---
         group_color_map = {g: _GROUP_COLORS[i % len(_GROUP_COLORS)] for i, g in enumerate(group_names)}
         group_results: Dict[str, Dict[str, Tuple[float, float, float]]] = {}
@@ -426,6 +560,11 @@ class TraitAmplificationModule(EvalModule):
             group_results[gname] = traits
             path = _plot_group_bars(gname, traits, all_cis, out_dir)
             plot_paths.append(str(path))
+            scatter_path = _plot_per_trait_scatter(
+                gname, list(traits.keys()), per_user_rhos, traits, out_dir,
+            )
+            if scatter_path is not None:
+                plot_paths.append(str(scatter_path))
 
         if group_results:
             scatter_path = _plot_scatter(group_results, all_cis, group_color_map, out_dir)

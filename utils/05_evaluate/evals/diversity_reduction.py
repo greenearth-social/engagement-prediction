@@ -265,24 +265,39 @@ def _plot_category_shift(
 
 def _plot_summary_bars(
     group_medians: Dict[str, float],
+    group_ratios: Dict[str, np.ndarray],
     group_color_map: Dict[str, str],
     out_dir: Path,
 ) -> Path:
-    """One horizontal bar per group showing median entropy ratio."""
+    """Median bar + jittered user-level points per group."""
     sorted_groups = sorted(group_medians, key=group_medians.get)  # type: ignore[arg-type]
     labels = [g.replace("_", " ") for g in sorted_groups]
     medians = [group_medians[g] for g in sorted_groups]
     colors = [group_color_map.get(g, "#999999") for g in sorted_groups]
 
-    fig, ax = plt.subplots(figsize=(7, max(2, 0.6 * len(labels))))
+    fig, ax = plt.subplots(figsize=(8, max(3, 0.7 * len(labels))))
     y_pos = np.arange(len(labels))
 
-    ax.barh(y_pos, medians, color=colors, edgecolor="white", linewidth=0.5)
+    rng = np.random.default_rng(42)
+    for i, gname in enumerate(sorted_groups):
+        vals = group_ratios.get(gname, np.array([]))
+        if len(vals) == 0:
+            continue
+        jitter = rng.uniform(-0.25, 0.25, size=len(vals))
+        ax.scatter(vals, i + jitter, s=3, alpha=0.15, color=colors[i],
+                   edgecolors="none", rasterized=True)
+
+    ax.barh(y_pos, medians, height=0.5, color=colors, edgecolor="white",
+            linewidth=0.5, alpha=0.45, zorder=3)
+    for i, med in enumerate(medians):
+        ax.plot(med, i, marker="|", color="black", markersize=14,
+                markeredgewidth=1.8, zorder=4)
+
     ax.set_yticks(y_pos)
     ax.set_yticklabels(labels, fontsize=9)
     ax.invert_yaxis()
     ax.axvline(1.0, color="black", linestyle="--", linewidth=0.8)
-    ax.set_xlabel("Median entropy ratio  H(predicted) / H(actual)", fontsize=9)
+    ax.set_xlabel("Entropy ratio  H(predicted) / H(actual)", fontsize=9)
     ax.set_title("Diversity Reduction Summary (< 1 = model narrows diversity)",
                  fontsize=10, fontweight="bold")
     plt.tight_layout()
@@ -367,6 +382,7 @@ class DiversityReductionModule(EvalModule):
         }
         plot_paths: List[str] = []
         group_medians: Dict[str, float] = {}
+        group_ratios: Dict[str, np.ndarray] = {}
         groups_json: Dict[str, Any] = {}
 
         for gname in group_names:
@@ -383,6 +399,7 @@ class DiversityReductionModule(EvalModule):
             ratios = result.H_predicted / result.H_actual
             med = float(np.median(ratios))
             group_medians[gname] = med
+            group_ratios[gname] = ratios
 
             plot_paths.append(
                 str(_plot_entropy_histogram(gname, result, out_dir)))
@@ -408,8 +425,8 @@ class DiversityReductionModule(EvalModule):
 
         if group_medians:
             plot_paths.insert(
-                0, str(_plot_summary_bars(group_medians, group_color_map,
-                                          out_dir)))
+                0, str(_plot_summary_bars(group_medians, group_ratios,
+                                          group_color_map, out_dir)))
 
         summary = {
             "n_users_eligible": n_users_eligible,
