@@ -24,9 +24,9 @@ systematic model bias at the individual level.
 Outputs (under trait_ecological/):
 - <group>_ecological.png:           composite KDE plot per inference group
 - <group>_ecological_diff.png:      difference distribution per inference group
-- <group>_ecological_quintiles.png:      true-pref rho by like-volume quintile
-- <group>_ecological_quintiles_diff.png: model bias by like-volume quintile
-- ecological_gap_summary.png:            headline bar chart of ecological gaps
+- <group>_ecological_p90.png:       true-pref rho split at 90th-percentile like volume
+- <group>_ecological_p90_diff.png:  model bias split at 90th-percentile like volume
+- ecological_gap_summary.png:       headline bar chart of ecological gaps
 - trait_ecological_summary.json
 """
 
@@ -282,22 +282,18 @@ def _plot_group_diff(
     return path
 
 
-_QUINTILE_COLORS = ["#c6dbef", "#6baed6", "#3182bd", "#08519c", "#08306b"]
-_QUINTILE_LABELS = ["Q1 (fewest)", "Q2", "Q3", "Q4", "Q5 (most)"]
+_P90_COLORS = {"below": "#6baed6", "above": "#08519c"}
+_P90_LABELS = {"below": "< p90", "above": "≥ p90"}
 
 
-def _plot_group_quintiles(
+def _plot_group_p90(
     group_name: str,
     trait_results: Dict[str, TraitEcoResult],
     did_to_likes: Dict[Any, int],
-    quintile_edges: np.ndarray,
+    p90_threshold: float,
     out_dir: Path,
 ) -> Path:
-    """Small-multiples: user-level rho_true KDEs stratified by like-volume quintile.
-
-    Each panel shows one trait with five overlaid KDE curves (one per quintile
-    of num_total_likes) plus the tweet-level rho as a dashed vertical line.
-    """
+    """Small-multiples: user-level rho_true KDEs split at the 90th-percentile like volume."""
     labels = sorted(trait_results.keys())
     n = len(labels)
     ncols = min(3, n)
@@ -314,21 +310,22 @@ def _plot_group_quintiles(
         tr = trait_results[label]
 
         likes = np.array([did_to_likes.get(uid, 0) for uid in tr.user_ids])
-        q_assign = np.digitize(likes, quintile_edges[1:-1])
+        above = likes >= p90_threshold
 
-        for qi in range(5):
-            mask = q_assign == qi
+        for key, mask in [("below", ~above), ("above", above)]:
             if mask.sum() < 5:
                 continue
             subset = tr.user_rho_true[mask]
             density = _safe_kde(subset, grid)
+            lbl = f"{_P90_LABELS[key]} (n={mask.sum()})"
             if density is not None:
-                ax.plot(grid, density, color=_QUINTILE_COLORS[qi],
-                        linewidth=1.2, label=f"{_QUINTILE_LABELS[qi]} (n={mask.sum()})")
+                ax.fill_between(grid, density, alpha=0.25,
+                                color=_P90_COLORS[key])
+                ax.plot(grid, density, color=_P90_COLORS[key],
+                        linewidth=1.2, label=lbl)
             else:
                 ax.hist(subset, bins=25, density=True, alpha=0.25,
-                        color=_QUINTILE_COLORS[qi],
-                        label=f"{_QUINTILE_LABELS[qi]} (n={mask.sum()})")
+                        color=_P90_COLORS[key], label=lbl)
 
         ax.axvline(tr.rho_tweet, color="#D65F5F", linestyle="--",
                    linewidth=1.3,
@@ -346,25 +343,25 @@ def _plot_group_quintiles(
 
     fig.suptitle(
         f"{group_name.replace('_', ' ').title()}"
-        " — True-Preference ρ by Like-Volume Quintile",
+        f" — True-Preference ρ by Like Volume (p90 = {p90_threshold:.0f})",
         fontsize=11, fontweight="bold",
     )
     plt.tight_layout(rect=[0, 0, 1, 0.96])
 
-    path = out_dir / f"{group_name}_ecological_quintiles.png"
+    path = out_dir / f"{group_name}_ecological_p90.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return path
 
 
-def _plot_group_quintiles_diff(
+def _plot_group_p90_diff(
     group_name: str,
     trait_results: Dict[str, TraitEcoResult],
     did_to_likes: Dict[Any, int],
-    quintile_edges: np.ndarray,
+    p90_threshold: float,
     out_dir: Path,
 ) -> Path:
-    """Small-multiples: per-user (rho_pred - rho_true) stratified by like-volume quintile."""
+    """Small-multiples: per-user (rho_pred - rho_true) split at 90th-percentile like volume."""
     labels = sorted(trait_results.keys())
     n = len(labels)
     ncols = min(3, n)
@@ -381,25 +378,25 @@ def _plot_group_quintiles_diff(
         diff = tr.user_rho_pred - tr.user_rho_true
 
         likes = np.array([did_to_likes.get(uid, 0) for uid in tr.user_ids])
-        q_assign = np.digitize(likes, quintile_edges[1:-1])
+        above = likes >= p90_threshold
 
         all_lo, all_hi = float(diff.min()) - 0.05, float(diff.max()) + 0.05
         grid = np.linspace(all_lo, all_hi, 300)
 
-        for qi in range(5):
-            mask = q_assign == qi
+        for key, mask in [("below", ~above), ("above", above)]:
             if mask.sum() < 5:
                 continue
             subset = diff[mask]
             density = _safe_kde(subset, grid)
+            lbl = f"{_P90_LABELS[key]} (n={mask.sum()})"
             if density is not None:
-                ax.plot(grid, density, color=_QUINTILE_COLORS[qi],
-                        linewidth=1.2,
-                        label=f"{_QUINTILE_LABELS[qi]} (n={mask.sum()})")
+                ax.fill_between(grid, density, alpha=0.25,
+                                color=_P90_COLORS[key])
+                ax.plot(grid, density, color=_P90_COLORS[key],
+                        linewidth=1.2, label=lbl)
             else:
                 ax.hist(subset, bins=25, density=True, alpha=0.25,
-                        color=_QUINTILE_COLORS[qi],
-                        label=f"{_QUINTILE_LABELS[qi]} (n={mask.sum()})")
+                        color=_P90_COLORS[key], label=lbl)
 
         ax.axvline(0, color="black", linestyle="--", linewidth=0.8)
         mean_d = float(np.mean(diff))
@@ -418,12 +415,12 @@ def _plot_group_quintiles_diff(
 
     fig.suptitle(
         f"{group_name.replace('_', ' ').title()}"
-        " — Model Bias (ρ_pred − ρ_true) by Like-Volume Quintile",
+        f" — Model Bias (ρ_pred − ρ_true) by Like Volume (p90 = {p90_threshold:.0f})",
         fontsize=11, fontweight="bold",
     )
     plt.tight_layout(rect=[0, 0, 1, 0.96])
 
-    path = out_dir / f"{group_name}_ecological_quintiles_diff.png"
+    path = out_dir / f"{group_name}_ecological_p90_diff.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return path
@@ -525,7 +522,7 @@ class TraitEcologicalModule(EvalModule):
 
         user_ids = flat["did"].unique().to_numpy()
 
-        # --- Like-volume quintiles from user metadata ---
+        # --- 90th-percentile like-volume threshold from user metadata ---
         meta = ctx.user_metadata_df
         did_to_likes: Dict[Any, int] = dict(
             zip(meta["did"], meta["num_total_likes"])
@@ -533,9 +530,7 @@ class TraitEcologicalModule(EvalModule):
         eligible_likes = np.array([
             did_to_likes.get(uid, 0) for uid in user_ids
         ])
-        quintile_edges = np.quantile(
-            eligible_likes, [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
-        )
+        p90_threshold = float(np.quantile(eligible_likes, 0.9))
 
         # --- Plots ---
         group_color_map = {
@@ -563,13 +558,13 @@ class TraitEcologicalModule(EvalModule):
             plot_paths.append(
                 str(_plot_group_diff(gname, group_traits, out_dir)))
             plot_paths.append(
-                str(_plot_group_quintiles(gname, group_traits,
-                                         did_to_likes, quintile_edges,
-                                         out_dir)))
+                str(_plot_group_p90(gname, group_traits,
+                                   did_to_likes, p90_threshold,
+                                   out_dir)))
             plot_paths.append(
-                str(_plot_group_quintiles_diff(gname, group_traits,
-                                              did_to_likes, quintile_edges,
-                                              out_dir)))
+                str(_plot_group_p90_diff(gname, group_traits,
+                                        did_to_likes, p90_threshold,
+                                        out_dir)))
 
         if all_gaps:
             plot_paths.insert(
