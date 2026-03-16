@@ -19,10 +19,11 @@ import sys
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 import json
 import copy
 
+from utils.pipeline import registry as reg
 from utils.experiment_tracking import build_experiment_tracker
 from utils.pipeline.core import (
     Context,
@@ -38,6 +39,9 @@ from utils.pipeline.core import (
 # Avoid heavy imports at module import time; import lazily inside handlers
 
 CLI_FILE_DIR = Path(__file__).parent
+
+TRAIN_PLACEHOLDER = 'train_placeholder'
+STAGE_ORDER = ['get_data', 'target_posts', 'user_history', TRAIN_PLACEHOLDER, 'evaluate']
 
 # Central default map for all run-all parameters
 DEFAULTS: Dict[str, Any] = {
@@ -253,7 +257,19 @@ def _generate_run_name(args: argparse.Namespace) -> str:
             else:
                 stages_str += args.stop_after
 
-    stages_str += f"_{args.model_type}"
+    # Add the model type if the training stage is included
+    model_type = args.model_type
+    train_key = _get_train_key(model_type)
+    stage_order = _get_stage_order_for_model_type(train_key)
+    _, _, includes_train = _get_stage_folder_and_start_stop_indices(
+        stage_order,
+        args.start_from,
+        args.stop_after,
+        train_key
+    )
+    if includes_train:
+        stages_str += f"_{model_type}"
+
     return stages_str
 
 
@@ -461,11 +477,59 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     return cmd__run_all_exec(args, ctx)
 
 
+def _get_train_key(model_type: str) -> str:
+    # Do not default to MLP if model name is not recognized - raise error instead
+    if model_type == 'mlp':
+        return 'train_mlp'
+    elif model_type == 'two-tower':
+        return 'train_two_tower'
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
+
+
+def _get_stage_order_for_model_type(train_key: str) -> List[str]:
+    # replace the generic 'train_placeholder' with the actual train stage key based on train_key:
+    stage_order = copy.deepcopy(STAGE_ORDER)
+    return [train_key if s == TRAIN_PLACEHOLDER else s for s in stage_order]
+
+
+def _get_stage_folder(stage_order: List[str]) -> Dict[str, str]:
+    stage_folder = {}
+    for key in stage_order:
+        _mp, _folder = reg.get_stage_spec(key)
+        stage_folder[key] = _folder
+    return stage_folder
+
+
+def _get_stage_folder_and_start_stop_indices(
+    stage_order: List[str],
+    start_from: Optional[str],
+    stop_after: Optional[str],
+    train_key: str,
+) -> Tuple[int, int, bool]:
+    # Respect selective reruns (map the generic "train" alias to the concrete train stage key)
+    if start_from == 'train':
+        start_from = train_key
+    if stop_after == 'train':
+        stop_after = train_key
+    if start_from and start_from not in stage_order:
+        raise ValueError(f"Unrecognized start_from: {start_from}. Please choose from: {stage_order}")
+    if stop_after and stop_after not in stage_order:
+        raise ValueError(f"Unrecognized stop_after: {stop_after}. Please choose from: {stage_order}")
+    start_idx = stage_order.index(start_from) if start_from in stage_order else 0
+    stop_idx = stage_order.index(stop_after) if stop_after in stage_order else (len(stage_order) - 1)
+
+    # Does this run include the training stage? Used for naming the run
+    train_idx = stage_order.index(train_key)
+    includes_train = False
+    if start_idx <= train_idx <= stop_idx:
+        includes_train = True
+
+    return start_idx, stop_idx, includes_train
+
+
 def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     """Execute the modular pipeline stages in the foreground sequentially."""
-    # Build Context and invoke stages via registry
-    from utils.pipeline import registry as reg
-
     run_dir = Path(ctx.run_dir).resolve()
     artifacts_dir = Path(ctx.artifacts_dir).resolve()
     output_root = Path(args.output_dir).resolve()
@@ -504,16 +568,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     if prior_04_train is not None:
         ctx.prior_outputs["04_train"] = prior_04_train
     
-    # Override train stage key if --model-type is specified
-    # Do not default to MLP if model name is not recognized - raise error instead
     model_type = args.model_type
-    train_key = 'train_mlp'  # default MLP
-    if model_type == 'mlp':
-        train_key = 'train_mlp'
-    elif model_type == 'two-tower':
-        train_key = 'train_two_tower'
-    else:
-        raise ValueError(f"Unknown model_type: {model_type}")
 
     # --- Validation for --user-encoder ---
     user_encoder = args.user_encoder
@@ -528,25 +583,16 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
             + f"Allowed values: {allowed}"
         )
     
-    stage_order = ['get_data', 'target_posts', 'user_history', train_key, 'evaluate']
-    stage_folder = {}
-    for key in stage_order:
-        _mp, _folder = reg.get_stage_spec(key)
-        stage_folder[key] = _folder
-
-    # Respect selective reruns (map the generic "train" alias to the concrete train stage key)
-    start_from = args.start_from
-    if start_from == 'train':
-        start_from = train_key
-    stop_after = args.stop_after
-    if stop_after == 'train':
-        stop_after = train_key
-    if start_from and start_from not in stage_order:
-        raise ValueError(f"Unrecognized start_from: {start_from}. Please choose from: {stage_order}")
-    if stop_after and stop_after not in stage_order:
-        raise ValueError(f"Unrecognized stop_after: {stop_after}. Please choose from: {stage_order}")
-    start_idx = stage_order.index(start_from) if start_from in stage_order else 0
-    stop_idx = stage_order.index(stop_after) if stop_after in stage_order else (len(stage_order) - 1)
+    # Override train stage key if --model-type is specified
+    train_key = _get_train_key(model_type)
+    stage_order = _get_stage_order_for_model_type(train_key)
+    stage_folder = _get_stage_folder(stage_order)
+    start_idx, stop_idx, _ = _get_stage_folder_and_start_stop_indices(
+        stage_order,
+        args.start_from,
+        args.stop_after,
+        train_key
+    )
 
     # Optional interactive chooser (foreground only)
     def _maybe_choose_prior(stage_key: str):
