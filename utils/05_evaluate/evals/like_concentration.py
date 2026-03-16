@@ -66,6 +66,17 @@ def _plot_lorenz(
             arrowprops=dict(arrowstyle="->", color=color, lw=0.8),
         )
 
+    half_x = float(np.interp(0.5, cum_val, cum_pop))
+    top_pct_for_half = round((1.0 - half_x) * 100)
+    half_y = 0.5
+    ax.annotate(
+        f"top {top_pct_for_half}% → 50% of likes",
+        xy=(half_x, half_y),
+        xytext=(half_x - 0.25, half_y + 0.15),
+        fontsize=8, color="black",
+        arrowprops=dict(arrowstyle="->", color="black", lw=0.8),
+    )
+
     ax.set_xlabel("Cumulative share of users (sorted by likes given)")
     ax.set_ylabel("Cumulative share of total likes")
     ax.set_title("Like-Giving Concentration")
