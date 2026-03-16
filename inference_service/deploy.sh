@@ -84,6 +84,17 @@ deploy_inference_service() {
 
     log_info "Deploying $service_name from source..."
 
+    # Write env vars to a temp YAML file so values with spaces or special
+    # characters (e.g. GCS paths) are passed safely to gcloud.
+    local temp_var_dir
+    temp_var_dir=$(mktemp -d)
+    trap "rm -rf $temp_var_dir" EXIT
+    cat > "$temp_var_dir/env-vars.yaml" <<EOF
+GE_INFERENCE_MODEL_URI: "$GE_INFERENCE_MODEL_URI"
+GE_INFERENCE_PREFER_CUDA: "0"
+GE_INFERENCE_WARMUP: "0"
+EOF
+
     local deploy_cmd="gcloud run deploy $service_name"
     deploy_cmd="$deploy_cmd --source=."
     deploy_cmd="$deploy_cmd --region=$GE_GCP_REGION"
@@ -96,10 +107,7 @@ deploy_inference_service() {
 
     deploy_cmd="$deploy_cmd --ingress=internal"
     deploy_cmd="$deploy_cmd --allow-unauthenticated"
-
-    deploy_cmd="$deploy_cmd --set-env-vars=GE_INFERENCE_MODEL_URI=$GE_INFERENCE_MODEL_URI"
-    deploy_cmd="$deploy_cmd --set-env-vars=GE_INFERENCE_PREFER_CUDA=0"
-    deploy_cmd="$deploy_cmd --set-env-vars=GE_INFERENCE_WARMUP=0"
+    deploy_cmd="$deploy_cmd --env-vars-file=$temp_var_dir/env-vars.yaml"
 
     deploy_cmd="$deploy_cmd --cpu=2"
     deploy_cmd="$deploy_cmd --memory=2Gi"
