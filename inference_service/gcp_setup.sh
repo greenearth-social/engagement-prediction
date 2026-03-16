@@ -122,7 +122,7 @@ check_vpc_connector() {
     else
         log_warn "VPC connector '$connector_name' does not exist"
         log_warn "If you need internal network access, run:"
-        log_warn "  cd ../ingex/ingest && ./scripts/gcp_setup.sh"
+        log_warn "  cd ../../ingex/ingest && ./scripts/gcp_setup.sh"
         log_warn ""
         log_warn "The inference service can still be deployed without VPC connector"
     fi
