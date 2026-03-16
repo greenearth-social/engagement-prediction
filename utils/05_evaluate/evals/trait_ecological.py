@@ -557,12 +557,26 @@ def _plot_group_split_points(
         label=split.label_hi,
     )
 
+    rho_tweets   = [trait_results[l].rho_tweet for l in labels]
+    mean_true_all = [float(np.mean(trait_results[l].user_rho_true)) for l in labels]
+    mean_pred_all = [float(np.mean(trait_results[l].user_rho_pred)) for l in labels]
+
+    ax.scatter(x, rho_tweets, marker="D", s=28, color="#D65F5F", zorder=5,
+               label="tweet-level ρ")
+    ax.scatter(x, mean_true_all, marker="v", s=28, color="#666666", zorder=5,
+               label="mean user ρ(true)")
+    ax.scatter(x, mean_pred_all, marker="^", s=28, color="#4878CF", zorder=5,
+               label="mean user ρ(pred)")
+
     p_vals = np.array([raw[l]["p_val"] for l in labels])
     _, q_vals, _, _ = multipletests(p_vals, alpha=0.05, method="fdr_bh")
 
     y_top = max(
         max(m + c for m, c in zip(means_lo, cis_lo)),
         max(m + c for m, c in zip(means_hi, cis_hi)),
+        max(rho_tweets),
+        max(mean_true_all),
+        max(mean_pred_all),
     )
     star_y = y_top + 0.02
     for i, q in enumerate(q_vals):

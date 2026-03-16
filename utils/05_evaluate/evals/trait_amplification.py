@@ -3,18 +3,31 @@
 """
 Trait Amplification Evaluation Module
 
-Compares the model's within-user association between predicted engagement and
-each NLP content trait against the *actual* within-user association (based on
-y_true).  The difference -- "amplification" -- reveals traits the model
-over- or under-weights relative to real user preferences.
+Compares the model's association between predicted engagement and each NLP
+content trait against the *actual* association (based on y_true).  The
+difference -- "amplification" -- reveals traits the model over- or
+under-weights relative to real user preferences.
 
-Uses the full holdout set (positives + negatives).  Within-user demeaning
-removes user-level base-rate differences so the pooled correlations reflect
-purely within-user variation.  Bootstrap resampling over users provides CIs.
+Uses the full holdout set (positives + random negatives).  Because the holdout
+has a balanced 1:1 pos/neg ratio per user, within-user demeaning of y_true is a
+no-op (every user's mean is 0.5).  Demeaning of y_pred_proba is meaningful
+since the model's per-user base-rate varies.  Trait values are intentionally
+*not* demeaned: with random negatives the per-user trait mean is a meaningless
+mix of the user's engaged-content signal and the platform average.
+
+Two correlation perspectives are reported:
+- **Pooled (post-weighted):** a single Spearman rho across all posts (each
+  post contributes equally, so prolific users have more influence).
+- **User-averaged:** mean of per-user Spearman rho values (each user
+  contributes equally, directly capturing "the average user's preference").
+
+Bootstrap resampling over users provides CIs for both perspectives.
 
 Outputs (under trait_amplification/):
-- amplification_scatter.png: headline scatter of rho_true vs rho_pred
-- <group>_amplification.png: paired-bar detail per inference group
+- amplification_scatter.png: headline scatter of rho_true vs rho_pred (pooled)
+- <group>_amplification.png: paired-bar detail per inference group (pooled)
+- amplification_scatter_user_avg.png: headline scatter (user-averaged)
+- <group>_user_avg_amplification.png: paired-bar detail (user-averaged)
 - <group>_per_user_scatter.png: small-multiples scatter of per-user rho_pred
   vs rho_true for each trait in the group
 - trait_amplification_summary.json: all correlations, deltas, CIs
@@ -22,6 +35,7 @@ Outputs (under trait_amplification/):
 
 from __future__ import annotations
 
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -67,6 +81,9 @@ def _filter_eligible_users(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def _demean_within_user(df: pl.DataFrame) -> pl.DataFrame:
+    # y_true demeaning is a no-op with balanced 1:1 pos/neg per user (constant
+    # 0.5 shift); kept for forward-compatibility if the sampling ratio changes.
+    # y_pred_proba demeaning is meaningful (model base-rate varies per user).
     return df.with_columns(
         (pl.col("y_true") - pl.col("y_true").mean().over("did")).alias("y_true_c"),
         (pl.col("y_pred_proba") - pl.col("y_pred_proba").mean().over("did")).alias("y_pred_c"),
@@ -240,8 +257,12 @@ def _compute_per_user_rhos(
     entry per user that had enough finite trait observations.
     """
     results: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    keys = sorted(valid_keys)
+    n_keys = len(keys)
 
-    for key in sorted(valid_keys):
+    for ki, key in enumerate(keys):
+        if ki % 20 == 0:
+            print(f"      per-user rho: trait {ki+1}/{n_keys}")
         vals = trait_arrays[key]
         fmask = finite_masks[key]
         rho_trues: List[float] = []
@@ -258,8 +279,9 @@ def _compute_per_user_rhos(
             tv = vals[vr]
             if np.std(tv) < 1e-12 or np.std(yt) < 1e-12 or np.std(yp) < 1e-12:
                 continue
-            rt, _ = spearmanr(yt, tv)
-            rp, _ = spearmanr(yp, tv)
+            tv_r = rankdata(tv)
+            rt = _pearson_1d(rankdata(yt), tv_r)
+            rp = _pearson_1d(rankdata(yp), tv_r)
             if np.isfinite(rt) and np.isfinite(rp):
                 rho_trues.append(rt)
                 rho_preds.append(rp)
@@ -268,6 +290,50 @@ def _compute_per_user_rhos(
             results[key] = (np.array(rho_trues), np.array(rho_preds))
 
     return results
+
+
+def _user_avg_correlations_and_cis(
+    per_user_rhos: Dict[str, Tuple[np.ndarray, np.ndarray]],
+    n_bootstrap: int = N_BOOTSTRAP,
+    alpha: float = ALPHA,
+    seed: int = 42,
+) -> Tuple[CorrelationResults, Dict[str, Tuple[float, float, float, float, float, float]]]:
+    """Mean-of-per-user rho with bootstrap CIs (resampling users).
+
+    Returns (point_estimates, cis) in the same formats as the pooled helpers
+    so the plotting functions can be reused directly.
+    """
+    rng = np.random.default_rng(seed)
+
+    point: CorrelationResults = {}
+    cis: Dict[str, Tuple[float, float, float, float, float, float]] = {}
+
+    for key, (rt_arr, rp_arr) in per_user_rhos.items():
+        n = len(rt_arr)
+        rt_mean = float(rt_arr.mean())
+        rp_mean = float(rp_arr.mean())
+        point[key] = (rt_mean, rp_mean, rp_mean - rt_mean)
+
+        boot_rt = np.empty(n_bootstrap)
+        boot_rp = np.empty(n_bootstrap)
+        for b in range(n_bootstrap):
+            idx = rng.integers(0, n, size=n)
+            boot_rt[b] = rt_arr[idx].mean()
+            boot_rp[b] = rp_arr[idx].mean()
+        boot_d = boot_rp - boot_rt
+
+        lo_q = alpha / 2 * 100
+        hi_q = (1 - alpha / 2) * 100
+        cis[key] = (
+            float(np.percentile(boot_rt, lo_q)),
+            float(np.percentile(boot_rt, hi_q)),
+            float(np.percentile(boot_rp, lo_q)),
+            float(np.percentile(boot_rp, hi_q)),
+            float(np.percentile(boot_d, lo_q)),
+            float(np.percentile(boot_d, hi_q)),
+        )
+
+    return point, cis
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +345,7 @@ def _plot_scatter(
     cis: Dict[str, Tuple],
     group_color_map: Dict[str, str],
     out_dir: Path,
+    suffix: str = "",
 ) -> Path:
     """rho_true (x) vs rho_pred (y), one dot per trait, colored by group."""
     fig, ax = plt.subplots(figsize=(7, 7))
@@ -313,13 +380,14 @@ def _plot_scatter(
     ax.set_aspect("equal")
     ax.set_xlabel("ρ(actual preference, trait)  [within-user]")
     ax.set_ylabel("ρ(predicted preference, trait)  [within-user]")
-    ax.set_title("Trait Amplification: Predicted vs Actual")
+    title_suffix = f"  {suffix.replace('_', ' ').strip()}" if suffix else ""
+    ax.set_title(f"Trait Amplification: Predicted vs Actual{title_suffix}")
     ax.legend(fontsize=7, loc="upper left", framealpha=0.8)
     ax.axhline(0, color="gray", linewidth=0.3)
     ax.axvline(0, color="gray", linewidth=0.3)
     plt.tight_layout()
 
-    path = out_dir / "amplification_scatter.png"
+    path = out_dir / f"amplification_scatter{suffix}.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return path
@@ -330,6 +398,7 @@ def _plot_group_bars(
     traits: Dict[str, Tuple[float, float, float]],
     cis: Dict[str, Tuple],
     out_dir: Path,
+    suffix: str = "",
 ) -> Path:
     """Paired horizontal bars: rho_true (gray) vs rho_pred (colored)."""
     labels = sorted(traits, key=lambda k: abs(traits[k][2]), reverse=True)
@@ -372,13 +441,15 @@ def _plot_group_bars(
     ax.set_yticklabels(labels, fontsize=7)
     ax.invert_yaxis()
     ax.axvline(0, color="black", linewidth=0.5)
-    ax.set_xlabel("Spearman ρ  [within-user demeaned]")
+    xlabel_detail = "user-averaged" if suffix else "pooled across posts"
+    ax.set_xlabel(f"Spearman ρ  [{xlabel_detail}]")
     mean_abs_d = np.mean([abs(traits[k][2]) for k in labels])
-    ax.set_title(f"{group_name.replace('_', ' ').title()}   (mean |δ| = {mean_abs_d:.4f})")
+    title_suffix = f"  {suffix.replace('_', ' ').strip()}" if suffix else ""
+    ax.set_title(f"{group_name.replace('_', ' ').title()}{title_suffix}   (mean |δ| = {mean_abs_d:.4f})")
     ax.legend(fontsize=7, loc="lower right")
     plt.tight_layout()
 
-    path = out_dir / f"{group_name}_amplification.png"
+    path = out_dir / f"{group_name}{suffix}_amplification.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return path
@@ -527,50 +598,76 @@ class TraitAmplificationModule(EvalModule):
                 trait_arrays[key] = arr
                 finite_masks[key] = np.isfinite(arr)
 
+        n_traits = len(trait_arrays)
+        print(f"    {n_users_eligible} users, {n_posts_matched} posts, "
+              f"{n_traits} traits across {len(group_names)} groups")
+
         # --- Point estimates ---
+        t0 = time.time()
         all_corrs = _compute_all_correlations(y_true_c, y_pred_c, trait_arrays, finite_masks)
+        print(f"    pooled correlations: {len(all_corrs)} traits ({time.time()-t0:.1f}s)")
 
         # --- Single bootstrap pass across all traits ---
+        t0 = time.time()
         all_cis = _bootstrap_cis(
             user_ids, user_to_rows, y_true_c, y_pred_c,
             trait_arrays, finite_masks,
             valid_keys=set(all_corrs.keys()),
         )
+        print(f"    pooled bootstrap CIs: {N_BOOTSTRAP} iterations ({time.time()-t0:.1f}s)")
 
-        # --- Per-user rhos for per-trait scatter plots ---
+        # --- Per-user rhos for per-trait scatter plots + user-averaged ---
+        t0 = time.time()
         per_user_rhos = _compute_per_user_rhos(
             user_ids, user_to_rows, y_true_c, y_pred_c,
             trait_arrays, finite_masks,
             valid_keys=set(all_corrs.keys()),
         )
+        print(f"    per-user rhos: {len(per_user_rhos)} traits ({time.time()-t0:.1f}s)")
 
-        # --- Partition results back by group ---
+        t0 = time.time()
+        ua_corrs, ua_cis = _user_avg_correlations_and_cis(per_user_rhos)
+        print(f"    user-avg bootstrap CIs: {len(ua_corrs)} traits ({time.time()-t0:.1f}s)")
+
+        # --- Partition results back by group and plot ---
+        t0 = time.time()
         group_color_map = {g: _GROUP_COLORS[i % len(_GROUP_COLORS)] for i, g in enumerate(group_names)}
         group_results: Dict[str, Dict[str, Tuple[float, float, float]]] = {}
+        ua_group_results: Dict[str, Dict[str, Tuple[float, float, float]]] = {}
         plot_paths: list[str] = []
 
         for gname in group_names:
             traits: Dict[str, Tuple[float, float, float]] = {}
+            ua_traits: Dict[str, Tuple[float, float, float]] = {}
             for label in group_labels.get(gname, []):
                 key = f"{gname}::{label}"
                 if key in all_corrs:
                     traits[label] = all_corrs[key]
-            if not traits:
-                continue
-            group_results[gname] = traits
-            path = _plot_group_bars(gname, traits, all_cis, out_dir)
-            plot_paths.append(str(path))
-            scatter_path = _plot_per_trait_scatter(
-                gname, list(traits.keys()), per_user_rhos, traits, out_dir,
-            )
-            if scatter_path is not None:
-                plot_paths.append(str(scatter_path))
+                if key in ua_corrs:
+                    ua_traits[label] = ua_corrs[key]
+            if traits:
+                group_results[gname] = traits
+                path = _plot_group_bars(gname, traits, all_cis, out_dir)
+                plot_paths.append(str(path))
+                scatter_path = _plot_per_trait_scatter(
+                    gname, list(traits.keys()), per_user_rhos, traits, out_dir,
+                )
+                if scatter_path is not None:
+                    plot_paths.append(str(scatter_path))
+            if ua_traits:
+                ua_group_results[gname] = ua_traits
+                path = _plot_group_bars(gname, ua_traits, ua_cis, out_dir, suffix="_user_avg")
+                plot_paths.append(str(path))
 
         if group_results:
             scatter_path = _plot_scatter(group_results, all_cis, group_color_map, out_dir)
             plot_paths.insert(0, str(scatter_path))
+        if ua_group_results:
+            scatter_path = _plot_scatter(ua_group_results, ua_cis, group_color_map, out_dir, suffix="_user_avg")
+            plot_paths.append(str(scatter_path))
+        print(f"    plots: {len(plot_paths)} files ({time.time()-t0:.1f}s)")
 
-        # --- Summary JSON ---
+        # --- Summary JSON (pooled) ---
         groups_json: Dict[str, Any] = {}
         all_abs_deltas: list[float] = []
         for gname, traits in group_results.items():
@@ -589,6 +686,25 @@ class TraitAmplificationModule(EvalModule):
                 gdict[label] = entry
             groups_json[gname] = gdict
 
+        # --- Summary JSON (user-averaged) ---
+        ua_groups_json: Dict[str, Any] = {}
+        ua_abs_deltas: list[float] = []
+        for gname, traits in ua_group_results.items():
+            gdict_ua: Dict[str, Any] = {}
+            for label, (rt, rp, delta) in traits.items():
+                ua_abs_deltas.append(abs(delta))
+                entry_ua: Dict[str, float] = {"rho_true": rt, "rho_pred": rp, "delta": delta}
+                key = f"{gname}::{label}"
+                if key in ua_cis:
+                    ci = ua_cis[key]
+                    entry_ua.update({
+                        "rho_true_ci_lo": ci[0], "rho_true_ci_hi": ci[1],
+                        "rho_pred_ci_lo": ci[2], "rho_pred_ci_hi": ci[3],
+                        "delta_ci_lo": ci[4], "delta_ci_hi": ci[5],
+                    })
+                gdict_ua[label] = entry_ua
+            ua_groups_json[gname] = gdict_ua
+
         summary = {
             "n_users_total": n_users_total,
             "n_users_eligible": n_users_eligible,
@@ -597,6 +713,8 @@ class TraitAmplificationModule(EvalModule):
             "n_bootstrap": N_BOOTSTRAP,
             "mean_abs_amplification": float(np.mean(all_abs_deltas)) if all_abs_deltas else 0.0,
             "groups": groups_json,
+            "mean_abs_amplification_user_avg": float(np.mean(ua_abs_deltas)) if ua_abs_deltas else 0.0,
+            "groups_user_avg": ua_groups_json,
         }
         self.save_json(summary, out_dir / "trait_amplification_summary.json")
 
@@ -605,5 +723,6 @@ class TraitAmplificationModule(EvalModule):
             "n_posts_matched": n_posts_matched,
             "groups_plotted": len(group_results),
             "mean_abs_amplification": summary["mean_abs_amplification"],
+            "mean_abs_amplification_user_avg": summary["mean_abs_amplification_user_avg"],
             "plot_paths": plot_paths,
         }
