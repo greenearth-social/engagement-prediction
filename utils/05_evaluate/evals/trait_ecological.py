@@ -467,13 +467,13 @@ def _compute_user_splits(
             if cumulative >= total_likes * 0.5:
                 break
         is_high_vol = {uid: uid in high_set for uid in user_ids}
-        n_hi = len(high_set)
+        pct_hi = 100.0 * len(high_set) / len(user_ids)
         splits.append(_SplitSpec(
             did_is_high=is_high_vol,
             tag="likes50pct",
-            title=f"Top-50%-of-likes ({n_hi} users = 50% of volume)",
+            title=f"Top-50%-of-likes ({pct_hi:.1f}% of users = 50% of volume)",
             label_lo=f"remaining users",
-            label_hi=f"top {n_hi} users (50% vol)",
+            label_hi=f"top {pct_hi:.1f}% of users (50% vol)",
         ))
 
     return splits
