@@ -27,6 +27,8 @@ nohup.out
 
 # Environment
 *.env
+.env.*
+!.env.example
 .venv/
 venv/
 ENV/
