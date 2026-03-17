@@ -46,6 +46,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
 from scipy.stats import rankdata, spearmanr
+from tqdm import tqdm
 
 from . import EvalContext, EvalModule, scaled_figsize
 from .trait_corrs import _load_inferences, _unnest_text_inferences, eb_shrink
@@ -100,15 +101,37 @@ def _compute_all_correlations(
     trait_arrays: Dict[str, np.ndarray],
     finite_masks: Dict[str, np.ndarray],
 ) -> CorrelationResults:
-    """Point estimates for every trait across all groups."""
+    """Point estimates for every trait (vectorised Pearson-of-ranks)."""
+    keys = list(trait_arrays.keys())
+    dense_keys = [k for k in keys if finite_masks[k].all()]
+    sparse_keys = [k for k in keys if not finite_masks[k].all()]
     results: CorrelationResults = {}
-    for key, vals in trait_arrays.items():
-        mask = finite_masks[key]
+
+    if dense_keys:
+        yt_r = rankdata(y_true_c).astype(np.float64)
+        yp_r = rankdata(y_pred_c).astype(np.float64)
+        trait_rank_mat = np.column_stack(
+            [rankdata(trait_arrays[k]).astype(np.float64) for k in dense_keys]
+        )
+        T_c = trait_rank_mat - trait_rank_mat.mean(axis=0)
+        yt_c = yt_r - yt_r.mean()
+        yp_c = yp_r - yp_r.mean()
+        rt_all = _col_pearson(T_c, yt_c)
+        rp_all = _col_pearson(T_c, yp_c)
+        for i, k in enumerate(dense_keys):
+            results[k] = (float(rt_all[i]), float(rp_all[i]), float(rp_all[i] - rt_all[i]))
+
+    for k in sparse_keys:
+        mask = finite_masks[k]
         if mask.sum() < 10:
             continue
-        rt, _ = spearmanr(y_true_c[mask], vals[mask])
-        rp, _ = spearmanr(y_pred_c[mask], vals[mask])
-        results[key] = (float(rt), float(rp), float(rp - rt))
+        yt_sub = rankdata(y_true_c[mask]).astype(np.float64)
+        yp_sub = rankdata(y_pred_c[mask]).astype(np.float64)
+        tv_sub = rankdata(trait_arrays[k][mask]).astype(np.float64)
+        rt = _pearson_1d(yt_sub, tv_sub)
+        rp = _pearson_1d(yp_sub, tv_sub)
+        results[k] = (float(rt), float(rp), float(rp - rt))
+
     return results
 
 
@@ -129,6 +152,22 @@ def _pearson_1d(x: np.ndarray, y: np.ndarray) -> float:
     return float((xc @ yc) / denom) if denom > 1e-30 else 0.0
 
 
+def _rank_columns_no_ties(X: np.ndarray) -> np.ndarray:
+    """Rank each column of X via argsort (no tie correction).
+
+    Valid for continuous float scores where ties are negligible.
+    """
+    n = X.shape[0]
+    order = np.argsort(X, axis=0)
+    ranks = np.empty_like(X, dtype=np.float64)
+    np.put_along_axis(
+        ranks, order,
+        np.arange(1, n + 1, dtype=np.float64).reshape(-1, 1),
+        axis=0,
+    )
+    return ranks
+
+
 def _bootstrap_cis(
     user_ids: np.ndarray,
     user_to_rows: Dict[Any, np.ndarray],
@@ -141,11 +180,12 @@ def _bootstrap_cis(
     alpha: float = ALPHA,
     seed: int = 42,
 ) -> Dict[str, Tuple[float, float, float, float, float, float]]:
-    """Bootstrap CIs using pre-ranked arrays (Spearman = Pearson-of-ranks).
+    """Bootstrap CIs via per-user sufficient statistics.
 
-    Pre-ranking removes the O(n log n) sort from every bootstrap iteration,
-    leaving only O(n) Pearson computations.  Dense (all-finite) traits are
-    batched into a single matrix-vector product per iteration.
+    Dense traits: pre-aggregate per-user sums / cross-products of pre-ranked
+    arrays so each bootstrap iteration only sums O(n_users) vectors instead
+    of re-indexing O(n_posts) rows.  Sparse traits fall back to the
+    per-iteration index approach.
 
     Returns {key: (rt_lo, rt_hi, rp_lo, rp_hi, delta_lo, delta_hi)}.
     """
@@ -155,75 +195,135 @@ def _bootstrap_cis(
 
     dense_keys = [k for k in keys if finite_masks[k].all()]
     sparse_keys = [k for k in keys if not finite_masks[k].all()]
+    n_dense = len(dense_keys)
 
-    # --- pre-rank all arrays once (one-time O(n log n) per array) --------
+    # --- pre-rank all arrays once ----------------------------------------
     yt_r = rankdata(y_true_c).astype(np.float64)
     yp_r = rankdata(y_pred_c).astype(np.float64)
 
     dense_rank_mat: np.ndarray | None = None
-    if dense_keys:
+    if n_dense > 0:
         dense_rank_mat = np.column_stack(
             [rankdata(trait_arrays[k]).astype(np.float64) for k in dense_keys]
         )
 
+    # --- per-user sufficient statistics for dense traits -----------------
+    pu_n = np.empty(n_users, dtype=np.float64)
+    pu_syt = np.empty(n_users)
+    pu_syp = np.empty(n_users)
+    pu_syt2 = np.empty(n_users)
+    pu_syp2 = np.empty(n_users)
+    pu_st: np.ndarray | None = None
+    pu_st2: np.ndarray | None = None
+    pu_syt_t: np.ndarray | None = None
+    pu_syp_t: np.ndarray | None = None
+
+    if n_dense > 0:
+        pu_st = np.empty((n_users, n_dense))
+        pu_st2 = np.empty((n_users, n_dense))
+        pu_syt_t = np.empty((n_users, n_dense))
+        pu_syp_t = np.empty((n_users, n_dense))
+
+    for i, u in enumerate(user_ids):
+        rows = user_to_rows[u]
+        yt_u = yt_r[rows]
+        yp_u = yp_r[rows]
+        pu_n[i] = len(rows)
+        pu_syt[i] = yt_u.sum()
+        pu_syp[i] = yp_u.sum()
+        pu_syt2[i] = (yt_u * yt_u).sum()
+        pu_syp2[i] = (yp_u * yp_u).sum()
+        if dense_rank_mat is not None:
+            t_u = dense_rank_mat[rows]
+            pu_st[i] = t_u.sum(axis=0)
+            pu_st2[i] = (t_u * t_u).sum(axis=0)
+            pu_syt_t[i] = (yt_u[:, None] * t_u).sum(axis=0)
+            pu_syp_t[i] = (yp_u[:, None] * t_u).sum(axis=0)
+
+    # --- sparse: pre-rank + index machinery (only when needed) -----------
     sparse_trait_ranks: Dict[str, np.ndarray] = {}
+    all_rows: np.ndarray | None = None
+    offsets: np.ndarray | None = None
+
     for k in sparse_keys:
         m = finite_masks[k]
         ranked = np.full(len(y_true_c), np.nan, dtype=np.float64)
         ranked[m] = rankdata(trait_arrays[k][m])
         sparse_trait_ranks[k] = ranked
 
-    # --- pre-build contiguous user-row index for vectorised resampling ---
-    row_arrays = [user_to_rows[u] for u in user_ids]
-    all_rows = np.concatenate(row_arrays)
-    offsets = np.empty(n_users + 1, dtype=np.int64)
-    offsets[0] = 0
-    np.cumsum([len(r) for r in row_arrays], out=offsets[1:])
+    if sparse_keys:
+        row_arrays = [user_to_rows[u] for u in user_ids]
+        all_rows = np.concatenate(row_arrays)
+        offsets = np.empty(n_users + 1, dtype=np.int64)
+        offsets[0] = 0
+        np.cumsum([len(r) for r in row_arrays], out=offsets[1:])
 
     # --- accumulators ----------------------------------------------------
     boot_rt: Dict[str, List[float]] = defaultdict(list)
     boot_rp: Dict[str, List[float]] = defaultdict(list)
     boot_d: Dict[str, List[float]] = defaultdict(list)
 
-    for _ in range(n_bootstrap):
+    for _b in tqdm(range(n_bootstrap), desc="      bootstrap", leave=False):
         sel = rng.integers(0, n_users, size=n_users)
 
-        sel_starts = offsets[sel]
-        sel_lens = offsets[sel + 1] - sel_starts
-        total = int(sel_lens.sum())
-        rep_starts = np.repeat(sel_starts, sel_lens)
-        cum = np.zeros(n_users + 1, dtype=np.int64)
-        np.cumsum(sel_lens, out=cum[1:])
-        within = np.arange(total, dtype=np.int64) - np.repeat(cum[:-1], sel_lens)
-        idx = all_rows[rep_starts + within]
+        # --- dense: sufficient statistics --------------------------------
+        if n_dense > 0:
+            N = pu_n[sel].sum()
+            SYt = pu_syt[sel].sum()
+            SYp = pu_syp[sel].sum()
+            SYt2 = pu_syt2[sel].sum()
+            SYp2 = pu_syp2[sel].sum()
+            ST = pu_st[sel].sum(axis=0)
+            ST2 = pu_st2[sel].sum(axis=0)
+            SYtT = pu_syt_t[sel].sum(axis=0)
+            SYpT = pu_syp_t[sel].sum(axis=0)
 
-        yt_b = yt_r[idx]
-        yp_b = yp_r[idx]
+            var_t = N * ST2 - ST * ST
+            var_yt = N * SYt2 - SYt * SYt
+            denom_t = np.sqrt(np.maximum(var_yt * var_t, 0.0))
+            rt_all = np.where(
+                denom_t > 1e-30,
+                (N * SYtT - SYt * ST) / denom_t,
+                0.0,
+            )
 
-        if dense_rank_mat is not None:
-            T_b = dense_rank_mat[idx]
-            T_c = T_b - T_b.mean(axis=0)
-            yt_c = yt_b - yt_b.mean()
-            yp_c = yp_b - yp_b.mean()
-
-            rt_all = _col_pearson(T_c, yt_c)
-            rp_all = _col_pearson(T_c, yp_c)
+            var_yp = N * SYp2 - SYp * SYp
+            denom_p = np.sqrt(np.maximum(var_yp * var_t, 0.0))
+            rp_all = np.where(
+                denom_p > 1e-30,
+                (N * SYpT - SYp * ST) / denom_p,
+                0.0,
+            )
 
             for i, k in enumerate(dense_keys):
                 boot_rt[k].append(float(rt_all[i]))
                 boot_rp[k].append(float(rp_all[i]))
                 boot_d[k].append(float(rp_all[i] - rt_all[i]))
 
-        for k in sparse_keys:
-            tv_b = sparse_trait_ranks[k][idx]
-            m = np.isfinite(tv_b)
-            if m.sum() < 10:
-                continue
-            rt = _pearson_1d(yt_b[m], tv_b[m])
-            rp = _pearson_1d(yp_b[m], tv_b[m])
-            boot_rt[k].append(rt)
-            boot_rp[k].append(rp)
-            boot_d[k].append(rp - rt)
+        # --- sparse: post-level index approach ---------------------------
+        if sparse_keys:
+            sel_starts = offsets[sel]
+            sel_lens = offsets[sel + 1] - sel_starts
+            total = int(sel_lens.sum())
+            rep_starts = np.repeat(sel_starts, sel_lens)
+            cum = np.zeros(n_users + 1, dtype=np.int64)
+            np.cumsum(sel_lens, out=cum[1:])
+            within = np.arange(total, dtype=np.int64) - np.repeat(cum[:-1], sel_lens)
+            idx = all_rows[rep_starts + within]
+
+            yt_b = yt_r[idx]
+            yp_b = yp_r[idx]
+
+            for k in sparse_keys:
+                tv_b = sparse_trait_ranks[k][idx]
+                m = np.isfinite(tv_b)
+                if m.sum() < 10:
+                    continue
+                rt = _pearson_1d(yt_b[m], tv_b[m])
+                rp = _pearson_1d(yp_b[m], tv_b[m])
+                boot_rt[k].append(rt)
+                boot_rp[k].append(rp)
+                boot_d[k].append(rp - rt)
 
     lo_q = alpha / 2 * 100
     hi_q = (1 - alpha / 2) * 100
@@ -253,47 +353,86 @@ def _compute_per_user_rhos(
 ) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
     """Per-user Spearman rho for each trait, with EB shrinkage.
 
-    Returns {key: (rho_true_array, rho_pred_array)} where each array has one
-    entry per user that had enough finite trait observations.  Raw per-user
-    rhos are shrunk via ``eb_shrink`` before returning.
+    Iterates users (outer) with dense-trait batching so y_true / y_pred are
+    ranked only once per user instead of once per (user, trait).
     """
-    results: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
     keys = sorted(valid_keys)
-    n_keys = len(keys)
+    dense_keys = [k for k in keys if finite_masks[k].all()]
+    sparse_keys = [k for k in keys if not finite_masks[k].all()]
 
-    for ki, key in enumerate(keys):
-        if ki % 20 == 0:
-            print(f"      per-user rho: trait {ki+1}/{n_keys}")
-        vals = trait_arrays[key]
-        fmask = finite_masks[key]
-        rho_trues: List[float] = []
-        rho_preds: List[float] = []
-        user_ns: List[int] = []
+    dense_mat: np.ndarray | None = None
+    if dense_keys:
+        dense_mat = np.column_stack([trait_arrays[k] for k in dense_keys])
 
-        for u in user_ids:
-            rows = user_to_rows[u]
-            row_finite = fmask[rows]
+    acc_rt: Dict[str, List[float]] = defaultdict(list)
+    acc_rp: Dict[str, List[float]] = defaultdict(list)
+    acc_ns: Dict[str, List[int]] = defaultdict(list)
+
+    for u in tqdm(user_ids, desc="      per-user rho", leave=False):
+        rows = user_to_rows[u]
+        n_rows = len(rows)
+        if n_rows < PER_USER_MIN_POSTS:
+            continue
+
+        yt = y_true_c[rows]
+        yp = y_pred_c[rows]
+        if np.std(yt) < 1e-12 or np.std(yp) < 1e-12:
+            continue
+
+        yt_r = rankdata(yt)
+        yp_r = rankdata(yp)
+
+        if dense_mat is not None:
+            tv_all = dense_mat[rows]
+            stds = tv_all.std(axis=0)
+            valid_mask = stds > 1e-12
+
+            if valid_mask.any():
+                tv_valid = tv_all[:, valid_mask]
+                tv_ranks = _rank_columns_no_ties(tv_valid)
+                tv_c = tv_ranks - tv_ranks.mean(axis=0)
+                yt_c = yt_r - yt_r.mean()
+                yp_c = yp_r - yp_r.mean()
+
+                rt_vals = _col_pearson(tv_c, yt_c)
+                rp_vals = _col_pearson(tv_c, yp_c)
+
+                valid_indices = np.where(valid_mask)[0]
+                for j, col_idx in enumerate(valid_indices):
+                    rt_v, rp_v = float(rt_vals[j]), float(rp_vals[j])
+                    if np.isfinite(rt_v) and np.isfinite(rp_v):
+                        k = dense_keys[col_idx]
+                        acc_rt[k].append(rt_v)
+                        acc_rp[k].append(rp_v)
+                        acc_ns[k].append(n_rows)
+
+        for k in sparse_keys:
+            row_finite = finite_masks[k][rows]
             vr = rows[row_finite]
             if len(vr) < PER_USER_MIN_POSTS:
                 continue
-            yt = y_true_c[vr]
-            yp = y_pred_c[vr]
-            tv = vals[vr]
-            if np.std(tv) < 1e-12 or np.std(yt) < 1e-12 or np.std(yp) < 1e-12:
+            tv = trait_arrays[k][vr]
+            if np.std(tv) < 1e-12:
+                continue
+            yt_sub = y_true_c[vr]
+            yp_sub = y_pred_c[vr]
+            if np.std(yt_sub) < 1e-12 or np.std(yp_sub) < 1e-12:
                 continue
             tv_r = rankdata(tv)
-            rt = _pearson_1d(rankdata(yt), tv_r)
-            rp = _pearson_1d(rankdata(yp), tv_r)
+            rt = _pearson_1d(rankdata(yt_sub), tv_r)
+            rp = _pearson_1d(rankdata(yp_sub), tv_r)
             if np.isfinite(rt) and np.isfinite(rp):
-                rho_trues.append(rt)
-                rho_preds.append(rp)
-                user_ns.append(len(vr))
+                acc_rt[k].append(float(rt))
+                acc_rp[k].append(float(rp))
+                acc_ns[k].append(len(vr))
 
-        if len(rho_trues) >= 5:
-            ns = np.array(user_ns)
-            shrunk_true, _ = eb_shrink(np.array(rho_trues), ns)
-            shrunk_pred, _ = eb_shrink(np.array(rho_preds), ns)
-            results[key] = (shrunk_true, shrunk_pred)
+    results: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    for k in keys:
+        if len(acc_rt[k]) >= 5:
+            ns = np.array(acc_ns[k])
+            shrunk_true, _ = eb_shrink(np.array(acc_rt[k]), ns)
+            shrunk_pred, _ = eb_shrink(np.array(acc_rp[k]), ns)
+            results[k] = (shrunk_true, shrunk_pred)
 
     return results
 
