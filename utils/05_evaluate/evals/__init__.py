@@ -32,6 +32,7 @@ from __future__ import annotations
 import importlib
 import json
 import pkgutil
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -195,23 +196,28 @@ def run_all_modules(
             continue
         
         print(f"  Running module: {module.name} - {module.description}")
+        t_start = time.time()
         try:
             result = module.run(ctx)
+            elapsed = time.time() - t_start
             results[module.name] = {
                 'status': 'success',
                 'description': module.description,
+                'duration_seconds': round(elapsed, 3),
                 **result,
             }
-            print(f"    Completed: {module.name}")
+            print(f"    Completed: {module.name} ({elapsed:.1f}s)")
         except Exception as e:
             import traceback
+            elapsed = time.time() - t_start
             results[module.name] = {
                 'status': 'error',
                 'description': module.description,
+                'duration_seconds': round(elapsed, 3),
                 'error': str(e),
                 'traceback': traceback.format_exc(),
             }
-            print(f"    Error in {module.name}: {e}")
+            print(f"    Error in {module.name} ({elapsed:.1f}s): {e}")
     
     return results
 

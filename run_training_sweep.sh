@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Configuration ──────────────────────────────────────────────────────
-DATA_DIR="outputs/20260316_012725"
+DATA_DIR="outputs/20260316_164800"
 
 EPOCHS=100
 BATCH_SIZE=4096
@@ -33,12 +33,12 @@ MLP_EXPERIMENTS=(
   #"summarized:mean"
   "summarized:ema"
   #"summarized:linear_recency"
-  "full_transformer:"
+  #"full_transformer:"
 )
 
 # Two-tower experiments (sequential -- heavy GPU/memory usage)
 TT_EXPERIMENTS=(
-  "full_transformer:"
+  #"full_transformer:"
   "cross_attention:"
 )
 
