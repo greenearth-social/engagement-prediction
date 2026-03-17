@@ -32,7 +32,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
 
-from . import EvalContext, EvalModule
+from . import EvalContext, EvalModule, scaled_figsize
 from .trait_corrs import _load_inferences, _unnest_text_inferences
 from .trait_amplification import MIN_USER_POSTS, _filter_eligible_users
 
@@ -183,7 +183,7 @@ def _plot_entropy_histogram(
     n_clipped = int((ratios > x_upper).sum())
     clipped = ratios[ratios <= x_upper]
 
-    fig, ax = plt.subplots(figsize=(7, 4))
+    fig, ax = plt.subplots(figsize=scaled_figsize(7, 4))
     _, _, patches = ax.hist(clipped, bins=bins, density=True,
                             edgecolor="white", linewidth=0.4)
     for patch in patches:
@@ -240,7 +240,7 @@ def _plot_category_shift(
     y = np.arange(len(labels))
     bar_h = 0.35
 
-    fig, ax = plt.subplots(figsize=(8, max(3, 0.45 * len(labels))))
+    fig, ax = plt.subplots(figsize=scaled_figsize(8, max(3, 0.45 * len(labels))))
     ax.barh(y - bar_h / 2, actual_s, bar_h, label="actual likes",
             color="#4878CF", edgecolor="white", linewidth=0.4)
     ax.barh(y + bar_h / 2, predicted_s, bar_h, label="model top picks",
@@ -275,7 +275,7 @@ def _plot_summary_bars(
     medians = [group_medians[g] for g in sorted_groups]
     colors = [group_color_map.get(g, "#999999") for g in sorted_groups]
 
-    fig, ax = plt.subplots(figsize=(8, max(3, 0.7 * len(labels))))
+    fig, ax = plt.subplots(figsize=scaled_figsize(8, max(3, 0.7 * len(labels))))
     y_pos = np.arange(len(labels))
 
     rng = np.random.default_rng(42)

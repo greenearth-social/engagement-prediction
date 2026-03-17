@@ -30,7 +30,7 @@ import numpy as np
 import polars as pl
 from scipy.stats import spearmanr
 
-from . import EvalContext, EvalModule
+from . import EvalContext, EvalModule, scaled_figsize
 
 STRUCT_PREFIX = "message.commit.record.text"
 
@@ -151,7 +151,7 @@ def _plot_group(
     xerr_pos = [hi - r for r, hi in zip(rhos, ci_hi)]
     colors = ["#4878CF" if v >= 0 else "#D65F5F" for v in rhos]
 
-    fig, ax = plt.subplots(figsize=(7, max(2.5, 0.35 * len(labels))))
+    fig, ax = plt.subplots(figsize=scaled_figsize(7, max(2.5, 0.35 * len(labels))))
     y_pos = np.arange(len(labels))
     ax.barh(y_pos, rhos, color=colors, edgecolor="white", linewidth=0.5,
             xerr=[xerr_neg, xerr_pos], error_kw=dict(ecolor="#333333", capsize=2, linewidth=0.8))

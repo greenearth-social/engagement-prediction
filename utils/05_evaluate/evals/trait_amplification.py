@@ -47,7 +47,7 @@ import numpy as np
 import polars as pl
 from scipy.stats import rankdata, spearmanr
 
-from . import EvalContext, EvalModule
+from . import EvalContext, EvalModule, scaled_figsize
 from .trait_corrs import _load_inferences, _unnest_text_inferences, eb_shrink
 
 MIN_USER_POSTS = 20
@@ -354,7 +354,7 @@ def _plot_scatter(
     suffix: str = "",
 ) -> Path:
     """rho_true (x) vs rho_pred (y), one dot per trait, colored by group."""
-    fig, ax = plt.subplots(figsize=(7, 7))
+    fig, ax = plt.subplots(figsize=scaled_figsize(7, 7))
 
     for gname, traits in group_results.items():
         color = group_color_map[gname]
@@ -426,7 +426,7 @@ def _plot_group_bars(
         return [lo_list, hi_list]
 
     bar_h = 0.35
-    fig, ax = plt.subplots(figsize=(8, max(3, 0.5 * n)))
+    fig, ax = plt.subplots(figsize=scaled_figsize(8, max(3, 0.5 * n)))
     y_pos = np.arange(n)
 
     ax.barh(
@@ -486,7 +486,7 @@ def _plot_per_trait_scatter(
 
     fig, axes = plt.subplots(
         nrows, ncols,
-        figsize=(3.5 * ncols, 3.5 * nrows),
+        figsize=scaled_figsize(3.5 * ncols, 3.5 * nrows),
         squeeze=False,
     )
 

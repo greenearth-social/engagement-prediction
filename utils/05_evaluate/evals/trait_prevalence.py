@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
 
-from . import EvalContext, EvalModule
+from . import EvalContext, EvalModule, scaled_figsize
 from .trait_corrs import _load_inferences, _unnest_text_inferences
 
 
@@ -59,7 +59,7 @@ def _plot_group(
     bar_height = 0.35
     y = np.arange(len(all_labels))
 
-    fig, ax = plt.subplots(figsize=(7, max(2.5, 0.45 * len(all_labels))))
+    fig, ax = plt.subplots(figsize=scaled_figsize(7, max(2.5, 0.45 * len(all_labels))))
     ax.barh(y - bar_height / 2, pos_vals, bar_height,
             label="positives (liked)", color="#4878CF",
             edgecolor="white", linewidth=0.5)

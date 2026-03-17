@@ -105,6 +105,7 @@ DEFAULTS: Dict[str, Any] = {
     "eval_holdout_type": "unseen_users",
     "skip_eval_modules": None,  # Comma-separated eval module names to skip (None = run all)
     "only_eval_modules": None,  # Comma-separated eval module names to run exclusively (None = run all)
+    "eval_plot_scale": 1.5,
     # Selection/prior behavior
     "use_latest": False,
     "start_from": None,
@@ -631,6 +632,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Comma-separated list of evaluation module names to skip (e.g. cold_start_curves,performance_inequality)")
     _add_arg_with_default(p_all, "--only-eval-modules", type=str, default=argparse.SUPPRESS,
                           help_text="Comma-separated list of evaluation module names to run exclusively (e.g. cold_start_curves,performance_inequality)")
+    _add_arg_with_default(p_all, "--eval-plot-scale", type=float, default=argparse.SUPPRESS,
+                          help_text="Scale factor for eval plots: >1 shrinks figures so text appears larger (default 1.5)")
     # Selection behavior
     _add_arg_with_default(p_all, "--use-latest", action="store_true", default=argparse.SUPPRESS,
                           help_text="(Deprecated) Always enabled during sequential run-all")

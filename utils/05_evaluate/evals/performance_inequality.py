@@ -35,6 +35,7 @@ from . import (
     compute_gini_coefficient,
     compute_lorenz_curve,
     compute_per_user_metrics,
+    scaled_figsize,
 )
 
 
@@ -141,7 +142,7 @@ class PerformanceInequalityModule(EvalModule):
         save_path: Path,
     ) -> None:
         """Generate a single Lorenz curve plot."""
-        fig, ax = plt.subplots(figsize=self.FIGURE_SIZE)
+        fig, ax = plt.subplots(figsize=scaled_figsize(*self.FIGURE_SIZE))
         
         # Compute Lorenz curve
         cum_pop, cum_val = compute_lorenz_curve(values)
@@ -178,7 +179,7 @@ class PerformanceInequalityModule(EvalModule):
         save_path: Path,
     ) -> None:
         """Generate a combined plot with all Lorenz curves."""
-        fig, ax = plt.subplots(figsize=(10, 8))
+        fig, ax = plt.subplots(figsize=scaled_figsize(10, 8))
         
         # Plot equality line
         ax.plot([0, 1], [0, 1], 'k--', alpha=0.7, label='Perfect Equality', linewidth=2)
@@ -235,7 +236,7 @@ class PerformanceInequalityModule(EvalModule):
         n_cols = min(3, n_metrics)
         n_rows = (n_metrics + n_cols - 1) // n_cols
         
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=scaled_figsize(5 * n_cols, 4 * n_rows))
         if n_metrics == 1:
             axes = [axes]
         else:

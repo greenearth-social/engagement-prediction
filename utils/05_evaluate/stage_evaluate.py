@@ -299,6 +299,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     only_eval_modules = args.only_eval_modules
     if only_eval_modules and isinstance(only_eval_modules, str):
         only_eval_modules = [m.strip() for m in only_eval_modules.split(',')]
+    eval_plot_scale = float(args.eval_plot_scale)
 
     # Resolve training output first so we can nest eval outputs inside it
     train_dir = resolve_train_output(run_dir, context)
@@ -370,6 +371,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         'batch_size': eval_batch_size,
         'embed_dim': embed_dim,
         'run_dir': run_dir,
+        'plot_scale': eval_plot_scale,
     }
 
     ctx = EvalContext(

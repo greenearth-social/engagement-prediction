@@ -29,6 +29,7 @@ from . import (
     EvalModule,
     compute_gini_coefficient,
     compute_lorenz_curve,
+    scaled_figsize,
 )
 
 
@@ -46,7 +47,7 @@ def _plot_lorenz(
 ) -> Path:
     cum_pop, cum_val = compute_lorenz_curve(likes)
 
-    fig, ax = plt.subplots(figsize=(7, 7))
+    fig, ax = plt.subplots(figsize=scaled_figsize(7, 7))
     ax.plot([0, 1], [0, 1], "k--", linewidth=0.8, alpha=0.5,
             label="perfect equality")
     ax.plot(cum_pop, cum_val, color="#1f77b4", linewidth=2,
@@ -97,7 +98,7 @@ def _plot_distribution(
     likes: np.ndarray,
     out_dir: Path,
 ) -> Path:
-    fig, ax = plt.subplots(figsize=(8, 4.5))
+    fig, ax = plt.subplots(figsize=scaled_figsize(8, 4.5))
 
     positive = likes[likes > 0]
     if len(positive) > 0:

@@ -39,7 +39,7 @@ import numpy as np
 import polars as pl
 from scipy.stats import gaussian_kde, ttest_1samp
 
-from . import EvalContext, EvalModule
+from . import EvalContext, EvalModule, scaled_figsize
 from .trait_corrs import _load_inferences, _unnest_text_inferences
 from .trait_amplification import MIN_USER_POSTS, _filter_eligible_users
 
@@ -192,7 +192,7 @@ def _plot_group_over_serving(
     nrows = math.ceil(n / ncols)
 
     fig, axes = plt.subplots(nrows, ncols,
-                             figsize=(5 * ncols, 3.5 * nrows),
+                             figsize=scaled_figsize(5 * ncols, 3.5 * nrows),
                              squeeze=False)
 
     for idx, label in enumerate(labels):
@@ -291,7 +291,7 @@ def _plot_summary_bar(
     xerr_neg = [m - lo for m, lo in zip(means, ci_los)]
     xerr_pos = [hi - m for m, hi in zip(means, ci_his)]
 
-    fig, ax = plt.subplots(figsize=(9, max(3, 0.35 * len(labels))))
+    fig, ax = plt.subplots(figsize=scaled_figsize(9, max(3, 0.35 * len(labels))))
     y_pos = np.arange(len(labels))
 
     ax.barh(y_pos, means, color=colors, edgecolor="white", linewidth=0.5,

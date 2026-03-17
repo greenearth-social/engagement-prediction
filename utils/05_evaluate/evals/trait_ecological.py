@@ -43,7 +43,7 @@ import numpy as np
 import polars as pl
 from scipy.stats import gaussian_kde
 
-from . import EvalContext, EvalModule
+from . import EvalContext, EvalModule, scaled_figsize
 from .trait_corrs import _load_inferences, _unnest_text_inferences, eb_shrink
 from .trait_amplification import MIN_USER_POSTS, _filter_eligible_users
 
@@ -178,7 +178,7 @@ def _plot_group_ecological(
     nrows = math.ceil(n / ncols)
 
     fig, axes = plt.subplots(nrows, ncols,
-                             figsize=(5 * ncols, 3.5 * nrows),
+                             figsize=scaled_figsize(5 * ncols, 3.5 * nrows),
                              squeeze=False)
 
     for idx, label in enumerate(labels):
@@ -249,7 +249,7 @@ def _plot_group_diff(
     nrows = math.ceil(n / ncols)
 
     fig, axes = plt.subplots(nrows, ncols,
-                             figsize=(5 * ncols, 3.5 * nrows),
+                             figsize=scaled_figsize(5 * ncols, 3.5 * nrows),
                              squeeze=False)
 
     for idx, label in enumerate(labels):
@@ -317,7 +317,7 @@ def _plot_group_p90(
     nrows = math.ceil(n / ncols)
 
     fig, axes = plt.subplots(nrows, ncols,
-                             figsize=(5 * ncols, 3.5 * nrows),
+                             figsize=scaled_figsize(5 * ncols, 3.5 * nrows),
                              squeeze=False)
     grid = np.linspace(-1, 1, 300)
 
@@ -385,7 +385,7 @@ def _plot_group_p90_diff(
     nrows = math.ceil(n / ncols)
 
     fig, axes = plt.subplots(nrows, ncols,
-                             figsize=(5 * ncols, 3.5 * nrows),
+                             figsize=scaled_figsize(5 * ncols, 3.5 * nrows),
                              squeeze=False)
 
     for idx, label in enumerate(labels):
@@ -544,7 +544,7 @@ def _plot_group_split_points(
     fname = f"{group_name}_ecological_{split.tag}_points.png"
     if n == 0:
         path = out_dir / fname
-        fig, ax = plt.subplots(figsize=(4, 3))
+        fig, ax = plt.subplots(figsize=scaled_figsize(4, 3))
         ax.text(0.5, 0.5, "insufficient data", transform=ax.transAxes,
                 ha="center", va="center", fontsize=9, color="#999999")
         fig.savefig(path, dpi=150)
@@ -559,7 +559,7 @@ def _plot_group_split_points(
     means_hi = [raw[l]["mean_hi"] for l in labels]
     cis_hi   = [raw[l]["ci_hi"]   for l in labels]
 
-    fig, ax = plt.subplots(figsize=(max(6, 0.55 * n), 5))
+    fig, ax = plt.subplots(figsize=scaled_figsize(max(6, 0.55 * n), 5))
 
     ax.errorbar(
         x - dodge, means_lo, yerr=cis_lo,
@@ -636,7 +636,7 @@ def _plot_gap_summary(
     colors = [group_color_map.get(all_gaps[k][0], "#999999")
               for k in sorted_keys]
 
-    fig, ax = plt.subplots(figsize=(8, max(3, 0.35 * len(labels))))
+    fig, ax = plt.subplots(figsize=scaled_figsize(8, max(3, 0.35 * len(labels))))
     y_pos = np.arange(len(labels))
 
     ax.barh(y_pos, gaps, color=colors, edgecolor="white", linewidth=0.5)

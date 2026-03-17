@@ -41,6 +41,27 @@ from typing import Any, Dict, List, Optional, Type
 import numpy as np
 import pandas as pd
 
+# ---------------------------------------------------------------------------
+# Global plot-scale support
+# ---------------------------------------------------------------------------
+_PLOT_SCALE: float = 1.0
+
+
+def set_plot_scale(scale: float) -> None:
+    """Set the global figure-size scale used by all eval plots."""
+    global _PLOT_SCALE
+    _PLOT_SCALE = scale
+
+
+def scaled_figsize(w: float, h: float) -> tuple:
+    """Return *(w, h)* shrunk by the current plot scale.
+
+    Shrinking the figure while keeping font sizes (in points) fixed makes all
+    text and line elements appear proportionally larger — an easy global
+    "zoom" knob.
+    """
+    return (w / _PLOT_SCALE, h / _PLOT_SCALE)
+
 
 @dataclass
 class EvalContext:
@@ -178,6 +199,8 @@ def run_all_modules(
     Returns:
         Dict mapping module name -> module results dict.
     """
+    set_plot_scale(ctx.config.get('plot_scale', 1.0))
+
     if modules is None:
         modules = discover_modules()
     
@@ -361,6 +384,8 @@ __all__ = [
     'EvalModule',
     'discover_modules',
     'run_all_modules',
+    'set_plot_scale',
+    'scaled_figsize',
     'compute_classification_metrics',
     'compute_per_user_metrics',
     'compute_gini_coefficient',

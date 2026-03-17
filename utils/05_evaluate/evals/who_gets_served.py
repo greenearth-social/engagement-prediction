@@ -33,7 +33,7 @@ import pandas as pd
 import polars as pl
 from scipy.stats import spearmanr
 
-from . import EvalContext, EvalModule, compute_per_user_metrics
+from . import EvalContext, EvalModule, compute_per_user_metrics, scaled_figsize
 from .trait_corrs import _load_inferences, _unnest_text_inferences
 from .trait_amplification import MIN_USER_POSTS, _filter_eligible_users
 
@@ -108,7 +108,7 @@ def _plot_scatter(
     p_value: float,
     out_dir: Path,
 ) -> Path:
-    fig, ax = plt.subplots(figsize=(7, 5))
+    fig, ax = plt.subplots(figsize=scaled_figsize(7, 5))
     color = _METRIC_COLORS.get(metric_name, "#333333")
 
     ax.scatter(mainstreamness, metric_values, s=8, alpha=0.4, color=color,
@@ -143,7 +143,7 @@ def _plot_quintile_bars(
         merged["mainstreamness"], 5, labels=["Q1\n(least)", "Q2", "Q3", "Q4", "Q5\n(most)"],
     )
 
-    fig, ax = plt.subplots(figsize=(9, 5))
+    fig, ax = plt.subplots(figsize=scaled_figsize(9, 5))
     quintile_order = ["Q1\n(least)", "Q2", "Q3", "Q4", "Q5\n(most)"]
     bar_width = 0.22
     x = np.arange(len(quintile_order))

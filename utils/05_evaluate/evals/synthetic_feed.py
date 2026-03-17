@@ -39,7 +39,7 @@ import numpy as np
 import polars as pl
 from scipy.stats import ttest_1samp
 
-from . import EvalContext, EvalModule
+from . import EvalContext, EvalModule, scaled_figsize
 from .trait_corrs import _load_inferences, _unnest_text_inferences
 
 # ---------------------------------------------------------------------------
@@ -359,7 +359,7 @@ def _plot_decomposition_bar(
     if n == 0:
         return path
 
-    fig, ax = plt.subplots(figsize=(10, max(3, 0.38 * n)))
+    fig, ax = plt.subplots(figsize=scaled_figsize(10, max(3, 0.38 * n)))
     y = np.arange(n)
     short = [k.split("::")[-1] for k in sorted_keys]
 
@@ -413,7 +413,7 @@ def _plot_group_decomposition(
     if n == 0:
         return path
 
-    fig, ax = plt.subplots(figsize=(8, max(3, 0.5 * n)))
+    fig, ax = plt.subplots(figsize=scaled_figsize(8, max(3, 0.5 * n)))
     y = np.arange(n)
     h = 0.25
 

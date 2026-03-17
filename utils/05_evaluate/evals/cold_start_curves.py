@@ -43,6 +43,7 @@ from . import (
     EvalContext,
     EvalModule,
     compute_classification_metrics,
+    scaled_figsize,
 )
 
 
@@ -308,7 +309,7 @@ class ColdStartCurvesModule(EvalModule):
         agg_y = agg_df[metric].to_numpy()
         color = self.METRIC_COLORS.get(metric, '#333333')
 
-        fig, ax = plt.subplots(figsize=self.FIGURE_SIZE)
+        fig, ax = plt.subplots(figsize=scaled_figsize(*self.FIGURE_SIZE))
 
         ax.plot(
             agg_x, agg_y,
@@ -346,7 +347,7 @@ class ColdStartCurvesModule(EvalModule):
         save_path: Path,
     ) -> None:
         """Plot distribution of predictions and users across bins."""
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=scaled_figsize(14, 5))
 
         bin_pred_counts = predictions_df['likes_bin'].value_counts().sort_index()
         bin_user_counts = (
