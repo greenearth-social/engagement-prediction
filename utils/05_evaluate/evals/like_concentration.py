@@ -54,19 +54,6 @@ def _plot_lorenz(
             label=f"likes  (Gini = {gini:.3f})")
     ax.fill_between(cum_pop, cum_val, cum_pop, alpha=0.15, color="#1f77b4")
 
-    sorted_likes = np.sort(likes)
-    for pct, color in [(0.10, "#d62728"), (0.05, "#ff7f0e"), (0.01, "#2ca02c")]:
-        share = _top_share(sorted_likes, pct)
-        x_pos = 1.0 - pct
-        y_interp = float(np.interp(x_pos, cum_pop, cum_val))
-        ax.annotate(
-            f"top {pct:.0%} → {share:.1%} of likes",
-            xy=(x_pos, y_interp),
-            xytext=(x_pos - 0.25, y_interp - 0.10),
-            fontsize=8, color=color,
-            arrowprops=dict(arrowstyle="->", color=color, lw=0.8),
-        )
-
     half_x = float(np.interp(0.5, cum_val, cum_pop))
     top_pct_for_half = round((1.0 - half_x) * 100)
     half_y = 0.5
