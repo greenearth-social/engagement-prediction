@@ -96,9 +96,9 @@ def _per_user_trait_means(
             if work[col].dtype not in (pl.Float32, pl.Float64):
                 work = work.with_columns(pl.col(col).cast(pl.Float64))
 
+            finite_vals = work.filter(pl.col(col).is_finite())
             per_user = (
-                work
-                .filter(pl.col(col).is_finite())
+                finite_vals
                 .group_by("did")
                 .agg(
                     pl.col(col).mean().alias("trait_mean"),
@@ -112,7 +112,8 @@ def _per_user_trait_means(
             key = f"{gname}::{col}"
             dids = per_user["did"].to_numpy()
             means = per_user["trait_mean"].to_numpy()
-            trait_data[key] = {"dids": dids, "means": means}
+            post_mean = float(finite_vals[col].mean())
+            trait_data[key] = {"dids": dids, "means": means, "post_mean": post_mean}
 
     return trait_data, group_labels
 
@@ -168,11 +169,14 @@ def _plot_volume_points(
         dids = td["dids"]
         means = td["means"].copy()
 
+        post_mean = td.get("post_mean", float("nan"))
+
         if standardize and baselines is not None:
             bl = baselines.get(key)
             if bl is None or bl[1] < 1e-12:
                 continue
             means = (means - bl[0]) / bl[1]
+            post_mean = (post_mean - bl[0]) / bl[1]
 
         mask_hi = np.array([is_high.get(uid, False) for uid in dids])
         lo_vals = means[~mask_hi]
@@ -188,12 +192,13 @@ def _plot_volume_points(
         ci_hi = z95 * float(np.std(hi_vals, ddof=1)) / np.sqrt(n_hi)
 
         _, p_val = ttest_ind(hi_vals, lo_vals, equal_var=False)
-        mean_all = float(np.mean(means))
+        mean_all_users = float(np.mean(means))
 
         raw_stats[col] = {
             "mean_lo": mean_lo, "ci_lo": ci_lo, "n_lo": n_lo,
             "mean_hi": mean_hi, "ci_hi": ci_hi, "n_hi": n_hi,
-            "mean_all": mean_all,
+            "mean_all_users": mean_all_users,
+            "mean_all_posts": post_mean,
             "diff": mean_hi - mean_lo,
             "p_val": float(p_val),
         }
@@ -218,7 +223,8 @@ def _plot_volume_points(
     c_lo = [raw_stats[l]["ci_lo"]   for l in labels]
     m_hi = [raw_stats[l]["mean_hi"] for l in labels]
     c_hi = [raw_stats[l]["ci_hi"]   for l in labels]
-    m_all = [raw_stats[l]["mean_all"] for l in labels]
+    m_all_users = [raw_stats[l]["mean_all_users"] for l in labels]
+    m_all_posts = [raw_stats[l]["mean_all_posts"] for l in labels]
 
     fig, ax = plt.subplots(figsize=scaled_figsize(max(6, 0.55 * n), 5))
 
@@ -234,8 +240,10 @@ def _plot_volume_points(
         capsize=3, capthick=0.8, linewidth=0.8,
         label=f"top {pct_hi_str}% of users (50% vol)",
     )
-    ax.scatter(x, m_all, marker="D", s=28, color="#666666", zorder=5,
-               label="overall mean")
+    ax.scatter(x, m_all_users, marker="D", s=28, color="#666666", zorder=5,
+               label="overall user mean")
+    ax.scatter(x, m_all_posts, marker="s", s=22, color="#aaaaaa", zorder=4,
+               label="overall post mean")
 
     p_vals = np.array([raw_stats[l]["p_val"] for l in labels])
     if len(p_vals) >= 1:
@@ -246,7 +254,8 @@ def _plot_volume_points(
     y_top = max(
         max(m + c for m, c in zip(m_lo, c_lo)),
         max(m + c for m, c in zip(m_hi, c_hi)),
-        max(m_all),
+        max(m_all_users),
+        max(m_all_posts),
     )
     star_y = y_top + (0.02 if not standardize else 0.05)
     for i, q in enumerate(q_vals):
