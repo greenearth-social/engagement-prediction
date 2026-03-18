@@ -611,7 +611,8 @@ class SyntheticFeedModule(EvalModule):
         from utils.helpers import get_device
 
         # ---- load data ----
-        print("    [synthetic_feed] Loading random pool + embeddings...")
+        print("    [synthetic_feed] Loading random pool + embeddings...",
+              flush=True)
         try:
             random_posts_lf, embeddings_mmap = _load_random_pool(run_dir)
         except FileNotFoundError as e:
@@ -622,7 +623,7 @@ class SyntheticFeedModule(EvalModule):
         except FileNotFoundError as e:
             return {"skipped": True, "reason": str(e)}
 
-        print("    [synthetic_feed] Loading user histories...")
+        print("    [synthetic_feed] Loading user histories...", flush=True)
         try:
             history_lf = _load_user_histories(run_dir)
         except FileNotFoundError as e:
@@ -640,7 +641,8 @@ class SyntheticFeedModule(EvalModule):
         n_with_inf = len(inference_available)
         print(
             f"    [synthetic_feed] Random posts with inferences: "
-            f"{n_with_inf:,}"
+            f"{n_with_inf:,}",
+            flush=True,
         )
         if n_with_inf < 100:
             return {
@@ -660,10 +662,11 @@ class SyntheticFeedModule(EvalModule):
 
         pool_emb_indices = pool_combined["emb_idx"].to_numpy()
         pool_flat, group_names = _unnest_text_inferences(pool_combined)
-        print(f"    [synthetic_feed] Pool: {n_pool} posts sampled for scoring")
+        print(f"    [synthetic_feed] Pool: {n_pool} posts sampled for scoring",
+              flush=True)
 
         # ---- load model ----
-        print("    [synthetic_feed] Loading model checkpoint...")
+        print("    [synthetic_feed] Loading model checkpoint...", flush=True)
         try:
             ckpt_path = _find_checkpoint(ctx)
         except FileNotFoundError as e:
@@ -673,7 +676,7 @@ class SyntheticFeedModule(EvalModule):
         model, ckpt = _load_model(ckpt_path, device)
 
         # ---- compute user summaries ----
-        print("    [synthetic_feed] Computing user summaries...")
+        print("    [synthetic_feed] Computing user summaries...", flush=True)
         preds_pl = pl.from_pandas(ctx.predictions_df)
         holdout_dids = preds_pl["did"].unique().to_list()
 
@@ -700,7 +703,8 @@ class SyntheticFeedModule(EvalModule):
         # ---- score pool for each user ----
         print(
             f"    [synthetic_feed] Scoring {n_pool} pool posts for "
-            f"{len(eligible_dids)} users..."
+            f"{len(eligible_dids)} users...",
+            flush=True,
         )
         pool_embeddings = embeddings_mmap[pool_emb_indices].copy()
         eligible_summaries = {d: user_summaries[d] for d in eligible_dids}
@@ -726,10 +730,12 @@ class SyntheticFeedModule(EvalModule):
             },
             out_dir / "synthetic_feed_topk.json",
         )
-        print("    [synthetic_feed] Saved top-K indices checkpoint")
+        print("    [synthetic_feed] Saved top-K indices checkpoint",
+              flush=True)
 
         # ---- trait decomposition ----
-        print("    [synthetic_feed] Computing trait decomposition...")
+        print("    [synthetic_feed] Joining liked posts to inferences...",
+              flush=True)
 
         liked_posts = preds_pl.filter(pl.col("y_true") == 1).select(
             "did", "post_id",
@@ -740,19 +746,34 @@ class SyntheticFeedModule(EvalModule):
                   how="inner")
             .collect()
         )
+        print(f"    [synthetic_feed] Matched {len(liked_combined):,} liked "
+              f"posts to inferences", flush=True)
+
         liked_flat, _ = _unnest_text_inferences(liked_combined)
         liked_dids = liked_flat["did"].to_numpy()
 
-        liked_did_to_rows: Dict[str, np.ndarray] = {}
-        for did in eligible_dids:
-            rows = np.where(liked_dids == did)[0]
-            if len(rows) >= MIN_USER_LIKES:
-                liked_did_to_rows[did] = rows
+        print(f"    [synthetic_feed] Building per-user row index for "
+              f"{len(eligible_dids):,} users...", flush=True)
+        eligible_set = set(eligible_dids)
+        did_to_rows_all: Dict[str, List[int]] = {}
+        for i, d in enumerate(liked_dids):
+            if d in eligible_set:
+                did_to_rows_all.setdefault(d, []).append(i)
+        liked_did_to_rows: Dict[str, np.ndarray] = {
+            d: np.array(rows)
+            for d, rows in did_to_rows_all.items()
+            if len(rows) >= MIN_USER_LIKES
+        }
+        print(f"    [synthetic_feed] {len(liked_did_to_rows):,} users have "
+              f">= {MIN_USER_LIKES} liked posts with inferences", flush=True)
 
+        print("    [synthetic_feed] Computing trait decomposition...",
+              flush=True)
         trait_results: Dict[str, TraitDecompResult] = {}
         group_labels: Dict[str, List[str]] = {}
+        total_traits = 0
 
-        for gname in group_names:
+        for gi, gname in enumerate(group_names, 1):
             pool_gdf = pool_flat.select(gname).unnest(gname)
             liked_gdf = (
                 liked_flat.select(gname).unnest(gname)
@@ -761,6 +782,11 @@ class SyntheticFeedModule(EvalModule):
             )
             cols = pool_gdf.columns
             group_labels[gname] = cols
+            print(
+                f"    [synthetic_feed]   group {gi}/{len(group_names)}: "
+                f"{gname} ({len(cols)} traits)",
+                flush=True,
+            )
 
             for col in cols:
                 pool_vals = pool_gdf[col].to_numpy().astype(np.float64)
@@ -786,8 +812,15 @@ class SyntheticFeedModule(EvalModule):
                 result = _compute_trait_decomposition(
                     pool_vals, user_actual, user_feed, eligible_dids,
                 )
+                total_traits += 1
                 if result is not None:
                     trait_results[f"{gname}::{col}"] = result
+
+        print(
+            f"    [synthetic_feed] Trait decomposition complete: "
+            f"{len(trait_results)}/{total_traits} traits had sufficient data",
+            flush=True,
+        )
 
         # ---- headline + JSON (saved before plots so a plot crash
         #      doesn't lose the numerical results) ----
@@ -833,12 +866,13 @@ class SyntheticFeedModule(EvalModule):
             "groups": groups_json,
         }
         self.save_json(summary, out_dir / "synthetic_feed_summary.json")
-        print("    [synthetic_feed] Saved summary JSON")
+        print("    [synthetic_feed] Saved summary JSON", flush=True)
 
         # ---- plots ----
         print(
             f"    [synthetic_feed] Generating plots for "
-            f"{len(trait_results)} traits..."
+            f"{len(trait_results)} traits...",
+            flush=True,
         )
         group_color_map = {
             g: _GROUP_COLORS[i % len(_GROUP_COLORS)]
