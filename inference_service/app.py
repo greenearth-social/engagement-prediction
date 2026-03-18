@@ -281,43 +281,10 @@ def _infer_signature(model_type: str) -> ModelSignature:
     raise RuntimeError(f"Unsupported model type: '{model_type}'")
 
 
-def _coerce_history_embeddings(value: Any, device: torch.device) -> torch.Tensor:
-    t = _tensor_from_nested_list("history_embeddings", value, dtype=DTYPE, device=device)
-    if t.dim() == 2:
-        t = t.unsqueeze(0)  # [1, T, D]
-    if t.dim() != 3:
-        raise HTTPException(status_code=400, detail="history_embeddings must have shape [T, D] or [B, T, D]")
-    return t
-
-
-def _coerce_history_mask(value: Any, device: torch.device, *, batch: int, seq_len: int) -> torch.Tensor:
-    if value is None:
-        raise HTTPException(status_code=422, detail="Missing required field 'history_mask'")
-
-    t = _tensor_from_nested_list("history_mask", value, dtype=torch.int64, device=device)
-    if t.dim() == 1:
-        t = t.unsqueeze(0)  # [1, T]
-    if t.dim() != 2:
-        raise HTTPException(status_code=422, detail="history_mask must have shape [T] or [B, T]")
-    b, t_len = t.shape
-    if int(b) != int(batch) or int(t_len) != int(seq_len):
-        raise HTTPException(
-            status_code=422,
-            detail=f"history_mask shape must match history_embeddings [B, T] = [{batch}, {seq_len}]",
-        )
-    return t.to(torch.bool)
-
-
-def _coerce_post_embeddings(value: Any, device: torch.device) -> torch.Tensor:
-    try:
-        t = torch.tensor(value, dtype=DTYPE, device=device)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid 'post_embeddings': {e}")
-
-    if t.dim() == 1:
-        t = t.unsqueeze(0)  # [1, D]
-    if t.dim() != 2:
-        raise HTTPException(status_code=400, detail="'post_embeddings' must have shape [D] or [B, D]")
+def _coerce_input(name: str, value: Any, dtype: torch.dtype, device: torch.device, non_batched_dim: int) -> torch.Tensor:
+    t = _tensor_from_nested_list(name, value, dtype, device)
+    if t.dim() == non_batched_dim:
+        t = t.unsqueeze(0) # add a batch dimension of size 1 at the beginning
     return t
 
 
@@ -539,19 +506,32 @@ def _predict_with_entry(entry: LoadedModel, req: PredictRequest) -> Any:
     with torch.inference_mode():
         if entry.model_type == "user-tower":
             assert isinstance(req, UserTowerPredictRequest)
-            history_embeddings = _coerce_history_embeddings(req.history_embeddings, device=entry.device)
-            history_mask = _coerce_history_mask(
-                req.history_mask,
+            history_embeddings = _coerce_input(
+                value=req.history_embeddings,
+                name="history_embeddings",
+                dtype=DTYPE,
                 device=entry.device,
-                batch=int(history_embeddings.shape[0]),
-                seq_len=int(history_embeddings.shape[1]),
+                non_batched_dim=2,
+            )
+            history_mask = _coerce_input(
+                value=req.history_mask,
+                name="history_mask",
+                dtype=torch.int64,
+                device=entry.device,
+                non_batched_dim=1,
             )
             y = entry.module(history_embeddings, history_mask)
             return y
 
         if entry.model_type == "post-tower":
             assert isinstance(req, PostTowerPredictRequest)
-            post_embeddings = _coerce_post_embeddings(req.post_embeddings, device=entry.device)
+            post_embeddings = _coerce_input(
+                value=req.post_embeddings,
+                name="post_embeddings",
+                dtype=DTYPE,
+                device=entry.device,
+                non_batched_dim=1,
+            )
             y = entry.module(post_embeddings)
             return y
 
