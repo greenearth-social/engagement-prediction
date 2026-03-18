@@ -40,6 +40,11 @@ MIN_LIKED_POSTS = 5
 
 _VOLUME_COLORS = {"lo": "#6baed6", "hi": "#08519c"}
 
+# Traits to exclude from specific groups (group_name -> set of col names).
+_EXCLUDED_TRAITS: Dict[str, set] = {
+    "moderation": {"OK"},
+}
+
 
 # ---------------------------------------------------------------------------
 # Volume split
@@ -91,7 +96,10 @@ def _per_user_trait_means(
         cols = [c for c in base.columns if c != "did"]
         group_labels[gname] = cols
 
+        excluded = _EXCLUDED_TRAITS.get(gname, set())
         for col in cols:
+            if col in excluded:
+                continue
             work = base.select("did", col)
             if work[col].dtype not in (pl.Float32, pl.Float64):
                 work = work.with_columns(pl.col(col).cast(pl.Float64))
@@ -279,7 +287,6 @@ def _plot_volume_points(
         f"  (top {pct_hi_str}% = 50% of likes)",
         fontsize=10, fontweight="bold",
     )
-    ax.legend(fontsize=7, loc="best", framealpha=0.8)
     ax.tick_params(axis="y", labelsize=7)
     plt.tight_layout()
 
@@ -287,6 +294,44 @@ def _plot_volume_points(
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return path, raw_stats, labels
+
+
+# ---------------------------------------------------------------------------
+# Standalone legend
+# ---------------------------------------------------------------------------
+
+def _save_legend(pct_hi_str: str, out_dir: Path) -> Path:
+    """Save a standalone legend PNG matching the volume-points plots."""
+    handles = [
+        plt.Line2D(
+            [0], [0], marker="o", color="w", markerfacecolor=_VOLUME_COLORS["lo"],
+            markersize=7, label="remaining users",
+        ),
+        plt.Line2D(
+            [0], [0], marker="o", color="w", markerfacecolor=_VOLUME_COLORS["hi"],
+            markersize=7, label=f"top {pct_hi_str}% of users (50% vol)",
+        ),
+        plt.Line2D(
+            [0], [0], marker="D", color="w", markerfacecolor="#666666",
+            markersize=7, label="overall user mean",
+        ),
+        plt.Line2D(
+            [0], [0], marker="s", color="w", markerfacecolor="#aaaaaa",
+            markersize=6, label="overall post mean",
+        ),
+    ]
+    fig, ax = plt.subplots(figsize=(1, 1))
+    legend = ax.legend(handles=handles, fontsize=8, framealpha=0.9,
+                       loc="center", frameon=True)
+    ax.set_axis_off()
+    fig.canvas.draw()
+    bbox = legend.get_window_extent().transformed(
+        fig.dpi_scale_trans.inverted()
+    )
+    path = out_dir / "liked_trait_volume_legend.png"
+    fig.savefig(path, dpi=150, bbox_inches=bbox)
+    plt.close(fig)
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +401,9 @@ class LikedTraitVolumeModule(EvalModule):
         n_hi = sum(1 for v in is_high.values() if v)
         n_lo = len(is_high) - n_hi
 
+        # --- Standalone legend ---
+        legend_path = _save_legend(pct_hi_str, out_dir)
+
         # --- Plots & summary ---
         plot_paths: list[str] = []
         groups_json: Dict[str, Any] = {}
@@ -408,4 +456,5 @@ class LikedTraitVolumeModule(EvalModule):
             "n_users": len(all_user_ids),
             "groups_plotted": len(groups_json),
             "plot_paths": plot_paths,
+            "legend_path": str(legend_path),
         }
