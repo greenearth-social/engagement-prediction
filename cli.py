@@ -105,7 +105,7 @@ DEFAULTS: Dict[str, Any] = {
     "eval_holdout_type": "unseen_users",
     "skip_eval_modules": None,  # Comma-separated eval module names to skip (None = run all)
     "only_eval_modules": None,  # Comma-separated eval module names to run exclusively (None = run all)
-    "eval_plot_scale": 1.5,
+    "eval_plot_scale": 1.75,
     # Selection/prior behavior
     "use_latest": False,
     "start_from": None,

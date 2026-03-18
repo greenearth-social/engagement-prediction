@@ -36,6 +36,10 @@ Outputs (under synthetic_feed/):
 - <group>_synthetic_feed_prevalence.png:   per-group vertical bars showing
                                            pool / liked / feed prevalence
                                            with 95% CIs and bias arrows
+- <group>_synthetic_feed_prevalence_detail.png:
+                                           same as above with hi/lo-volume
+                                           liker points overlaid on the
+                                           liked bar
 """
 
 from __future__ import annotations
@@ -68,6 +72,20 @@ _EXCLUDED_TRAITS: Dict[str, set] = {
     "emotion_sentiment": {"neutral"},
 }
 
+_SUBSET_TRAITS: Dict[str, Tuple[str, set]] = {
+    "text_arbitrary": (
+        "text_arbitrary_selected",
+        {
+            "News & Media", "Politics", "Programming",
+            "Arts & Creative", "Gaming", "Music", "Food & Lifestyle",
+        },
+    ),
+    "sentiment": (
+        "sentiment_negative",
+        {"Negative"},
+    ),
+}
+
 _GROUP_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
     "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
@@ -92,6 +110,7 @@ class TraitDecompResult(NamedTuple):
     p_amp: float
     p_excess: float
     n_pool_finite: int
+    user_dids: List[str]
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +310,7 @@ def _compute_trait_decomposition(
     up_list: List[float] = []
     ma_list: List[float] = []
     me_list: List[float] = []
+    did_list: List[str] = []
 
     for did in eligible_dids:
         actual = user_actual_traits.get(did)
@@ -306,6 +326,7 @@ def _compute_trait_decomposition(
         up_list.append((actual_mean - pool_mean) / pool_sd)
         ma_list.append((feed_mean - actual_mean) / pool_sd)
         me_list.append((feed_mean - pool_mean) / pool_sd)
+        did_list.append(did)
 
     if len(up_list) < 10:
         return None
@@ -337,6 +358,7 @@ def _compute_trait_decomposition(
         p_amp=p_amp,
         p_excess=p_excess,
         n_pool_finite=len(finite_pool),
+        user_dids=did_list,
     )
 
 
@@ -516,13 +538,17 @@ def _plot_group_prevalence(
     group_name: str,
     group_traits: Dict[str, TraitDecompResult],
     out_dir: Path,
-) -> Path:
+    *,
+    ylim: Optional[Tuple[float, float]] = None,
+) -> Tuple[Path, Tuple[float, float]]:
     """Per-group vertical bar chart: pool / liked / feed prevalence with 95% CIs.
 
     For each trait, three bars show the raw trait prevalence in the random pool,
     in users' liked posts (averaged across users), and in the model's top-K
     synthetic feed (averaged across users).  A directed arrow from the liked
     estimate to the feed estimate visualises the model's bias.
+
+    Returns ``(path, ylim)`` so a companion plot can reuse the same axis range.
     """
     z95 = 1.96
     excluded = _EXCLUDED_TRAITS.get(group_name, set())
@@ -560,7 +586,7 @@ def _plot_group_prevalence(
     n = len(labels)
     path = out_dir / f"{group_name}_synthetic_feed_prevalence.png"
     if n == 0:
-        return path
+        return path, (0.0, 1.0)
 
     x = np.arange(n)
     w = 0.25
@@ -600,32 +626,26 @@ def _plot_group_prevalence(
     arrow_x = offsets[3]
     annotation_pad = w * 0.15
     for i in range(n):
+        lv, fv = liked_vals[i], feed_vals[i]
+        ax_x = x[i] + arrow_x
         ax.annotate(
             "",
-            xy=(x[i] + arrow_x, feed_vals[i]),
-            xytext=(x[i] + arrow_x, liked_vals[i]),
+            xy=(ax_x, fv), xytext=(ax_x, lv),
             arrowprops=dict(
                 arrowstyle="->,head_width=0.25,head_length=0.15",
-                color="#D65F5F",
-                lw=1.5,
-                shrinkA=2,
-                shrinkB=2,
+                color="#D65F5F", lw=1.5,
+                shrinkA=0, shrinkB=0,
             ),
         )
+
         r = records[labels[i]]
         stars = _significance_stars(r["p_amp"])
-        mid_y = (liked_vals[i] + feed_vals[i]) / 2
+        mid_y = (lv + fv) / 2
         ax.text(
-            x[i] + arrow_x + annotation_pad, mid_y,
+            ax_x + annotation_pad, mid_y,
             f"{r['raw_shift']:+.4f}\nd={r['cohen_d_amp']:+.2f}{stars}",
             fontsize=5, va="center", ha="left", color="#333333",
         )
-
-    arrow_proxy = plt.Line2D(
-        [0, 0], [0, 1],
-        color="#D65F5F", lw=1.5,
-        marker="^", markersize=6, markevery=[1],
-    )
 
     ax.axhline(0, color="black", linewidth=0.4)
     ax.set_xlim(x[0] + offsets[0] - w, x[-1] + offsets[3] + 3 * w)
@@ -639,16 +659,245 @@ def _plot_group_prevalence(
         fontsize=10, fontweight="bold",
     )
     ax.tick_params(axis="y", labelsize=7)
-    handles, leg_labels = ax.get_legend_handles_labels()
-    handles.append(arrow_proxy)
-    leg_labels.append("Model bias (F\u2212L)")
-    ax.legend(handles, leg_labels, fontsize=7, loc="best", framealpha=0.8)
+    if ylim is not None:
+        ax.set_ylim(ylim)
     fig.subplots_adjust(
         bottom=BOTTOM / total_h, top=0.92, left=0.10, right=0.97,
     )
+    actual_ylim = ax.get_ylim()
     fig.savefig(path, dpi=180, bbox_inches="tight")
     plt.close(fig)
-    return path
+    return path, actual_ylim
+
+
+def _plot_group_prevalence_detail(
+    group_name: str,
+    group_traits: Dict[str, TraitDecompResult],
+    is_high: Dict[str, bool],
+    pct_hi_str: str,
+    out_dir: Path,
+    *,
+    ylim: Optional[Tuple[float, float]] = None,
+) -> Tuple[Path, Tuple[float, float]]:
+    """Like _plot_group_prevalence but overlays hi/lo-volume liker points on
+    the Liked bar column.
+
+    Returns ``(path, ylim)`` so a companion plot can reuse the same axis range.
+    """
+    z95 = 1.96
+    excluded = _EXCLUDED_TRAITS.get(group_name, set())
+
+    records: Dict[str, Dict[str, float]] = {}
+    for label, tr in group_traits.items():
+        if label in excluded:
+            continue
+        user_actual = tr.pool_mean + tr.user_pref_std * tr.pool_sd
+        user_feed = tr.pool_mean + tr.model_excess_std * tr.pool_sd
+
+        pool_prev = tr.pool_mean
+        pool_ci = z95 * tr.pool_sd / np.sqrt(tr.n_pool_finite)
+        liked_prev = float(np.mean(user_actual))
+        liked_ci = z95 * float(np.std(user_actual, ddof=1)) / np.sqrt(tr.n_users)
+        feed_prev = float(np.mean(user_feed))
+        feed_ci = z95 * float(np.std(user_feed, ddof=1)) / np.sqrt(tr.n_users)
+
+        raw_shift = float(np.mean(tr.model_amp_std)) * tr.pool_sd
+
+        mask_hi = np.array([is_high.get(d, False) for d in tr.user_dids])
+        lo_actual = user_actual[~mask_hi]
+        hi_actual = user_actual[mask_hi]
+
+        lo_prev = float(np.mean(lo_actual)) if len(lo_actual) >= 5 else float("nan")
+        lo_ci = (
+            z95 * float(np.std(lo_actual, ddof=1)) / np.sqrt(len(lo_actual))
+            if len(lo_actual) >= 5 else 0.0
+        )
+        hi_prev = float(np.mean(hi_actual)) if len(hi_actual) >= 5 else float("nan")
+        hi_ci = (
+            z95 * float(np.std(hi_actual, ddof=1)) / np.sqrt(len(hi_actual))
+            if len(hi_actual) >= 5 else 0.0
+        )
+
+        records[label] = {
+            "pool": pool_prev, "pool_ci": pool_ci,
+            "liked": liked_prev, "liked_ci": liked_ci,
+            "feed": feed_prev, "feed_ci": feed_ci,
+            "raw_shift": raw_shift,
+            "cohen_d_amp": tr.cohen_d_amp,
+            "p_amp": tr.p_amp,
+            "lo_prev": lo_prev, "lo_ci": lo_ci,
+            "hi_prev": hi_prev, "hi_ci": hi_ci,
+        }
+
+    labels = sorted(
+        records,
+        key=lambda k: abs(records[k]["feed"] - records[k]["liked"]),
+        reverse=True,
+    )
+    n = len(labels)
+    path = out_dir / f"{group_name}_synthetic_feed_prevalence_detail.png"
+    if n == 0:
+        return path, (0.0, 1.0)
+
+    x = np.arange(n)
+    w = 0.25
+
+    pool_vals = [records[l]["pool"] for l in labels]
+    pool_cis = [records[l]["pool_ci"] for l in labels]
+    liked_vals = [records[l]["liked"] for l in labels]
+    liked_cis = [records[l]["liked_ci"] for l in labels]
+    feed_vals = [records[l]["feed"] for l in labels]
+    feed_cis = [records[l]["feed_ci"] for l in labels]
+
+    PLOT_H = 4.5
+    BOTTOM = 1.8
+    total_h = PLOT_H + BOTTOM
+    fig_w, fig_h = scaled_figsize(max(6, 0.7 * n), total_h)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    offsets = np.array([-1.5, -0.5, 0.5, 1.5]) * w
+
+    ax.bar(
+        x + offsets[0], pool_vals, width=w, yerr=pool_cis,
+        color="#aaaaaa", alpha=0.85, capsize=3,
+        error_kw=dict(linewidth=0.8), label="Pool",
+    )
+    ax.bar(
+        x + offsets[1], liked_vals, width=w, yerr=liked_cis,
+        color="#4878CF", alpha=0.85, capsize=3,
+        error_kw=dict(linewidth=0.8), label="Liked (user avg)",
+    )
+    ax.bar(
+        x + offsets[2], feed_vals, width=w, yerr=feed_cis,
+        color="#D65F5F", alpha=0.85, capsize=3,
+        error_kw=dict(linewidth=0.8), label="Feed (user avg)",
+    )
+
+    # hi/lo volume points on the liked column
+    dodge = w * 0.15
+    lo_vals = [records[l]["lo_prev"] for l in labels]
+    lo_cis = [records[l]["lo_ci"] for l in labels]
+    hi_vals_pts = [records[l]["hi_prev"] for l in labels]
+    hi_cis = [records[l]["hi_ci"] for l in labels]
+
+    ax.errorbar(
+        x + offsets[1] - dodge, lo_vals, yerr=lo_cis,
+        fmt="o", color="#6baed6", markersize=4, capsize=2, capthick=0.7,
+        linewidth=0.7, zorder=5, label="Liked lo-vol",
+    )
+    ax.errorbar(
+        x + offsets[1] + dodge, hi_vals_pts, yerr=hi_cis,
+        fmt="o", color="#08519c", markersize=4, capsize=2, capthick=0.7,
+        linewidth=0.7, zorder=5,
+        label=f"Liked hi-vol (top {pct_hi_str}%)",
+    )
+
+    arrow_x = offsets[3]
+    annotation_pad = w * 0.15
+    for i in range(n):
+        lv, fv = liked_vals[i], feed_vals[i]
+        ax_x = x[i] + arrow_x
+        ax.annotate(
+            "",
+            xy=(ax_x, fv), xytext=(ax_x, lv),
+            arrowprops=dict(
+                arrowstyle="->,head_width=0.25,head_length=0.15",
+                color="#D65F5F", lw=1.5,
+                shrinkA=0, shrinkB=0,
+            ),
+        )
+
+        r = records[labels[i]]
+        stars = _significance_stars(r["p_amp"])
+        mid_y = (lv + fv) / 2
+        ax.text(
+            ax_x + annotation_pad, mid_y,
+            f"{r['raw_shift']:+.4f}\nd={r['cohen_d_amp']:+.2f}{stars}",
+            fontsize=5, va="center", ha="left", color="#333333",
+        )
+
+    ax.axhline(0, color="black", linewidth=0.4)
+    ax.set_xlim(x[0] + offsets[0] - w, x[-1] + offsets[3] + 3 * w)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+    ax.set_ylabel("Trait prevalence (raw units)", fontsize=8)
+
+    title = group_name.replace("_", " ").title()
+    ax.set_title(
+        f"{title}: pool / liked / feed prevalence (detail)",
+        fontsize=10, fontweight="bold",
+    )
+    ax.tick_params(axis="y", labelsize=7)
+    if ylim is not None:
+        ax.set_ylim(ylim)
+    fig.subplots_adjust(
+        bottom=BOTTOM / total_h, top=0.92, left=0.10, right=0.97,
+    )
+    actual_ylim = ax.get_ylim()
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return path, actual_ylim
+
+
+def _save_prevalence_legends(pct_hi_str: str, out_dir: Path) -> List[str]:
+    """Save standalone legend PNGs for the prevalence and prevalence-detail plots."""
+    paths: List[str] = []
+
+    arrow_proxy = plt.Line2D(
+        [0, 0], [0, 1], color="#D65F5F", lw=1.5,
+        marker="^", markersize=6, markevery=[1],
+    )
+
+    base_handles = [
+        plt.Rectangle((0, 0), 1, 1, fc="#aaaaaa", alpha=0.85),
+        plt.Rectangle((0, 0), 1, 1, fc="#4878CF", alpha=0.85),
+        plt.Rectangle((0, 0), 1, 1, fc="#D65F5F", alpha=0.85),
+        arrow_proxy,
+    ]
+    base_labels = [
+        "Pool", "Liked (user avg)", "Feed (user avg)",
+        "Model bias (F\u2212L)",
+    ]
+
+    for suffix, extra_handles, extra_labels in [
+        ("prevalence", [], []),
+        (
+            "prevalence_detail",
+            [
+                plt.Line2D(
+                    [0], [0], marker="o", color="w",
+                    markerfacecolor="#6baed6", markersize=7,
+                    label="Liked lo-vol",
+                ),
+                plt.Line2D(
+                    [0], [0], marker="o", color="w",
+                    markerfacecolor="#08519c", markersize=7,
+                    label=f"Liked hi-vol (top {pct_hi_str}%)",
+                ),
+            ],
+            [
+                "Liked lo-vol",
+                f"Liked hi-vol (top {pct_hi_str}%)",
+            ],
+        ),
+    ]:
+        fig_leg, ax_leg = plt.subplots(figsize=(1, 1))
+        legend = ax_leg.legend(
+            base_handles + extra_handles,
+            base_labels + extra_labels,
+            fontsize=8, framealpha=0.9, loc="center", frameon=True,
+        )
+        ax_leg.set_axis_off()
+        fig_leg.canvas.draw()
+        bbox = legend.get_window_extent().transformed(
+            fig_leg.dpi_scale_trans.inverted(),
+        )
+        p = out_dir / f"synthetic_feed_{suffix}_legend.png"
+        fig_leg.savefig(p, dpi=150, bbox_inches=bbox)
+        plt.close(fig_leg)
+        paths.append(str(p))
+
+    return paths
 
 
 # ---------------------------------------------------------------------------
@@ -1017,6 +1266,18 @@ class SyntheticFeedModule(EvalModule):
         self.save_json(summary, out_dir / "synthetic_feed_summary.json")
         print("    [synthetic_feed] Saved summary JSON", flush=True)
 
+        # ---- volume split for detail plots ----
+        from .liked_trait_volume import _givers_of_half_the_likes
+
+        meta = ctx.user_metadata_df
+        did_to_likes: Dict[str, int] = dict(
+            zip(meta["did"], meta["num_total_likes"])
+        )
+        eligible_arr = np.array(eligible_dids)
+        is_high, _pct_hi, pct_hi_str = _givers_of_half_the_likes(
+            eligible_arr, did_to_likes,
+        )
+
         # ---- plots ----
         print(
             f"    [synthetic_feed] Generating plots for "
@@ -1028,6 +1289,7 @@ class SyntheticFeedModule(EvalModule):
             for i, g in enumerate(group_names)
         }
         plot_paths: List[str] = []
+        plot_paths.extend(_save_prevalence_legends(pct_hi_str, out_dir))
 
         if trait_results:
             plot_paths.append(
@@ -1060,9 +1322,27 @@ class SyntheticFeedModule(EvalModule):
                         gname, gt, out_dir, standardize=False,
                     ))
                 )
-                plot_paths.append(
-                    str(_plot_group_prevalence(gname, gt, out_dir))
+                detail_path, shared_ylim = _plot_group_prevalence_detail(
+                    gname, gt, is_high, pct_hi_str, out_dir,
                 )
+                prev_path, _ = _plot_group_prevalence(
+                    gname, gt, out_dir, ylim=shared_ylim,
+                )
+                plot_paths.append(str(prev_path))
+                plot_paths.append(str(detail_path))
+
+                if gname in _SUBSET_TRAITS:
+                    sub_name, sub_keep = _SUBSET_TRAITS[gname]
+                    sub_gt = {k: v for k, v in gt.items() if k in sub_keep}
+                    if sub_gt:
+                        sub_detail, sub_ylim = _plot_group_prevalence_detail(
+                            sub_name, sub_gt, is_high, pct_hi_str, out_dir,
+                        )
+                        sub_prev, _ = _plot_group_prevalence(
+                            sub_name, sub_gt, out_dir, ylim=sub_ylim,
+                        )
+                        plot_paths.append(str(sub_prev))
+                        plot_paths.append(str(sub_detail))
 
         return {
             "headline": headline,
