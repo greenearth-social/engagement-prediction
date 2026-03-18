@@ -234,7 +234,11 @@ def _plot_volume_points(
     m_all_users = [raw_stats[l]["mean_all_users"] for l in labels]
     m_all_posts = [raw_stats[l]["mean_all_posts"] for l in labels]
 
-    fig, ax = plt.subplots(figsize=scaled_figsize(max(6, 0.55 * n), 5))
+    PLOT_AREA_HEIGHT = 4.0
+    BOTTOM_MARGIN = 2.0
+    total_h = PLOT_AREA_HEIGHT + BOTTOM_MARGIN
+    fig_w, fig_h = scaled_figsize(max(6, 0.55 * n), total_h)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
     ax.errorbar(
         x - dodge, m_lo, yerr=c_lo,
@@ -288,10 +292,11 @@ def _plot_volume_points(
         fontsize=10, fontweight="bold",
     )
     ax.tick_params(axis="y", labelsize=7)
-    plt.tight_layout()
+    fig.subplots_adjust(bottom=BOTTOM_MARGIN / total_h, top=0.92, left=0.10,
+                        right=0.97)
 
     path = out_dir / fname
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path, dpi=150)
     plt.close(fig)
     return path, raw_stats, labels
 
