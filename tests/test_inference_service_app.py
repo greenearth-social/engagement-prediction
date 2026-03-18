@@ -2,14 +2,9 @@ import os
 
 import pytest
 
-
-fastapi = pytest.importorskip("fastapi")
-pydantic = pytest.importorskip("pydantic")
-torch = pytest.importorskip("torch")
-pytest.importorskip("clearml")
-
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+import torch
 
 _prev_max_history_len = os.environ.get("GE_INFERENCE_MAX_HISTORY_LEN")
 os.environ["GE_INFERENCE_MAX_HISTORY_LEN"] = "2"
