@@ -17,13 +17,22 @@ For each holdout user *u* and trait *t*:
     model_amp(u)     = model_feed(u)   - user_actual(u)  (model amplification)
     model_excess(u)  = model_feed(u)   - pool_mean       (total excess)
 
-All quantities are standardized by sd(trait across pool).  The additive
-identity  model_excess = user_pref + model_amp  holds exactly.
+All quantities are computed both **standardized** (divided by pool SD, useful
+for cross-trait comparison) and **absolute** (raw trait-probability units,
+useful for gauging real-world magnitude).  The additive identity
+model_excess = user_pref + model_amp  holds exactly in both scales.
+
+Note: standardized values can inflate rare traits with small pool SDs.
+The absolute-scale plots provide a complementary view.
 
 Outputs (under synthetic_feed/):
-- synthetic_feed_decomposition.png: headline decomposition bar chart
-- <group>_synthetic_feed.png:       per-group small-multiples
-- synthetic_feed_summary.json
+- synthetic_feed_topk.json:                per-user top-K pool indices (saved
+                                           immediately after scoring)
+- synthetic_feed_summary.json:             numerical results (saved before plots)
+- synthetic_feed_decomposition.png:        headline bar chart (standardized)
+- synthetic_feed_decomposition_abs.png:    headline bar chart (absolute)
+- <group>_synthetic_feed.png:              per-group bars (standardized)
+- <group>_synthetic_feed_abs.png:          per-group bars (absolute)
 """
 
 from __future__ import annotations
@@ -347,15 +356,30 @@ def _plot_decomposition_bar(
     trait_results: Dict[str, TraitDecompResult],
     group_color_map: Dict[str, str],
     out_dir: Path,
+    *,
+    standardize: bool = True,
 ) -> Path:
-    """Headline horizontal stacked bar: user_pref + model_amp = model_excess."""
+    """Headline horizontal stacked bar: user_pref + model_amp = model_excess.
+
+    When *standardize* is False the bars are in raw trait-probability units
+    instead of pool-SD units, giving a sense of absolute magnitude.
+    """
+    tag = "std" if standardize else "abs"
+
+    def _scale(k: str, arr_name: str) -> float:
+        tr = trait_results[k]
+        v = float(np.mean(getattr(tr, arr_name)))
+        return v if standardize else v * tr.pool_sd
+
     sorted_keys = sorted(
         trait_results,
-        key=lambda k: abs(float(np.mean(trait_results[k].model_excess_std))),
+        key=lambda k: abs(_scale(k, "model_excess_std")),
         reverse=True,
     )
     n = len(sorted_keys)
-    path = out_dir / "synthetic_feed_decomposition.png"
+    fname = "synthetic_feed_decomposition.png" if standardize else \
+            "synthetic_feed_decomposition_abs.png"
+    path = out_dir / fname
     if n == 0:
         return path
 
@@ -363,30 +387,39 @@ def _plot_decomposition_bar(
     y = np.arange(n)
     short = [k.split("::")[-1] for k in sorted_keys]
 
-    pref = [float(np.mean(trait_results[k].user_pref_std)) for k in sorted_keys]
-    amp = [float(np.mean(trait_results[k].model_amp_std)) for k in sorted_keys]
+    pref = [_scale(k, "user_pref_std") for k in sorted_keys]
+    amp = [_scale(k, "model_amp_std") for k in sorted_keys]
 
     ax.barh(y, pref, height=0.6, color="#4878CF", alpha=0.85,
             label="User preference (likes \u2212 pool)")
     ax.barh(y, amp, height=0.6, left=pref, color="#D65F5F", alpha=0.85,
             label="Model amplification (feed \u2212 likes)")
 
+    fmt = "+.3f" if standardize else "+.4f"
     for i, k in enumerate(sorted_keys):
         tr = trait_results[k]
-        excess = float(np.mean(tr.model_excess_std))
+        excess = _scale(k, "model_excess_std")
         stars = _significance_stars(tr.p_excess)
-        offset = 0.01 if excess >= 0 else -0.01
+        offset = 0.01 * (1 if standardize else tr.pool_sd)
+        if excess < 0:
+            offset = -offset
         ha = "left" if excess >= 0 else "right"
-        ax.text(excess + offset, i, f"{excess:+.3f}{stars}",
+        ax.text(excess + offset, i, f"{excess:{fmt}}{stars}",
                 va="center", ha=ha, fontsize=6, fontweight="bold")
 
     ax.set_yticks(y)
     ax.set_yticklabels(short, fontsize=7)
     ax.invert_yaxis()
     ax.axvline(0, color="black", linewidth=0.5)
-    ax.set_xlabel("Mean over-serving (pool SDs)", fontsize=9)
+
+    if standardize:
+        ax.set_xlabel("Mean over-serving (pool SDs)", fontsize=9)
+        subtitle = "(standardized by pool SD)"
+    else:
+        ax.set_xlabel("Mean over-serving (raw trait units)", fontsize=9)
+        subtitle = "(absolute, raw trait units)"
     ax.set_title(
-        "Synthetic feed: trait decomposition\n"
+        f"Synthetic feed: trait decomposition {subtitle}\n"
         "model_excess = user_preference + model_amplification",
         fontsize=10, fontweight="bold",
     )
@@ -401,15 +434,27 @@ def _plot_group_decomposition(
     group_name: str,
     group_traits: Dict[str, TraitDecompResult],
     out_dir: Path,
+    *,
+    standardize: bool = True,
 ) -> Path:
-    """Per-group grouped bar chart: three bars per trait."""
+    """Per-group grouped bar chart: three bars per trait.
+
+    When *standardize* is False the bars are in raw trait-probability units.
+    """
+
+    def _scale(k: str, arr_name: str) -> float:
+        tr = group_traits[k]
+        v = float(np.mean(getattr(tr, arr_name)))
+        return v if standardize else v * tr.pool_sd
+
     labels = sorted(
         group_traits,
-        key=lambda k: abs(float(np.mean(group_traits[k].model_excess_std))),
+        key=lambda k: abs(_scale(k, "model_excess_std")),
         reverse=True,
     )
     n = len(labels)
-    path = out_dir / f"{group_name}_synthetic_feed.png"
+    suffix = "" if standardize else "_abs"
+    path = out_dir / f"{group_name}_synthetic_feed{suffix}.png"
     if n == 0:
         return path
 
@@ -417,9 +462,9 @@ def _plot_group_decomposition(
     y = np.arange(n)
     h = 0.25
 
-    pref = [float(np.mean(group_traits[k].user_pref_std)) for k in labels]
-    amp = [float(np.mean(group_traits[k].model_amp_std)) for k in labels]
-    excess = [float(np.mean(group_traits[k].model_excess_std)) for k in labels]
+    pref = [_scale(k, "user_pref_std") for k in labels]
+    amp = [_scale(k, "model_amp_std") for k in labels]
+    excess = [_scale(k, "model_excess_std") for k in labels]
 
     ax.barh(y - h, pref, height=h, color="#4878CF", alpha=0.85,
             label="User pref")
@@ -441,9 +486,14 @@ def _plot_group_decomposition(
     ax.set_yticklabels(labels, fontsize=7)
     ax.invert_yaxis()
     ax.axvline(0, color="black", linewidth=0.5)
-    ax.set_xlabel("Mean (pool SDs)", fontsize=8)
+
+    if standardize:
+        ax.set_xlabel("Mean (pool SDs)", fontsize=8)
+    else:
+        ax.set_xlabel("Mean (raw trait units)", fontsize=8)
     title = group_name.replace("_", " ").title()
-    ax.set_title(f"{title}: synthetic feed decomposition",
+    scale_tag = "standardized" if standardize else "absolute"
+    ax.set_title(f"{title}: synthetic feed decomposition ({scale_tag})",
                  fontsize=9, fontweight="bold")
     ax.legend(fontsize=6, loc="lower right", framealpha=0.8)
     plt.tight_layout()
@@ -462,9 +512,16 @@ def _generate_headline(
     if not trait_results:
         return ["No traits had enough data for synthetic feed analysis."]
 
-    by_excess = sorted(
+    by_excess_std = sorted(
         trait_results.items(),
         key=lambda kv: abs(float(np.mean(kv[1].model_excess_std))),
+        reverse=True,
+    )
+    by_excess_abs = sorted(
+        trait_results.items(),
+        key=lambda kv: abs(
+            float(np.mean(kv[1].model_excess_std)) * kv[1].pool_sd
+        ),
         reverse=True,
     )
 
@@ -480,7 +537,7 @@ def _generate_headline(
         f"(feed \u2260 likes, p < .05)."
     )
 
-    top_k, top_tr = by_excess[0]
+    top_k, top_tr = by_excess_std[0]
     top_label = top_k.split("::")[-1]
     top_excess = float(np.mean(top_tr.model_excess_std))
     top_pref = float(np.mean(top_tr.user_pref_std))
@@ -488,13 +545,29 @@ def _generate_headline(
     direction = "over" if top_excess > 0 else "under"
 
     sentences.append(
-        f"Largest effect: {top_label} is {direction}-represented by "
+        f"Largest effect (standardized): {top_label} is "
+        f"{direction}-represented by "
         f"{abs(top_excess):.3f} SD in the synthetic feed vs the random pool. "
         f"Of this, {abs(top_pref):.3f} SD reflects user preference and "
         f"{abs(top_amp):.3f} SD is model amplification "
         f"(d_excess = {top_tr.cohen_d_excess:+.2f}, "
         f"{_fmt_pvalue(top_tr.p_excess)})."
     )
+
+    abs_k, abs_tr = by_excess_abs[0]
+    abs_label = abs_k.split("::")[-1]
+    abs_excess = float(np.mean(abs_tr.model_excess_std)) * abs_tr.pool_sd
+    abs_direction = "over" if abs_excess > 0 else "under"
+    if abs_k != top_k:
+        sentences.append(
+            f"Largest effect (absolute): {abs_label} is "
+            f"{abs_direction}-represented by "
+            f"{abs(abs_excess):.4f} raw units in the synthetic feed vs the "
+            f"random pool (pool_mean={abs_tr.pool_mean:.4f}, "
+            f"pool_sd={abs_tr.pool_sd:.4f}). "
+            f"This differs from the standardized ranking because "
+            f"SD-normalization inflates rare traits with small pool SDs."
+        )
 
     by_amp = sorted(
         trait_results.items(),
@@ -641,6 +714,20 @@ class SyntheticFeedModule(EvalModule):
         for did, scores in user_scores.items():
             user_topk[did] = np.argsort(scores)[-k:][::-1]
 
+        # ---- persist scoring outputs early ----
+        self.save_json(
+            {
+                "n_pool": n_pool,
+                "top_k": k,
+                "n_users_scored": len(user_scores),
+                "user_topk": {
+                    did: idx.tolist() for did, idx in user_topk.items()
+                },
+            },
+            out_dir / "synthetic_feed_topk.json",
+        )
+        print("    [synthetic_feed] Saved top-K indices checkpoint")
+
         # ---- trait decomposition ----
         print("    [synthetic_feed] Computing trait decomposition...")
 
@@ -702,36 +789,8 @@ class SyntheticFeedModule(EvalModule):
                 if result is not None:
                     trait_results[f"{gname}::{col}"] = result
 
-        # ---- plots ----
-        print(
-            f"    [synthetic_feed] Generating plots for "
-            f"{len(trait_results)} traits..."
-        )
-        group_color_map = {
-            g: _GROUP_COLORS[i % len(_GROUP_COLORS)]
-            for i, g in enumerate(group_names)
-        }
-        plot_paths: List[str] = []
-
-        if trait_results:
-            plot_paths.append(
-                str(_plot_decomposition_bar(
-                    trait_results, group_color_map, out_dir,
-                ))
-            )
-
-        for gname in group_names:
-            gt: Dict[str, TraitDecompResult] = {}
-            for label in group_labels.get(gname, []):
-                key = f"{gname}::{label}"
-                if key in trait_results:
-                    gt[label] = trait_results[key]
-            if gt:
-                plot_paths.append(
-                    str(_plot_group_decomposition(gname, gt, out_dir))
-                )
-
-        # ---- headline + JSON ----
+        # ---- headline + JSON (saved before plots so a plot crash
+        #      doesn't lose the numerical results) ----
         headline = _generate_headline(trait_results)
 
         groups_json: Dict[str, Any] = {}
@@ -748,6 +807,9 @@ class SyntheticFeedModule(EvalModule):
                     "mean_model_excess_std": float(
                         np.mean(tr.model_excess_std),
                     ),
+                    "mean_user_pref_abs": float(np.mean(tr.user_pref_std)) * tr.pool_sd,
+                    "mean_model_amp_abs": float(np.mean(tr.model_amp_std)) * tr.pool_sd,
+                    "mean_model_excess_abs": float(np.mean(tr.model_excess_std)) * tr.pool_sd,
                     "pool_mean": tr.pool_mean,
                     "pool_sd": tr.pool_sd,
                     "n_users": tr.n_users,
@@ -771,6 +833,50 @@ class SyntheticFeedModule(EvalModule):
             "groups": groups_json,
         }
         self.save_json(summary, out_dir / "synthetic_feed_summary.json")
+        print("    [synthetic_feed] Saved summary JSON")
+
+        # ---- plots ----
+        print(
+            f"    [synthetic_feed] Generating plots for "
+            f"{len(trait_results)} traits..."
+        )
+        group_color_map = {
+            g: _GROUP_COLORS[i % len(_GROUP_COLORS)]
+            for i, g in enumerate(group_names)
+        }
+        plot_paths: List[str] = []
+
+        if trait_results:
+            plot_paths.append(
+                str(_plot_decomposition_bar(
+                    trait_results, group_color_map, out_dir,
+                    standardize=True,
+                ))
+            )
+            plot_paths.append(
+                str(_plot_decomposition_bar(
+                    trait_results, group_color_map, out_dir,
+                    standardize=False,
+                ))
+            )
+
+        for gname in group_names:
+            gt: Dict[str, TraitDecompResult] = {}
+            for label in group_labels.get(gname, []):
+                key = f"{gname}::{label}"
+                if key in trait_results:
+                    gt[label] = trait_results[key]
+            if gt:
+                plot_paths.append(
+                    str(_plot_group_decomposition(
+                        gname, gt, out_dir, standardize=True,
+                    ))
+                )
+                plot_paths.append(
+                    str(_plot_group_decomposition(
+                        gname, gt, out_dir, standardize=False,
+                    ))
+                )
 
         return {
             "headline": headline,
