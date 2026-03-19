@@ -30,6 +30,7 @@ from utils.pipeline.core import (
     generate_run_timestamp,
     DEFAULT_ARTIFACTS_DIR,
     DEFAULT_RUNS_DIR,
+    LINEAGE_FILENAME,
     new_pipeline_run_dir,
     ensure_pipeline_run_dir,
     update_latest_symlink,
@@ -448,7 +449,7 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     args_dict = {k: v for k, v in vars(args).items() if k != "func" and not callable(v)}
     run_resolved_config_path.write_text(json.dumps(args_dict, indent=2, sort_keys=True) + "\n")
 
-    lineage_path = run_dir / "lineage.yaml"
+    lineage_path = run_dir / LINEAGE_FILENAME
     if not lineage_path.exists():
         try:
             proc = subprocess.run(

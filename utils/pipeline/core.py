@@ -34,6 +34,9 @@ ROOT = UTILS_DIR.parent
 RUN_TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
 DEFAULT_ARTIFACTS_DIR = ROOT / "artifacts"
 DEFAULT_RUNS_DIR = ROOT / "runs"
+LINEAGE_FILENAME = "lineage.json"
+STAGE_MANIFEST_FILENAME = "manifest.json"
+STAGE_RESOLVED_CONFIG_FILENAME = "resolved_config.json"
 
 
 def generate_run_timestamp() -> str:
@@ -50,14 +53,13 @@ def _normalize_for_json(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, dict):
-        return {k: _normalize_for_json(v) for k, v in value.items() if v is not None}
+        return {k: _normalize_for_json(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_normalize_for_json(v) for v in value]
     return value
 
 
-def _write_yaml_compatible_json(path: Path, data: Dict[str, Any]) -> None:
-    # JSON is valid YAML 1.2, so this produces a .yml that is parsable by YAML tooling.
+def _write_json(path: Path, data: Dict[str, Any]) -> None:
     path.write_text(json.dumps(_normalize_for_json(data), indent=2, sort_keys=True) + "\n")
 
 
@@ -142,11 +144,25 @@ class Context:
     _active_stage_folder: Optional[str] = None
     _active_stage_inputs: Dict[str, str] = field(default_factory=dict)
 
-    def new_stage_dir(self, stage_name: str, tag: str = "") -> Path:
+    def new_stage_dir(self, stage_folder: Optional[str] = None, tag: str = "") -> Path:
+        """Create a new canonical artifact directory for the active stage.
+
+        If called during `registry.run_stage()`, `Context.begin_stage()` has already set
+        `self._active_stage_folder`, so callers can omit `stage_folder` to avoid
+        accidentally writing under the wrong artifact folder.
+        """
+        if stage_folder is None:
+            if not self._active_stage_folder:
+                raise ValueError("new_stage_dir(stage_folder=None) requires Context.begin_stage() to be called first.")
+            stage_folder = self._active_stage_folder
+        elif self._active_stage_folder and stage_folder != self._active_stage_folder:
+            raise ValueError(
+                f"Stage folder mismatch: requested '{stage_folder}' but active stage folder is '{self._active_stage_folder}'."
+            )
         # Stage outputs are written to the canonical artifact store, not under run_dir.
         return new_stage_artifact_dir(
             artifacts_dir=Path(self.artifacts_dir).resolve(),
-            stage_folder=stage_name,
+            stage_folder=stage_folder,
             tag=tag,
         )
 
@@ -183,11 +199,11 @@ class Context:
         pipeline_run_dir.mkdir(parents=True, exist_ok=True)
         _ensure_symlink(pipeline_run_dir / stage_folder, output_dir)
 
-        resolved_config_path = output_dir / "resolved_config.yml"
+        resolved_config_path = output_dir / STAGE_RESOLVED_CONFIG_FILENAME
         args_dict = {k: v for k, v in vars(args).items() if k != "func" and not callable(v)}
-        _write_yaml_compatible_json(resolved_config_path, args_dict)
+        _write_json(resolved_config_path, args_dict)
 
-        manifest_path = output_dir / "manifest.yaml"
+        manifest_path = output_dir / STAGE_MANIFEST_FILENAME
         manifest: Dict[str, Any] = {
             "stage_key": stage_key,
             "stage_folder": stage_folder,
@@ -198,7 +214,7 @@ class Context:
             "argv": list(argv) if argv is not None else None,
             "inputs": self._active_stage_inputs.copy(),
         }
-        _write_yaml_compatible_json(manifest_path, manifest)
+        _write_json(manifest_path, manifest)
 
         self._update_lineage(
             stage_key=stage_key,
@@ -229,10 +245,13 @@ class Context:
         resolved_config_path: Path,
         manifest_path: Path,
     ) -> None:
-        lineage_path = Path(self.run_dir).resolve() / "lineage.yaml"
-        if lineage_path.exists():
+        run_dir = Path(self.run_dir).resolve()
+        lineage_path = run_dir / LINEAGE_FILENAME
+        legacy_lineage_path = run_dir / "lineage.yaml"
+        read_path = lineage_path if lineage_path.exists() else legacy_lineage_path
+        if read_path.exists():
             try:
-                lineage: Dict[str, Any] = json.loads(lineage_path.read_text())
+                lineage: Dict[str, Any] = json.loads(read_path.read_text())
             except Exception:
                 lineage = {}
         else:
@@ -249,13 +268,7 @@ class Context:
             "resolved_config": str(Path(resolved_config_path).resolve()),
             "manifest": str(Path(manifest_path).resolve()),
         }
-        _write_yaml_compatible_json(lineage_path, lineage)
-
-
-def stage_base_dir(artifacts_dir: Path, stage_folder: str) -> Path:
-    base = Path(artifacts_dir) / stage_folder
-    base.mkdir(parents=True, exist_ok=True)
-    return base
+        _write_json(lineage_path, lineage)
 
 
 def new_stage_artifact_dir(
@@ -265,7 +278,8 @@ def new_stage_artifact_dir(
     *,
     timestamp: Optional[str] = None,
 ) -> Path:
-    base = stage_base_dir(artifacts_dir, stage_folder)
+    base = (Path(artifacts_dir) / stage_folder).resolve()
+    base.mkdir(parents=True, exist_ok=True)
     ts = str(timestamp).strip() if timestamp else generate_run_timestamp()
     tag_str = str(tag).strip()
     dirname = f"{ts}_{tag_str}_{_short_uuid()}" if tag_str else f"{ts}_{_short_uuid()}"
@@ -285,13 +299,40 @@ def new_stage_artifact_dir(
     return out
 
 
+def _parse_stage_run_timestamp(stage_run_id: str) -> Optional[datetime]:
+    # stage_run_id formats:
+    # - <ts>_<uuid>
+    # - <ts>_<tag>_<uuid>
+    # - legacy: <ts>
+    # where <ts> is RUN_TIMESTAMP_FORMAT: YYYYMMDD_HHMMSS
+    s = str(stage_run_id).strip()
+    if not s:
+        return None
+    parts = s.split("_")
+    if len(parts) >= 2:
+        ts_str = f"{parts[0]}_{parts[1]}"
+    else:
+        ts_str = s
+    try:
+        return datetime.strptime(ts_str, RUN_TIMESTAMP_FORMAT)
+    except Exception:
+        return None
+
+
 def list_stage_outputs(artifacts_dir: Path, stage_folder: str) -> List[Path]:
-    base = stage_base_dir(artifacts_dir, stage_folder)
-    if not base.exists():
+    base = (Path(artifacts_dir) / stage_folder).resolve()
+    if not base.exists() or not base.is_dir():
         return []
     subdirs = [p for p in base.iterdir() if p.is_dir()]
-    # Sort by mtime desc
-    subdirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    # Sort by parsed timestamp desc; tie-break by mtime desc.
+    def _key(p: Path):
+        ts = _parse_stage_run_timestamp(p.name) or datetime.min
+        try:
+            mtime = float(p.stat().st_mtime)
+        except Exception:
+            mtime = 0.0
+        return (ts, mtime)
+    subdirs.sort(key=_key, reverse=True)
     return subdirs
 
 
