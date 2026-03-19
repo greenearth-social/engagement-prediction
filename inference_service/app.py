@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from hashlib import sha256
-from typing import Any, Dict, List, Literal, Optional, Union, Annotated, get_args
+from typing import Any, Dict, List, Literal, Optional, Union, Annotated, assert_never, get_args
 from urllib.parse import urlparse
 import logging
 
@@ -275,12 +275,14 @@ def _read_model_env(model_type: str, suffix: str) -> Optional[str]:
     return os.getenv(f"GE_INFERENCE_{key}_{suffix}")
 
 
-def _infer_signature(model_type: str) -> ModelSignature:
-    if model_type == "user-tower":
-        return "history"
-    if model_type == "post-tower":
-        return "vector"
-    raise RuntimeError(f"Unsupported model type: '{model_type}'")
+def _infer_signature(model_type: ModelType) -> ModelSignature:
+    match model_type:
+        case "user-tower":
+            return "history"
+        case "post-tower":
+            return "vector"
+        case _:
+            assert_never(model_type)
 
 
 def _coerce_input(name: str, value: Any, dtype: torch.dtype, device: torch.device, non_batched_dim: int) -> torch.Tensor:
@@ -350,7 +352,7 @@ def _init_registry() -> None:
             if not models_env:
                 raise RuntimeError(
                     "No models configured. Set GE_INFERENCE_MODELS (e.g. 'user-tower,post-tower') "
-                    "and per-model MODEL_PATH/MODEL_URI/CLEARML_MODEL_ID env vars."
+                    "and per-model GE_INFERENCE_{MODEL_TYPE}_MODEL_PATH/GE_INFERENCE_{MODEL_TYPE}_MODEL_URI/GE_INFERENCE_{MODEL_TYPE}_CLEARML_MODEL_ID env vars."
                 )
 
             env_model_types: List[str] = []
@@ -410,8 +412,9 @@ def _resolve_model_file(entry: LoadedModel) -> tuple[str, Optional[str]]:
     else:
         model_id = entry.configured_clearml_model_id
         if not model_id:
+            model_env_key = _model_env_key(entry.model_type)
             raise RuntimeError(
-                f"Model '{entry.model_type}' is missing a source (MODEL_PATH | MODEL_URI | CLEARML_MODEL_ID)"
+                f"Model '{entry.model_type}' is missing a source (GE_INFERENCE_{model_env_key}_MODEL_PATH | GE_INFERENCE_{model_env_key}_MODEL_URI | GE_INFERENCE_{model_env_key}_CLEARML_MODEL_ID)"
             )
         cm = Model(model_id=model_id)
         local_copy = cm.get_local_copy()
@@ -494,16 +497,21 @@ def _predict_with_entry(entry: LoadedModel, req: PredictRequest) -> Any:
     assert entry.module is not None and entry.device is not None
 
     # Enforce schema against registered model type.
-    if entry.model_type == "user-tower" and not isinstance(req, UserTowerPredictRequest):
-        raise HTTPException(
-            status_code=422,
-            detail=f"Model type '{entry.model_type}' expects a user-tower request body with 'history_embeddings'",
-        )
-    if entry.model_type == "post-tower" and not isinstance(req, PostTowerPredictRequest):
-        raise HTTPException(
-            status_code=422,
-            detail=f"Model type '{entry.model_type}' expects a post-tower request body with 'post_embeddings'",
-        )
+    match entry.model_type:
+        case "user-tower":
+            if not isinstance(req, UserTowerPredictRequest):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Model type '{entry.model_type}' expects a user-tower request body with 'history_embeddings'",
+                )
+        case "post-tower":
+            if not isinstance(req, PostTowerPredictRequest):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Model type '{entry.model_type}' expects a post-tower request body with 'post_embeddings'",
+                )
+        case _:
+            assert_never(entry.model_type)
 
     with torch.inference_mode():
         if entry.model_type == "user-tower":
