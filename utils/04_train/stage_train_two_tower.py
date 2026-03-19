@@ -408,7 +408,7 @@ class TwoTowerModel(nn.Module):
         """
         # unpack inputs
         if self.user_encoder_type == "summarized":
-            features = batch["features"].to(device) # [B, embed_dim*2]
+            features = batch["features"].to(device, non_blocking=True) # [B, embed_dim*2]
             user_summary = features[:, :embed_dim] # [B, embed_dim]
             history_embeddings = user_summary.unsqueeze(1)  # [B, 1, embed_dim] (summary token at position 0)
             post_embeddings = features[:, embed_dim:] # [B, embed_dim]
@@ -420,10 +420,10 @@ class TwoTowerModel(nn.Module):
             history_mask = has_history.unsqueeze(1).to(device=device, dtype=torch.bool) # [B, 1]
             assert history_embeddings.shape[-1] == post_embeddings.shape[-1]
         else:
-            history_embeddings = batch["history_embeddings"].to(device) # [B, seq_len, embed_dim]
-            history_mask = batch["history_mask"].to(device) # [B, seq_len]
-            post_embeddings = batch["target_post_embedding"].to(device) # [B, embed_dim]
-        labels = batch["label"].to(device)
+            history_embeddings = batch["history_embeddings"].to(device, non_blocking=True) # [B, seq_len, embed_dim]
+            history_mask = batch["history_mask"].to(device, non_blocking=True) # [B, seq_len]
+            post_embeddings = batch["target_post_embedding"].to(device, non_blocking=True) # [B, embed_dim]
+        labels = batch["label"].to(device, non_blocking=True)
 
         scores = self.forward(history_embeddings, history_mask, post_embeddings)
         probs = torch.sigmoid(scores)
@@ -473,7 +473,7 @@ def train_two_tower_model(
         train_labels: List[float] = []
 
         for batch in tqdm(train_loader, desc="Training", leave=False, disable=disable_progress):
-            labels = batch["label"].to(device)
+            labels = batch["label"]
 
             optimizer.zero_grad()
             loss, scores = model.compute_loss_and_preds(batch, device, embed_dim)
@@ -493,7 +493,7 @@ def train_two_tower_model(
 
         with torch.inference_mode():
             for batch in tqdm(val_loader, desc="Validation", leave=False, disable=disable_progress):
-                labels = batch["label"].to(device)
+                labels = batch["label"]
 
                 loss, scores = model.compute_loss_and_preds(batch, device, embed_dim)
 
