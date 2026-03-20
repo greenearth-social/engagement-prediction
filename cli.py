@@ -543,25 +543,25 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
 
     # Apply non-interactive prior pins (paths or stage_run_ids).
     prior_01_get_data = _resolve_prior_spec(
-        getattr(args, "prior_01_get_data", None),
+        args.prior_01_get_data,
         output_root=output_root,
         artifacts_dir=artifacts_dir,
         stage_folder="01_get_data",
     )
     prior_02_target_posts = _resolve_prior_spec(
-        getattr(args, "prior_02_target_posts", None),
+        args.prior_02_target_posts,
         output_root=output_root,
         artifacts_dir=artifacts_dir,
         stage_folder="02_target_posts",
     )
     prior_03_user_history = _resolve_prior_spec(
-        getattr(args, "prior_03_user_history", None),
+        args.prior_03_user_history,
         output_root=output_root,
         artifacts_dir=artifacts_dir,
         stage_folder="03_user_history",
     )
     prior_04_train = _resolve_prior_spec(
-        getattr(args, "prior_04_train", None),
+        args.prior_04_train,
         output_root=output_root,
         artifacts_dir=artifacts_dir,
         stage_folder="04_train",
