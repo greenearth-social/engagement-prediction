@@ -10,6 +10,20 @@ PostTower = stage_train_two_tower.PostTower
 TwoTowerModel = stage_train_two_tower.TwoTowerModel
 
 
+FIT_DISABLED_KWARGS = {
+    "use_fit": False,
+    "fit_num_queries": 64,
+    "fit_tau_init": 1.0,
+    "fit_tau_min": 0.1,
+    "fit_tau_decay": 0.9995,
+    "fit_use_lss": False,
+}
+
+
+def build_two_tower_model(**kwargs):
+    return TwoTowerModel(**FIT_DISABLED_KWARGS, **kwargs)
+
+
 # =============================================================================
 # PostTower Tests
 # =============================================================================
@@ -144,7 +158,7 @@ def test_post_tower_eval_mode():
 
 def test_two_tower_model_full_transformer_encoder():
     """Test TwoTowerModel with full-transformer encoder."""
-    model = TwoTowerModel(
+    model = build_two_tower_model(
         post_embedding_dim=384,
         shared_dim=128,
         user_hidden_dim=256,
@@ -166,7 +180,7 @@ def test_two_tower_model_full_transformer_encoder():
 
 def test_two_tower_model_cross_attention_encoder():
     """Test TwoTowerModel with cross-attention encoder."""
-    model = TwoTowerModel(
+    model = build_two_tower_model(
         post_embedding_dim=384,
         shared_dim=128,
         user_hidden_dim=256,
@@ -187,7 +201,7 @@ def test_two_tower_model_cross_attention_encoder():
 def test_two_tower_model_invalid_encoder_type():
     """Test TwoTowerModel raises error for invalid encoder type."""
     with pytest.raises(ValueError, match="Unknown user_encoder_type"):
-        TwoTowerModel(
+        build_two_tower_model(
             post_embedding_dim=384,
             shared_dim=128,
             user_hidden_dim=256,
@@ -212,7 +226,7 @@ def test_two_tower_encode_user_shape():
     input_dim = 384
     shared_dim = 128
     
-    model = TwoTowerModel(
+    model = build_two_tower_model(
         post_embedding_dim=input_dim,
         shared_dim=shared_dim,
         user_hidden_dim=256,
@@ -239,7 +253,7 @@ def test_two_tower_encode_user_with_mask():
     batch_size = 8
     seq_len = 30
     
-    model = TwoTowerModel(
+    model = build_two_tower_model(
         post_embedding_dim=384,
         shared_dim=128,
         user_hidden_dim=256,
@@ -267,7 +281,7 @@ def test_two_tower_encode_user_empty_history():
     batch_size = 4
     seq_len = 20
     
-    model = TwoTowerModel(
+    model = build_two_tower_model(
         post_embedding_dim=384,
         shared_dim=128,
         user_hidden_dim=256,
@@ -300,7 +314,7 @@ def test_two_tower_encode_post_shape():
     input_dim = 384
     shared_dim = 128
     
-    model = TwoTowerModel(
+    model = build_two_tower_model(
         post_embedding_dim=input_dim,
         shared_dim=shared_dim,
         user_hidden_dim=256,
@@ -323,7 +337,7 @@ def test_two_tower_encode_post_shape():
 
 def test_two_tower_encode_post_single():
     """Test TwoTowerModel encode_post with single post."""
-    model = TwoTowerModel(
+    model = build_two_tower_model(
         post_embedding_dim=384,
         shared_dim=128,
         user_hidden_dim=256,
@@ -352,7 +366,7 @@ def test_two_tower_forward_shape():
     seq_len = 50
     input_dim = 384
     
-    model = TwoTowerModel(
+    model = build_two_tower_model(
         post_embedding_dim=input_dim,
         shared_dim=128,
         user_hidden_dim=256,
@@ -378,7 +392,7 @@ def test_two_tower_forward_shape():
 
 def test_two_tower_forward_dot_product():
     """Test TwoTowerModel forward computes dot product correctly."""
-    model = TwoTowerModel(
+    model = build_two_tower_model(
         post_embedding_dim=384,
         shared_dim=128,
         user_hidden_dim=256,
@@ -418,7 +432,7 @@ def test_two_tower_forward_both_encoder_types():
     post_embeddings = torch.randn(batch_size, 384)
     
     for encoder_type in ["full_transformer", "cross_attention"]:
-        model = TwoTowerModel(
+        model = build_two_tower_model(
             post_embedding_dim=384,
             shared_dim=128,
             user_hidden_dim=256,
@@ -437,7 +451,7 @@ def test_two_tower_forward_both_encoder_types():
 def test_two_tower_summarized_user_tower_torchscript():
     """Test summarized user_tower can be TorchScript scripted (serving artifact)."""
     embed_dim = 128
-    model = TwoTowerModel(
+    model = build_two_tower_model(
         post_embedding_dim=embed_dim,
         shared_dim=embed_dim,
         user_hidden_dim=64,
@@ -463,7 +477,7 @@ def test_two_tower_summarized_user_tower_torchscript():
 
 def test_two_tower_compute_loss_and_preds():
     """Test TwoTowerModel compute_loss_and_preds method."""
-    model = TwoTowerModel(
+    model = build_two_tower_model(
         post_embedding_dim=384,
         shared_dim=128,
         user_hidden_dim=256,
@@ -506,7 +520,7 @@ def test_two_tower_compute_loss_and_preds():
 
 def test_two_tower_compute_loss_all_positive():
     """Test TwoTowerModel compute_loss with all positive labels."""
-    model = TwoTowerModel(
+    model = build_two_tower_model(
         post_embedding_dim=128,
         shared_dim=64,
         user_hidden_dim=128,
@@ -539,7 +553,7 @@ def test_two_tower_compute_loss_all_positive():
 
 def test_two_tower_compute_loss_all_negative():
     """Test TwoTowerModel compute_loss with all negative labels."""
-    model = TwoTowerModel(
+    model = build_two_tower_model(
         post_embedding_dim=128,
         shared_dim=64,
         user_hidden_dim=128,
@@ -576,7 +590,7 @@ def test_two_tower_compute_loss_all_negative():
 
 def test_two_tower_backward_pass():
     """Test TwoTowerModel gradients flow through both towers."""
-    model = TwoTowerModel(
+    model = build_two_tower_model(
         post_embedding_dim=384,
         shared_dim=128,
         user_hidden_dim=256,
@@ -617,7 +631,7 @@ def test_two_tower_backward_pass():
 
 def test_two_tower_eval_mode():
     """Test TwoTowerModel behaves consistently in eval mode."""
-    model = TwoTowerModel(
+    model = build_two_tower_model(
         post_embedding_dim=384,
         shared_dim=128,
         user_hidden_dim=256,
@@ -654,7 +668,7 @@ def test_two_tower_eval_mode():
 
 def test_two_tower_parameter_count():
     """Test TwoTowerModel has reasonable number of parameters."""
-    model = TwoTowerModel(
+    model = build_two_tower_model(
         post_embedding_dim=384,
         shared_dim=128,
         user_hidden_dim=256,
@@ -684,7 +698,7 @@ def test_two_tower_parameter_count():
 
 def test_two_tower_cross_attention_fewer_params():
     """Test cross_attention encoder has fewer params than full_transformer."""
-    full_transformer_model = TwoTowerModel(
+    full_transformer_model = build_two_tower_model(
         post_embedding_dim=384,
         shared_dim=128,
         user_hidden_dim=256,
@@ -697,7 +711,7 @@ def test_two_tower_cross_attention_fewer_params():
         use_post_encoder=True,
     )
     
-    cross_attention_model = TwoTowerModel(
+    cross_attention_model = build_two_tower_model(
         post_embedding_dim=384,
         shared_dim=128,
         user_hidden_dim=256,
@@ -724,7 +738,7 @@ def test_two_tower_cross_attention_fewer_params():
 def test_two_tower_different_shared_dims():
     """Test TwoTowerModel with different shared dimensions."""
     for shared_dim in [32, 64, 128, 256]:
-        model = TwoTowerModel(
+        model = build_two_tower_model(
             post_embedding_dim=384,
             shared_dim=shared_dim,
             user_hidden_dim=256,
@@ -752,7 +766,7 @@ def test_two_tower_different_num_heads():
         # user_hidden_dim must be divisible by num_heads
         user_hidden_dim = 256 if num_heads <= 4 else 512
         
-        model = TwoTowerModel(
+        model = build_two_tower_model(
             post_embedding_dim=384,
             shared_dim=128,
             user_hidden_dim=user_hidden_dim,
@@ -772,3 +786,99 @@ def test_two_tower_different_num_heads():
         
         scores = model.forward(history_embeddings, history_mask, post_embeddings)
         assert scores.shape == (batch_size,)
+
+
+def test_two_tower_fit_initializes_optional_components():
+    model = TwoTowerModel(
+        post_embedding_dim=384,
+        shared_dim=128,
+        user_hidden_dim=256,
+        post_hidden_dim=256,
+        num_attention_heads=4,
+        num_attention_layers=2,
+        max_history_len=50,
+        dropout_rate=0.3,
+        user_encoder_type="full_transformer",
+        use_post_encoder=True,
+        use_fit=True,
+        fit_num_queries=32,
+        fit_tau_init=1.0,
+        fit_tau_min=0.1,
+        fit_tau_decay=0.9995,
+        fit_use_lss=True,
+    )
+
+    assert model.use_fit is True
+    assert model.mqm is not None
+    assert model.lss is not None
+
+
+def test_two_tower_forward_with_fit_shape():
+    batch_size = 6
+    seq_len = 20
+    input_dim = 128
+
+    model = TwoTowerModel(
+        post_embedding_dim=input_dim,
+        shared_dim=64,
+        user_hidden_dim=64,
+        post_hidden_dim=64,
+        num_attention_heads=4,
+        num_attention_layers=1,
+        max_history_len=seq_len,
+        dropout_rate=0.1,
+        user_encoder_type="cross_attention",
+        use_post_encoder=True,
+        use_fit=True,
+        fit_num_queries=16,
+        fit_tau_init=1.0,
+        fit_tau_min=0.1,
+        fit_tau_decay=0.9995,
+        fit_use_lss=False,
+    )
+
+    history_embeddings = torch.randn(batch_size, seq_len, input_dim)
+    history_mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
+    post_embeddings = torch.randn(batch_size, input_dim)
+
+    scores = model.forward(history_embeddings, history_mask, post_embeddings)
+
+    assert scores.shape == (batch_size,)
+    assert torch.isfinite(scores).all()
+
+
+def test_two_tower_fit_updates_tau_during_training():
+    model = TwoTowerModel(
+        post_embedding_dim=128,
+        shared_dim=64,
+        user_hidden_dim=64,
+        post_hidden_dim=64,
+        num_attention_heads=4,
+        num_attention_layers=1,
+        max_history_len=20,
+        dropout_rate=0.1,
+        user_encoder_type="full_transformer",
+        use_post_encoder=True,
+        use_fit=True,
+        fit_num_queries=8,
+        fit_tau_init=1.0,
+        fit_tau_min=0.1,
+        fit_tau_decay=0.9995,
+        fit_use_lss=False,
+    )
+    model.fit_tau_threshold = 4
+    model.train()
+
+    batch = {
+        "history_embeddings": torch.randn(4, 20, 128),
+        "history_mask": torch.ones(4, 20, dtype=torch.bool),
+        "target_post_embedding": torch.randn(4, 128),
+        "label": torch.randint(0, 2, (4,)).float(),
+    }
+
+    start_tau = float(model.fit_tau.item())
+    loss, scores = model.compute_loss_and_preds(batch, device="cpu", embed_dim=128)
+
+    assert torch.isfinite(loss)
+    assert scores.shape == (4,)
+    assert float(model.fit_tau.item()) <= start_tau
