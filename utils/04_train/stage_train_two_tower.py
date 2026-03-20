@@ -468,9 +468,10 @@ def train_two_tower_model(
     for epoch in tqdm(range(epochs), desc="Training epochs", disable=disable_progress):
         # --- Training ---
         model.train()
-        train_losses: List[float] = []
-        train_preds: List[float] = []
-        train_labels: List[float] = []
+        train_loss_sum = torch.zeros((), device=device)
+        train_batches = 0
+        train_scores_chunks: List[torch.Tensor] = []
+        train_labels_chunks: List[torch.Tensor] = []
 
         for batch in tqdm(train_loader, desc="Training", leave=False, disable=disable_progress):
             labels = batch["label"]
@@ -481,15 +482,17 @@ def train_two_tower_model(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_max_norm)
             optimizer.step()
 
-            train_losses.append(loss.item())
-            train_preds.extend(torch.sigmoid(scores).detach().cpu().numpy().tolist())
-            train_labels.extend(labels.cpu().numpy().tolist())
+            train_loss_sum += loss.detach()
+            train_batches += 1
+            train_scores_chunks.append(scores.detach())
+            train_labels_chunks.append(labels.detach())
 
         # --- Validation ---
         model.eval()
-        val_losses: List[float] = []
-        val_preds: List[float] = []
-        val_labels: List[float] = []
+        val_loss_sum = torch.zeros((), device=device)
+        val_batches = 0
+        val_scores_chunks: List[torch.Tensor] = []
+        val_labels_chunks: List[torch.Tensor] = []
 
         with torch.inference_mode():
             for batch in tqdm(val_loader, desc="Validation", leave=False, disable=disable_progress):
@@ -497,14 +500,38 @@ def train_two_tower_model(
 
                 loss, scores = model.compute_loss_and_preds(batch, device, embed_dim)
 
-                val_losses.append(loss.item())
-                val_preds.extend(torch.sigmoid(scores).detach().cpu().numpy().tolist())
-                val_labels.extend(labels.cpu().numpy().tolist())
+                val_loss_sum += loss.detach()
+                val_batches += 1
+                val_scores_chunks.append(scores.detach())
+                val_labels_chunks.append(labels.detach())
 
-        train_loss = float(np.mean(train_losses))
-        val_loss = float(np.mean(val_losses))
-        train_auc = roc_auc_score(train_labels, train_preds) if len(set(train_labels)) > 1 else 0.5
-        val_auc = roc_auc_score(val_labels, val_preds) if len(set(val_labels)) > 1 else 0.5
+        train_loss = (train_loss_sum / max(train_batches, 1)).item()
+        val_loss = (val_loss_sum / max(val_batches, 1)).item()
+
+        train_probs = (
+            torch.sigmoid(torch.cat(train_scores_chunks)).float().cpu().numpy()
+            if train_scores_chunks
+            else np.array([])
+        )
+        train_labels_np = (
+            torch.cat(train_labels_chunks).float().cpu().numpy()
+            if train_labels_chunks
+            else np.array([])
+        )
+
+        val_probs = (
+            torch.sigmoid(torch.cat(val_scores_chunks)).float().cpu().numpy()
+            if val_scores_chunks
+            else np.array([])
+        )
+        val_labels_np = (
+            torch.cat(val_labels_chunks).float().cpu().numpy()
+            if val_labels_chunks
+            else np.array([])
+        )
+
+        train_auc = roc_auc_score(train_labels_np, train_probs) if np.unique(train_labels_np).size > 1 else 0.5
+        val_auc = roc_auc_score(val_labels_np, val_probs) if np.unique(val_labels_np).size > 1 else 0.5
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
@@ -556,8 +583,8 @@ def _evaluate_two_tower_model(
     model = model.to(device)
     model.eval()
 
-    all_preds: List[float] = []
-    all_labels: List[float] = []
+    labels_chunks: List[torch.Tensor] = []
+    probs_chunks: List[torch.Tensor] = []
     all_user_ids: List[str] = []
     all_post_ids: List[str] = []
 
@@ -568,13 +595,16 @@ def _evaluate_two_tower_model(
             _, scores = model.compute_loss_and_preds(batch, device, embed_dim)
             probs = torch.sigmoid(scores)
 
-            all_preds.extend(probs.cpu().numpy().tolist())
-            all_labels.extend(labels.numpy().tolist())
+            probs_chunks.append(probs.detach())
+            labels_chunks.append(labels.detach())
             all_user_ids.extend(batch["user_id"])
             all_post_ids.extend(batch["post_id"])
 
-    y_true = np.array(all_labels)
-    y_pred = np.array(all_preds)
+    probs_all = torch.cat(probs_chunks).float().cpu() if probs_chunks else torch.empty(0)
+    labels_all = torch.cat(labels_chunks).float().cpu() if labels_chunks else torch.empty(0)
+
+    y_true = labels_all.numpy()
+    y_pred = probs_all.numpy()
 
     metrics: Dict[str, Any] = {
         "total_samples": len(y_true),
@@ -582,7 +612,7 @@ def _evaluate_two_tower_model(
         "negative_samples": int(len(y_true) - y_true.sum()),
     }
 
-    if len(set(y_true)) > 1:
+    if np.unique(y_true).size > 1:
         metrics["auc_roc"] = float(roc_auc_score(y_true, y_pred))
         metrics["average_precision"] = float(average_precision_score(y_true, y_pred))
 
