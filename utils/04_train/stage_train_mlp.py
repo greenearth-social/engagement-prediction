@@ -234,6 +234,7 @@ def train_mlp_model(
     checkpoints_dir: Optional[Path] = None,
     disable_progress: bool = False,
     gradient_clip_max_norm: float = 1.0,
+    experiment_tracker: Optional[Any] = None,
 ) -> Dict[str, Any]:
     from torch.optim.lr_scheduler import ReduceLROnPlateau
     import torch.optim as optim
@@ -284,6 +285,34 @@ def train_mlp_model(
         history["val_loss"].append(avg_val_loss)
         history["train_auc"].append(float(train_auc))
         history["val_auc"].append(float(val_auc))
+
+        if experiment_tracker is not None:
+            iteration = epoch + 1
+            experiment_tracker.log_scalar(
+                title="Training Loss History",
+                series="Train Loss",
+                value=avg_train_loss,
+                iteration=iteration,
+            )
+            experiment_tracker.log_scalar(
+                title="Training Loss History",
+                series="Validation Loss",
+                value=avg_val_loss,
+                iteration=iteration,
+            )
+            experiment_tracker.log_scalar(
+                title="Training AUC History",
+                series="Train AUC",
+                value=float(train_auc),
+                iteration=iteration,
+            )
+            experiment_tracker.log_scalar(
+                title="Training AUC History",
+                series="Validation AUC",
+                value=float(val_auc),
+                iteration=iteration,
+            )
+
         scheduler.step(val_auc)
 
         if val_auc > best_val_auc:
@@ -489,19 +518,13 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         lr_scheduler_factor=lr_scheduler_factor,
         lr_scheduler_patience=lr_scheduler_patience,
         gradient_clip_max_norm=gradient_clip_max_norm,
+        experiment_tracker=context.tracker,
     )
     trained_model: nn.Module = training_results["model"]
     clear_cuda_memory()
 
     # --- plots & evaluation ---
     hist = training_results["history"]
-
-    # experiment tracker scalars (always logged, regardless of --no-plots)
-    for e in range(len(hist["train_loss"])):
-        context.tracker.log_scalar(title="Training Loss History", series="Train Loss", value=hist["train_loss"][e], iteration=e + 1)
-        context.tracker.log_scalar(title="Training Loss History", series="Validation Loss", value=hist["val_loss"][e], iteration=e + 1)
-        context.tracker.log_scalar(title="Training AUC History", series="Train AUC", value=hist["train_auc"][e], iteration=e + 1)
-        context.tracker.log_scalar(title="Training AUC History", series="Validation AUC", value=hist["val_auc"][e], iteration=e + 1)
 
     if generate_plots:
         log_operation_start("Generate plots", STAGE_LOG_NAME, logger)

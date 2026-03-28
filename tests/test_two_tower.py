@@ -153,6 +153,7 @@ def test_two_tower_model_full_transformer_encoder():
         num_attention_layers=2,
         max_history_len=50,
         dropout_rate=0.3,
+        similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
     )
@@ -175,6 +176,7 @@ def test_two_tower_model_cross_attention_encoder():
         num_attention_layers=2,
         max_history_len=50,
         dropout_rate=0.3,
+        similarity_temperature=0.2,
         user_encoder_type="cross_attention",
         use_post_encoder=True,
     )
@@ -196,6 +198,7 @@ def test_two_tower_model_invalid_encoder_type():
             num_attention_layers=2,
             max_history_len=50,
             dropout_rate=0.3,
+            similarity_temperature=0.2,
             user_encoder_type="invalid_type",
             use_post_encoder=True,
         )
@@ -221,6 +224,7 @@ def test_two_tower_encode_user_shape():
         num_attention_layers=2,
         max_history_len=seq_len,
         dropout_rate=0.3,
+        similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
     )
@@ -232,6 +236,7 @@ def test_two_tower_encode_user_shape():
     
     assert user_emb.shape == (batch_size, shared_dim)
     assert user_emb.dtype == torch.float32
+    assert torch.allclose(user_emb.norm(dim=-1), torch.ones(batch_size), atol=1e-5)
 
 
 def test_two_tower_encode_user_with_mask():
@@ -248,6 +253,7 @@ def test_two_tower_encode_user_with_mask():
         num_attention_layers=2,
         max_history_len=seq_len,
         dropout_rate=0.3,
+        similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
     )
@@ -260,6 +266,7 @@ def test_two_tower_encode_user_with_mask():
     
     assert user_emb.shape == (batch_size, 128)
     assert torch.isfinite(user_emb).all()
+    assert torch.allclose(user_emb.norm(dim=-1), torch.ones(batch_size), atol=1e-5)
 
 
 def test_two_tower_encode_user_empty_history():
@@ -276,6 +283,7 @@ def test_two_tower_encode_user_empty_history():
         num_attention_layers=2,
         max_history_len=seq_len,
         dropout_rate=0.3,
+        similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
     )
@@ -288,6 +296,7 @@ def test_two_tower_encode_user_empty_history():
     
     assert user_emb.shape == (batch_size, 128)
     assert torch.isfinite(user_emb).all()
+    assert torch.allclose(user_emb.norm(dim=-1), torch.ones(batch_size), atol=1e-5)
 
 def test_two_tower_empty_history_scores_vary_with_post_full_transformer():
     """Cold-start users should not get identical Two-Tower scores for all posts."""
@@ -305,6 +314,7 @@ def test_two_tower_empty_history_scores_vary_with_post_full_transformer():
         num_attention_layers=1,
         max_history_len=seq_len,
         dropout_rate=0.0,
+        similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
     )
@@ -336,6 +346,7 @@ def test_two_tower_empty_history_scores_vary_with_post_summarized():
         num_attention_layers=1,
         max_history_len=10,
         dropout_rate=0.0,
+        similarity_temperature=0.2,
         user_encoder_type="summarized",
         use_post_encoder=False,
     )
@@ -372,6 +383,7 @@ def test_two_tower_encode_post_shape():
         num_attention_layers=2,
         max_history_len=50,
         dropout_rate=0.3,
+        similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
     )
@@ -382,6 +394,7 @@ def test_two_tower_encode_post_shape():
     
     assert post_emb.shape == (batch_size, shared_dim)
     assert post_emb.dtype == torch.float32
+    assert torch.allclose(post_emb.norm(dim=-1), torch.ones(batch_size), atol=1e-5)
 
 
 def test_two_tower_encode_post_single():
@@ -395,6 +408,7 @@ def test_two_tower_encode_post_single():
         num_attention_layers=2,
         max_history_len=50,
         dropout_rate=0.3,
+        similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
     )
@@ -403,6 +417,7 @@ def test_two_tower_encode_post_single():
     post_emb = model.encode_post(post_embedding)
     
     assert post_emb.shape == (1, 128)
+    assert torch.allclose(post_emb.norm(dim=-1), torch.ones(1), atol=1e-5)
 
 
 # =============================================================================
@@ -424,6 +439,7 @@ def test_two_tower_forward_shape():
         num_attention_layers=2,
         max_history_len=seq_len,
         dropout_rate=0.3,
+        similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
     )
@@ -440,7 +456,7 @@ def test_two_tower_forward_shape():
 
 
 def test_two_tower_forward_dot_product():
-    """Test TwoTowerModel forward computes dot product correctly."""
+    """Test TwoTowerModel forward computes cosine similarity from normalized towers."""
     model = TwoTowerModel(
         post_embedding_dim=384,
         shared_dim=128,
@@ -450,6 +466,7 @@ def test_two_tower_forward_dot_product():
         num_attention_layers=2,
         max_history_len=50,
         dropout_rate=0.0,  # No dropout for deterministic test
+        similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
     )
@@ -467,7 +484,7 @@ def test_two_tower_forward_dot_product():
         # Compute manually
         user_emb = model.encode_user(history_embeddings, history_mask)
         post_emb = model.encode_post(post_embeddings)
-        manual_scores = (user_emb * post_emb).sum(dim=-1)
+        manual_scores = (user_emb * post_emb).sum(dim=-1) / model.similarity_temperature
         
         # Should match
         assert torch.allclose(scores, manual_scores, rtol=1e-5)
@@ -490,6 +507,7 @@ def test_two_tower_forward_both_encoder_types():
             num_attention_layers=2,
             max_history_len=30,
             dropout_rate=0.3,
+            similarity_temperature=0.2,
             user_encoder_type=encoder_type,
             use_post_encoder=True,
         )
@@ -509,6 +527,7 @@ def test_two_tower_summarized_user_tower_torchscript():
         num_attention_layers=1,
         max_history_len=20,
         dropout_rate=0.1,
+        similarity_temperature=0.2,
         user_encoder_type="summarized",
         use_post_encoder=False,
     )
@@ -535,6 +554,7 @@ def test_two_tower_compute_loss_and_preds():
         num_attention_layers=2,
         max_history_len=50,
         dropout_rate=0.3,
+        similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
     )
@@ -580,6 +600,7 @@ def test_two_tower_compute_loss_and_preds_summarized_empty_history_uses_empty_em
         num_attention_layers=1,
         max_history_len=10,
         dropout_rate=0.0,
+        similarity_temperature=0.2,
         user_encoder_type="summarized",
         use_post_encoder=False,
     )
@@ -592,11 +613,13 @@ def test_two_tower_compute_loss_and_preds_summarized_empty_history_uses_empty_em
     batch = {"features": features, "label": torch.randint(0, 2, (batch_size,)).float()}
 
     with torch.no_grad():
-        model.user_tower.empty_user_embedding.fill_(0.1)
+        model.user_tower.tower.empty_user_embedding.zero_()
+        model.user_tower.tower.empty_user_embedding[0] = 1.0
     _, scores1 = model.compute_loss_and_preds(batch, device="cpu", embed_dim=embed_dim)
 
     with torch.no_grad():
-        model.user_tower.empty_user_embedding.fill_(0.2)
+        model.user_tower.tower.empty_user_embedding.zero_()
+        model.user_tower.tower.empty_user_embedding[1] = 1.0
     _, scores2 = model.compute_loss_and_preds(batch, device="cpu", embed_dim=embed_dim)
 
     assert not torch.allclose(scores1, scores2), "Scores should depend on the cold-start embedding for empty histories"
@@ -613,6 +636,7 @@ def test_two_tower_compute_loss_all_positive():
         num_attention_layers=1,
         max_history_len=20,
         dropout_rate=0.2,
+        similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
     )
@@ -646,6 +670,7 @@ def test_two_tower_compute_loss_all_negative():
         num_attention_layers=1,
         max_history_len=20,
         dropout_rate=0.2,
+        similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
     )
@@ -683,6 +708,7 @@ def test_two_tower_backward_pass():
         num_attention_layers=2,
         max_history_len=50,
         dropout_rate=0.3,
+        similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
     )
@@ -729,6 +755,7 @@ def test_two_tower_eval_mode():
         num_attention_layers=2,
         max_history_len=50,
         dropout_rate=0.5,  # High dropout
+        similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
     )
@@ -766,6 +793,7 @@ def test_two_tower_parameter_count():
         num_attention_layers=2,
         max_history_len=50,
         dropout_rate=0.3,
+        similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
     )
@@ -796,6 +824,7 @@ def test_two_tower_cross_attention_fewer_params():
         num_attention_layers=2,
         max_history_len=50,
         dropout_rate=0.3,
+        similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
     )
@@ -809,6 +838,7 @@ def test_two_tower_cross_attention_fewer_params():
         num_attention_layers=2,
         max_history_len=50,
         dropout_rate=0.3,
+        similarity_temperature=0.2,
         user_encoder_type="cross_attention",
         use_post_encoder=True,
     )
@@ -836,6 +866,7 @@ def test_two_tower_different_shared_dims():
             num_attention_layers=2,
             max_history_len=50,
             dropout_rate=0.3,
+            similarity_temperature=0.2,
             user_encoder_type="full_transformer",
             use_post_encoder=True,
         )
@@ -864,6 +895,7 @@ def test_two_tower_different_num_heads():
             num_attention_layers=2,
             max_history_len=50,
             dropout_rate=0.3,
+            similarity_temperature=0.2,
             user_encoder_type="full_transformer",
             use_post_encoder=True,
         )

@@ -197,6 +197,32 @@ class PostTower(nn.Module):
         return self.network(post_embeddings)
 
 
+class L2NormalizedUserTower(nn.Module):
+    """Wrap a user tower so it emits unit-length embeddings."""
+
+    def __init__(self, tower: nn.Module, eps: float = 1e-12):
+        super().__init__()
+        self.tower = tower
+        self.eps = float(eps)
+
+    def forward(self, history_embeddings: torch.Tensor, history_mask: torch.Tensor) -> torch.Tensor:
+        embeddings = self.tower(history_embeddings, history_mask)
+        return F.normalize(embeddings, p=2.0, dim=-1, eps=self.eps)
+
+
+class L2NormalizedPostTower(nn.Module):
+    """Wrap a post tower so it emits unit-length embeddings."""
+
+    def __init__(self, tower: nn.Module, eps: float = 1e-12):
+        super().__init__()
+        self.tower = tower
+        self.eps = float(eps)
+
+    def forward(self, post_embeddings: torch.Tensor) -> torch.Tensor:
+        embeddings = self.tower(post_embeddings)
+        return F.normalize(embeddings, p=2.0, dim=-1, eps=self.eps)
+
+
 # =============================================================================
 # Two-Tower Engagement Model
 # =============================================================================
@@ -210,17 +236,17 @@ class TwoTowerModel(nn.Module):
     
     Architecture:
         User Tower:
-            - "full_transformer": TransformerDualPoolingEncoder(history_sequence, mask) -> user_vector [shared_dim]
-            - "cross_attention": CrossAttentionPoolingEncoder(history_sequence, mask) -> user_vector [shared_dim]
-            - "summarized": user_vector is provided by SummarizedEngagementDataset
+            - "full_transformer": TransformerDualPoolingEncoder(history_sequence, mask) -> normalized user_vector [shared_dim]
+            - "cross_attention": CrossAttentionPoolingEncoder(history_sequence, mask) -> normalized user_vector [shared_dim]
+            - "summarized": normalized user_vector is provided by SummarizedEngagementDataset
               (the model treats the dataset-provided user summary as the user embedding)
         
         Post Tower:
-            - use_post_encoder=True:  PostTower(post_embedding) -> post_vector [shared_dim]
-            - use_post_encoder=False: post_vector is the raw post embedding (identity)
+            - use_post_encoder=True:  PostTower(post_embedding) -> normalized post_vector [shared_dim]
+            - use_post_encoder=False: normalized post_vector is the raw post embedding (identity)
         
-        Scoring: dot_product(user_vector, post_vector) -> raw score
-                 sigmoid(raw_score) -> engagement_probability
+        Scoring: dot_product(user_vector, post_vector) / temperature -> raw logit
+                 sigmoid(raw_logit) -> engagement_probability
     
     Key characteristics:
         - Shared embedding space: Both towers output the same dimensionality for dot product
@@ -256,18 +282,22 @@ class TwoTowerModel(nn.Module):
         num_attention_layers: int,
         max_history_len: int,
         dropout_rate: float,
+        similarity_temperature: float,
         user_encoder_type: str,
         use_post_encoder: bool,
     ):
         super().__init__()
         self.shared_dim = shared_dim
         self.post_embedding_dim = post_embedding_dim
+        if similarity_temperature <= 0.0:
+            raise ValueError("similarity_temperature must be > 0")
+        self.similarity_temperature = float(similarity_temperature)
         self.user_encoder_type = user_encoder_type
         self.use_post_encoder = use_post_encoder
 
         # Instantiate user tower based on encoder type
         if user_encoder_type == "cross_attention":
-            self.user_tower = CrossAttentionPoolingEncoder(
+            raw_user_tower = CrossAttentionPoolingEncoder(
                 input_dim=post_embedding_dim,
                 hidden_dim=user_hidden_dim,
                 output_dim=shared_dim,
@@ -275,7 +305,7 @@ class TwoTowerModel(nn.Module):
                 dropout_rate=dropout_rate,
             )
         elif user_encoder_type == "full_transformer":
-            self.user_tower = TransformerDualPoolingEncoder(
+            raw_user_tower = TransformerDualPoolingEncoder(
                 input_dim=post_embedding_dim,
                 hidden_dim=user_hidden_dim,
                 output_dim=shared_dim,
@@ -289,7 +319,7 @@ class TwoTowerModel(nn.Module):
             # (e.g., mean/EMA/linear-recency summary). The model treats the
             # history input as an already-encoded user embedding (placed at
             # position 0 in a padded sequence for a consistent forward() signature).
-            self.user_tower = SummarizedUserTower(embed_dim=post_embedding_dim)
+            raw_user_tower = SummarizedUserTower(embed_dim=post_embedding_dim)
 
             # If we still learn a post projection (use_post_encoder=True), its output
             # dimension must match the dataset-provided user embedding dimension.
@@ -313,14 +343,17 @@ class TwoTowerModel(nn.Module):
 
         if use_post_encoder:
             # Post tower is the same regardless of user encoder type
-            self.post_tower = PostTower(
+            raw_post_tower = PostTower(
                 input_dim=post_embedding_dim,
                 hidden_dim=post_hidden_dim,
                 output_dim=shared_dim,
                 dropout_rate=dropout_rate,
             )
         else:
-            self.post_tower = nn.Identity()
+            raw_post_tower = nn.Identity()
+
+        self.user_tower = L2NormalizedUserTower(raw_user_tower)
+        self.post_tower = L2NormalizedPostTower(raw_post_tower)
 
 
     def encode_user(self, history_embeddings: torch.Tensor, history_mask: torch.Tensor) -> torch.Tensor:
@@ -331,7 +364,7 @@ class TwoTowerModel(nn.Module):
             history_mask: Boolean mask [batch, seq_len], True = valid position
         
         Returns:
-            User vectors in shared space [batch, shared_dim]
+            Unit-length user vectors in shared space [batch, shared_dim]
         """
         return self.user_tower(history_embeddings, history_mask)
 
@@ -345,6 +378,7 @@ class TwoTowerModel(nn.Module):
             Post vectors for dot product scoring.
                 - use_post_encoder=True: [batch, shared_dim]
                 - otherwise: [batch, post_embedding_dim] (identity)
+            All outputs are L2-normalized along the embedding dimension.
         """
         return self.post_tower(post_embeddings)
 
@@ -374,8 +408,10 @@ class TwoTowerModel(nn.Module):
         user_emb = self.encode_user(history_embeddings, history_mask)
         post_emb = self.encode_post(post_embeddings)
         
-        # Dot product: element-wise multiply then sum over shared_dim
-        return (user_emb * post_emb).sum(dim=-1)
+        # The tower outputs are L2-normalized, so this dot product is cosine similarity.
+        # Temperature rescales the cosine to a wider or narrower logit range.
+        cosine_similarity = (user_emb * post_emb).sum(dim=-1)
+        return cosine_similarity / self.similarity_temperature
 
     def compute_loss_and_preds(
         self,
@@ -386,8 +422,9 @@ class TwoTowerModel(nn.Module):
         """Compute loss and predictions for a batch.
         
         This method provides a unified interface for training, validation, and
-        inference loops. It computes raw scores (dot products), applies sigmoid
-        to get probabilities, and calculates binary cross-entropy loss.
+        inference loops. It computes raw scores (cosine similarities after the
+        tower-level L2 normalization) and calculates binary cross-entropy loss
+        directly from the logits for numerical stability.
         
         Args:
             batch: Batch dictionary. Expected keys depend on `user_encoder_type`:
@@ -399,8 +436,8 @@ class TwoTowerModel(nn.Module):
         
         Returns:
             Tuple of (loss, scores):
-                - loss: Scalar BCE loss tensor
-                - scores: Raw dot product scores [batch] (before sigmoid)
+                - loss: Scalar BCE-with-logits loss tensor
+                - scores: Raw similarity scores [batch] (before sigmoid)
         
         Note:
             Returns raw scores (not probabilities) for flexibility in evaluation.
@@ -426,8 +463,7 @@ class TwoTowerModel(nn.Module):
         labels = batch["label"].to(device, non_blocking=True)
 
         scores = self.forward(history_embeddings, history_mask, post_embeddings)
-        probs = torch.sigmoid(scores)
-        loss = F.binary_cross_entropy(probs, labels.float())
+        loss = F.binary_cross_entropy_with_logits(scores, labels.float())
         return loss, scores
 
 
@@ -449,7 +485,8 @@ def train_two_tower_model(
     lr_scheduler_factor: float,
     lr_scheduler_patience: int,
     gradient_clip_max_norm: float,
-    embed_dim: int
+    embed_dim: int,
+    experiment_tracker: Optional[Any] = None,
 ) -> Dict[str, Any]:
     from tqdm import tqdm
 
@@ -537,6 +574,33 @@ def train_two_tower_model(
         history["val_loss"].append(val_loss)
         history["train_auc"].append(float(train_auc))
         history["val_auc"].append(float(val_auc))
+
+        if experiment_tracker is not None:
+            iteration = epoch + 1
+            experiment_tracker.log_scalar(
+                title="Training Loss History",
+                series="Train Loss",
+                value=float(train_loss),
+                iteration=iteration,
+            )
+            experiment_tracker.log_scalar(
+                title="Training Loss History",
+                series="Validation Loss",
+                value=float(val_loss),
+                iteration=iteration,
+            )
+            experiment_tracker.log_scalar(
+                title="Training AUC History",
+                series="Train AUC",
+                value=float(train_auc),
+                iteration=iteration,
+            )
+            experiment_tracker.log_scalar(
+                title="Training AUC History",
+                series="Validation AUC",
+                value=float(val_auc),
+                iteration=iteration,
+            )
 
         scheduler.step(val_auc)
 
@@ -674,6 +738,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     num_attention_heads = int(args.num_attention_heads)
     num_attention_layers = int(args.num_attention_layers)
     dropout_rate = float(args.dropout_rate_two_tower)
+    similarity_temperature = float(args.similarity_temperature)
     batch_size = int(args.batch_size)
     learning_rate = float(args.learning_rate)
     weight_decay = float(args.weight_decay_two_tower)
@@ -744,6 +809,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         num_attention_layers=num_attention_layers,
         max_history_len=max_history_len,
         dropout_rate=dropout_rate,
+        similarity_temperature=similarity_temperature,
         user_encoder_type=user_encoder_type,
         use_post_encoder=use_post_encoder,
     )
@@ -770,19 +836,13 @@ def run(context: Context, args) -> Dict[str, Any]:
             lr_scheduler_patience=lr_scheduler_patience,
             gradient_clip_max_norm=gradient_clip_max_norm,
             embed_dim=embed_dim,
+            experiment_tracker=context.tracker,
         )
         trained_model: TwoTowerModel = training_results["model"]
         clear_cuda_memory()
 
         # --- plots & evaluation ---
         hist = training_results["history"]
-
-        # experiment tracker scalars (always logged, regardless of --no-plots)
-        for e in range(len(hist["train_loss"])):
-            context.tracker.log_scalar(title="Training Loss History", series="Train Loss", value=hist["train_loss"][e], iteration=e + 1)
-            context.tracker.log_scalar(title="Training Loss History", series="Validation Loss", value=hist["val_loss"][e], iteration=e + 1)
-            context.tracker.log_scalar(title="Training AUC History", series="Train AUC", value=hist["train_auc"][e], iteration=e + 1)
-            context.tracker.log_scalar(title="Training AUC History", series="Validation AUC", value=hist["val_auc"][e], iteration=e + 1)
 
         if generate_plots:
             try:
@@ -841,6 +901,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         "num_attention_layers": num_attention_layers,
         "max_history_len": max_history_len,
         "dropout_rate": dropout_rate,
+        "similarity_temperature": similarity_temperature,
     }
     if save_model:
         model_path = checkpoints_dir / f"two_tower_{timestamp}.pth"
@@ -966,7 +1027,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         f"stage: train_two_tower",
         f"timestamp: {timestamp}",
         f"runtime_seconds: {runtime:.2f}",
-        f"settings: batch_size={batch_size}, lr={learning_rate}, epochs={epochs}, user_encoder={user_encoder_type}",
+        f"settings: batch_size={batch_size}, lr={learning_rate}, epochs={epochs}, user_encoder={user_encoder_type}, tau={similarity_temperature}",
         f"train_samples: {len(train_dataset)}",
         f"val_samples: {len(val_dataset)}",
         f"best_val_auc: {best_val_auc:.4f}",
