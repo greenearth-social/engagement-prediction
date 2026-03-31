@@ -71,7 +71,8 @@ setup_gcp_project() {
         run.googleapis.com \
         artifactregistry.googleapis.com \
         vpcaccess.googleapis.com \
-        compute.googleapis.com
+        compute.googleapis.com \
+        dns.googleapis.com
 
     log_info "GCP project setup complete."
 }
@@ -111,6 +112,24 @@ create_engagement_prediction_model_storage() {
     log_info "Granted objectAdmin to engagement prediction service account for bucket: $BUCKET_NAME"
 }
 
+setup_dns_zone() {
+    log_info "Setting up Cloud DNS private zone for internal service discovery..."
+
+    local zone_name="ge-internal"
+    local dns_name="ge.internal."
+
+    if gcloud dns managed-zones describe "$zone_name" > /dev/null 2>&1; then
+        log_info "Cloud DNS zone '$zone_name' already exists"
+    else
+        gcloud dns managed-zones create "$zone_name" \
+            --dns-name="$dns_name" \
+            --description="Private DNS zone for GreenEarth internal services" \
+            --visibility=private \
+            --networks=default
+        log_info "Cloud DNS zone '$zone_name' created (DNS name: $dns_name)"
+    fi
+}
+
 check_vpc_connector() {
     log_info "Checking for VPC connector..."
 
@@ -142,6 +161,7 @@ main() {
     setup_gcp_project
     create_service_account
     create_engagement_prediction_model_storage
+    setup_dns_zone
     check_vpc_connector
 
     log_info "Environment setup complete!"
@@ -156,6 +176,7 @@ main() {
     echo "- Model files are stored in: gs://$GE_GCP_PROJECT_ID-engagement-prediction-model-$GE_ENVIRONMENT"
     echo "- Service account: engagement-prediction-sa-$GE_ENVIRONMENT@$GE_GCP_PROJECT_ID.iam.gserviceaccount.com"
     echo "- Service name: engagement-prediction-inference-$GE_ENVIRONMENT"
+    echo "- Stable internal URL (after deploy): http://inference-$GE_ENVIRONMENT.ge.internal"
     echo
 }
 
