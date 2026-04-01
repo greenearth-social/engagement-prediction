@@ -1063,41 +1063,16 @@ def _prepare_split_data(
     target_and_history_split_df = filter_split_and_join_history(target_posts_df, history_df, split).sort("target_idx")
     logger.info(f"  Split '{split}': {len(target_and_history_split_df):,} target rows (after dropping null neg_emb_idx)")
 
-    # {target_idx -> {column -> value}}
-    target_and_history_split_dict = target_and_history_split_df.to_pandas().set_index('target_idx').to_dict(orient='index')
+    # Extract embedding indices for positive and negative posts
+    like_emb_idx = target_and_history_split_df["like_emb_idx"].to_numpy().astype(np.int64)
+    target_dids = target_and_history_split_df["target_did"].to_list()
+    like_uris = target_and_history_split_df["like_uri"].to_list()
 
-    # # Extract embedding indices for positive and negative posts
-    # like_emb_idx = target_and_history_split_df["like_emb_idx"].to_numpy().astype(np.int64)
-    # target_dids = target_and_history_split_df["target_did"].to_list()
-    # like_uris = target_and_history_split_df["like_uri"].to_list()
-
-    # handle negatives - there can be multiple negatives for each target (positive)
-    neg_posts_dict = (
-        neg_posts_df
-        .join(
-            target_and_history_split_df.select(['target_idx', 'split']),
-            on=["target_idx"],
-            how="inner"
-        )
-        .filter(pl.col("split") == split)
-        .sort('target_idx')
-        .group_by('target_idx', maintain_order=True)
-        .agg(
-            pl.col('neg_emb_idx'),
-            pl.col('neg_uri'),
-        )
-    ).to_pandas().set_index('target_idx').to_dict(orient='index')
-
-    final_dict = {
-        k: {**target_and_history_split_dict.get(k, {}), **neg_posts_dict.get(k, {})}
-        for k in set(target_and_history_split_dict) | set(neg_posts_dict)
-    }
-
-    # neg_emb_indices_np = np.array([
-    #     np.array(x, dtype=np.uint64) 
-    #     for x in neg_posts_grouped_df['neg_emb_idx'].to_list()
-    # ]) # np array of arrays
-    # neg_uris_list = neg_posts_grouped_df['neg_uri'].to_list() # list of lists
+    neg_emb_indices_np = np.array([
+        np.array(x, dtype=np.uint64) 
+        for x in target_and_history_split_df['neg_emb_idx'].to_list()
+    ]) # np array of arrays
+    neg_uris_list = target_and_history_split_df['neg_uri'].to_list() # list of lists
     
     # Convert Polars List[UInt32] column to Python list of numpy arrays
     # This allows each user to have a different history length (variable-length)
