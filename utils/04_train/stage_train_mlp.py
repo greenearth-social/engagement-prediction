@@ -227,6 +227,7 @@ def train_mlp_model(
     learning_rate: float,
     weight_decay: float,
     patience: int,
+    early_stopping_min_delta: float,
     lr_scheduler_factor: float,
     lr_scheduler_patience: int,
     model_name: str = "engagement_model",
@@ -244,6 +245,7 @@ def train_mlp_model(
     scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=lr_scheduler_factor, patience=lr_scheduler_patience)
     history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "train_auc": [], "val_auc": []}
     best_val_auc = 0.0
+    best_reset_val_auc = 0.0
     best_val_loss = float("inf")
     patience_counter = 0
     checkpoint_dir = Path(checkpoints_dir) if checkpoints_dir is not None else (Path(__file__).resolve().parents[2] / "outputs" / "checkpoints")
@@ -326,6 +328,13 @@ def train_mlp_model(
                 checkpoint_full,
             )
             torch.save(model.state_dict(), checkpoint_weights)
+
+        significant_improvement = (
+            val_auc > best_reset_val_auc
+            and (val_auc - best_reset_val_auc) >= early_stopping_min_delta
+        )
+        if significant_improvement:
+            best_reset_val_auc = val_auc
             patience_counter = 0
         else:
             patience_counter += 1
@@ -396,6 +405,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     learning_rate = float(args.learning_rate)
     weight_decay = float(args.weight_decay_mlp)
     patience = int(args.patience)
+    early_stopping_min_delta = float(args.early_stopping_min_delta)
     disable_progress = bool(args.disable_progress)
     generate_plots = not bool(args.no_plots)
     save_model = not bool(args.no_save_model)
@@ -512,6 +522,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         patience=patience,
+        early_stopping_min_delta=early_stopping_min_delta,
         load_best_checkpoint=True,
         checkpoints_dir=checkpoints_dir,
         disable_progress=disable_progress,
@@ -620,6 +631,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                     "weight_decay": weight_decay,
                     "epochs": epochs,
                     "patience": patience,
+                    "early_stopping_min_delta": early_stopping_min_delta,
                 },
                 "data_info": {
                     "train_samples": len(train_dataset),
@@ -715,6 +727,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "weight_decay": weight_decay,
         "epochs": epochs,
         "patience": patience,
+        "early_stopping_min_delta": early_stopping_min_delta,
         "random_seed": random_seed,
         "train_samples": len(train_dataset),
         "val_samples": len(val_dataset),
@@ -732,7 +745,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"stage: train_mlp",
         f"timestamp: {timestamp}",
         f"runtime_seconds: {runtime:.2f}",
-        f"settings: batch_size={batch_size}, lr={learning_rate}, epochs={epochs}, user_encoder={user_encoder}, summarizer={summarizer_name}",
+        f"settings: batch_size={batch_size}, lr={learning_rate}, epochs={epochs}, user_encoder={user_encoder}, summarizer={summarizer_name}, early_stopping_min_delta={early_stopping_min_delta}",
         f"inputs: embeddings memmap, target_posts, user_history",
         f"train_samples: {len(train_dataset)}",
         f"val_samples: {len(val_dataset)}",
