@@ -480,6 +480,7 @@ def train_two_tower_model(
     learning_rate: float,
     weight_decay: float,
     patience: int,
+    early_stopping_min_delta: float,
     checkpoints_dir: Optional[Path],
     disable_progress: bool,
     lr_scheduler_factor: float,
@@ -498,6 +499,7 @@ def train_two_tower_model(
 
     history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "train_auc": [], "val_auc": []}
     best_val_auc = 0.0
+    best_reset_val_auc = 0.0
     best_val_loss = float("inf")
     patience_counter = 0
     best_state_dict = None
@@ -608,13 +610,20 @@ def train_two_tower_model(
             best_val_auc = val_auc
             best_val_loss = val_loss
             best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            patience_counter = 0
 
             if checkpoints_dir is not None:
                 torch.save(
                     {"epoch": epoch, "model_state_dict": best_state_dict, "val_loss": val_loss, "val_auc": val_auc, "history": history},
                     checkpoints_dir / "two_tower_best.pth",
                 )
+
+        significant_improvement = (
+            val_auc > best_reset_val_auc
+            and (val_auc - best_reset_val_auc) >= early_stopping_min_delta
+        )
+        if significant_improvement:
+            best_reset_val_auc = val_auc
+            patience_counter = 0
         else:
             patience_counter += 1
 
@@ -744,6 +753,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     weight_decay = float(args.weight_decay_two_tower)
     epochs = int(args.epochs)
     patience = int(args.patience)
+    early_stopping_min_delta = float(args.early_stopping_min_delta)
     disable_progress = bool(args.disable_progress)
     user_encoder_type = args.user_encoder
     use_post_encoder = args.use_post_encoder
@@ -830,6 +840,7 @@ def run(context: Context, args) -> Dict[str, Any]:
             learning_rate=learning_rate,
             weight_decay=weight_decay,
             patience=patience,
+            early_stopping_min_delta=early_stopping_min_delta,
             checkpoints_dir=checkpoints_dir,
             disable_progress=disable_progress,
             lr_scheduler_factor=lr_scheduler_factor,
@@ -1010,6 +1021,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         "weight_decay": weight_decay,
         "epochs": epochs,
         "patience": patience,
+        "early_stopping_min_delta": early_stopping_min_delta,
         "random_seed": random_seed,
         "train_samples": len(train_dataset),
         "val_samples": len(val_dataset),
@@ -1027,7 +1039,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         f"stage: train_two_tower",
         f"timestamp: {timestamp}",
         f"runtime_seconds: {runtime:.2f}",
-        f"settings: batch_size={batch_size}, lr={learning_rate}, epochs={epochs}, user_encoder={user_encoder_type}, tau={similarity_temperature}",
+        f"settings: batch_size={batch_size}, lr={learning_rate}, epochs={epochs}, user_encoder={user_encoder_type}, early_stopping_min_delta={early_stopping_min_delta}, tau={similarity_temperature}",
         f"train_samples: {len(train_dataset)}",
         f"val_samples: {len(val_dataset)}",
         f"best_val_auc: {best_val_auc:.4f}",

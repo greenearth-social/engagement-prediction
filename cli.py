@@ -101,6 +101,7 @@ DEFAULTS: Dict[str, Any] = {
     "prediction_posts_per_user": 1,
     "device": None,
     "patience": 50,
+    "early_stopping_min_delta": 0.002,
     "run_tag": None,  # Optional tag appended to training output directory name
     "no_plots": False,
     "no_save_model": False,
@@ -792,6 +793,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Device for training")
     _add_arg_with_default(p_all, "--patience", type=int, default=argparse.SUPPRESS,
                           help_text="Early stopping patience")
+    _add_arg_with_default(p_all, "--early-stopping-min-delta", type=float, default=argparse.SUPPRESS,
+                          help_text="Minimum absolute validation AUC improvement required to reset early stopping patience")
     _add_arg_with_default(p_all, "--run-tag", type=str, default=argparse.SUPPRESS,
                           help_text="Tag appended to training output directory name (e.g. mlp_summarized_mean)")
     _add_arg_with_default(p_all, "--no-plots", action="store_true", default=argparse.SUPPRESS,
