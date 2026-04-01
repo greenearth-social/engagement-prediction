@@ -1068,11 +1068,25 @@ def _prepare_split_data(
     target_dids = target_and_history_split_df["target_did"].to_list()
     like_uris = target_and_history_split_df["like_uri"].to_list()
 
-    neg_emb_indices_np = np.array([
-        np.array(x, dtype=np.uint64) 
-        for x in target_and_history_split_df['neg_emb_idx'].to_list()
-    ]) # np array of arrays
-    neg_uris_list = target_and_history_split_df['neg_uri'].to_list() # list of lists
+    neg_emb_idx_list = target_and_history_split_df["neg_emb_idx"].to_list()
+    neg_uris_list = target_and_history_split_df["neg_uri"].to_list()
+    neg_lengths = [len(row) for row in neg_emb_idx_list]
+    neg_uri_lengths = [len(row) for row in neg_uris_list]
+    unique_neg_lengths = sorted(set(neg_lengths))
+    if len(unique_neg_lengths) != 1:
+        raise ValueError(
+            f"Expected all rows in split '{split}' to have the same number of negatives, "
+            f"but found lengths {unique_neg_lengths}."
+        )
+    if unique_neg_lengths[0] == 0:
+        raise ValueError(f"Expected split '{split}' to have at least one negative per target row.")
+    if neg_uri_lengths != neg_lengths:
+        raise ValueError(
+            f"Expected neg_uri and neg_emb_idx list lengths to match for split '{split}', "
+            "but found mismatched rows."
+        )
+
+    neg_emb_indices_np = np.asarray(neg_emb_idx_list, dtype=np.int64)  # [N, num_negatives]
     
     # Convert Polars List[UInt32] column to Python list of numpy arrays
     # This allows each user to have a different history length (variable-length)
@@ -1345,7 +1359,6 @@ class SequenceEngagementDataset(Dataset):
         self,
         embeddings_mmap: np.ndarray,
         target_posts_df: pl.DataFrame,
-        neg_posts_df: pl.DataFrame,
         history_df: pl.DataFrame,
         split: str,
         max_history_len: int,
@@ -1365,7 +1378,7 @@ class SequenceEngagementDataset(Dataset):
             self.target_dids,
             self.like_uris,
             self.neg_uris_list,
-        ) = _prepare_split_data(target_posts_df, neg_posts_df, history_df, split, logger)
+        ) = _prepare_split_data(target_posts_df, history_df, split, logger)
 
         self._n_rows = len(like_emb_idx)
 
@@ -1432,6 +1445,7 @@ class SequenceEngagementDataset(Dataset):
             "labels": labels,                                # [1 + num_negatives]
             "user_id": self.target_dids[idx],
             "post_id": self.like_uris[idx],
+            "post_ids": [self.like_uris[idx], *self.neg_uris_list[idx]],
         }
 
 

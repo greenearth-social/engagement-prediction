@@ -664,7 +664,26 @@ def _evaluate_two_tower_model(
             probs_chunks.append(probs.ravel().detach())
             labels_chunks.append(labels.ravel().detach())
             all_user_ids.extend([id for id in batch["user_id"] for _ in range(num_samples_per_batch)])
-            all_post_ids.extend([id for id in batch["post_id"] for _ in range(num_samples_per_batch)])
+
+            if "post_ids" in batch:
+                batch_post_ids = batch["post_ids"]
+                if len(batch_post_ids) != num_samples_per_batch:
+                    raise ValueError(
+                        f"Expected {num_samples_per_batch} candidate post-id columns, "
+                        f"got {len(batch_post_ids)}."
+                    )
+                batch_size = len(batch["user_id"])
+                for candidate_post_ids in batch_post_ids:
+                    if len(candidate_post_ids) != batch_size:
+                        raise ValueError(
+                            f"Expected each candidate post-id column to have batch size {batch_size}, "
+                            f"got {len(candidate_post_ids)}."
+                        )
+                for sample_idx in range(batch_size):
+                    for candidate_idx in range(num_samples_per_batch):
+                        all_post_ids.append(batch_post_ids[candidate_idx][sample_idx])
+            else:
+                all_post_ids.extend([id for id in batch["post_id"] for _ in range(num_samples_per_batch)])
 
     probs_all = torch.cat(probs_chunks).float().cpu() if probs_chunks else torch.empty(0)
     labels_all = torch.cat(labels_chunks).float().cpu() if labels_chunks else torch.empty(0)
@@ -728,7 +747,7 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # --- load data from prior stages ---
     log_operation_start("Load training data from prior stages", STAGE_LOG_NAME, logger)
-    embeddings_mmap, target_posts_df, neg_posts_df, history_df, embed_dim = load_training_data(
+    embeddings_mmap, target_posts_df, history_df, embed_dim = load_training_data(
         context, logger=logger,
     )
 
@@ -780,11 +799,11 @@ def run(context: Context, args) -> Dict[str, Any]:
         )
     else:
         train_dataset = SequenceEngagementDataset(
-            embeddings_mmap, target_posts_df, neg_posts_df, history_df, split="train",
+            embeddings_mmap, target_posts_df, history_df, split="train",
             max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
         )
         val_dataset = SequenceEngagementDataset(
-            embeddings_mmap, target_posts_df, neg_posts_df, history_df, split="val",
+            embeddings_mmap, target_posts_df, history_df, split="val",
             max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
         )
 

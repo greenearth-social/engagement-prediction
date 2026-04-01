@@ -99,7 +99,6 @@ DEFAULTS: Dict[str, Any] = {
     "hidden_dims": [64, 32, 16],
     "dropout_rate_mlp": 0.5,
     "dropout_rate_two_tower": 0.1,
-    "prediction_posts_per_user": 1,
     "device": None,
     "patience": 50,
     "run_tag": None,  # Optional tag appended to training output directory name
@@ -789,8 +788,6 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Dropout rate for MLP model")
     _add_arg_with_default(p_all, "--dropout-rate-two-tower", type=float, default=argparse.SUPPRESS,
                           help_text="Dropout rate for two tower model")
-    _add_arg_with_default(p_all, "--prediction-posts-per-user", type=float, default=argparse.SUPPRESS,
-                          help_text="Prediction posts per user")
     _add_arg_with_default(p_all, "--device", type=str, choices=["cpu", "cuda"], default=argparse.SUPPRESS,
                           help_text="Device for training")
     _add_arg_with_default(p_all, "--patience", type=int, default=argparse.SUPPRESS,
