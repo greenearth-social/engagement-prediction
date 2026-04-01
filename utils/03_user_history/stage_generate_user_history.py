@@ -77,16 +77,10 @@ def _build_user_history_directory(
     """
     logger.info("Building user history directory...")
 
-    # Assign an integer row index for memory-efficient keying during the
-    # expensive fan-out join.  Carrying a UInt32 target_idx through hundreds
-    # of millions of intermediate rows is far cheaper than carrying like_uri
-    # strings (~80-100 bytes each).
-    targets_indexed = targets_lf.with_row_index("target_idx")
-
     # For the heavy join, only carry target_idx + the columns needed for
     # joining (target_did) and filtering (seen_at).  like_uri is NOT included
     # here to save memory during the fan-out.
-    join_keys = targets_indexed.select(["target_idx", "target_did", "seen_at"])
+    join_keys = targets_lf.select(["target_idx", "target_did", "seen_at"])
 
     # Rename likes columns to avoid collision after join
     # We need: did (join key), record_created_at (for filtering/sorting), emb_idx (the result)
@@ -147,7 +141,7 @@ def _build_user_history_directory(
     # though (target_did, like_uri) is the official join key.  Downstream
     # consumers should join on the key columns, but positional alignment can be
     # relied upon as an optimization if needed.
-    all_target_keys = targets_indexed.select(["target_idx", "target_did", "like_uri", "seen_at"])
+    all_target_keys = targets_lf.select(["target_idx", "target_did", "like_uri", "seen_at"])
     directory_lf = all_target_keys.join(
         directory_lf,
         on="target_idx",

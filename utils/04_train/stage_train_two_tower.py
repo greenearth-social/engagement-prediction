@@ -405,13 +405,12 @@ class TwoTowerModel(nn.Module):
         Returns:
             Raw engagement scores [batch] (logits before sigmoid)
         """
-        user_emb = self.encode_user(history_embeddings, history_mask)
-        post_emb = self.encode_post(post_embeddings)
+        user_emb = self.encode_user(history_embeddings, history_mask) # [B, D]
+        post_emb = self.encode_post(post_embeddings)                  # [B, 1+num_negatives, D]
         
         # The tower outputs are L2-normalized, so this dot product is cosine similarity.
         # Temperature rescales the cosine to a wider or narrower logit range.
-        cosine_similarity = (user_emb * post_emb).sum(dim=-1)
-        return cosine_similarity / self.similarity_temperature
+        return (user_emb.unsqueeze(1) * post_emb).sum(dim=-1) / self.similarity_temperature        # [B, 1+num_negatives]
 
     def compute_loss_and_preds(
         self,
@@ -458,12 +457,13 @@ class TwoTowerModel(nn.Module):
             assert history_embeddings.shape[-1] == post_embeddings.shape[-1]
         else:
             history_embeddings = batch["history_embeddings"].to(device, non_blocking=True) # [B, seq_len, embed_dim]
-            history_mask = batch["history_mask"].to(device, non_blocking=True) # [B, seq_len]
-            post_embeddings = batch["target_post_embedding"].to(device, non_blocking=True) # [B, embed_dim]
-        labels = batch["label"].to(device, non_blocking=True)
+            history_mask = batch["history_mask"].to(device, non_blocking=True)             # [B, seq_len]
+            post_embeddings = batch["post_embeddings"].to(device, non_blocking=True)       # [B, 1+num_negatives,embed_dim]
+        
+        labels = batch["labels"].to(device, non_blocking=True)                             # [B, 1+num_negatives]
 
-        scores = self.forward(history_embeddings, history_mask, post_embeddings)
-        loss = F.binary_cross_entropy_with_logits(scores, labels.float())
+        scores = self.forward(history_embeddings, history_mask, post_embeddings)           # [B, 1+num_negatives]  
+        loss = F.cross_entropy(scores, labels.float())                                     # scalar
         return loss, scores
 
 
@@ -511,7 +511,7 @@ def train_two_tower_model(
         train_labels_chunks: List[torch.Tensor] = []
 
         for batch in tqdm(train_loader, desc="Training", leave=False, disable=disable_progress):
-            labels = batch["label"]
+            labels = batch["labels"]
 
             optimizer.zero_grad()
             loss, scores = model.compute_loss_and_preds(batch, device, embed_dim)
@@ -521,8 +521,8 @@ def train_two_tower_model(
 
             train_loss_sum += loss.detach()
             train_batches += 1
-            train_scores_chunks.append(scores.detach())
-            train_labels_chunks.append(labels.detach())
+            train_scores_chunks.append(scores.ravel().detach())
+            train_labels_chunks.append(labels.ravel().detach())
 
         # --- Validation ---
         model.eval()
@@ -533,14 +533,14 @@ def train_two_tower_model(
 
         with torch.inference_mode():
             for batch in tqdm(val_loader, desc="Validation", leave=False, disable=disable_progress):
-                labels = batch["label"]
+                labels = batch["labels"]
 
                 loss, scores = model.compute_loss_and_preds(batch, device, embed_dim)
 
                 val_loss_sum += loss.detach()
                 val_batches += 1
-                val_scores_chunks.append(scores.detach())
-                val_labels_chunks.append(labels.detach())
+                val_scores_chunks.append(scores.ravel().detach())
+                val_labels_chunks.append(labels.ravel().detach())
 
         train_loss = (train_loss_sum / max(train_batches, 1)).item()
         val_loss = (val_loss_sum / max(val_batches, 1)).item()
@@ -654,15 +654,17 @@ def _evaluate_two_tower_model(
 
     with torch.inference_mode():
         for batch in data_loader:
-            labels = batch["label"]
+            labels = batch["labels"]
 
             _, scores = model.compute_loss_and_preds(batch, device, embed_dim)
             probs = torch.sigmoid(scores)
+            num_samples_per_batch = probs.shape[1]
+            assert labels.shape == probs.shape, f"Expected labels and probs to have the same shape, got {labels.shape} and {probs.shape}"
 
-            probs_chunks.append(probs.detach())
-            labels_chunks.append(labels.detach())
-            all_user_ids.extend(batch["user_id"])
-            all_post_ids.extend(batch["post_id"])
+            probs_chunks.append(probs.ravel().detach())
+            labels_chunks.append(labels.ravel().detach())
+            all_user_ids.extend([id for id in batch["user_id"] for _ in range(num_samples_per_batch)])
+            all_post_ids.extend([id for id in batch["post_id"] for _ in range(num_samples_per_batch)])
 
     probs_all = torch.cat(probs_chunks).float().cpu() if probs_chunks else torch.empty(0)
     labels_all = torch.cat(labels_chunks).float().cpu() if labels_chunks else torch.empty(0)
@@ -726,7 +728,7 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # --- load data from prior stages ---
     log_operation_start("Load training data from prior stages", STAGE_LOG_NAME, logger)
-    embeddings_mmap, target_posts_df, history_df, embed_dim = load_training_data(
+    embeddings_mmap, target_posts_df, neg_posts_df, history_df, embed_dim = load_training_data(
         context, logger=logger,
     )
 
@@ -778,11 +780,11 @@ def run(context: Context, args) -> Dict[str, Any]:
         )
     else:
         train_dataset = SequenceEngagementDataset(
-            embeddings_mmap, target_posts_df, history_df, split="train",
+            embeddings_mmap, target_posts_df, neg_posts_df, history_df, split="train",
             max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
         )
         val_dataset = SequenceEngagementDataset(
-            embeddings_mmap, target_posts_df, history_df, split="val",
+            embeddings_mmap, target_posts_df, neg_posts_df, history_df, split="val",
             max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
         )
 

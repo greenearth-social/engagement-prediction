@@ -14,8 +14,9 @@ import os
 import sys
 import json
 import random
+import types
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Set, Any, TYPE_CHECKING
+from typing import Dict, List, Tuple, Optional, Set, Any, TYPE_CHECKING, Union, get_args, get_origin
 from datetime import datetime, timedelta, timezone
 import multiprocessing as mp
 import subprocess
@@ -232,6 +233,28 @@ def validate_dataframe_schema(
             if isinstance(expected, (list, tuple, set)):
                 return any(_matches_expected_dtype_polars(dtype, e) for e in expected)
 
+            origin = get_origin(expected)
+            if origin is not None:
+                expected_args = get_args(expected)
+                non_none_args = tuple(arg for arg in expected_args if arg is not type(None))
+
+                if len(non_none_args) != len(expected_args) and non_none_args:
+                    return any(_matches_expected_dtype_polars(dtype, arg) for arg in non_none_args)
+
+                if origin is Union or origin is types.UnionType:
+                    return any(_matches_expected_dtype_polars(dtype, arg) for arg in non_none_args)
+
+                if origin is list:
+                    base_type = getattr(dtype, "base_type", None)
+                    if not callable(base_type) or base_type() != pl.List:
+                        return False
+                    if len(non_none_args) != 1:
+                        return True
+                    inner_dtype = getattr(dtype, "inner", None)
+                    if inner_dtype is None:
+                        return False
+                    return _matches_expected_dtype_polars(inner_dtype, non_none_args[0])
+
             if isinstance(expected, pl.DataType) or type(expected).__name__ == "DataTypeClass":
                 return dtype == expected
 
@@ -323,6 +346,20 @@ def validate_dataframe_schema(
             return any(_matches_expected_dtype_pandas(series, e) for e in expected)
 
         dtype = series.dtype
+
+        origin = get_origin(expected)
+        if origin is not None:
+            expected_args = get_args(expected)
+            non_none_args = tuple(arg for arg in expected_args if arg is not type(None))
+
+            if len(non_none_args) != len(expected_args) and non_none_args:
+                return any(_matches_expected_dtype_pandas(series, arg) for arg in non_none_args)
+
+            if origin is Union or origin is types.UnionType:
+                return any(_matches_expected_dtype_pandas(series, arg) for arg in non_none_args)
+
+            if origin is list:
+                return pd.api.types.is_object_dtype(dtype)
 
         if isinstance(expected, str):
             key = expected.strip().lower()

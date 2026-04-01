@@ -27,8 +27,7 @@ Outputs under <run_dir>/target_posts/<timestamp>/:
 """
 
 from __future__ import annotations
-from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import argparse
 import hashlib
 import polars as pl
@@ -50,26 +49,35 @@ STAGE_NAME_FOR_LOGGING = '02_TARGET_POSTS'
 RAW_TS_COL_NAME = 'record_created_at'
 
 
-def _resolve_negative_bucket_index(row: Dict[str, Any]) -> Optional[int]:
+def _resolve_negative_bucket_index(row: Dict[str, Any]) -> Optional[List[int]]:
     """
     Convert an unliked rank within a bucket into the actual post index while only
     storing the sorted liked indices for that (user, bucket) pair.
     """
-    neg_rank = row.get('neg_rank')
+    neg_rank_list = row.get('neg_rank_list') or []
     bucket_size = row.get('bucket_size')
     liked_idx_list = row.get('liked_idx_list') or []
 
-    if neg_rank is None or bucket_size is None:
+    actual_idx_list = []
+
+    if bucket_size is None:
         return None
 
-    actual_idx = int(neg_rank)
-    for liked_idx in liked_idx_list:
-        liked_idx = int(liked_idx)
-        if liked_idx > actual_idx:
-            break
-        actual_idx += 1
+    for neg_rank in neg_rank_list:
+        if neg_rank is None:
+            continue
 
-    return actual_idx if actual_idx < int(bucket_size) else None
+        actual_idx = int(neg_rank)
+        for liked_idx in liked_idx_list:
+            liked_idx = int(liked_idx)
+            if liked_idx > actual_idx:
+                break
+            actual_idx += 1
+        
+        if actual_idx < int(bucket_size):
+            actual_idx_list.append(actual_idx)
+
+    return actual_idx_list
 
 
 def _get_liked_target_posts(
@@ -108,7 +116,8 @@ def _get_negative_target_posts(
     posts_lf: pl.LazyFrame,
     liked_target_posts_lf: pl.LazyFrame,
     logger: logging.Logger,
-    context: Context
+    context: Context,
+    negs_per_like: int,
 ) -> pl.LazyFrame:
     """
     Samples one negative (unliked) post per like by bucketing posts in time and
@@ -191,70 +200,80 @@ def _get_negative_target_posts(
         .select(['target_did', 'bucket', 'bucket_size', 'liked_idx_list', 'unliked_count'])
     )
 
-    likes_lf = (
+    likes_and_negs_df = (
         likes_with_bucket_lf
         .join(user_bucket_candidates_lf, on=['target_did', 'bucket'], how='left')
         .with_columns(
             # deterministic "random" seed per (user, liked_post)
-            pl.struct(
-                [pl.col('target_did'), pl.col('like_uri')]
-            ).hash(seed=random_seed).cast(pl.UInt64).alias('seed'),
+            pl.concat_list([
+                pl.when(pl.col("unliked_count") > 0)
+                .then(
+                    (
+                        pl.struct([
+                            pl.col("target_did"),
+                            pl.col("like_uri"),
+                            pl.lit(i).alias("neg_slot"),
+                        ])
+                        .hash(seed=random_seed)
+                        .cast(pl.UInt64)
+                        % pl.col("unliked_count").cast(pl.UInt64)
+                    ).cast(pl.Int64)
+                )
+                .otherwise(None)
+                for i in range(negs_per_like)
+            ]).alias("neg_rank_list")
             # seed and neg_rank together assign a random *unliked* post in the bucket to each like
             # (multiple likes can be assigned to the same negative post, which is what we want)
         )
         .with_columns(
-            pl.when(pl.col('unliked_count') > 0)
-            .then((pl.col('seed') % pl.col('unliked_count').cast(pl.UInt64)).cast(pl.Int64))
-            .otherwise(None)
-            .alias('neg_rank'),
+            pl
+            .struct(['liked_idx_list', 'neg_rank_list', 'bucket_size'])
+            .map_elements(_resolve_negative_bucket_index, return_dtype=pl.List(pl.Int64))
+            .alias('neg_idx_list')
         )
-        .with_columns(
-            pl.struct(['liked_idx_list', 'neg_rank', 'bucket_size'])
-            .map_elements(_resolve_negative_bucket_index, return_dtype=pl.Int64)
-            .alias('neg_idx')
-        )
+        .with_row_index('target_idx')
     ) # 'target_did', 'seen_at', 'like_uri', 'like_emb_idx', 'like_posted_at', 'like_author_did' 'bucket', 'bucket_size', 'seed', 'neg_idx'
 
-    # (Shouldn't happen but) keep track of any potential lost likes by joining to bucket sizes.
-    n_likes_orig = liked_target_posts_lf.select(pl.len()).collect(engine='streaming').item()
-    n_likes_after_bucket_join = likes_lf.select(pl.len()).collect(engine='streaming').item()
-    n_likes_lost_from_bucket_join = n_likes_orig - n_likes_after_bucket_join
-    logger.info(f"Started with {n_likes_orig:,} likes; have {n_likes_after_bucket_join:,} after joining to post buckets. (Lost {n_likes_lost_from_bucket_join:,} likes).")
-    context.tracker.log_single_value('Target Posts - Dropped Likes from Bucket Join', n_likes_lost_from_bucket_join)
+    # # (Shouldn't happen but) keep track of any potential lost likes by joining to bucket sizes.
+    # n_likes_orig = liked_target_posts_lf.select(pl.len()).collect(engine='streaming').item()
+    # n_likes_after_bucket_join = likes_lf.select(pl.len()).collect(engine='streaming').item()
+    # n_likes_lost_from_bucket_join = n_likes_orig - n_likes_after_bucket_join
+    # logger.info(f"Started with {n_likes_orig:,} likes; have {n_likes_after_bucket_join:,} after joining to post buckets. (Lost {n_likes_lost_from_bucket_join:,} likes).")
+    # context.tracker.log_single_value('Target Posts - Dropped Likes from Bucket Join', n_likes_lost_from_bucket_join)
 
-    # If a user liked every post in a bucket, there is no valid negative for that like.
-    n_likes_without_neg = (
-        likes_lf
-        .filter(pl.col('neg_idx').is_null())
-        .select(pl.len())
-        .collect(engine='streaming')
-        .item()
-    )
-    if n_likes_without_neg > 0:
-        logger.info(f"Dropping {n_likes_without_neg:,} likes with no unliked negatives in the bucket.")
-        context.tracker.log_single_value('Target Posts - Dropped Likes with No Unliked Negatives', n_likes_without_neg)
-        likes_lf = likes_lf.filter(pl.col('neg_idx').is_not_null())
+    # # If a user liked every post in a bucket, there is no valid negative for that like.
+    # n_likes_without_neg = (
+    #     likes_lf
+    #     .filter(pl.col('neg_idx').is_null())
+    #     .select(pl.len())
+    #     .collect(engine='streaming')
+    #     .item()
+    # )
+    # if n_likes_without_neg > 0:
+    #     logger.info(f"Dropping {n_likes_without_neg:,} likes with no unliked negatives in the bucket.")
+    #     context.tracker.log_single_value('Target Posts - Dropped Likes with No Unliked Negatives', n_likes_without_neg)
+    #     likes_lf = likes_lf.filter(pl.col('neg_idx').is_not_null())
 
-    final_lf = (
-        likes_lf
+    target_posts_df = (
+        likes_and_negs_df
+        .explode('neg_idx_list')
+        .rename({'neg_idx_list': 'neg_idx'})
         .join(
             posts_lf.select(['bucket', 'idx_in_bucket', 'neg_uri', 'neg_emb_idx', 'neg_author_did']),
             left_on=['bucket', 'neg_idx'],
             right_on=['bucket', 'idx_in_bucket'],
             how='left'
         )
-        .select([
-            'target_did',
-            'seen_at',
-            'like_uri',
-            'like_emb_idx',
-            'like_author_did',
-            'neg_uri',
-            'neg_emb_idx',
-            'neg_author_did',
+        # .select(['target_idx', 'neg_uri', 'neg_emb_idx', 'neg_author_did'])
+        .group_by(['target_idx', 'target_did', 'seen_at', 'like_uri', 'like_emb_idx', 'like_author_did'])
+        .agg([
+            pl.col('neg_uri'),
+            pl.col('neg_emb_idx'),
+            pl.col('neg_author_did')
         ])
-    ) 
-    return final_lf
+    )
+
+    return target_posts_df
     
 
 def _log_final_metrics(
@@ -305,8 +324,8 @@ def _get_target_posts(
     context: Context
 ) -> pl.LazyFrame:
     liked_target_posts_lf = _get_liked_target_posts(likes_lf, posts_lf)
-    all_target_posts_lf = _get_negative_target_posts(args, posts_lf, liked_target_posts_lf, logger, context)
-    _log_final_metrics(all_target_posts_lf, liked_target_posts_lf, logger, context)
+    all_target_posts_lf = _get_negative_target_posts(args, posts_lf, liked_target_posts_lf, logger, context, args.negs_per_like)
+    # _log_final_metrics(all_target_posts_lf, liked_target_posts_lf, logger, context)
     return all_target_posts_lf
 
 
@@ -493,16 +512,19 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     })
 
     log_operation_start('Generate target posts dataset from likes and posts', STAGE_NAME_FOR_LOGGING, logger)
-    target_posts_lf: pl.LazyFrame = _get_target_posts(args, posts_core_lf, likes_core_lf, logger, context)
+    target_posts_lf = _get_target_posts(args, posts_core_lf, likes_core_lf, logger, context)
+    
+    # target posts
     validate_dataframe_schema(target_posts_lf, {
+        'target_idx': int,
         'target_did': str,
         'seen_at': datetime,
         'like_uri': str,
         'like_emb_idx': int,
         'like_author_did': str,
-        'neg_uri': str,
-        'neg_emb_idx': int,
-        'neg_author_did': str,
+        'neg_uri': List[str],
+        'neg_emb_idx': List[int],
+        'neg_author_did': List[str],
     })
 
     target_posts_lf = _apply_splits(args, target_posts_lf, logger)

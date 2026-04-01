@@ -1017,7 +1017,7 @@ def _prepare_split_data(
     history_df: pl.DataFrame,
     split: str,
     logger: Optional[logging.Logger] = None,
-) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[str], List[str], List[str]]:
+) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[str], List[str], List[List[str]]]:
     """Filter data to a single split and return aligned numpy arrays.
     
     This internal helper performs the core data preparation logic shared by both
@@ -1060,20 +1060,49 @@ def _prepare_split_data(
     if logger is None:
         logger = get_stage_logger("DATALOADERS")
 
-    joined = filter_split_and_join_history(target_posts_df, history_df, split)
-    logger.info(f"  Split '{split}': {len(joined):,} target rows (after dropping null neg_emb_idx)")
+    target_and_history_split_df = filter_split_and_join_history(target_posts_df, history_df, split).sort("target_idx")
+    logger.info(f"  Split '{split}': {len(target_and_history_split_df):,} target rows (after dropping null neg_emb_idx)")
 
-    # Extract embedding indices for positive and negative posts
-    like_emb_idx = joined["like_emb_idx"].to_numpy().astype(np.int64)
-    neg_emb_idx = joined["neg_emb_idx"].to_numpy().astype(np.int64)
-    target_dids = joined["target_did"].to_list()
-    like_uris = joined["like_uri"].to_list()
-    neg_uris = joined["neg_uri"].to_list()
+    # {target_idx -> {column -> value}}
+    target_and_history_split_dict = target_and_history_split_df.to_pandas().set_index('target_idx').to_dict(orient='index')
 
+    # # Extract embedding indices for positive and negative posts
+    # like_emb_idx = target_and_history_split_df["like_emb_idx"].to_numpy().astype(np.int64)
+    # target_dids = target_and_history_split_df["target_did"].to_list()
+    # like_uris = target_and_history_split_df["like_uri"].to_list()
+
+    # handle negatives - there can be multiple negatives for each target (positive)
+    neg_posts_dict = (
+        neg_posts_df
+        .join(
+            target_and_history_split_df.select(['target_idx', 'split']),
+            on=["target_idx"],
+            how="inner"
+        )
+        .filter(pl.col("split") == split)
+        .sort('target_idx')
+        .group_by('target_idx', maintain_order=True)
+        .agg(
+            pl.col('neg_emb_idx'),
+            pl.col('neg_uri'),
+        )
+    ).to_pandas().set_index('target_idx').to_dict(orient='index')
+
+    final_dict = {
+        k: {**target_and_history_split_dict.get(k, {}), **neg_posts_dict.get(k, {})}
+        for k in set(target_and_history_split_dict) | set(neg_posts_dict)
+    }
+
+    # neg_emb_indices_np = np.array([
+    #     np.array(x, dtype=np.uint64) 
+    #     for x in neg_posts_grouped_df['neg_emb_idx'].to_list()
+    # ]) # np array of arrays
+    # neg_uris_list = neg_posts_grouped_df['neg_uri'].to_list() # list of lists
+    
     # Convert Polars List[UInt32] column to Python list of numpy arrays
     # This allows each user to have a different history length (variable-length)
     # while still supporting fast numpy indexing into the embeddings memmap
-    prior_col = joined["prior_emb_indices"]
+    prior_col = target_and_history_split_df["prior_emb_indices"]
     prior_emb_indices_list: List[np.ndarray] = []
     for row_val in prior_col.to_list():
         if row_val is None or len(row_val) == 0:
@@ -1083,7 +1112,7 @@ def _prepare_split_data(
         else:
             prior_emb_indices_list.append(np.array(row_val, dtype=np.uint32))
 
-    return like_emb_idx, neg_emb_idx, prior_emb_indices_list, target_dids, like_uris, neg_uris
+    return like_emb_idx, neg_emb_indices_np, prior_emb_indices_list, target_dids, like_uris, neg_uris_list
 
 
 # ---------------------------------------------------------------------------
@@ -1341,6 +1370,7 @@ class SequenceEngagementDataset(Dataset):
         self,
         embeddings_mmap: np.ndarray,
         target_posts_df: pl.DataFrame,
+        neg_posts_df: pl.DataFrame,
         history_df: pl.DataFrame,
         split: str,
         max_history_len: int,
@@ -1355,12 +1385,12 @@ class SequenceEngagementDataset(Dataset):
         # Prepare aligned arrays for the requested split
         (
             like_emb_idx,
-            neg_emb_idx,
+            neg_emb_idices_np,
             self.prior_emb_indices,
             self.target_dids,
             self.like_uris,
-            self.neg_uris,
-        ) = _prepare_split_data(target_posts_df, history_df, split, logger)
+            self.neg_uris_list,
+        ) = _prepare_split_data(target_posts_df, neg_posts_df, history_df, split, logger)
 
         self._n_rows = len(like_emb_idx)
 
@@ -1368,9 +1398,10 @@ class SequenceEngagementDataset(Dataset):
         # Target post embeddings are small enough to pre-compute, avoiding repeated
         # memmap lookups for the same posts during training
         pos_embs = np.array(embeddings_mmap[like_emb_idx], dtype=np.float32)
-        neg_embs = np.array(embeddings_mmap[neg_emb_idx], dtype=np.float32)
-        self._pos_post_embs = torch.from_numpy(pos_embs)
-        self._neg_post_embs = torch.from_numpy(neg_embs)
+        neg_embs = np.array(embeddings_mmap[neg_emb_idices_np], dtype=np.float32)
+        self._pos_post_embs = torch.from_numpy(pos_embs) # [N, D]
+        self._neg_post_embs = torch.from_numpy(neg_embs) # [N, num_negatives, D]
+        print(self._neg_post_embs.shape)
 
         if logger:
             mem_mb = (pos_embs.nbytes + neg_embs.nbytes) / (1024 * 1024)
@@ -1387,7 +1418,7 @@ class SequenceEngagementDataset(Dataset):
 
     def __len__(self) -> int:
         """Return total number of samples (2 per target post: positive + negative)."""
-        return self._n_rows * 2
+        return self._n_rows
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """Get a single training sample by index.
@@ -1409,34 +1440,23 @@ class SequenceEngagementDataset(Dataset):
                 - "user_id": User identifier string
                 - "post_id": Post URI (or "neg_uri" for negatives)
         """
-        # Map dataset index to target post row and sample type
-        row_idx = idx // 2
-        is_positive = (idx % 2) == 0
-
         # --- Load and pad/truncate history sequence from memmap ---
         # This is the key difference from SummarizedEngagementDataset: we load
         # the raw sequence here rather than using a pre-computed summary
-        hist_indices = self.prior_emb_indices[row_idx]
+        hist_indices = self.prior_emb_indices[idx]
         hist_embeddings = self.embeddings[hist_indices]
         padded, mask = get_padded_embedding_history_and_mask(hist_embeddings, self.max_history_len, self.embed_dim)
 
-        # --- Select target post embedding (pre-computed) ---
-        if is_positive:
-            post_vec = self._pos_post_embs[row_idx]  # [D]
-            label = 1.0
-            post_id = self.like_uris[row_idx]
-        else:
-            post_vec = self._neg_post_embs[row_idx]  # [D]
-            label = 0.0
-            post_id = self.neg_uris[row_idx]
+        post_embeddings = torch.cat([self._pos_post_embs[idx].unsqueeze(0), self._neg_post_embs[idx]], dim=0) # [1 + num_negatives, D]
+        labels = torch.tensor([1.0] + [0.0] * self._neg_post_embs.shape[1], dtype=torch.float32) # [1 + num_negatives]
 
         return {
             "history_embeddings": torch.from_numpy(padded),  # [max_seq, D]
-            "history_mask": torch.from_numpy(mask),  # [max_seq]
-            "target_post_embedding": post_vec,
-            "label": torch.tensor(label, dtype=torch.float32),
-            "user_id": self.target_dids[row_idx],
-            "post_id": post_id,
+            "history_mask": torch.from_numpy(mask),          # [max_seq]
+            "post_embeddings": post_embeddings,              # [1 + num_negatives, D]
+            "labels": labels,                                # [1 + num_negatives]
+            "user_id": self.target_dids[idx],
+            "post_id": self.like_uris[idx],
         }
 
 

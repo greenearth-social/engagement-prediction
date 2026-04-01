@@ -66,6 +66,7 @@ DEFAULTS: Dict[str, Any] = {
     "embedding_model": "all_MiniLM_L12_v2",
     "skip_embeddings": False,
     # Stage 2 Target posts and Split
+    "negs_per_like": 1,
     "max_prior_likes": None,  # Stage 3: cap on prior likes per target for user history (None = no cap)
     "history_buffer_hours": None,  # Stage 3: buffer in hours between seen_at and prior-like cutoff (None = no buffer)
     "neg_sample_bucket": "1h",
@@ -714,6 +715,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--skip-embeddings", action="store_true", default=argparse.SUPPRESS,
                           help_text="Skip embedding validation/memmap write in Stage 1 (faster iteration; later stages that need embeddings will fail)")
     # Stage 2/3 options
+    _add_arg_with_default(p_all, "--negs-per-like", type=int, default=argparse.SUPPRESS,
+                          help_text="Number of non-liked posts to sample for each liked post")
     _add_arg_with_default(p_all, "--max-prior-likes", type=int, default=argparse.SUPPRESS,
                           help_text="Cap on prior likes per target in Stage 3 user history (None = no cap, keeps all prior likes)")
     _add_arg_with_default(p_all, "--history-buffer-hours", type=float, default=argparse.SUPPRESS,
