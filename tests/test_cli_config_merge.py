@@ -73,12 +73,12 @@ def test_background_effective_config_preserves_no_post_encoder(tmp_path):
     assert cfg["_initial_log"] == str(initial_log)
 
 
-def test_merge_args_with_config_defaults_l2_normalize_embeddings_to_true():
+def test_merge_args_with_config_defaults_l2_normalize_embeddings_to_false():
     parser = cli.build_parser()
     raw = parser.parse_args([])
     merged = cli._merge_args_with_config(raw)
 
-    assert merged.l2_normalize_embeddings is True
+    assert merged.l2_normalize_embeddings is False
 
 
 def test_background_effective_config_preserves_no_l2_normalize_embeddings(tmp_path):
@@ -131,6 +131,25 @@ def test_background_effective_config_allows_cli_to_override_config_to_default_l2
     )
 
     assert cfg["l2_normalize_embeddings"] is True
+
+
+@pytest.mark.parametrize(
+    ("config_key", "disable_flag"),
+    [
+        ("dataloader_pin_memory", "--no-dataloader-pin-memory"),
+        ("dataloader_persistent_workers", "--no-dataloader-persistent-workers"),
+        ("background", "--no-background"),
+    ],
+)
+def test_merge_args_with_config_allows_cli_to_disable_true_config_bool(tmp_path, config_key, disable_flag):
+    config_path = Path(tmp_path) / "config.yml"
+    config_path.write_text(f"{config_key}: true\n")
+
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--config", str(config_path), disable_flag])
+    merged = cli._merge_args_with_config(raw)
+
+    assert getattr(merged, config_key) is False
 
 
 def test_merge_args_with_config_accepts_prior_pins(tmp_path):
