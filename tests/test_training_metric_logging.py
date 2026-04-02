@@ -115,6 +115,7 @@ def test_train_two_tower_model_logs_epoch_metrics_to_tracker(tmp_path):
         num_attention_layers=1,
         max_history_len=4,
         dropout_rate=0.0,
+        l2_normalize_embeddings=True,
         similarity_temperature=1.0,
         user_encoder_type="summarized",
         use_post_encoder=False,

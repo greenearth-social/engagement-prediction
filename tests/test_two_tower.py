@@ -156,6 +156,7 @@ def test_two_tower_model_full_transformer_encoder():
         similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
+        l2_normalize_embeddings=True,
     )
     
     assert model.shared_dim == 128
@@ -179,6 +180,7 @@ def test_two_tower_model_cross_attention_encoder():
         similarity_temperature=0.2,
         user_encoder_type="cross_attention",
         use_post_encoder=True,
+        l2_normalize_embeddings=True,
     )
     
     assert model.user_encoder_type == "cross_attention"
@@ -201,6 +203,7 @@ def test_two_tower_model_invalid_encoder_type():
             similarity_temperature=0.2,
             user_encoder_type="invalid_type",
             use_post_encoder=True,
+        l2_normalize_embeddings=True,
         )
 
 
@@ -227,6 +230,7 @@ def test_two_tower_encode_user_shape():
         similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
+        l2_normalize_embeddings=True,
     )
     
     history_embeddings = torch.randn(batch_size, seq_len, input_dim)
@@ -256,6 +260,7 @@ def test_two_tower_encode_user_with_mask():
         similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
+        l2_normalize_embeddings=True,
     )
     
     history_embeddings = torch.randn(batch_size, seq_len, 384)
@@ -286,6 +291,7 @@ def test_two_tower_encode_user_empty_history():
         similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
+        l2_normalize_embeddings=True,
     )
     
     # Empty history
@@ -317,6 +323,7 @@ def test_two_tower_empty_history_scores_vary_with_post_full_transformer():
         similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
+        l2_normalize_embeddings=True,
     )
     model.eval()
 
@@ -349,6 +356,7 @@ def test_two_tower_empty_history_scores_vary_with_post_summarized():
         similarity_temperature=0.2,
         user_encoder_type="summarized",
         use_post_encoder=False,
+        l2_normalize_embeddings=True,
     )
     model.eval()
 
@@ -386,6 +394,7 @@ def test_two_tower_encode_post_shape():
         similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
+        l2_normalize_embeddings=True,
     )
     
     post_embeddings = torch.randn(batch_size, input_dim)
@@ -411,6 +420,7 @@ def test_two_tower_encode_post_single():
         similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
+        l2_normalize_embeddings=True,
     )
     
     post_embedding = torch.randn(1, 384)
@@ -418,6 +428,31 @@ def test_two_tower_encode_post_single():
     
     assert post_emb.shape == (1, 128)
     assert torch.allclose(post_emb.norm(dim=-1), torch.ones(1), atol=1e-5)
+
+
+def test_two_tower_encode_post_can_skip_l2_normalization():
+    """Test TwoTowerModel encode_post can return unnormalized embeddings."""
+    model = TwoTowerModel(
+        post_embedding_dim=384,
+        shared_dim=128,
+        user_hidden_dim=256,
+        post_hidden_dim=256,
+        num_attention_heads=4,
+        num_attention_layers=2,
+        max_history_len=50,
+        dropout_rate=0.3,
+        similarity_temperature=0.2,
+        user_encoder_type="full_transformer",
+        use_post_encoder=True,
+        l2_normalize_embeddings=False,
+    )
+
+    post_embeddings = torch.randn(16, 384)
+    post_emb = model.encode_post(post_embeddings)
+
+    assert post_emb.shape == (16, 128)
+    assert post_emb.dtype == torch.float32
+    assert not torch.allclose(post_emb.norm(dim=-1), torch.ones(16), atol=1e-5)
 
 
 # =============================================================================
@@ -442,6 +477,7 @@ def test_two_tower_forward_shape():
         similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
+        l2_normalize_embeddings=True,
     )
     
     history_embeddings = torch.randn(batch_size, seq_len, input_dim)
@@ -469,6 +505,7 @@ def test_two_tower_forward_dot_product():
         similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
+        l2_normalize_embeddings=True,
     )
     
     model.eval()
@@ -488,6 +525,58 @@ def test_two_tower_forward_dot_product():
         
         # Should match
         assert torch.allclose(scores, manual_scores, rtol=1e-5)
+
+
+def test_two_tower_forward_without_l2_normalization_uses_raw_dot_product():
+    """Disabling L2 normalization should switch scoring from cosine to raw dot product."""
+    model = TwoTowerModel(
+        post_embedding_dim=2,
+        shared_dim=2,
+        user_hidden_dim=4,
+        post_hidden_dim=4,
+        num_attention_heads=1,
+        num_attention_layers=1,
+        max_history_len=10,
+        dropout_rate=0.0,
+        similarity_temperature=1.0,
+        user_encoder_type="summarized",
+        use_post_encoder=False,
+        l2_normalize_embeddings=False,
+    )
+
+    history_embeddings = torch.tensor([[[3.0, 4.0]]])
+    history_mask = torch.ones(1, 1, dtype=torch.bool)
+    post_embeddings = torch.tensor([[0.0, 5.0]])
+
+    score = model.forward(history_embeddings, history_mask, post_embeddings)
+
+    assert torch.allclose(score, torch.tensor([20.0]))
+
+
+def test_two_tower_forward_with_l2_normalization_uses_cosine_similarity():
+    """Enabling L2 normalization should preserve cosine-style scoring."""
+    model = TwoTowerModel(
+        post_embedding_dim=2,
+        shared_dim=2,
+        user_hidden_dim=4,
+        post_hidden_dim=4,
+        num_attention_heads=1,
+        num_attention_layers=1,
+        max_history_len=10,
+        dropout_rate=0.0,
+        similarity_temperature=1.0,
+        user_encoder_type="summarized",
+        use_post_encoder=False,
+        l2_normalize_embeddings=True,
+    )
+
+    history_embeddings = torch.tensor([[[3.0, 4.0]]])
+    history_mask = torch.ones(1, 1, dtype=torch.bool)
+    post_embeddings = torch.tensor([[0.0, 5.0]])
+
+    score = model.forward(history_embeddings, history_mask, post_embeddings)
+
+    assert torch.allclose(score, torch.tensor([0.8]))
 
 
 def test_two_tower_forward_both_encoder_types():
@@ -510,6 +599,7 @@ def test_two_tower_forward_both_encoder_types():
             similarity_temperature=0.2,
             user_encoder_type=encoder_type,
             use_post_encoder=True,
+        l2_normalize_embeddings=True,
         )
         
         scores = model.forward(history_embeddings, history_mask, post_embeddings)
@@ -530,6 +620,7 @@ def test_two_tower_summarized_user_tower_torchscript():
         similarity_temperature=0.2,
         user_encoder_type="summarized",
         use_post_encoder=False,
+        l2_normalize_embeddings=True,
     )
 
     scripted = torch.jit.script(model.user_tower)
@@ -557,6 +648,7 @@ def test_two_tower_compute_loss_and_preds():
         similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
+        l2_normalize_embeddings=True,
     )
     
     batch_size = 16
@@ -603,6 +695,7 @@ def test_two_tower_compute_loss_and_preds_summarized_empty_history_uses_empty_em
         similarity_temperature=0.2,
         user_encoder_type="summarized",
         use_post_encoder=False,
+        l2_normalize_embeddings=True,
     )
     model.eval()
 
@@ -639,6 +732,7 @@ def test_two_tower_compute_loss_all_positive():
         similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
+        l2_normalize_embeddings=True,
     )
     
     batch_size = 8
@@ -673,6 +767,7 @@ def test_two_tower_compute_loss_all_negative():
         similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
+        l2_normalize_embeddings=True,
     )
     
     batch_size = 8
@@ -711,6 +806,7 @@ def test_two_tower_backward_pass():
         similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
+        l2_normalize_embeddings=True,
     )
     
     batch_size = 8
@@ -758,6 +854,7 @@ def test_two_tower_eval_mode():
         similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
+        l2_normalize_embeddings=True,
     )
     
     batch_size = 8
@@ -796,6 +893,7 @@ def test_two_tower_parameter_count():
         similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
+        l2_normalize_embeddings=True,
     )
     
     total_params = sum(p.numel() for p in model.parameters())
@@ -827,6 +925,7 @@ def test_two_tower_cross_attention_fewer_params():
         similarity_temperature=0.2,
         user_encoder_type="full_transformer",
         use_post_encoder=True,
+        l2_normalize_embeddings=True,
     )
     
     cross_attention_model = TwoTowerModel(
@@ -841,6 +940,7 @@ def test_two_tower_cross_attention_fewer_params():
         similarity_temperature=0.2,
         user_encoder_type="cross_attention",
         use_post_encoder=True,
+        l2_normalize_embeddings=True,
     )
     
     attention_params = sum(p.numel() for p in full_transformer_model.parameters())
@@ -869,6 +969,7 @@ def test_two_tower_different_shared_dims():
             similarity_temperature=0.2,
             user_encoder_type="full_transformer",
             use_post_encoder=True,
+        l2_normalize_embeddings=True,
         )
         
         batch_size = 4
@@ -898,6 +999,7 @@ def test_two_tower_different_num_heads():
             similarity_temperature=0.2,
             user_encoder_type="full_transformer",
             use_post_encoder=True,
+        l2_normalize_embeddings=True,
         )
         
         batch_size = 4

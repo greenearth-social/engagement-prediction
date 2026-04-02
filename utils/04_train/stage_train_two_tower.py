@@ -198,28 +198,34 @@ class PostTower(nn.Module):
 
 
 class L2NormalizedUserTower(nn.Module):
-    """Wrap a user tower so it emits unit-length embeddings."""
+    """Wrap a user tower and optionally emit unit-length embeddings."""
 
-    def __init__(self, tower: nn.Module, eps: float = 1e-12):
+    def __init__(self, tower: nn.Module, enabled: bool, eps: float = 1e-12):
         super().__init__()
         self.tower = tower
+        self.enabled = bool(enabled)
         self.eps = float(eps)
 
     def forward(self, history_embeddings: torch.Tensor, history_mask: torch.Tensor) -> torch.Tensor:
         embeddings = self.tower(history_embeddings, history_mask)
+        if not self.enabled:
+            return embeddings
         return F.normalize(embeddings, p=2.0, dim=-1, eps=self.eps)
 
 
 class L2NormalizedPostTower(nn.Module):
-    """Wrap a post tower so it emits unit-length embeddings."""
+    """Wrap a post tower and optionally emit unit-length embeddings."""
 
-    def __init__(self, tower: nn.Module, eps: float = 1e-12):
+    def __init__(self, tower: nn.Module, enabled: bool, eps: float = 1e-12):
         super().__init__()
         self.tower = tower
+        self.enabled = bool(enabled)
         self.eps = float(eps)
 
     def forward(self, post_embeddings: torch.Tensor) -> torch.Tensor:
         embeddings = self.tower(post_embeddings)
+        if not self.enabled:
+            return embeddings
         return F.normalize(embeddings, p=2.0, dim=-1, eps=self.eps)
 
 
@@ -236,16 +242,16 @@ class TwoTowerModel(nn.Module):
     
     Architecture:
         User Tower:
-            - "full_transformer": TransformerDualPoolingEncoder(history_sequence, mask) -> normalized user_vector [shared_dim]
-            - "cross_attention": CrossAttentionPoolingEncoder(history_sequence, mask) -> normalized user_vector [shared_dim]
-            - "summarized": normalized user_vector is provided by SummarizedEngagementDataset
+            - "full_transformer": TransformerDualPoolingEncoder(history_sequence, mask) -> user_vector [shared_dim]
+            - "cross_attention": CrossAttentionPoolingEncoder(history_sequence, mask) -> user_vector [shared_dim]
+            - "summarized": user_vector is provided by SummarizedEngagementDataset
               (the model treats the dataset-provided user summary as the user embedding)
         
         Post Tower:
-            - use_post_encoder=True:  PostTower(post_embedding) -> normalized post_vector [shared_dim]
-            - use_post_encoder=False: normalized post_vector is the raw post embedding (identity)
+            - use_post_encoder=True:  PostTower(post_embedding) -> post_vector [shared_dim]
+            - use_post_encoder=False: post_vector is the raw post embedding (identity)
         
-        Scoring: dot_product(user_vector, post_vector) / temperature -> raw logit
+        Scoring: similarity(user_vector, post_vector) / temperature -> raw logit
                  sigmoid(raw_logit) -> engagement_probability
     
     Key characteristics:
@@ -282,6 +288,7 @@ class TwoTowerModel(nn.Module):
         num_attention_layers: int,
         max_history_len: int,
         dropout_rate: float,
+        l2_normalize_embeddings: bool,
         similarity_temperature: float,
         user_encoder_type: str,
         use_post_encoder: bool,
@@ -294,6 +301,7 @@ class TwoTowerModel(nn.Module):
         self.similarity_temperature = float(similarity_temperature)
         self.user_encoder_type = user_encoder_type
         self.use_post_encoder = use_post_encoder
+        self.l2_normalize_embeddings = bool(l2_normalize_embeddings)
 
         # Instantiate user tower based on encoder type
         if user_encoder_type == "cross_attention":
@@ -352,8 +360,8 @@ class TwoTowerModel(nn.Module):
         else:
             raw_post_tower = nn.Identity()
 
-        self.user_tower = L2NormalizedUserTower(raw_user_tower)
-        self.post_tower = L2NormalizedPostTower(raw_post_tower)
+        self.user_tower = L2NormalizedUserTower(raw_user_tower, enabled=self.l2_normalize_embeddings)
+        self.post_tower = L2NormalizedPostTower(raw_post_tower, enabled=self.l2_normalize_embeddings)
 
 
     def encode_user(self, history_embeddings: torch.Tensor, history_mask: torch.Tensor) -> torch.Tensor:
@@ -364,7 +372,8 @@ class TwoTowerModel(nn.Module):
             history_mask: Boolean mask [batch, seq_len], True = valid position
         
         Returns:
-            Unit-length user vectors in shared space [batch, shared_dim]
+            User vectors in shared space [batch, shared_dim].
+            When `l2_normalize_embeddings=True`, these are unit-length.
         """
         return self.user_tower(history_embeddings, history_mask)
 
@@ -378,7 +387,7 @@ class TwoTowerModel(nn.Module):
             Post vectors for dot product scoring.
                 - use_post_encoder=True: [batch, shared_dim]
                 - otherwise: [batch, post_embedding_dim] (identity)
-            All outputs are L2-normalized along the embedding dimension.
+            When `l2_normalize_embeddings=True`, outputs are L2-normalized.
         """
         return self.post_tower(post_embeddings)
 
@@ -408,10 +417,8 @@ class TwoTowerModel(nn.Module):
         user_emb = self.encode_user(history_embeddings, history_mask)
         post_emb = self.encode_post(post_embeddings)
         
-        # The tower outputs are L2-normalized, so this dot product is cosine similarity.
-        # Temperature rescales the cosine to a wider or narrower logit range.
-        cosine_similarity = (user_emb * post_emb).sum(dim=-1)
-        return cosine_similarity / self.similarity_temperature
+        similarity_score = (user_emb * post_emb).sum(dim=-1)
+        return similarity_score / self.similarity_temperature
 
     def compute_loss_and_preds(
         self,
@@ -422,9 +429,10 @@ class TwoTowerModel(nn.Module):
         """Compute loss and predictions for a batch.
         
         This method provides a unified interface for training, validation, and
-        inference loops. It computes raw scores (cosine similarities after the
-        tower-level L2 normalization) and calculates binary cross-entropy loss
-        directly from the logits for numerical stability.
+        inference loops. It computes raw similarity scores (optionally cosine
+        similarities when tower-level L2 normalization is enabled) and
+        calculates binary cross-entropy loss directly from the logits for
+        numerical stability.
         
         Args:
             batch: Batch dictionary. Expected keys depend on `user_encoder_type`:
@@ -747,6 +755,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     num_attention_heads = int(args.num_attention_heads)
     num_attention_layers = int(args.num_attention_layers)
     dropout_rate = float(args.dropout_rate_two_tower)
+    l2_normalize_embeddings = bool(args.l2_normalize_embeddings)
     similarity_temperature = float(args.similarity_temperature)
     batch_size = int(args.batch_size)
     learning_rate = float(args.learning_rate)
@@ -819,6 +828,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         num_attention_layers=num_attention_layers,
         max_history_len=max_history_len,
         dropout_rate=dropout_rate,
+        l2_normalize_embeddings=l2_normalize_embeddings,
         similarity_temperature=similarity_temperature,
         user_encoder_type=user_encoder_type,
         use_post_encoder=use_post_encoder,
@@ -912,6 +922,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         "num_attention_layers": num_attention_layers,
         "max_history_len": max_history_len,
         "dropout_rate": dropout_rate,
+        "l2_normalize_embeddings": l2_normalize_embeddings,
         "similarity_temperature": similarity_temperature,
     }
     if save_model:
@@ -1039,7 +1050,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         f"stage: train_two_tower",
         f"timestamp: {timestamp}",
         f"runtime_seconds: {runtime:.2f}",
-        f"settings: batch_size={batch_size}, lr={learning_rate}, epochs={epochs}, user_encoder={user_encoder_type}, early_stopping_min_delta={early_stopping_min_delta}, tau={similarity_temperature}",
+        f"settings: batch_size={batch_size}, lr={learning_rate}, epochs={epochs}, user_encoder={user_encoder_type}, l2_norm={l2_normalize_embeddings}, early_stopping_min_delta={early_stopping_min_delta}, tau={similarity_temperature}",
         f"train_samples: {len(train_dataset)}",
         f"val_samples: {len(val_dataset)}",
         f"best_val_auc: {best_val_auc:.4f}",

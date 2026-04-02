@@ -89,6 +89,7 @@ DEFAULTS: Dict[str, Any] = {
     "num_attention_layers": 2,
     "max_history_len": 20,
     "attention_dropout": 0.1,  # Dropout rate for attention-based user encoders
+    "l2_normalize_embeddings": True,
     "similarity_temperature": 0.2,
     "epochs": 300,
     "batch_size": 256,
@@ -768,6 +769,9 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Max user history length")
     _add_arg_with_default(p_all, "--attention-dropout", type=float, default=argparse.SUPPRESS,
                           help_text="Dropout rate for attention-based user encoders")
+    _add_arg_with_default(p_all, "--l2-normalize-embeddings", dest="l2_normalize_embeddings",
+                          action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
+                          help_text="Enable or disable L2 normalization on two-tower user/post embeddings before similarity scoring")
     _add_arg_with_default(p_all, "--similarity-temperature", type=float, default=argparse.SUPPRESS,
                           help_text="Temperature used to scale cosine-similarity logits in the two-tower model")
     # Stage 5 options (shared)
