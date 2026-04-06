@@ -9,7 +9,7 @@ import zlib
 import numpy as np
 
 # ----------------------------------------
-# String hashing helpers
+# Hashing helpers
 # ----------------------------------------
 
 def get_hashed_value_from_string(value: str, variant: int) -> int:
@@ -24,6 +24,51 @@ def get_hashed_value_from_string(value: str, variant: int) -> int:
 
     digest = hashlib.sha256(f"{variant}:{value}".encode("utf-8")).digest()
     return int.from_bytes(digest[:8], byteorder="big", signed=False)
+
+
+# Integer hashing
+MASK64 = 0xFFFFFFFFFFFFFFFF
+GOLDEN_GAMMA = 0x9E3779B97F4A7C15
+
+def _golden_gamma_and_mask(x: int) -> int:
+    return (x + GOLDEN_GAMMA) & MASK64
+
+def _splitmix64_after_mask(z: int) -> int:
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & MASK64
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & MASK64
+    z = (z ^ (z >> 31)) & MASK64
+    return z
+
+def _splitmix64(x: int) -> int:
+    z = _golden_gamma_and_mask(x)
+    z = _splitmix64_after_mask(z)
+    return z
+
+def _generate_hashes(x: int, n: int) -> list[int]:
+    state = int(x) & MASK64
+    out = []
+    for _ in range(n):
+        state = _golden_gamma_and_mask(state)
+        z = state
+        z = _splitmix64_after_mask(z)
+        out.append(z)
+    return out
+
+def generate_hash_indices(x: int, n: int, num_buckets: int) -> list[int]:
+    # Bucket 0 is reserved for padding in the embedding table, so real hashes
+    # must land in [1, num_buckets - 1].
+    if num_buckets <= 1:
+        raise ValueError("num_buckets must be greater than 1 when bucket 0 is reserved for padding")
+    if n <= 0:
+        raise ValueError("n must be positive")
+    state = int(x) & MASK64
+    out = []
+    for _ in range(n):
+        state = _golden_gamma_and_mask(state)
+        z = state
+        z = _splitmix64_after_mask(z)
+        out.append(1 + (z % (num_buckets - 1)))
+    return out
 
 
 # ----------------------------------------

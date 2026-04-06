@@ -7,6 +7,7 @@ import torch.nn as nn
 # Import from module with numeric prefix
 stage_train_two_tower = importlib.import_module("utils.04_train.stage_train_two_tower")
 PostTower = stage_train_two_tower.PostTower
+SharedPostFeatureEncoder = stage_train_two_tower.SharedPostFeatureEncoder
 TwoTowerModel = stage_train_two_tower.TwoTowerModel
 
 
@@ -136,6 +137,16 @@ def test_post_tower_eval_mode():
     # All outputs should be identical
     for i in range(len(outputs) - 1):
         assert torch.allclose(outputs[i], outputs[i + 1])
+
+
+def test_shared_post_feature_encoder_zeroes_padding_row():
+    encoder = SharedPostFeatureEncoder(
+        post_embedding_dim=16,
+        num_embedding_table_rows=32,
+        num_hashes_for_embedding_table=3,
+    )
+
+    assert torch.all(encoder.collab_table.weight[0] == 0)
 
 
 # =============================================================================
