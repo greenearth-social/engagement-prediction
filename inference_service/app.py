@@ -11,8 +11,9 @@ import logging
 
 import torch
 from clearml import Model
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Security
 from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Discriminator, Tag, model_validator
 
 
@@ -22,7 +23,13 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     yield
 
 
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
 app = FastAPI(lifespan=lifespan)
+
+
+def _require_api_key(api_key: str = Security(_api_key_header)) -> None:
+    if api_key != _API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
 
 # -------------------------
 # Logging
@@ -36,6 +43,7 @@ logger = logging.getLogger(__name__)
 GE_INFERENCE_MAX_BATCH = int(os.getenv("GE_INFERENCE_MAX_BATCH", "1024"))
 GE_INFERENCE_PREFER_CUDA = os.getenv("GE_INFERENCE_PREFER_CUDA", "1") == "1"
 GE_INFERENCE_WARMUP = os.getenv("GE_INFERENCE_WARMUP", "1") == "1"
+_API_KEY: str | None = os.environ.get("GE_INFERENCE_API_KEY") or None
 
 # If you know these shapes, set them to validate and to create dummy warmup.
 GE_INFERENCE_EMBED_DIM = int(os.getenv("GE_INFERENCE_EMBED_DIM", "0")) # 0 means unknown/skip dim validation
@@ -557,7 +565,7 @@ def health() -> dict:
     return {"ok": True}
 
 
-@app.get("/ready")
+@app.get("/ready", dependencies=[Security(_require_api_key)])
 def ready():
     _init_registry()
     ensure_models_loaded()
@@ -592,7 +600,7 @@ def ready():
     status = 200 if all_ready else 503
     return JSONResponse(content=payload, status_code=status)
 
-@app.get("/models")
+@app.get("/models", dependencies=[Security(_require_api_key)])
 def list_models() -> dict:
     _init_registry()
     ensure_models_loaded()
@@ -614,7 +622,7 @@ def list_models() -> dict:
     return {"models": models_payload, "registry_error": _models_init_error}
 
 
-@app.post("/models/{model_name}/predict")
+@app.post("/models/{model_name}/predict", dependencies=[Security(_require_api_key)])
 def predict_model(model_name: str, req: PredictRequest) -> dict:
     entry = _get_entry_or_404(model_name)
     try:
