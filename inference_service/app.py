@@ -27,7 +27,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
-    if _API_KEY is None or request.url.path == "/health":
+    if _API_KEY is None or request.url.path in ("/health", "/docs", "/redoc", "/openapi.json"):
         return await call_next(request)
     if request.headers.get("X-API-Key") != _API_KEY:
         return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key"})
