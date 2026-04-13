@@ -34,8 +34,10 @@ import polars as pl
 from scipy.stats import spearmanr
 
 from . import EvalContext, EvalModule, compute_per_user_metrics, scaled_figsize
-from .trait_corrs import _load_inferences, _unnest_text_inferences
-from .trait_amplification import MIN_USER_POSTS, _filter_eligible_users
+from ._helpers import (
+    _load_inferences, _unnest_text_inferences,
+    MIN_USER_POSTS, _filter_eligible_users,
+)
 
 MIN_FINITE_TRAITS = 10
 METRICS = ["recall", "f1", "precision"]

@@ -33,8 +33,10 @@ import numpy as np
 import polars as pl
 
 from . import EvalContext, EvalModule, scaled_figsize
-from .trait_corrs import _load_inferences, _unnest_text_inferences
-from .trait_amplification import MIN_USER_POSTS, _filter_eligible_users
+from ._helpers import (
+    _load_inferences, _unnest_text_inferences,
+    MIN_USER_POSTS, _filter_eligible_users,
+)
 
 MIN_LIKED_POSTS = 10
 MIN_USERS_PER_GROUP = 30

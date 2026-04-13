@@ -40,6 +40,11 @@ Outputs (under synthetic_feed/):
                                            same as above with hi/lo-volume
                                            liker points overlaid on the
                                            liked bar
+- <group>_synthetic_feed_user_scatter.png: per-user scatter of liked vs
+                                           feed trait prevalence (small
+                                           multiples, one panel per trait)
+- <group>_synthetic_feed_over_serving.png: KDE of per-user over-serving
+                                           (feed minus liked prevalence)
 """
 
 from __future__ import annotations
@@ -53,10 +58,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
-from scipy.stats import ttest_1samp
+from scipy.stats import gaussian_kde, spearmanr, ttest_1samp
 
 from . import EvalContext, EvalModule, scaled_figsize
-from .trait_corrs import _load_inferences, _unnest_text_inferences
+from ._helpers import _load_inferences, _unnest_text_inferences, _givers_of_half_the_likes
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -862,6 +867,177 @@ def _plot_group_prevalence_detail(
     return path, actual_ylim
 
 
+def _plot_user_scatter(
+    group_name: str,
+    group_traits: Dict[str, TraitDecompResult],
+    out_dir: Path,
+) -> Optional[Path]:
+    """Small multiples: per-user liked prevalence (x) vs feed prevalence (y).
+
+    Points above the diagonal indicate over-serving for that user/trait.
+    """
+    excluded = _EXCLUDED_TRAITS.get(group_name, set())
+    valid_labels = sorted(
+        (l for l in group_traits if l not in excluded),
+        key=lambda l: abs(group_traits[l].cohen_d_amp),
+        reverse=True,
+    )
+    if not valid_labels:
+        return None
+
+    n = len(valid_labels)
+    ncols = min(4, n)
+    nrows = (n + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=scaled_figsize(3.5 * ncols, 3.5 * nrows),
+        squeeze=False,
+    )
+
+    for i, label in enumerate(valid_labels):
+        ax = axes[i // ncols][i % ncols]
+        tr = group_traits[label]
+
+        liked_prev = tr.pool_mean + tr.user_pref_std * tr.pool_sd
+        feed_prev = tr.pool_mean + tr.model_excess_std * tr.pool_sd
+
+        colors = np.where(feed_prev > liked_prev, "#2ca02c", "#d62728")
+        ax.scatter(liked_prev, feed_prev, s=5, alpha=0.25,
+                   edgecolors="none", c=colors)
+
+        lo = min(ax.get_xlim()[0], ax.get_ylim()[0])
+        hi = max(ax.get_xlim()[1], ax.get_ylim()[1])
+        margin = (hi - lo) * 0.05
+        lo -= margin
+        hi += margin
+        ax.plot([lo, hi], [lo, hi], "k--", linewidth=0.5, alpha=0.4)
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(lo, hi)
+        ax.set_aspect("equal")
+
+        ax.set_xlabel("Liked prevalence", fontsize=7)
+        ax.set_ylabel("Feed prevalence", fontsize=7)
+        ax.set_title(label, fontsize=8)
+        ax.tick_params(labelsize=6)
+        ax.axhline(tr.pool_mean, color="gray", linewidth=0.3)
+        ax.axvline(tr.pool_mean, color="gray", linewidth=0.3)
+
+        r, _ = spearmanr(liked_prev, feed_prev)
+        ax.text(
+            0.05, 0.95,
+            f"r={r:.2f}\nn={tr.n_users}",
+            transform=ax.transAxes, fontsize=6, va="top",
+            bbox=dict(facecolor="white", alpha=0.7, edgecolor="none", pad=1),
+        )
+
+    for i in range(n, nrows * ncols):
+        axes[i // ncols][i % ncols].set_visible(False)
+
+    fig.suptitle(
+        f"{group_name.replace('_', ' ').title()}"
+        " \u2014 Per-User Prevalence: Liked vs Feed",
+        fontsize=11,
+    )
+    plt.tight_layout()
+
+    path = out_dir / f"{group_name}_synthetic_feed_user_scatter.png"
+    fig.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def _safe_kde(values: np.ndarray, grid: np.ndarray) -> Optional[np.ndarray]:
+    try:
+        return gaussian_kde(values)(grid)
+    except Exception:
+        return None
+
+
+def _plot_over_serving_kde(
+    group_name: str,
+    group_traits: Dict[str, TraitDecompResult],
+    out_dir: Path,
+) -> Optional[Path]:
+    """Small-multiples KDE of per-user over-serving (feed prevalence minus
+    liked prevalence) for each trait in a group."""
+    excluded = _EXCLUDED_TRAITS.get(group_name, set())
+    valid_labels = sorted(
+        (l for l in group_traits if l not in excluded),
+        key=lambda l: abs(group_traits[l].cohen_d_amp),
+        reverse=True,
+    )
+    if not valid_labels:
+        return None
+
+    n = len(valid_labels)
+    ncols = min(3, n)
+    nrows = (n + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=scaled_figsize(5 * ncols, 3.5 * nrows),
+        squeeze=False,
+    )
+
+    for idx, label in enumerate(valid_labels):
+        row, col = divmod(idx, ncols)
+        ax = axes[row][col]
+        tr = group_traits[label]
+        vals = tr.model_amp_std * tr.pool_sd  # feed - liked in raw units
+
+        lo = float(vals.min()) - 0.1 * max(abs(vals.min()), 0.01)
+        hi = float(vals.max()) + 0.1 * max(abs(vals.max()), 0.01)
+        grid = np.linspace(lo, hi, 300)
+
+        density = _safe_kde(vals, grid)
+        color_fill = "#e06000" if float(np.mean(vals)) >= 0 else "#4878CF"
+        if density is not None:
+            ax.fill_between(grid, density, alpha=0.3, color=color_fill)
+            ax.plot(grid, density, color=color_fill, linewidth=1.0)
+        else:
+            ax.hist(vals, bins=30, density=True, alpha=0.3, color=color_fill)
+
+        ax.axvline(0, color="black", linestyle="--", linewidth=0.8)
+        mean_v = float(np.mean(vals))
+        median_v = float(np.median(vals))
+        pct_over = float(np.mean(vals > 0) * 100)
+
+        ax.axvline(mean_v, color="#c04000", linewidth=1.0,
+                   label=f"mean = {mean_v:+.4f}")
+        ax.axvline(median_v, color="#c04000", linewidth=0.8, linestyle=":",
+                   label=f"median = {median_v:+.4f}")
+
+        stars = _significance_stars(tr.p_amp)
+        ax.set_title(
+            f"{label}  (d = {tr.cohen_d_amp:+.3f}{stars})",
+            fontsize=8, fontweight="bold",
+        )
+        ax.set_xlabel("Feed \u2212 Liked prevalence", fontsize=7)
+        ax.set_ylabel("density", fontsize=7)
+        ax.tick_params(labelsize=6)
+        ax.legend(
+            title=f"{pct_over:.0f}% > 0  (N={tr.n_users})",
+            title_fontsize=5, fontsize=5, loc="upper right", framealpha=0.7,
+        )
+
+    for idx in range(n, nrows * ncols):
+        row, col = divmod(idx, ncols)
+        axes[row][col].set_visible(False)
+
+    fig.suptitle(
+        f"{group_name.replace('_', ' ').title()}"
+        " \u2014 Over-Serving (feed \u2212 liked prevalence per user)",
+        fontsize=11, fontweight="bold",
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+    path = out_dir / f"{group_name}_synthetic_feed_over_serving.png"
+    fig.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
 def _save_prevalence_legends(pct_hi_str: str, out_dir: Path) -> List[str]:
     """Save standalone legend PNGs for the prevalence and prevalence-detail plots."""
     paths: List[str] = []
@@ -1290,8 +1466,6 @@ class SyntheticFeedModule(EvalModule):
         print("    [synthetic_feed] Saved summary JSON", flush=True)
 
         # ---- volume split for detail plots ----
-        from .liked_trait_volume import _givers_of_half_the_likes
-
         meta = ctx.user_metadata_df
         did_to_likes: Dict[str, int] = dict(
             zip(meta["did"], meta["num_total_likes"])
@@ -1353,6 +1527,14 @@ class SyntheticFeedModule(EvalModule):
                 )
                 plot_paths.append(str(prev_path))
                 plot_paths.append(str(detail_path))
+
+                scatter_path = _plot_user_scatter(gname, gt, out_dir)
+                if scatter_path is not None:
+                    plot_paths.append(str(scatter_path))
+
+                kde_path = _plot_over_serving_kde(gname, gt, out_dir)
+                if kde_path is not None:
+                    plot_paths.append(str(kde_path))
 
                 if gname in _SUBSET_TRAITS:
                     sub_name, sub_keep = _SUBSET_TRAITS[gname]
