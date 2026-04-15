@@ -43,6 +43,7 @@ ENV/
 # Agents
 CLAUDE.md
 .claude/
+.codex/
 
 # OS
 .DS_Store

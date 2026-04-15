@@ -197,6 +197,38 @@ class PostTower(nn.Module):
         return self.network(post_embeddings)
 
 
+class L2NormalizedUserTower(nn.Module):
+    """Wrap a user tower and optionally emit unit-length embeddings."""
+
+    def __init__(self, tower: nn.Module, enabled: bool, eps: float = 1e-12):
+        super().__init__()
+        self.tower = tower
+        self.enabled = bool(enabled)
+        self.eps = float(eps)
+
+    def forward(self, history_embeddings: torch.Tensor, history_mask: torch.Tensor) -> torch.Tensor:
+        embeddings = self.tower(history_embeddings, history_mask)
+        if not self.enabled:
+            return embeddings
+        return F.normalize(embeddings, p=2.0, dim=-1, eps=self.eps)
+
+
+class L2NormalizedPostTower(nn.Module):
+    """Wrap a post tower and optionally emit unit-length embeddings."""
+
+    def __init__(self, tower: nn.Module, enabled: bool, eps: float = 1e-12):
+        super().__init__()
+        self.tower = tower
+        self.enabled = bool(enabled)
+        self.eps = float(eps)
+
+    def forward(self, post_embeddings: torch.Tensor) -> torch.Tensor:
+        embeddings = self.tower(post_embeddings)
+        if not self.enabled:
+            return embeddings
+        return F.normalize(embeddings, p=2.0, dim=-1, eps=self.eps)
+
+
 # =============================================================================
 # Two-Tower Engagement Model
 # =============================================================================
@@ -219,8 +251,8 @@ class TwoTowerModel(nn.Module):
             - use_post_encoder=True:  PostTower(post_embedding) -> post_vector [shared_dim]
             - use_post_encoder=False: post_vector is the raw post embedding (identity)
         
-        Scoring: dot_product(user_vector, post_vector) -> raw score
-                 sigmoid(raw_score) -> engagement_probability
+        Scoring: similarity(user_vector, post_vector) / temperature -> raw logit
+                 sigmoid(raw_logit) -> engagement_probability
     
     Key characteristics:
         - Shared embedding space: Both towers output the same dimensionality for dot product
@@ -256,18 +288,24 @@ class TwoTowerModel(nn.Module):
         num_attention_layers: int,
         max_history_len: int,
         dropout_rate: float,
+        l2_normalize_embeddings: bool,
+        similarity_temperature: float,
         user_encoder_type: str,
         use_post_encoder: bool,
     ):
         super().__init__()
         self.shared_dim = shared_dim
         self.post_embedding_dim = post_embedding_dim
+        if similarity_temperature <= 0.0:
+            raise ValueError("similarity_temperature must be > 0")
+        self.similarity_temperature = float(similarity_temperature)
         self.user_encoder_type = user_encoder_type
         self.use_post_encoder = use_post_encoder
+        self.l2_normalize_embeddings = bool(l2_normalize_embeddings)
 
         # Instantiate user tower based on encoder type
         if user_encoder_type == "cross_attention":
-            self.user_tower = CrossAttentionPoolingEncoder(
+            raw_user_tower = CrossAttentionPoolingEncoder(
                 input_dim=post_embedding_dim,
                 hidden_dim=user_hidden_dim,
                 output_dim=shared_dim,
@@ -275,7 +313,7 @@ class TwoTowerModel(nn.Module):
                 dropout_rate=dropout_rate,
             )
         elif user_encoder_type == "full_transformer":
-            self.user_tower = TransformerDualPoolingEncoder(
+            raw_user_tower = TransformerDualPoolingEncoder(
                 input_dim=post_embedding_dim,
                 hidden_dim=user_hidden_dim,
                 output_dim=shared_dim,
@@ -289,7 +327,7 @@ class TwoTowerModel(nn.Module):
             # (e.g., mean/EMA/linear-recency summary). The model treats the
             # history input as an already-encoded user embedding (placed at
             # position 0 in a padded sequence for a consistent forward() signature).
-            self.user_tower = SummarizedUserTower(embed_dim=post_embedding_dim)
+            raw_user_tower = SummarizedUserTower(embed_dim=post_embedding_dim)
 
             # If we still learn a post projection (use_post_encoder=True), its output
             # dimension must match the dataset-provided user embedding dimension.
@@ -313,14 +351,17 @@ class TwoTowerModel(nn.Module):
 
         if use_post_encoder:
             # Post tower is the same regardless of user encoder type
-            self.post_tower = PostTower(
+            raw_post_tower = PostTower(
                 input_dim=post_embedding_dim,
                 hidden_dim=post_hidden_dim,
                 output_dim=shared_dim,
                 dropout_rate=dropout_rate,
             )
         else:
-            self.post_tower = nn.Identity()
+            raw_post_tower = nn.Identity()
+
+        self.user_tower = L2NormalizedUserTower(raw_user_tower, enabled=self.l2_normalize_embeddings)
+        self.post_tower = L2NormalizedPostTower(raw_post_tower, enabled=self.l2_normalize_embeddings)
 
 
     def encode_user(self, history_embeddings: torch.Tensor, history_mask: torch.Tensor) -> torch.Tensor:
@@ -331,7 +372,8 @@ class TwoTowerModel(nn.Module):
             history_mask: Boolean mask [batch, seq_len], True = valid position
         
         Returns:
-            User vectors in shared space [batch, shared_dim]
+            User vectors in shared space [batch, shared_dim].
+            When `l2_normalize_embeddings=True`, these are unit-length.
         """
         return self.user_tower(history_embeddings, history_mask)
 
@@ -345,6 +387,7 @@ class TwoTowerModel(nn.Module):
             Post vectors for dot product scoring.
                 - use_post_encoder=True: [batch, shared_dim]
                 - otherwise: [batch, post_embedding_dim] (identity)
+            When `l2_normalize_embeddings=True`, outputs are L2-normalized.
         """
         return self.post_tower(post_embeddings)
 
@@ -374,8 +417,8 @@ class TwoTowerModel(nn.Module):
         user_emb = self.encode_user(history_embeddings, history_mask)
         post_emb = self.encode_post(post_embeddings)
         
-        # Dot product: element-wise multiply then sum over shared_dim
-        return (user_emb * post_emb).sum(dim=-1)
+        similarity_score = (user_emb * post_emb).sum(dim=-1)
+        return similarity_score / self.similarity_temperature
 
     def compute_loss_and_preds(
         self,
@@ -386,8 +429,10 @@ class TwoTowerModel(nn.Module):
         """Compute loss and predictions for a batch.
         
         This method provides a unified interface for training, validation, and
-        inference loops. It computes raw scores (dot products), applies sigmoid
-        to get probabilities, and calculates binary cross-entropy loss.
+        inference loops. It computes raw similarity scores (optionally cosine
+        similarities when tower-level L2 normalization is enabled) and
+        calculates binary cross-entropy loss directly from the logits for
+        numerical stability.
         
         Args:
             batch: Batch dictionary. Expected keys depend on `user_encoder_type`:
@@ -399,8 +444,8 @@ class TwoTowerModel(nn.Module):
         
         Returns:
             Tuple of (loss, scores):
-                - loss: Scalar BCE loss tensor
-                - scores: Raw dot product scores [batch] (before sigmoid)
+                - loss: Scalar BCE-with-logits loss tensor
+                - scores: Raw similarity scores [batch] (before sigmoid)
         
         Note:
             Returns raw scores (not probabilities) for flexibility in evaluation.
@@ -408,7 +453,7 @@ class TwoTowerModel(nn.Module):
         """
         # unpack inputs
         if self.user_encoder_type == "summarized":
-            features = batch["features"].to(device) # [B, embed_dim*2]
+            features = batch["features"].to(device, non_blocking=True) # [B, embed_dim*2]
             user_summary = features[:, :embed_dim] # [B, embed_dim]
             history_embeddings = user_summary.unsqueeze(1)  # [B, 1, embed_dim] (summary token at position 0)
             post_embeddings = features[:, embed_dim:] # [B, embed_dim]
@@ -420,14 +465,13 @@ class TwoTowerModel(nn.Module):
             history_mask = has_history.unsqueeze(1).to(device=device, dtype=torch.bool) # [B, 1]
             assert history_embeddings.shape[-1] == post_embeddings.shape[-1]
         else:
-            history_embeddings = batch["history_embeddings"].to(device) # [B, seq_len, embed_dim]
-            history_mask = batch["history_mask"].to(device) # [B, seq_len]
-            post_embeddings = batch["target_post_embedding"].to(device) # [B, embed_dim]
-        labels = batch["label"].to(device)
+            history_embeddings = batch["history_embeddings"].to(device, non_blocking=True) # [B, seq_len, embed_dim]
+            history_mask = batch["history_mask"].to(device, non_blocking=True) # [B, seq_len]
+            post_embeddings = batch["target_post_embedding"].to(device, non_blocking=True) # [B, embed_dim]
+        labels = batch["label"].to(device, non_blocking=True)
 
         scores = self.forward(history_embeddings, history_mask, post_embeddings)
-        probs = torch.sigmoid(scores)
-        loss = F.binary_cross_entropy(probs, labels.float())
+        loss = F.binary_cross_entropy_with_logits(scores, labels.float())
         return loss, scores
 
 
@@ -444,12 +488,14 @@ def train_two_tower_model(
     learning_rate: float,
     weight_decay: float,
     patience: int,
+    early_stopping_min_delta: float,
     checkpoints_dir: Optional[Path],
     disable_progress: bool,
     lr_scheduler_factor: float,
     lr_scheduler_patience: int,
     gradient_clip_max_norm: float,
-    embed_dim: int
+    embed_dim: int,
+    experiment_tracker: Optional[Any] = None,
 ) -> Dict[str, Any]:
     from tqdm import tqdm
 
@@ -461,6 +507,7 @@ def train_two_tower_model(
 
     history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "train_auc": [], "val_auc": []}
     best_val_auc = 0.0
+    best_reset_val_auc = 0.0
     best_val_loss = float("inf")
     patience_counter = 0
     best_state_dict = None
@@ -468,12 +515,13 @@ def train_two_tower_model(
     for epoch in tqdm(range(epochs), desc="Training epochs", disable=disable_progress):
         # --- Training ---
         model.train()
-        train_losses: List[float] = []
-        train_preds: List[float] = []
-        train_labels: List[float] = []
+        train_loss_sum = torch.zeros((), device=device)
+        train_batches = 0
+        train_scores_chunks: List[torch.Tensor] = []
+        train_labels_chunks: List[torch.Tensor] = []
 
         for batch in tqdm(train_loader, desc="Training", leave=False, disable=disable_progress):
-            labels = batch["label"].to(device)
+            labels = batch["label"]
 
             optimizer.zero_grad()
             loss, scores = model.compute_loss_and_preds(batch, device, embed_dim)
@@ -481,35 +529,88 @@ def train_two_tower_model(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_max_norm)
             optimizer.step()
 
-            train_losses.append(loss.item())
-            train_preds.extend(torch.sigmoid(scores).detach().cpu().numpy().tolist())
-            train_labels.extend(labels.cpu().numpy().tolist())
+            train_loss_sum += loss.detach()
+            train_batches += 1
+            train_scores_chunks.append(scores.detach())
+            train_labels_chunks.append(labels.detach())
 
         # --- Validation ---
         model.eval()
-        val_losses: List[float] = []
-        val_preds: List[float] = []
-        val_labels: List[float] = []
+        val_loss_sum = torch.zeros((), device=device)
+        val_batches = 0
+        val_scores_chunks: List[torch.Tensor] = []
+        val_labels_chunks: List[torch.Tensor] = []
 
         with torch.inference_mode():
             for batch in tqdm(val_loader, desc="Validation", leave=False, disable=disable_progress):
-                labels = batch["label"].to(device)
+                labels = batch["label"]
 
                 loss, scores = model.compute_loss_and_preds(batch, device, embed_dim)
 
-                val_losses.append(loss.item())
-                val_preds.extend(torch.sigmoid(scores).detach().cpu().numpy().tolist())
-                val_labels.extend(labels.cpu().numpy().tolist())
+                val_loss_sum += loss.detach()
+                val_batches += 1
+                val_scores_chunks.append(scores.detach())
+                val_labels_chunks.append(labels.detach())
 
-        train_loss = float(np.mean(train_losses))
-        val_loss = float(np.mean(val_losses))
-        train_auc = roc_auc_score(train_labels, train_preds) if len(set(train_labels)) > 1 else 0.5
-        val_auc = roc_auc_score(val_labels, val_preds) if len(set(val_labels)) > 1 else 0.5
+        train_loss = (train_loss_sum / max(train_batches, 1)).item()
+        val_loss = (val_loss_sum / max(val_batches, 1)).item()
+
+        train_probs = (
+            torch.sigmoid(torch.cat(train_scores_chunks)).float().cpu().numpy()
+            if train_scores_chunks
+            else np.array([])
+        )
+        train_labels_np = (
+            torch.cat(train_labels_chunks).float().cpu().numpy()
+            if train_labels_chunks
+            else np.array([])
+        )
+
+        val_probs = (
+            torch.sigmoid(torch.cat(val_scores_chunks)).float().cpu().numpy()
+            if val_scores_chunks
+            else np.array([])
+        )
+        val_labels_np = (
+            torch.cat(val_labels_chunks).float().cpu().numpy()
+            if val_labels_chunks
+            else np.array([])
+        )
+
+        train_auc = roc_auc_score(train_labels_np, train_probs) if np.unique(train_labels_np).size > 1 else 0.5
+        val_auc = roc_auc_score(val_labels_np, val_probs) if np.unique(val_labels_np).size > 1 else 0.5
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["train_auc"].append(float(train_auc))
         history["val_auc"].append(float(val_auc))
+
+        if experiment_tracker is not None:
+            iteration = epoch + 1
+            experiment_tracker.log_scalar(
+                title="Training Loss History",
+                series="Train Loss",
+                value=float(train_loss),
+                iteration=iteration,
+            )
+            experiment_tracker.log_scalar(
+                title="Training Loss History",
+                series="Validation Loss",
+                value=float(val_loss),
+                iteration=iteration,
+            )
+            experiment_tracker.log_scalar(
+                title="Training AUC History",
+                series="Train AUC",
+                value=float(train_auc),
+                iteration=iteration,
+            )
+            experiment_tracker.log_scalar(
+                title="Training AUC History",
+                series="Validation AUC",
+                value=float(val_auc),
+                iteration=iteration,
+            )
 
         scheduler.step(val_auc)
 
@@ -517,13 +618,20 @@ def train_two_tower_model(
             best_val_auc = val_auc
             best_val_loss = val_loss
             best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            patience_counter = 0
 
             if checkpoints_dir is not None:
                 torch.save(
                     {"epoch": epoch, "model_state_dict": best_state_dict, "val_loss": val_loss, "val_auc": val_auc, "history": history},
                     checkpoints_dir / "two_tower_best.pth",
                 )
+
+        significant_improvement = (
+            val_auc > best_reset_val_auc
+            and (val_auc - best_reset_val_auc) >= early_stopping_min_delta
+        )
+        if significant_improvement:
+            best_reset_val_auc = val_auc
+            patience_counter = 0
         else:
             patience_counter += 1
 
@@ -556,8 +664,8 @@ def _evaluate_two_tower_model(
     model = model.to(device)
     model.eval()
 
-    all_preds: List[float] = []
-    all_labels: List[float] = []
+    labels_chunks: List[torch.Tensor] = []
+    probs_chunks: List[torch.Tensor] = []
     all_user_ids: List[str] = []
     all_post_ids: List[str] = []
 
@@ -568,13 +676,16 @@ def _evaluate_two_tower_model(
             _, scores = model.compute_loss_and_preds(batch, device, embed_dim)
             probs = torch.sigmoid(scores)
 
-            all_preds.extend(probs.cpu().numpy().tolist())
-            all_labels.extend(labels.numpy().tolist())
+            probs_chunks.append(probs.detach())
+            labels_chunks.append(labels.detach())
             all_user_ids.extend(batch["user_id"])
             all_post_ids.extend(batch["post_id"])
 
-    y_true = np.array(all_labels)
-    y_pred = np.array(all_preds)
+    probs_all = torch.cat(probs_chunks).float().cpu() if probs_chunks else torch.empty(0)
+    labels_all = torch.cat(labels_chunks).float().cpu() if labels_chunks else torch.empty(0)
+
+    y_true = labels_all.numpy()
+    y_pred = probs_all.numpy()
 
     metrics: Dict[str, Any] = {
         "total_samples": len(y_true),
@@ -582,7 +693,7 @@ def _evaluate_two_tower_model(
         "negative_samples": int(len(y_true) - y_true.sum()),
     }
 
-    if len(set(y_true)) > 1:
+    if np.unique(y_true).size > 1:
         metrics["auc_roc"] = float(roc_auc_score(y_true, y_pred))
         metrics["average_precision"] = float(average_precision_score(y_true, y_pred))
 
@@ -644,11 +755,14 @@ def run(context: Context, args) -> Dict[str, Any]:
     num_attention_heads = int(args.num_attention_heads)
     num_attention_layers = int(args.num_attention_layers)
     dropout_rate = float(args.dropout_rate_two_tower)
+    l2_normalize_embeddings = bool(args.l2_normalize_embeddings)
+    similarity_temperature = float(args.similarity_temperature)
     batch_size = int(args.batch_size)
     learning_rate = float(args.learning_rate)
     weight_decay = float(args.weight_decay_two_tower)
     epochs = int(args.epochs)
     patience = int(args.patience)
+    early_stopping_min_delta = float(args.early_stopping_min_delta)
     disable_progress = bool(args.disable_progress)
     user_encoder_type = args.user_encoder
     use_post_encoder = args.use_post_encoder
@@ -714,6 +828,8 @@ def run(context: Context, args) -> Dict[str, Any]:
         num_attention_layers=num_attention_layers,
         max_history_len=max_history_len,
         dropout_rate=dropout_rate,
+        l2_normalize_embeddings=l2_normalize_embeddings,
+        similarity_temperature=similarity_temperature,
         user_encoder_type=user_encoder_type,
         use_post_encoder=use_post_encoder,
     )
@@ -734,25 +850,20 @@ def run(context: Context, args) -> Dict[str, Any]:
             learning_rate=learning_rate,
             weight_decay=weight_decay,
             patience=patience,
+            early_stopping_min_delta=early_stopping_min_delta,
             checkpoints_dir=checkpoints_dir,
             disable_progress=disable_progress,
             lr_scheduler_factor=lr_scheduler_factor,
             lr_scheduler_patience=lr_scheduler_patience,
             gradient_clip_max_norm=gradient_clip_max_norm,
             embed_dim=embed_dim,
+            experiment_tracker=context.tracker,
         )
         trained_model: TwoTowerModel = training_results["model"]
         clear_cuda_memory()
 
         # --- plots & evaluation ---
         hist = training_results["history"]
-
-        # experiment tracker scalars (always logged, regardless of --no-plots)
-        for e in range(len(hist["train_loss"])):
-            context.tracker.log_scalar(title="Training Loss History", series="Train Loss", value=hist["train_loss"][e], iteration=e + 1)
-            context.tracker.log_scalar(title="Training Loss History", series="Validation Loss", value=hist["val_loss"][e], iteration=e + 1)
-            context.tracker.log_scalar(title="Training AUC History", series="Train AUC", value=hist["train_auc"][e], iteration=e + 1)
-            context.tracker.log_scalar(title="Training AUC History", series="Validation AUC", value=hist["val_auc"][e], iteration=e + 1)
 
         if generate_plots:
             try:
@@ -811,6 +922,8 @@ def run(context: Context, args) -> Dict[str, Any]:
         "num_attention_layers": num_attention_layers,
         "max_history_len": max_history_len,
         "dropout_rate": dropout_rate,
+        "l2_normalize_embeddings": l2_normalize_embeddings,
+        "similarity_temperature": similarity_temperature,
     }
     if save_model:
         model_path = checkpoints_dir / f"two_tower_{timestamp}.pth"
@@ -919,6 +1032,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         "weight_decay": weight_decay,
         "epochs": epochs,
         "patience": patience,
+        "early_stopping_min_delta": early_stopping_min_delta,
         "random_seed": random_seed,
         "train_samples": len(train_dataset),
         "val_samples": len(val_dataset),
@@ -936,7 +1050,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         f"stage: train_two_tower",
         f"timestamp: {timestamp}",
         f"runtime_seconds: {runtime:.2f}",
-        f"settings: batch_size={batch_size}, lr={learning_rate}, epochs={epochs}, user_encoder={user_encoder_type}",
+        f"settings: batch_size={batch_size}, lr={learning_rate}, epochs={epochs}, user_encoder={user_encoder_type}, l2_norm={l2_normalize_embeddings}, early_stopping_min_delta={early_stopping_min_delta}, tau={similarity_temperature}",
         f"train_samples: {len(train_dataset)}",
         f"val_samples: {len(val_dataset)}",
         f"best_val_auc: {best_val_auc:.4f}",

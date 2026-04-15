@@ -89,6 +89,8 @@ DEFAULTS: Dict[str, Any] = {
     "num_attention_layers": 2,
     "max_history_len": 20,
     "attention_dropout": 0.1,  # Dropout rate for attention-based user encoders
+    "l2_normalize_embeddings": False,
+    "similarity_temperature": 1.0,
     "epochs": 300,
     "batch_size": 256,
     "learning_rate": 0.001,
@@ -100,6 +102,7 @@ DEFAULTS: Dict[str, Any] = {
     "prediction_posts_per_user": 1,
     "device": None,
     "patience": 50,
+    "early_stopping_min_delta": 0.002,
     "run_tag": None,  # Optional tag appended to training output directory name
     "no_plots": False,
     "no_save_model": False,
@@ -704,13 +707,13 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Memory check mode: full (enforce limits), ignore (log only), skip (no estimation)")
     _add_arg_with_default(p_all, "--output-dir", type=str, default=argparse.SUPPRESS,
                           help_text="Optional explicit run directory root")
-    _add_arg_with_default(p_all, "--debug", action="store_true", default=argparse.SUPPRESS,
+    _add_arg_with_default(p_all, "--debug", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help_text="Enable verbose debug logging for Stage 1")
     _add_arg_with_default(p_all, "--random-seed", type=int, default=argparse.SUPPRESS,
                           help_text="Random seed for splitting")
     _add_arg_with_default(p_all, "--embedding-model", type=str, choices=["all_MiniLM_L6_v2", "all_MiniLM_L12_v2"],
                           default=argparse.SUPPRESS, help_text="SentenceTransformers model for embeddings")
-    _add_arg_with_default(p_all, "--skip-embeddings", action="store_true", default=argparse.SUPPRESS,
+    _add_arg_with_default(p_all, "--skip-embeddings", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help_text="Skip embedding validation/memmap write in Stage 1 (faster iteration; later stages that need embeddings will fail)")
     # Stage 2/3 options
     _add_arg_with_default(p_all, "--max-prior-likes", type=int, default=argparse.SUPPRESS,
@@ -766,6 +769,11 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Max user history length")
     _add_arg_with_default(p_all, "--attention-dropout", type=float, default=argparse.SUPPRESS,
                           help_text="Dropout rate for attention-based user encoders")
+    _add_arg_with_default(p_all, "--l2-normalize-embeddings", dest="l2_normalize_embeddings",
+                          action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
+                          help_text="Enable or disable L2 normalization on two-tower user/post embeddings before similarity scoring")
+    _add_arg_with_default(p_all, "--similarity-temperature", type=float, default=argparse.SUPPRESS,
+                          help_text="Temperature used to scale cosine-similarity logits in the two-tower model")
     # Stage 5 options (shared)
     _add_arg_with_default(p_all, "--epochs", type=int, default=argparse.SUPPRESS,
                           help_text="Training epochs")
@@ -789,6 +797,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Device for training")
     _add_arg_with_default(p_all, "--patience", type=int, default=argparse.SUPPRESS,
                           help_text="Early stopping patience")
+    _add_arg_with_default(p_all, "--early-stopping-min-delta", type=float, default=argparse.SUPPRESS,
+                          help_text="Minimum absolute validation AUC improvement required to reset early stopping patience")
     _add_arg_with_default(p_all, "--run-tag", type=str, default=argparse.SUPPRESS,
                           help_text="Tag appended to training output directory name (e.g. mlp_summarized_mean)")
     _add_arg_with_default(p_all, "--no-plots", action="store_true", default=argparse.SUPPRESS,
@@ -800,9 +810,9 @@ def build_parser() -> argparse.ArgumentParser:
     # Stage 4 (train) - DataLoader settings
     _add_arg_with_default(p_all, "--num-dataloader-workers", type=int, default=argparse.SUPPRESS,
                           help_text="Number of DataLoader worker processes")
-    _add_arg_with_default(p_all, "--dataloader-pin-memory", action="store_true", default=argparse.SUPPRESS,
+    _add_arg_with_default(p_all, "--dataloader-pin-memory", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help_text="Enable DataLoader pin_memory for faster GPU transfer")
-    _add_arg_with_default(p_all, "--dataloader-persistent-workers", action="store_true", default=argparse.SUPPRESS,
+    _add_arg_with_default(p_all, "--dataloader-persistent-workers", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help_text="Keep DataLoader workers alive between epochs")
     _add_arg_with_default(p_all, "--dataloader-prefetch-factor", type=int, default=argparse.SUPPRESS,
                           help_text="Number of batches to prefetch per DataLoader worker")
@@ -823,7 +833,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--skip-modules", type=str, default=argparse.SUPPRESS,
                           help_text="Comma-separated list of evaluation module names to skip (e.g. cold_start_curves,performance_inequality)")
     # Selection behavior
-    _add_arg_with_default(p_all, "--use-latest", action="store_true", default=argparse.SUPPRESS,
+    _add_arg_with_default(p_all, "--use-latest", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help_text="(Deprecated) Always enabled during sequential run-all")
     # Selective reruns and prior pinning
     _add_arg_with_default(p_all, "--start-from", type=str,
@@ -832,7 +842,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--stop-after", type=str,
                           choices=["get_data", "target_posts", "user_history", "train", "train_mlp", "train_two_tower", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Stop after this stage completes")
-    _add_arg_with_default(p_all, "--pick-prior", action="store_true", default=argparse.SUPPRESS,
+    _add_arg_with_default(p_all, "--pick-prior", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help_text="If multiple prior outputs exist, prompt to pick (foreground only)")
     _add_arg_with_default(p_all, "--prior-01-get-data", type=str, default=argparse.SUPPRESS,
                           help_text="Pin prior Stage 1 (01_get_data) artifact dir by stage_run_id or path")
@@ -843,7 +853,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--prior-04-train", type=str, default=argparse.SUPPRESS,
                           help_text="Pin prior Stage 4 (04_train) artifact dir by stage_run_id or path (used by eval)")
     # Execution behavior
-    _add_arg_with_default(p_all, "--background", action="store_true", default=argparse.SUPPRESS,
+    _add_arg_with_default(p_all, "--background", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help_text="Run in background with nohup (default: foreground)")
     p_all.add_argument("--_initial-log", type=str, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     # Experiment tracking
