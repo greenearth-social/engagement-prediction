@@ -28,8 +28,6 @@ from utils.experiment_tracking import build_experiment_tracker
 from utils.pipeline.core import (
     Context,
     generate_run_timestamp,
-    DEFAULT_ARTIFACTS_DIR,
-    DEFAULT_RUNS_DIR,
     LINEAGE_FILENAME,
     new_pipeline_run_dir,
     ensure_pipeline_run_dir,
