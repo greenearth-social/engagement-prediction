@@ -120,7 +120,11 @@ from utils.helpers import (
     load_parquet_from_prior,
     log_operation_start,
 )
-from shared.input_data_helpers import get_padded_embedding_history_and_mask
+from shared.input_data_helpers import (
+    get_padded_embedding_history_and_mask, 
+    generate_hash_indices,
+    get_hashed_value_from_string,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1001,7 +1005,7 @@ def filter_split_and_join_history(
         (pl.col("split") == split) & pl.col("neg_emb_idx").is_not_null()
     )
     return filtered.join(
-        history_df.select(["target_did", "like_uri", "prior_emb_indices"]),
+        history_df.select(["target_did", "like_uri", "prior_emb_indices", "prior_author_hashes"]),
         on=["target_did", "like_uri"],
         how="left",
         maintain_order="left",
@@ -1016,8 +1020,11 @@ def _prepare_split_data(
     target_posts_df: pl.DataFrame,
     history_df: pl.DataFrame,
     split: str,
+    use_author_emb_table: bool,
+    n_rows_author_emb_table: Optional[int] = None,
+    n_hashes_author_emb_table: Optional[int] = None,
     logger: Optional[logging.Logger] = None,
-) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[str], List[str], List[str]]:
+) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[str], List[str], List[str], List[str], List[str], Optional[List[np.ndarray]]]:
     """Filter data to a single split and return aligned numpy arrays.
     
     This internal helper performs the core data preparation logic shared by both
@@ -1069,21 +1076,48 @@ def _prepare_split_data(
     target_dids = joined["target_did"].to_list()
     like_uris = joined["like_uri"].to_list()
     neg_uris = joined["neg_uri"].to_list()
+    like_author_dids = joined["like_author_did"].to_list()
+    neg_author_dids = joined["neg_author_did"].to_list()
 
     # Convert Polars List[UInt32] column to Python list of numpy arrays
     # This allows each user to have a different history length (variable-length)
     # while still supporting fast numpy indexing into the embeddings memmap
-    prior_col = joined["prior_emb_indices"]
-    prior_emb_indices_list: List[np.ndarray] = []
-    for row_val in prior_col.to_list():
-        if row_val is None or len(row_val) == 0:
+    prior_emb_indices_input_list = joined["prior_emb_indices"].to_list()
+    prior_emb_indices_output_list: List[np.ndarray] = []    
+    prior_author_hashes_input_list = joined["prior_author_hashes"].to_list()
+    prior_author_hashes_output_list = [] if use_author_emb_table else None
+
+    for i in range(len(joined)):
+        this_prior_emb_indices = prior_emb_indices_input_list[i]
+        if this_prior_emb_indices is None or len(this_prior_emb_indices) == 0:
             # Users with no history get an empty array (will become zero vector
             # in SummarizedEngagementDataset or all-masked sequence in SequenceEngagementDataset)
-            prior_emb_indices_list.append(np.array([], dtype=np.uint32))
+            prior_emb_indices_output_list.append(np.array([], dtype=np.uint32))
+            if use_author_emb_table:
+                prior_author_hashes_output_list.append(np.array([], dtype=np.uint32)) # type: ignore
         else:
-            prior_emb_indices_list.append(np.array(row_val, dtype=np.uint32))
+            prior_emb_indices_output_list.append(np.array(this_prior_emb_indices, dtype=np.uint32))
 
-    return like_emb_idx, neg_emb_idx, prior_emb_indices_list, target_dids, like_uris, neg_uris
+            if use_author_emb_table:
+                if n_rows_author_emb_table is None or n_hashes_author_emb_table is None:
+                    raise ValueError("n_rows_author_emb_table and n_hashes_author_emb_table must be provided when use_author_emb_table is True")
+                this_prior_author_hashes_list = [
+                    generate_hash_indices(author_hash, n_hashes_author_emb_table, n_rows_author_emb_table) 
+                    for author_hash in prior_author_hashes_input_list[i]
+                ]
+                prior_author_hashes_output_list.append(np.array(this_prior_author_hashes_list, dtype=np.uint32)) # type: ignore
+
+    return (
+        like_emb_idx,
+        neg_emb_idx,
+        prior_emb_indices_output_list,
+        target_dids,
+        like_uris,
+        neg_uris,
+        like_author_dids,
+        neg_author_dids,
+        prior_author_hashes_output_list,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1194,8 +1228,8 @@ class SummarizedEngagementDataset(Dataset):
         # for fast __getitem__ lookups. This is cheap compared to history sequences.
         pos_embs = np.array(embeddings_mmap[like_emb_idx], dtype=np.float32)
         neg_embs = np.array(embeddings_mmap[neg_emb_idx], dtype=np.float32)
-        self._pos_post_embs = torch.from_numpy(pos_embs)
-        self._neg_post_embs = torch.from_numpy(neg_embs)
+        self.pos_post_embs = torch.from_numpy(pos_embs)
+        self.neg_post_embs = torch.from_numpy(neg_embs)
 
         if logger:
             mem_mb = (user_summaries.nbytes + pos_embs.nbytes + neg_embs.nbytes) / (1024 * 1024)
@@ -1233,11 +1267,11 @@ class SummarizedEngagementDataset(Dataset):
         
         # Select post embedding based on sample type
         if is_positive:
-            post_vec = self._pos_post_embs[row_idx]  # [D]
+            post_vec = self.pos_post_embs[row_idx]  # [D]
             label = 1.0
             post_id = self.like_uris[row_idx]
         else:
-            post_vec = self._neg_post_embs[row_idx]  # [D]
+            post_vec = self.neg_post_embs[row_idx]  # [D]
             label = 0.0
             post_id = self.neg_uris[row_idx]
 
@@ -1332,12 +1366,18 @@ class SequenceEngagementDataset(Dataset):
         split: str,
         max_history_len: int,
         embed_dim: int,
+        use_author_emb_table: bool,
+        n_rows_author_emb_table: Optional[int] = None,
+        n_hashes_author_emb_table: Optional[int] = None,
         logger: Optional[logging.Logger] = None,
     ):
         # Store memmap reference for on-the-fly sequence loading
-        self.embeddings = embeddings_mmap
+        self.content_embeddings = embeddings_mmap
         self.max_history_len = max_history_len
         self.embed_dim = embed_dim
+        self.use_author_emb_table = use_author_emb_table
+        self.n_rows_author_emb_table = n_rows_author_emb_table
+        self.n_hashes_author_emb_table = n_hashes_author_emb_table
 
         # Prepare aligned arrays for the requested split
         (
@@ -1347,7 +1387,18 @@ class SequenceEngagementDataset(Dataset):
             self.target_dids,
             self.like_uris,
             self.neg_uris,
-        ) = _prepare_split_data(target_posts_df, history_df, split, logger)
+            like_author_dids,
+            neg_author_dids,
+            self.prior_author_hashes,
+        ) = _prepare_split_data(
+            target_posts_df, 
+            history_df, 
+            split, 
+            use_author_emb_table,
+            n_rows_author_emb_table,
+            n_hashes_author_emb_table,
+            logger,
+        )
 
         self._n_rows = len(like_emb_idx)
 
@@ -1356,8 +1407,20 @@ class SequenceEngagementDataset(Dataset):
         # memmap lookups for the same posts during training
         pos_embs = np.array(embeddings_mmap[like_emb_idx], dtype=np.float32)
         neg_embs = np.array(embeddings_mmap[neg_emb_idx], dtype=np.float32)
-        self._pos_post_embs = torch.from_numpy(pos_embs)
-        self._neg_post_embs = torch.from_numpy(neg_embs)
+        self.pos_post_embs = torch.from_numpy(pos_embs)
+        self.neg_post_embs = torch.from_numpy(neg_embs)
+
+        if use_author_emb_table:
+            if n_hashes_author_emb_table is None or n_rows_author_emb_table is None:
+                raise ValueError("n_rows_author_emb_table and n_hashes_author_emb_table must be provided when use_author_emb_table is True")
+            self.pos_author_hash = torch.tensor([
+                generate_hash_indices(get_hashed_value_from_string(like_author_hash, variant=0), n_hashes_author_emb_table, n_rows_author_emb_table)
+                for like_author_hash in like_author_dids
+            ])
+            self.neg_author_hash = torch.tensor([
+                generate_hash_indices(get_hashed_value_from_string(neg_author_hash, variant=0), n_hashes_author_emb_table, n_rows_author_emb_table)
+                for neg_author_hash in neg_author_dids
+            ])
 
         if logger:
             mem_mb = (pos_embs.nbytes + neg_embs.nbytes) / (1024 * 1024)
@@ -1404,26 +1467,48 @@ class SequenceEngagementDataset(Dataset):
         # This is the key difference from SummarizedEngagementDataset: we load
         # the raw sequence here rather than using a pre-computed summary
         hist_indices = self.prior_emb_indices[row_idx]
-        hist_embeddings = self.embeddings[hist_indices]
-        padded, mask = get_padded_embedding_history_and_mask(hist_embeddings, self.max_history_len, self.embed_dim)
+        hist_embeddings = self.content_embeddings[hist_indices]
+        hist_embeddings_padded, mask = get_padded_embedding_history_and_mask(hist_embeddings, self.max_history_len, self.embed_dim)
+
+        if self.use_author_emb_table:
+            if self.prior_author_hashes is None:
+                raise ValueError("prior_hashes must be provided when use_author_emb_table is True")
+            if self.max_history_len is None or self.n_hashes_author_emb_table is None:
+                raise ValueError("max_history_len and n_hashes_author_emb_table must be provided when use_author_emb_table is True")
+            hist_post_author_hashes = torch.from_numpy(self.prior_author_hashes[row_idx])
+            hist_post_author_hashes_padded = torch.zeros((self.max_history_len, self.n_hashes_author_emb_table), dtype=hist_post_author_hashes.dtype)
+            if hist_post_author_hashes.shape[0] > 0:
+                hist_post_author_hashes_padded[:hist_post_author_hashes.shape[0]] = hist_post_author_hashes[:self.max_history_len]
+        else:
+            hist_post_author_hashes_padded = torch.zeros((self.max_history_len, 1))
 
         # --- Select target post embedding (pre-computed) ---
         if is_positive:
-            post_vec = self._pos_post_embs[row_idx]  # [D]
+            post_vec = self.pos_post_embs[row_idx]  # [D]
             label = 1.0
             post_id = self.like_uris[row_idx]
+            if self.use_author_emb_table: 
+                post_author_hash = self.pos_author_hash[row_idx]
+            else:
+                post_author_hash = 0
         else:
-            post_vec = self._neg_post_embs[row_idx]  # [D]
+            post_vec = self.neg_post_embs[row_idx]  # [D]
             label = 0.0
             post_id = self.neg_uris[row_idx]
+            if self.use_author_emb_table: 
+                post_author_hash = self.neg_author_hash[row_idx]
+            else:
+                post_author_hash = 0
 
         return {
-            "history_embeddings": torch.from_numpy(padded),  # [max_seq, D]
+            "history_embeddings": torch.from_numpy(hist_embeddings_padded),  # [max_seq, D]
             "history_mask": torch.from_numpy(mask),  # [max_seq]
             "target_post_embedding": post_vec,
             "label": torch.tensor(label, dtype=torch.float32),
             "user_id": self.target_dids[row_idx],
             "post_id": post_id,
+            "post_author_hash": post_author_hash,
+            "history_post_author_hashes": hist_post_author_hashes_padded,
         }
 
 

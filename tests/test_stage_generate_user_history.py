@@ -22,6 +22,8 @@ from pathlib import Path
 import polars as pl
 import pytest
 
+from shared.input_data_helpers import get_hashed_value_from_string
+
 
 # ---------------------------------------------------------------------------
 # Load the production module by file path (03_user_history isn't a valid
@@ -84,13 +86,17 @@ def _make_likes(
     timestamps: list[datetime],
     subject_uris: list[str],
     emb_idxs: list[int],
+    author_dids: list[str] | None = None,
 ) -> pl.LazyFrame:
     """Build a minimal likes LazyFrame."""
+    if author_dids is None:
+        author_dids = [f"author_{subject_uri}" for subject_uri in subject_uris]
     return pl.DataFrame({
         "did": dids,
         "record_created_at": timestamps,
         "subject_uri": subject_uris,
         "emb_idx": emb_idxs,
+        "author_did": author_dids,
     }).lazy()
 
 
@@ -141,10 +147,10 @@ def test_directory_recency_ordering(build_history):
     likes_lf = _make_likes(
         ["u1", "u1", "u1", "u1"],
         [
-            datetime(2024, 1, 5, 0, 0),   # 3rd most recent
+            datetime(2024, 1, 7, 0, 0),   # tied for 2nd most recent
             datetime(2024, 1, 10, 0, 0),  # most recent
             datetime(2024, 1, 1, 0, 0),   # oldest
-            datetime(2024, 1, 7, 0, 0),   # 2nd most recent
+            datetime(2024, 1, 7, 0, 0),   # tied for 2nd most recent
         ],
         ["p1", "p2", "p3", "p4"],
         [10, 20, 30, 40],
@@ -162,7 +168,7 @@ def test_directory_recency_ordering(build_history):
     ).collect()
 
     prior = result["prior_emb_indices"][0].to_list()
-    # Expected order by recency: p2 (Jan 10) -> p4 (Jan 7) -> p1 (Jan 5) -> p3 (Jan 1)
+    # Expected order by recency with emb_idx tie-breaker: p2 (Jan 10) -> p4 (Jan 7, emb 40) -> p1 (Jan 7, emb 10) -> p3 (Jan 1)
     assert prior == [20, 40, 10, 30]
 
 
@@ -230,6 +236,7 @@ def test_directory_no_prior_history_returns_empty_list(build_history):
     # u2 has no prior likes (empty list, not null)
     u2_row = result.filter(pl.col("target_did") == "u2")
     assert u2_row["prior_emb_indices"][0].to_list() == []
+    assert u2_row["prior_author_hashes"][0].to_list() == []
 
 
 def test_directory_first_like_produces_empty_history(build_history):
@@ -263,6 +270,47 @@ def test_directory_first_like_produces_empty_history(build_history):
 
     assert result.height == 1
     assert result["prior_emb_indices"][0].to_list() == []
+    assert result["prior_author_hashes"][0].to_list() == []
+
+
+def test_directory_prior_author_hashes_align_with_prior_emb_indices(build_history):
+    """Test prior_author_hashes stays position-aligned with prior_emb_indices."""
+    logger = _make_test_logger()
+
+    likes_lf = _make_likes(
+        ["u1", "u1", "u1", "u1"],
+        [
+            datetime(2024, 1, 7, 0, 0),   # tied for 2nd most recent
+            datetime(2024, 1, 10, 0, 0),  # most recent
+            datetime(2024, 1, 1, 0, 0),   # oldest
+            datetime(2024, 1, 7, 0, 0),   # tied for 2nd most recent
+        ],
+        ["p1", "p2", "p3", "p4"],
+        [10, 20, 30, 40],
+        ["author_p1", "author_p2", "author_p3", "author_p4"],
+    )
+
+    targets_lf = _make_targets(
+        ["u1"], ["at://u1/like/5"], [datetime(2024, 1, 15, 0, 0)],
+    )
+
+    result = build_history(
+        targets_lf=targets_lf,
+        likes_lf=likes_lf,
+        max_prior_likes=3,
+        logger=logger,
+    ).collect()
+
+    prior = result["prior_emb_indices"][0].to_list()
+    author_hashes = result["prior_author_hashes"][0].to_list()
+
+    assert prior == [20, 40, 10]
+    assert len(author_hashes) == len(prior)
+    assert author_hashes == [
+        get_hashed_value_from_string("author_p2", variant=0),
+        get_hashed_value_from_string("author_p4", variant=0),
+        get_hashed_value_from_string("author_p1", variant=0),
+    ]
 
 
 def test_directory_excludes_future_likes(build_history):
@@ -409,6 +457,7 @@ def test_directory_output_schema(build_history):
     assert "like_uri" in result.columns
     assert "seen_at" in result.columns
     assert "prior_emb_indices" in result.columns
+    assert "prior_author_hashes" in result.columns
     assert "raw_prior_count" in result.columns
 
     # Internal columns should NOT be present
@@ -418,6 +467,7 @@ def test_directory_output_schema(build_history):
 
     # Check that prior_emb_indices is List[UInt32]
     assert result.schema["prior_emb_indices"] == pl.List(pl.UInt32)
+    assert result.schema["prior_author_hashes"] == pl.List(pl.UInt64)
 
 
 def test_directory_raw_prior_count(build_history):

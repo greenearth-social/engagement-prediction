@@ -8,20 +8,21 @@ liked post embedding indices, enabling efficient on-the-fly embedding retrieval
 during training.
 
 Inputs:
-- likes_core_*.parquet from 01_get_data: Contains {did, subject_uri, record_created_at, emb_idx}
+- likes_core_*.parquet from 01_get_data: Contains {did, subject_uri, record_created_at, emb_idx, author_did}
 - target_posts_*.parquet from 02_target_posts: Wide format with
   {target_did, seen_at, like_uri, like_emb_idx, ..., neg_uri, neg_emb_idx, ..., split}
 
 Outputs under <run_dir>/02_featurize/<timestamp>/:
-- history_posts_<timestamp>.parquet: {target_did, like_uri, prior_emb_indices}
+- history_posts_<timestamp>.parquet: {target_did, like_uri, prior_emb_indices, prior_author_hashes}
   where prior_emb_indices is a List[UInt32] of embedding indices sorted by recency (most recent first),
+  prior_author_hashes is a position-aligned List[UInt64] of deterministic hashes for each prior liked post's author,
   indexed on (target_did, like_uri) so there is one history per (user, like-event) pair.
   Rows where the user has no prior likes in the dataset get an empty list.
 """
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional
 import argparse
 import logging
 import polars as pl
@@ -30,6 +31,7 @@ import time
 from utils.pipeline.core import Context
 from utils.helpers import get_stage_logger, log_operation_start, validate_dataframe_schema, load_parquet_from_prior, TIMESTAMP_COL_NAME
 from utils.memory_helpers import MemoryTracker
+from shared.input_data_helpers import get_hashed_value_from_string
 
 
 def _build_user_history_directory(
@@ -62,7 +64,7 @@ def _build_user_history_directory(
 
     Args:
         targets_lf: LazyFrame with at least columns [target_did, seen_at, like_uri, ...]
-        likes_lf: LazyFrame with columns [did, subject_uri, record_created_at, emb_idx]
+        likes_lf: LazyFrame with columns [did, subject_uri, record_created_at, emb_idx, author_did]
         max_prior_likes: Optional cap on prior likes per target (None = no cap)
         logger: Logger instance
         history_buffer_hours: Optional buffer in hours to subtract from seen_at when
@@ -72,7 +74,7 @@ def _build_user_history_directory(
             boundary.  None or 0 means no buffer (original behaviour).
 
     Returns:
-        LazyFrame with columns [target_did, like_uri, seen_at, prior_emb_indices, raw_prior_count]
+        LazyFrame with columns [target_did, like_uri, seen_at, prior_emb_indices, prior_author_hashes, raw_prior_count]
         where raw_prior_count is the uncapped number of prior likes (for distribution analysis).
     """
     logger.info("Building user history directory...")
@@ -88,12 +90,19 @@ def _build_user_history_directory(
     # here to save memory during the fan-out.
     join_keys = targets_indexed.select(["target_idx", "target_did", "seen_at"])
 
-    # Rename likes columns to avoid collision after join
-    # We need: did (join key), record_created_at (for filtering/sorting), emb_idx (the result)
+    # Rename likes columns to avoid collision after join. Hash author_did once
+    # before the fan-out so the join carries a compact UInt64 instead of a
+    # large string column.
+    # We need: did (join key), record_created_at (for filtering/sorting),
+    # emb_idx (the result), author hash (aligned side-channel feature).
     likes_renamed = likes_lf.select([
         pl.col("did"),
         pl.col(TIMESTAMP_COL_NAME).alias("like_ts"),
         pl.col("emb_idx").alias("like_emb_idx"),
+        pl.col("author_did").map_elements(
+            lambda author_did: get_hashed_value_from_string(author_did, variant=0),
+            return_dtype=pl.UInt64,
+        ).alias("prior_author_hash"),
     ])
 
     # Join targets with likes on user identity
@@ -118,23 +127,32 @@ def _build_user_history_directory(
         pl.col("like_ts") < cutoff
     )
 
-    # Build aggregation expression: sort by recency (descending) and optionally cap
-    # The result is a list of emb_idx values, most recent first
-    agg_expr = (
+    # Build aggregation expressions: sort by recency (descending) and optionally cap.
+    # The two lists must be kept position-aligned: prior_author_hashes[i] is the
+    # hashed author of prior_emb_indices[i].  Use like_emb_idx as a shared
+    # deterministic tie-breaker for identical timestamps.
+    prior_emb_expr = (
         pl.col("like_emb_idx")
-        .sort_by(pl.col("like_ts"), descending=True)
+        .sort_by([pl.col("like_ts"), pl.col("like_emb_idx")], descending=[True, True])
+    )
+    prior_author_hash_expr = (
+        pl.col("prior_author_hash")
+        .sort_by([pl.col("like_ts"), pl.col("like_emb_idx")], descending=[True, True])
     )
 
     if max_prior_likes is not None and max_prior_likes > 0:
-        agg_expr = agg_expr.head(max_prior_likes)
+        prior_emb_expr = prior_emb_expr.head(max_prior_likes)
+        prior_author_hash_expr = prior_author_hash_expr.head(max_prior_likes)
         logger.info(f"  Capping prior likes to {max_prior_likes} per target")
     else:
         logger.info("  No cap on prior likes (using all available history)")
 
-    # Group by integer target_idx (cheap) and collect prior emb_idx as list.
+    # Group by integer target_idx (cheap) and collect prior emb_idx + author
+    # hash lists.
     # Also compute raw (uncapped) count for distribution analysis.
     directory_lf = prior_likes.group_by("target_idx").agg(
-        agg_expr.alias("prior_emb_indices"),
+        prior_emb_expr.alias("prior_emb_indices"),
+        prior_author_hash_expr.alias("prior_author_hashes"),
         pl.len().alias("raw_prior_count"),
     )
 
@@ -157,8 +175,12 @@ def _build_user_history_directory(
         .then(pl.lit([]).cast(pl.List(pl.UInt32)))
         .otherwise(pl.col("prior_emb_indices").cast(pl.List(pl.UInt32)))
         .alias("prior_emb_indices"),
+        pl.when(pl.col("prior_author_hashes").is_null())
+        .then(pl.lit([]).cast(pl.List(pl.UInt64)))
+        .otherwise(pl.col("prior_author_hashes").cast(pl.List(pl.UInt64)))
+        .alias("prior_author_hashes"),
         pl.col("raw_prior_count").fill_null(0),
-    ).select(["target_did", "like_uri", "seen_at", "prior_emb_indices", "raw_prior_count"])
+    ).select(["target_did", "like_uri", "seen_at", "prior_emb_indices", "prior_author_hashes", "raw_prior_count"])
 
     return directory_lf
 
@@ -342,6 +364,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         TIMESTAMP_COL_NAME: pl.Datetime,
         "subject_uri": str,
         "emb_idx": int,
+        "author_did": str,
     }
     validate_dataframe_schema(likes_lf, likes_schema)
     logger.info("✓ likes_core schema validated")
@@ -390,8 +413,17 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # Log and plot the per-user history distribution before/after capping
     _log_and_plot_history_distribution(directory_df, max_prior_likes, out_dir, logger)
 
+    n_misaligned_author_hashes = directory_df.filter(
+        pl.col("prior_emb_indices").list.len() != pl.col("prior_author_hashes").list.len()
+    ).height
+    if n_misaligned_author_hashes > 0:
+        raise ValueError(
+            "prior_emb_indices and prior_author_hashes length mismatch for "
+            f"{n_misaligned_author_hashes:,} history rows"
+        )
+
     # Select only the required output columns (drop analysis columns)
-    directory_df = directory_df.select(["target_did", "like_uri", "prior_emb_indices"])
+    directory_df = directory_df.select(["target_did", "like_uri", "prior_emb_indices", "prior_author_hashes"])
 
     directory_df.write_parquet(output_path, compression="zstd")
 

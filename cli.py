@@ -28,8 +28,6 @@ from utils.experiment_tracking import build_experiment_tracker
 from utils.pipeline.core import (
     Context,
     generate_run_timestamp,
-    DEFAULT_ARTIFACTS_DIR,
-    DEFAULT_RUNS_DIR,
     LINEAGE_FILENAME,
     new_pipeline_run_dir,
     ensure_pipeline_run_dir,
@@ -76,6 +74,11 @@ DEFAULTS: Dict[str, Any] = {
     "holdout_start": None,
     "holdout_end": None,
     # Stage 4 (train) - Model architecture
+    "use_author_emb_table": False,
+    "n_rows_author_emb_table": None,
+    "n_hashes_author_emb_table": None,
+    "author_emb_dim": 32,
+    "author_hash_dropout_rate": 0.1,
     "user_summarization": "mean",  # MLP user-history summarization: mean, ema, linear_recency
     "ema_alpha": 0.1,  # EMA smoothing factor (only used when user_summarization=ema)
     "user_encoder": "summarized",  # User encoder type: must be explicitly specified and compatible with model_type
@@ -739,6 +742,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--min-likes-per-user", type=int, default=argparse.SUPPRESS,
                           help_text="Minimum likes per user for inclusion (used in Stage 1 filtering and later stages)")
     # Stage 4 (train) user summarization + model selection
+    _add_arg_with_default(p_all, "--use-author-emb-table", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
+                          help_text="Use a learned embedding table for the author DID in two tower model.")
+    _add_arg_with_default(p_all, "--n-rows-author-emb-table", type=int, default=argparse.SUPPRESS,
+                          help_text="Number of rows in the learned author embedding table (only used if --use-author-emb-table is enabled)")
+    _add_arg_with_default(p_all, "--n-hashes-author-emb-table", type=int, default=argparse.SUPPRESS,
+                          help_text="Number of hashes of the author DID to use to look up embeddings from the learned embedding table (only used if --use-author-emb-table is enabled)")
+    _add_arg_with_default(p_all, "--author-emb-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="Dimension of each learned author embedding vector before fusion")
+    _add_arg_with_default(p_all, "--author-hash-dropout-rate", type=float, default=argparse.SUPPRESS,
+                          help_text="Training-time probability of replacing each author hash lookup with padding before fusion")
     _add_arg_with_default(p_all, "--user-summarization", type=str, choices=["mean", "ema", "linear_recency"],
                           default=argparse.SUPPRESS,
                           help_text="User-history summarization strategy for MLP (mean, ema, linear_recency)")

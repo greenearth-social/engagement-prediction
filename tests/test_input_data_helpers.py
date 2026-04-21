@@ -10,8 +10,10 @@ from shared.input_data_helpers import (
     _decompress_and_unpack_embedding,
     _extract_compressed_embedding_vector_from_struct,
     _is_embedding_struct,
+    generate_hash_indices,
     get_embedding_dim_for_known_model,
     get_expanded_embedding_vector,
+    get_hashed_value_from_string,
     get_padded_embedding_history_and_mask,
     get_user_tower_input_from_single_raw_history_embeddings,
     query_user_tower_with_processed_history_embeddings,
@@ -63,6 +65,34 @@ def test_get_embedding_dim_for_known_model_ok_and_unknown():
     assert get_embedding_dim_for_known_model("all-MiniLM-L6-v2") == 384
     with pytest.raises(ValueError, match="Unknown embedding model"):
         get_embedding_dim_for_known_model("does-not-exist")
+
+
+def test_get_hashed_value_from_string_is_deterministic_and_variant_scoped():
+    value = "did:plc:abc123"
+
+    hash_a_0 = get_hashed_value_from_string(value, variant=0)
+    hash_b_0 = get_hashed_value_from_string(value, variant=0)
+    hash_a_1 = get_hashed_value_from_string(value, variant=1)
+
+    assert hash_a_0 == hash_b_0
+    assert hash_a_0 != hash_a_1
+
+
+def test_get_hashed_value_from_string_rejects_negative_variant():
+    with pytest.raises(ValueError, match="non-negative"):
+        get_hashed_value_from_string("abc", variant=-1)
+
+
+def test_generate_hash_indices_reserves_bucket_zero_for_padding():
+    hashes = generate_hash_indices(12345, n=16, num_buckets=128)
+
+    assert len(hashes) == 16
+    assert all(1 <= h < 128 for h in hashes)
+
+
+def test_generate_hash_indices_rejects_too_few_buckets_when_padding_reserved():
+    with pytest.raises(ValueError, match="greater than 1"):
+        generate_hash_indices(123, n=2, num_buckets=1)
 
 
 def _encode_embedding_bytes(vec: list[float], *, compress: bool) -> str:

@@ -230,6 +230,69 @@ class L2NormalizedPostTower(nn.Module):
 
 
 # =============================================================================
+# Embedding Table Module
+# =============================================================================
+
+class SharedPostFeatureEncoder(nn.Module):
+    def __init__(
+        self, 
+        post_embedding_dim: int, 
+        n_rows_author_emb_table: int,
+        n_hashes_author_emb_table: int,
+        author_emb_dim: int,
+        author_hash_dropout_rate: float,
+    ):
+        super().__init__()
+        if author_emb_dim <= 0:
+            raise ValueError("author_emb_dim must be positive")
+        if n_hashes_author_emb_table <= 0:
+            raise ValueError("n_hashes_author_emb_table must be positive")
+        if not 0.0 <= author_hash_dropout_rate < 1.0:
+            raise ValueError("author_hash_dropout_rate must be in [0, 1)")
+
+        self.n_hashes_author_emb_table = int(n_hashes_author_emb_table)
+        self.author_hash_dropout_rate = float(author_hash_dropout_rate)
+        self.author_emb_table = nn.Embedding(
+            num_embeddings=n_rows_author_emb_table, 
+            embedding_dim=author_emb_dim,
+            padding_idx=0
+        )
+        nn.init.xavier_uniform_(self.author_emb_table.weight)
+        with torch.no_grad():
+            self.author_emb_table.weight[0].zero_()
+
+        # Each hash is another probe for the same categorical feature, so combine
+        # them into one author vector instead of giving each probe its own slot.
+        in_features = post_embedding_dim + author_emb_dim
+        self.fusion_layer = nn.Linear(in_features=in_features, out_features=post_embedding_dim)
+        nn.init.xavier_uniform_(self.fusion_layer.weight)
+        if self.fusion_layer.bias is not None:
+            nn.init.zeros_(self.fusion_layer.bias)
+
+    def featurize_post(
+        self,
+        content_embeddings: torch.Tensor, 
+        post_author_hashes: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.training and self.author_hash_dropout_rate > 0.0:
+            keep_mask = torch.rand(
+                post_author_hashes.shape,
+                device=post_author_hashes.device,
+            ) >= self.author_hash_dropout_rate
+            post_author_hashes = torch.where(
+                keep_mask,
+                post_author_hashes,
+                torch.zeros_like(post_author_hashes),
+            )
+
+        author_embeddings = self.author_emb_table(post_author_hashes) # [..., num_hashes, author_emb_dim]
+        author_embedding = author_embeddings.mean(dim=-2) # [..., author_emb_dim]
+        fused_embeddings = self.fusion_layer(torch.cat([content_embeddings, author_embedding], dim=-1)) # [..., post_embedding_dim]
+        return fused_embeddings
+
+
+
+# =============================================================================
 # Two-Tower Engagement Model
 # =============================================================================
 class TwoTowerModel(nn.Module):
@@ -292,6 +355,11 @@ class TwoTowerModel(nn.Module):
         similarity_temperature: float,
         user_encoder_type: str,
         use_post_encoder: bool,
+        use_author_emb_table: bool,
+        n_rows_author_emb_table: Optional[int],
+        n_hashes_author_emb_table: Optional[int],
+        author_emb_dim: Optional[int],
+        author_hash_dropout_rate: float,
     ):
         super().__init__()
         self.shared_dim = shared_dim
@@ -302,6 +370,24 @@ class TwoTowerModel(nn.Module):
         self.user_encoder_type = user_encoder_type
         self.use_post_encoder = use_post_encoder
         self.l2_normalize_embeddings = bool(l2_normalize_embeddings)
+        self.use_author_emb_table = bool(use_author_emb_table)
+
+        # Feature encoder: embedding table - for collaborative filtering-like features fused with content embeddings
+        self.post_feature_encoder = None
+        if self.use_author_emb_table:
+            if n_rows_author_emb_table is None:
+                raise ValueError("num_embedding_table_rows must be specified when use_author_emb_table is True")
+            if n_hashes_author_emb_table is None:
+                raise ValueError("n_hashes_author_emb_table must be specified when use_author_emb_table is True")
+            if author_emb_dim is None:
+                raise ValueError("author_emb_dim must be specified when use_author_emb_table is True")
+            self.post_feature_encoder = SharedPostFeatureEncoder(
+                post_embedding_dim=post_embedding_dim,
+                n_rows_author_emb_table=n_rows_author_emb_table,
+                n_hashes_author_emb_table=n_hashes_author_emb_table,
+                author_emb_dim=author_emb_dim,
+                author_hash_dropout_rate=author_hash_dropout_rate,
+            )
 
         # Instantiate user tower based on encoder type
         if user_encoder_type == "cross_attention":
@@ -364,7 +450,12 @@ class TwoTowerModel(nn.Module):
         self.post_tower = L2NormalizedPostTower(raw_post_tower, enabled=self.l2_normalize_embeddings)
 
 
-    def encode_user(self, history_embeddings: torch.Tensor, history_mask: torch.Tensor) -> torch.Tensor:
+    def encode_user(
+        self, 
+        history_embeddings: torch.Tensor, 
+        history_mask: torch.Tensor, 
+        history_post_author_hashes: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Encode user engagement history into shared space representation.
         
         Args:
@@ -375,9 +466,16 @@ class TwoTowerModel(nn.Module):
             User vectors in shared space [batch, shared_dim].
             When `l2_normalize_embeddings=True`, these are unit-length.
         """
-        return self.user_tower(history_embeddings, history_mask)
+        fused_history_embeddings = history_embeddings
+        if self.use_author_emb_table:
+            fused_history_embeddings = self.post_feature_encoder.featurize_post(history_embeddings, history_post_author_hashes) # type: ignore
+        return self.user_tower(fused_history_embeddings, history_mask)
 
-    def encode_post(self, post_embeddings: torch.Tensor) -> torch.Tensor:
+    def encode_post(
+        self, 
+        post_embeddings: torch.Tensor, 
+        post_author_hashes: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Encode post embeddings into shared space representation.
         
         Args:
@@ -389,13 +487,19 @@ class TwoTowerModel(nn.Module):
                 - otherwise: [batch, post_embedding_dim] (identity)
             When `l2_normalize_embeddings=True`, outputs are L2-normalized.
         """
-        return self.post_tower(post_embeddings)
+        fused_post_embeddings = post_embeddings
+        if self.use_author_emb_table:
+            fused_post_embeddings = self.post_feature_encoder.featurize_post(post_embeddings, post_author_hashes) # type: ignore
+
+        return self.post_tower(fused_post_embeddings)
 
     def forward(
         self,
         history_embeddings: torch.Tensor,
         history_mask: torch.Tensor,
         post_embeddings: torch.Tensor,
+        history_post_author_hashes: Optional[torch.Tensor] = None,
+        post_author_hashes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute engagement scores via dot product in shared space.
         
@@ -403,7 +507,7 @@ class TwoTowerModel(nn.Module):
         then measure similarity via dot product. Higher dot product = higher
         predicted engagement probability.
         
-        Args:
+        Args: 
             history_embeddings: User history input.
                 - all modes: padded history sequences [batch, seq_len, input_dim]
                   In "summarized" mode, the user summary is expected to be placed
@@ -414,8 +518,8 @@ class TwoTowerModel(nn.Module):
         Returns:
             Raw engagement scores [batch] (logits before sigmoid)
         """
-        user_emb = self.encode_user(history_embeddings, history_mask)
-        post_emb = self.encode_post(post_embeddings)
+        user_emb = self.encode_user(history_embeddings, history_mask, history_post_author_hashes)
+        post_emb = self.encode_post(post_embeddings, post_author_hashes)
         
         similarity_score = (user_emb * post_emb).sum(dim=-1)
         return similarity_score / self.similarity_temperature
@@ -464,13 +568,21 @@ class TwoTowerModel(nn.Module):
             has_history = user_summary.abs().sum(dim=1) > 0 # [B]
             history_mask = has_history.unsqueeze(1).to(device=device, dtype=torch.bool) # [B, 1]
             assert history_embeddings.shape[-1] == post_embeddings.shape[-1]
+        
         else:
             history_embeddings = batch["history_embeddings"].to(device, non_blocking=True) # [B, seq_len, embed_dim]
             history_mask = batch["history_mask"].to(device, non_blocking=True) # [B, seq_len]
             post_embeddings = batch["target_post_embedding"].to(device, non_blocking=True) # [B, embed_dim]
+            
+            history_post_author_hashes = None
+            post_author_hashes = None
+            if self.use_author_emb_table:
+                history_post_author_hashes = batch["history_post_author_hashes"].to(device, dtype=torch.long, non_blocking=True) # [B, seq_len, num_hashes]
+                post_author_hashes = batch["post_author_hash"].to(device, dtype=torch.long, non_blocking=True) # [B, num_hashes]
+
         labels = batch["label"].to(device, non_blocking=True)
 
-        scores = self.forward(history_embeddings, history_mask, post_embeddings)
+        scores = self.forward(history_embeddings, history_mask, post_embeddings, history_post_author_hashes, post_author_hashes)
         loss = F.binary_cross_entropy_with_logits(scores, labels.float())
         return loss, scores
 
@@ -772,6 +884,11 @@ def run(context: Context, args) -> Dict[str, Any]:
     lr_scheduler_patience = int(args.lr_scheduler_patience)
     gradient_clip_max_norm = float(args.gradient_clip_max_norm)
     eval_holdout_type = str(args.eval_holdout_type)
+    use_author_emb_table = bool(args.use_author_emb_table)
+    n_rows_author_emb_table = int(args.n_rows_author_emb_table) if use_author_emb_table else None
+    n_hashes_author_emb_table = int(args.n_hashes_author_emb_table) if use_author_emb_table else None
+    author_emb_dim = int(args.author_emb_dim) if use_author_emb_table else None
+    author_hash_dropout_rate = float(args.author_hash_dropout_rate)
 
     # Worker settings
     num_workers = int(args.num_dataloader_workers)
@@ -798,11 +915,15 @@ def run(context: Context, args) -> Dict[str, Any]:
     else:
         train_dataset = SequenceEngagementDataset(
             embeddings_mmap, target_posts_df, history_df, split="train",
-            max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
+            max_history_len=max_history_len, embed_dim=embed_dim, use_author_emb_table=use_author_emb_table, 
+            n_hashes_author_emb_table=n_hashes_author_emb_table, 
+            n_rows_author_emb_table=n_rows_author_emb_table, logger=logger,
         )
         val_dataset = SequenceEngagementDataset(
             embeddings_mmap, target_posts_df, history_df, split="val",
-            max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
+            max_history_len=max_history_len, embed_dim=embed_dim, use_author_emb_table=use_author_emb_table,
+            n_hashes_author_emb_table=n_hashes_author_emb_table,
+            n_rows_author_emb_table=n_rows_author_emb_table, logger=logger,
         )
 
     # Create data loaders using centralized helper
@@ -832,6 +953,11 @@ def run(context: Context, args) -> Dict[str, Any]:
         similarity_temperature=similarity_temperature,
         user_encoder_type=user_encoder_type,
         use_post_encoder=use_post_encoder,
+        use_author_emb_table=use_author_emb_table,
+        n_rows_author_emb_table=n_rows_author_emb_table,
+        n_hashes_author_emb_table=n_hashes_author_emb_table,
+        author_emb_dim=author_emb_dim,
+        author_hash_dropout_rate=author_hash_dropout_rate,
     )
 
     if (not use_post_encoder) and (user_encoder_type == "summarized"):
@@ -924,6 +1050,11 @@ def run(context: Context, args) -> Dict[str, Any]:
         "dropout_rate": dropout_rate,
         "l2_normalize_embeddings": l2_normalize_embeddings,
         "similarity_temperature": similarity_temperature,
+        "use_author_emb_table": use_author_emb_table,
+        "n_rows_author_emb_table": n_rows_author_emb_table,
+        "n_hashes_author_emb_table": n_hashes_author_emb_table,
+        "author_emb_dim": author_emb_dim,
+        "author_hash_dropout_rate": author_hash_dropout_rate,
     }
     if save_model:
         model_path = checkpoints_dir / f"two_tower_{timestamp}.pth"
