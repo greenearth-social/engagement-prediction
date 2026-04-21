@@ -1478,7 +1478,7 @@ class SequenceEngagementDataset(Dataset):
             hist_post_author_hashes = torch.from_numpy(self.prior_author_hashes[row_idx])
             hist_post_author_hashes_padded = torch.zeros((self.max_history_len, self.n_hashes_author_emb_table), dtype=hist_post_author_hashes.dtype)
             if hist_post_author_hashes.shape[0] > 0:
-                hist_post_author_hashes_padded[:hist_post_author_hashes.shape[0]] = hist_post_author_hashes
+                hist_post_author_hashes_padded[:hist_post_author_hashes.shape[0]] = hist_post_author_hashes[:self.max_history_len]
         else:
             hist_post_author_hashes_padded = torch.zeros((self.max_history_len, 1))
 

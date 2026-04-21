@@ -239,20 +239,31 @@ class SharedPostFeatureEncoder(nn.Module):
         post_embedding_dim: int, 
         n_rows_author_emb_table: int,
         n_hashes_author_emb_table: int,
+        author_emb_dim: int,
+        author_hash_dropout_rate: float,
     ):
         super().__init__()
+        if author_emb_dim <= 0:
+            raise ValueError("author_emb_dim must be positive")
+        if n_hashes_author_emb_table <= 0:
+            raise ValueError("n_hashes_author_emb_table must be positive")
+        if not 0.0 <= author_hash_dropout_rate < 1.0:
+            raise ValueError("author_hash_dropout_rate must be in [0, 1)")
+
+        self.n_hashes_author_emb_table = int(n_hashes_author_emb_table)
+        self.author_hash_dropout_rate = float(author_hash_dropout_rate)
         self.author_emb_table = nn.Embedding(
             num_embeddings=n_rows_author_emb_table, 
-            embedding_dim=post_embedding_dim, 
+            embedding_dim=author_emb_dim,
             padding_idx=0
         )
         nn.init.xavier_uniform_(self.author_emb_table.weight)
         with torch.no_grad():
             self.author_emb_table.weight[0].zero_()
 
-        # Project the embedding table vectors and the content embeddings back to the common dimension.
-        # There are num_hashes+1 vectors total - the +1 is for the content embedding.
-        in_features = (n_hashes_author_emb_table + 1) * post_embedding_dim
+        # Each hash is another probe for the same categorical feature, so combine
+        # them into one author vector instead of giving each probe its own slot.
+        in_features = post_embedding_dim + author_emb_dim
         self.fusion_layer = nn.Linear(in_features=in_features, out_features=post_embedding_dim)
         nn.init.xavier_uniform_(self.fusion_layer.weight)
         if self.fusion_layer.bias is not None:
@@ -263,9 +274,20 @@ class SharedPostFeatureEncoder(nn.Module):
         content_embeddings: torch.Tensor, 
         post_author_hashes: torch.Tensor,
     ) -> torch.Tensor:
-        author_embeddings = self.author_emb_table(post_author_hashes) # [..., num_hashes, post_embedding_dim]
-        author_embeddings_concat = author_embeddings.flatten(start_dim=-2) # [..., num_hashes * post_embedding_dim]
-        fused_embeddings = self.fusion_layer(torch.cat([content_embeddings, author_embeddings_concat], dim=-1)) # [..., post_embedding_dim]
+        if self.training and self.author_hash_dropout_rate > 0.0:
+            keep_mask = torch.rand(
+                post_author_hashes.shape,
+                device=post_author_hashes.device,
+            ) >= self.author_hash_dropout_rate
+            post_author_hashes = torch.where(
+                keep_mask,
+                post_author_hashes,
+                torch.zeros_like(post_author_hashes),
+            )
+
+        author_embeddings = self.author_emb_table(post_author_hashes) # [..., num_hashes, author_emb_dim]
+        author_embedding = author_embeddings.mean(dim=-2) # [..., author_emb_dim]
+        fused_embeddings = self.fusion_layer(torch.cat([content_embeddings, author_embedding], dim=-1)) # [..., post_embedding_dim]
         return fused_embeddings
 
 
@@ -336,6 +358,8 @@ class TwoTowerModel(nn.Module):
         use_author_emb_table: bool,
         n_rows_author_emb_table: Optional[int],
         n_hashes_author_emb_table: Optional[int],
+        author_emb_dim: Optional[int],
+        author_hash_dropout_rate: float,
     ):
         super().__init__()
         self.shared_dim = shared_dim
@@ -355,7 +379,15 @@ class TwoTowerModel(nn.Module):
                 raise ValueError("num_embedding_table_rows must be specified when use_author_emb_table is True")
             if n_hashes_author_emb_table is None:
                 raise ValueError("n_hashes_author_emb_table must be specified when use_author_emb_table is True")
-            self.post_feature_encoder = SharedPostFeatureEncoder(post_embedding_dim, n_rows_author_emb_table, n_hashes_author_emb_table)
+            if author_emb_dim is None:
+                raise ValueError("author_emb_dim must be specified when use_author_emb_table is True")
+            self.post_feature_encoder = SharedPostFeatureEncoder(
+                post_embedding_dim=post_embedding_dim,
+                n_rows_author_emb_table=n_rows_author_emb_table,
+                n_hashes_author_emb_table=n_hashes_author_emb_table,
+                author_emb_dim=author_emb_dim,
+                author_hash_dropout_rate=author_hash_dropout_rate,
+            )
 
         # Instantiate user tower based on encoder type
         if user_encoder_type == "cross_attention":
@@ -855,6 +887,8 @@ def run(context: Context, args) -> Dict[str, Any]:
     use_author_emb_table = bool(args.use_author_emb_table)
     n_rows_author_emb_table = int(args.n_rows_author_emb_table) if use_author_emb_table else None
     n_hashes_author_emb_table = int(args.n_hashes_author_emb_table) if use_author_emb_table else None
+    author_emb_dim = int(args.author_emb_dim) if use_author_emb_table else None
+    author_hash_dropout_rate = float(args.author_hash_dropout_rate)
 
     # Worker settings
     num_workers = int(args.num_dataloader_workers)
@@ -922,6 +956,8 @@ def run(context: Context, args) -> Dict[str, Any]:
         use_author_emb_table=use_author_emb_table,
         n_rows_author_emb_table=n_rows_author_emb_table,
         n_hashes_author_emb_table=n_hashes_author_emb_table,
+        author_emb_dim=author_emb_dim,
+        author_hash_dropout_rate=author_hash_dropout_rate,
     )
 
     if (not use_post_encoder) and (user_encoder_type == "summarized"):
@@ -1014,6 +1050,11 @@ def run(context: Context, args) -> Dict[str, Any]:
         "dropout_rate": dropout_rate,
         "l2_normalize_embeddings": l2_normalize_embeddings,
         "similarity_temperature": similarity_temperature,
+        "use_author_emb_table": use_author_emb_table,
+        "n_rows_author_emb_table": n_rows_author_emb_table,
+        "n_hashes_author_emb_table": n_hashes_author_emb_table,
+        "author_emb_dim": author_emb_dim,
+        "author_hash_dropout_rate": author_hash_dropout_rate,
     }
     if save_model:
         model_path = checkpoints_dir / f"two_tower_{timestamp}.pth"
