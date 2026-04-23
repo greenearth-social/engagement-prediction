@@ -328,6 +328,52 @@ def _generate_author_idx_mapping(
     return author_idx_df
 
 
+def _add_author_indices_to_history(
+    directory_df: pl.DataFrame,
+    author_idx_df: pl.DataFrame,
+    logger: logging.Logger,
+) -> pl.DataFrame:
+    logger.info("Adding prior_author_indices via explode/join/regroup")
+
+    directory_with_idx = directory_df.with_row_index("history_row_idx")
+
+    exploded_history = (
+        directory_with_idx
+        .filter(pl.col("prior_emb_indices").list.len() > 0)
+        .select(
+            "history_row_idx",
+            "prior_emb_indices",
+            pl.int_ranges(0, pl.col("prior_emb_indices").list.len()).alias("prior_pos"),
+        )
+        .explode(["prior_emb_indices", "prior_pos"])
+    )
+
+    joined = exploded_history.join(
+        author_idx_df.select(["emb_idx", "author_idx"]).unique(),
+        left_on="prior_emb_indices",
+        right_on="emb_idx",
+        how="left",
+    )
+
+    prior_author_indices = joined.group_by("history_row_idx").agg(
+        pl.col("author_idx").sort_by("prior_pos").alias("prior_author_indices")
+    )
+
+    user_history_df = (
+        directory_with_idx
+        .join(prior_author_indices, on="history_row_idx", how="left")
+        .with_columns(
+            pl.when(pl.col("prior_author_indices").is_null())
+            .then(pl.lit([]).cast(pl.List(pl.UInt32)))
+            .otherwise(pl.col("prior_author_indices").cast(pl.List(pl.UInt32)))
+            .alias("prior_author_indices")
+        )
+        .drop("history_row_idx")
+    )
+
+    return user_history_df
+
+
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     """
     Stage 3: Generate user history directory.
@@ -430,11 +476,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     author_output_path = out_dir / f"author_idx_mapping_{out_dir.name}.parquet"
     author_idx_df.write_parquet(author_output_path, compression="zstd")
 
-    # user_history_df = _add_author_indices_to_history(directory_df, author_idx_df, logger)
-    user_history_df = directory_df
+    user_history_df = _add_author_indices_to_history(directory_df, author_idx_df, logger)
 
     # Select only the required output columns (drop analysis columns)
-    user_history_df = user_history_df.select(["target_did", "like_uri", "prior_emb_indices"]) # "prior_author_indices"
+    user_history_df = user_history_df.select(["target_did", "like_uri", "prior_emb_indices", "prior_author_indices"])
     user_history_output_path = out_dir / f"history_posts_{out_dir.name}.parquet"
     user_history_df.write_parquet(user_history_output_path, compression="zstd")
 
