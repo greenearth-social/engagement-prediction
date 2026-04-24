@@ -31,8 +31,10 @@ from utils.pipeline.core import (
     DEFAULT_ARTIFACTS_DIR,
     DEFAULT_RUNS_DIR,
     LINEAGE_FILENAME,
+    STAGE_MANIFEST_FILENAME,
     new_pipeline_run_dir,
     ensure_pipeline_run_dir,
+    list_stage_outputs,
     update_latest_symlink,
 )
 
@@ -43,6 +45,20 @@ CLI_FILE_DIR = Path(__file__).parent
 
 TRAIN_PLACEHOLDER = 'train_placeholder'
 STAGE_ORDER = ['get_data', 'target_posts', 'user_history', TRAIN_PLACEHOLDER, 'evaluate']
+STAGE_INPUT_FOLDERS: Dict[str, List[str]] = {
+    "01_get_data": [],
+    "02_target_posts": ["01_get_data"],
+    "03_user_history": ["01_get_data", "02_target_posts"],
+    "04_train": ["01_get_data", "02_target_posts", "03_user_history"],
+    "05_evaluate": ["01_get_data", "02_target_posts", "03_user_history", "04_train"],
+}
+STAGE_FOLDER_TO_KEYS: Dict[str, Tuple[str, ...]] = {
+    "01_get_data": ("get_data",),
+    "02_target_posts": ("target_posts",),
+    "03_user_history": ("user_history",),
+    "04_train": ("train_mlp", "train_two_tower"),
+    "05_evaluate": ("evaluate",),
+}
 
 # Central default map for all run-all parameters
 DEFAULTS: Dict[str, Any] = {
@@ -343,6 +359,268 @@ def _resolve_prior_spec(
     )
 
 
+def _load_stage_manifest(stage_dir: Path) -> Dict[str, Any]:
+    stage_dir = Path(stage_dir).resolve()
+    manifest_path = stage_dir / STAGE_MANIFEST_FILENAME
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f"Missing {STAGE_MANIFEST_FILENAME} in stage artifact directory '{stage_dir}'. "
+            "Cannot validate lineage for this prior stage output."
+        )
+
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Failed to parse manifest at '{manifest_path}': {exc}") from exc
+
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Manifest at '{manifest_path}' must contain a JSON object.")
+    inputs = manifest.get("inputs")
+    if inputs is None:
+        manifest["inputs"] = {}
+    elif not isinstance(inputs, dict):
+        raise ValueError(f"Manifest at '{manifest_path}' has invalid 'inputs'; expected a JSON object.")
+    return manifest
+
+
+def _format_lineage_mismatch(
+    *,
+    consumer_stage_folder: str,
+    artifact_stage_folder: str,
+    artifact_dir: Path,
+    input_stage_folder: str,
+    expected_path: Path,
+    recorded_path: Path,
+) -> str:
+    return (
+        f"Misaligned inputs for stage '{consumer_stage_folder}': selected artifact '{artifact_dir}' "
+        f"for stage folder '{artifact_stage_folder}' was created from '{recorded_path}' as its "
+        f"'{input_stage_folder}' input, but this run resolved '{input_stage_folder}' to "
+        f"'{expected_path}'. Pin aligned artifacts or omit ancestor pins so lineage can be inferred "
+        "from downstream manifests."
+    )
+
+
+def _get_context_artifact_dir_for_folder(ctx: Context, stage_folder: str) -> Optional[Path]:
+    for stage_key in STAGE_FOLDER_TO_KEYS.get(stage_folder, ()):
+        art_dir = ctx.get_artifact_dir(stage_key)
+        if art_dir is not None and Path(art_dir).exists():
+            return Path(art_dir).resolve()
+    return None
+
+
+def _validate_explicit_prior_pin_consistency(ctx: Context) -> None:
+    explicit = {
+        folder: Path(path).resolve()
+        for folder, path in ctx.prior_outputs.items()
+        if path is not None
+    }
+    if not explicit:
+        return
+
+    manifest_cache: Dict[Path, Dict[str, Any]] = {}
+    for stage_folder, artifact_dir in explicit.items():
+        parents = STAGE_INPUT_FOLDERS.get(stage_folder, [])
+        if not parents:
+            continue
+        manifest = manifest_cache.get(artifact_dir)
+        if manifest is None:
+            manifest = _load_stage_manifest(artifact_dir)
+            manifest_cache[artifact_dir] = manifest
+        recorded_inputs = manifest.get("inputs", {})
+        for parent_folder in parents:
+            expected_path = explicit.get(parent_folder)
+            if expected_path is None:
+                continue
+            recorded_raw = recorded_inputs.get(parent_folder)
+            if not recorded_raw:
+                raise ValueError(
+                    f"Explicit prior pins are inconsistent: pinned artifact '{artifact_dir}' for stage "
+                    f"folder '{stage_folder}' is missing recorded input '{parent_folder}' in its manifest."
+                )
+            recorded_path = Path(recorded_raw).resolve()
+            if recorded_path != expected_path:
+                raise ValueError(
+                    f"Explicit prior pins are inconsistent: pinned artifact '{artifact_dir}' for stage "
+                    f"folder '{stage_folder}' was created from '{recorded_path}' as its "
+                    f"'{parent_folder}' input, but this run also pinned '{parent_folder}' to "
+                    f"'{expected_path}'."
+                )
+
+
+def _apply_manifest_constraints(
+    *,
+    consumer_stage_folder: str,
+    artifact_stage_folder: str,
+    artifact_dir: Path,
+    resolved: Dict[str, Path],
+    manifest_cache: Dict[Path, Dict[str, Any]],
+) -> None:
+    artifact_dir = Path(artifact_dir).resolve()
+    parents = STAGE_INPUT_FOLDERS.get(artifact_stage_folder, [])
+    if not parents:
+        return
+
+    manifest = manifest_cache.get(artifact_dir)
+    if manifest is None:
+        manifest = _load_stage_manifest(artifact_dir)
+        manifest_cache[artifact_dir] = manifest
+
+    recorded_inputs = manifest.get("inputs", {})
+    for parent_folder in parents:
+        recorded_raw = recorded_inputs.get(parent_folder)
+        if not recorded_raw:
+            raise ValueError(
+                f"Artifact '{artifact_dir}' for stage folder '{artifact_stage_folder}' is missing "
+                f"recorded input '{parent_folder}' in its manifest."
+            )
+        recorded_path = Path(recorded_raw).resolve()
+        existing = resolved.get(parent_folder)
+        if existing is None:
+            resolved[parent_folder] = recorded_path
+            continue
+        if existing != recorded_path:
+            raise ValueError(
+                _format_lineage_mismatch(
+                    consumer_stage_folder=consumer_stage_folder,
+                    artifact_stage_folder=artifact_stage_folder,
+                    artifact_dir=artifact_dir,
+                    input_stage_folder=parent_folder,
+                    expected_path=existing,
+                    recorded_path=recorded_path,
+                )
+            )
+
+
+def _select_stage_output_matching_inputs(
+    *,
+    artifacts_dir: Path,
+    stage_folder: str,
+    expected_inputs: Dict[str, Path],
+    manifest_cache: Dict[Path, Dict[str, Any]],
+) -> Optional[Path]:
+    options = list_stage_outputs(artifacts_dir=artifacts_dir, stage_folder=stage_folder)
+    if not options:
+        return None
+
+    parents = STAGE_INPUT_FOLDERS.get(stage_folder, [])
+    if not parents:
+        return Path(options[0]).resolve()
+
+    for option in options:
+        option = Path(option).resolve()
+        manifest = manifest_cache.get(option)
+        if manifest is None:
+            try:
+                manifest = _load_stage_manifest(option)
+            except (FileNotFoundError, ValueError):
+                continue
+            manifest_cache[option] = manifest
+        recorded_inputs = manifest.get("inputs", {})
+        matches = True
+        for parent_folder, expected_path in expected_inputs.items():
+            recorded_raw = recorded_inputs.get(parent_folder)
+            if not recorded_raw or Path(recorded_raw).resolve() != Path(expected_path).resolve():
+                matches = False
+                break
+        if matches:
+            return option
+    return None
+
+
+def _resolve_stage_dependencies_for_run(
+    *,
+    ctx: Context,
+    consumer_stage_folder: str,
+) -> Dict[str, Path]:
+    deps = list(STAGE_INPUT_FOLDERS.get(consumer_stage_folder, []))
+    if not deps:
+        return {}
+
+    artifacts_dir = Path(ctx.artifacts_dir).resolve()
+    resolved: Dict[str, Path] = {}
+    manifest_cache: Dict[Path, Dict[str, Any]] = {}
+
+    for folder in deps:
+        chosen = _get_context_artifact_dir_for_folder(ctx, folder)
+        if chosen is not None:
+            resolved[folder] = chosen
+            continue
+        prior = ctx.prior_outputs.get(folder)
+        if prior is not None:
+            resolved[folder] = Path(prior).resolve()
+
+    progress = True
+    while len(resolved) < len(deps) and progress:
+        progress = False
+        for folder in reversed(deps):
+            chosen = resolved.get(folder)
+            selected_now = False
+            if chosen is None:
+                expected_inputs = {
+                    parent_folder: resolved[parent_folder]
+                    for parent_folder in STAGE_INPUT_FOLDERS.get(folder, [])
+                    if parent_folder in resolved
+                }
+                selected = _select_stage_output_matching_inputs(
+                    artifacts_dir=artifacts_dir,
+                    stage_folder=folder,
+                    expected_inputs=expected_inputs,
+                    manifest_cache=manifest_cache,
+                )
+                if selected is None:
+                    continue
+                resolved[folder] = selected
+                chosen = selected
+                selected_now = True
+            before_count = len(resolved)
+            _apply_manifest_constraints(
+                consumer_stage_folder=consumer_stage_folder,
+                artifact_stage_folder=folder,
+                artifact_dir=chosen,
+                resolved=resolved,
+                manifest_cache=manifest_cache,
+            )
+            if selected_now or len(resolved) > before_count:
+                progress = True
+
+    missing = [folder for folder in deps if folder not in resolved]
+    if missing:
+        details = []
+        for folder in missing:
+            expected_inputs = {
+                parent_folder: str(resolved[parent_folder])
+                for parent_folder in STAGE_INPUT_FOLDERS.get(folder, [])
+                if parent_folder in resolved
+            }
+            details.append(f"{folder} expected_inputs={expected_inputs or '{}'}")
+        raise FileNotFoundError(
+            f"Could not resolve a lineage-aligned prior output chain for stage '{consumer_stage_folder}'. "
+            f"Missing selections: {', '.join(details)}."
+        )
+
+    for folder in deps:
+        _apply_manifest_constraints(
+            consumer_stage_folder=consumer_stage_folder,
+            artifact_stage_folder=folder,
+            artifact_dir=resolved[folder],
+            resolved=resolved,
+            manifest_cache=manifest_cache,
+        )
+
+    return resolved
+
+
+def _pin_lineage_aligned_inputs(ctx: Context, stage_key: str, stage_folder_map: Dict[str, str]) -> None:
+    consumer_stage_folder = stage_folder_map[stage_key]
+    resolved = _resolve_stage_dependencies_for_run(
+        ctx=ctx,
+        consumer_stage_folder=consumer_stage_folder,
+    )
+    for folder, path in resolved.items():
+        ctx.prior_outputs[folder] = Path(path).resolve()
+
+
 def cmd_run_all(args: argparse.Namespace) -> int:
     """Run the 5-stage pipeline.
 
@@ -581,6 +859,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
         ctx.prior_outputs["03_user_history"] = prior_03_user_history
     if prior_04_train is not None:
         ctx.prior_outputs["04_train"] = prior_04_train
+    _validate_explicit_prior_pin_consistency(ctx)
     
     model_type = args.model_type
 
@@ -668,6 +947,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
             }
             label = label_map.get(key, f"Stage {idx+1}: {key}…")
             print(f"\n[{idx+1}/5] ▶️  {label}")
+            _pin_lineage_aligned_inputs(ctx, key, stage_folder)
             reg.run_stage(key, ctx, args)
     finally:
         ctx.tracker.close()
