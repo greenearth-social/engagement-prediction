@@ -43,20 +43,6 @@ CLI_FILE_DIR = Path(__file__).parent
 
 TRAIN_PLACEHOLDER = 'train_placeholder'
 STAGE_ORDER = ['get_data', 'target_posts', 'user_history', TRAIN_PLACEHOLDER, 'evaluate']
-STAGE_INPUT_FOLDERS: Dict[str, List[str]] = {
-    "01_get_data": [],
-    "02_target_posts": ["01_get_data"],
-    "03_user_history": ["01_get_data", "02_target_posts"],
-    "04_train": ["01_get_data", "02_target_posts", "03_user_history"],
-    "05_evaluate": ["01_get_data", "02_target_posts", "03_user_history", "04_train"],
-}
-STAGE_FOLDER_TO_KEYS: Dict[str, Tuple[str, ...]] = {
-    "01_get_data": ("get_data",),
-    "02_target_posts": ("target_posts",),
-    "03_user_history": ("user_history",),
-    "04_train": ("train_mlp", "train_two_tower"),
-    "05_evaluate": ("evaluate",),
-}
 
 # Central default map for all run-all parameters
 DEFAULTS: Dict[str, Any] = {
@@ -396,7 +382,7 @@ def _format_lineage_mismatch(
 
 
 def _get_context_artifact_dir_for_folder(ctx: Context, stage_folder: str) -> Optional[Path]:
-    for stage_key in STAGE_FOLDER_TO_KEYS.get(stage_folder, ()):
+    for stage_key in _get_stage_folder_to_keys().get(stage_folder, ()):
         art_dir = ctx.get_artifact_dir(stage_key)
         if art_dir is not None and Path(art_dir).exists():
             return Path(art_dir).resolve()
@@ -414,7 +400,7 @@ def _validate_explicit_prior_pin_consistency(ctx: Context) -> None:
 
     manifest_cache: Dict[Path, Dict[str, Any]] = {}
     for stage_folder, artifact_dir in explicit.items():
-        parents = STAGE_INPUT_FOLDERS.get(stage_folder, [])
+        parents = _get_stage_input_folders().get(stage_folder, [])
         if not parents:
             continue
         manifest = manifest_cache.get(artifact_dir)
@@ -451,7 +437,7 @@ def _apply_manifest_constraints(
     manifest_cache: Dict[Path, Dict[str, Any]],
 ) -> None:
     artifact_dir = Path(artifact_dir).resolve()
-    parents = STAGE_INPUT_FOLDERS.get(artifact_stage_folder, [])
+    parents = _get_stage_input_folders().get(artifact_stage_folder, [])
     if not parents:
         return
 
@@ -497,7 +483,7 @@ def _select_stage_output_matching_inputs(
     if not options:
         return None
 
-    parents = STAGE_INPUT_FOLDERS.get(stage_folder, [])
+    parents = _get_stage_input_folders().get(stage_folder, [])
     if not parents:
         return Path(options[0]).resolve()
 
@@ -527,7 +513,8 @@ def _resolve_stage_dependencies_for_run(
     ctx: Context,
     consumer_stage_folder: str,
 ) -> Dict[str, Path]:
-    deps = list(STAGE_INPUT_FOLDERS.get(consumer_stage_folder, []))
+    stage_input_folders = _get_stage_input_folders()
+    deps = list(stage_input_folders.get(consumer_stage_folder, []))
     if not deps:
         return {}
 
@@ -553,7 +540,7 @@ def _resolve_stage_dependencies_for_run(
             if chosen is None:
                 expected_inputs = {
                     parent_folder: resolved[parent_folder]
-                    for parent_folder in STAGE_INPUT_FOLDERS.get(folder, [])
+                    for parent_folder in stage_input_folders.get(folder, [])
                     if parent_folder in resolved
                 }
                 selected = _select_stage_output_matching_inputs(
@@ -584,7 +571,7 @@ def _resolve_stage_dependencies_for_run(
         for folder in missing:
             expected_inputs = {
                 parent_folder: str(resolved[parent_folder])
-                for parent_folder in STAGE_INPUT_FOLDERS.get(folder, [])
+                for parent_folder in stage_input_folders.get(folder, [])
                 if parent_folder in resolved
             }
             details.append(f"{folder} expected_inputs={expected_inputs or '{}'}")
@@ -785,6 +772,31 @@ def _get_stage_folder(stage_order: List[str]) -> Dict[str, str]:
         _mp, _folder = reg.get_stage_spec(key)
         stage_folder[key] = _folder
     return stage_folder
+
+
+def _get_stage_folder_to_keys() -> Dict[str, Tuple[str, ...]]:
+    folder_to_keys: Dict[str, List[str]] = {}
+    for stage_key, (_module_path, folder) in reg.STAGE_SPECS.items():
+        folder_to_keys.setdefault(folder, []).append(stage_key)
+    return {folder: tuple(keys) for folder, keys in folder_to_keys.items()}
+
+
+def _get_stage_input_folders() -> Dict[str, List[str]]:
+    """Derive cumulative stage-folder dependencies from the canonical linear stage order.
+
+    This pipeline is currently linear: each stage depends on all prior stage folders.
+    Deriving these folders from the registry avoids a second hand-maintained map.
+    """
+    canonical_stage_order = _get_stage_order_for_model_type("train_mlp")
+    folder_order: List[str] = []
+    for stage_key in canonical_stage_order:
+        folder = reg.get_stage_spec(stage_key)[1]
+        if not folder_order or folder_order[-1] != folder:
+            folder_order.append(folder)
+    return {
+        folder: folder_order[:idx]
+        for idx, folder in enumerate(folder_order)
+    }
 
 
 def _get_stage_folder_and_start_stop_indices(

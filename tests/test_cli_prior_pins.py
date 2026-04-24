@@ -72,6 +72,26 @@ def test_resolve_prior_spec_raises_if_missing(tmp_path):
         )
 
 
+def test_get_stage_folder_to_keys_is_derived_from_registry():
+    assert cli._get_stage_folder_to_keys() == {
+        "01_get_data": ("get_data",),
+        "02_target_posts": ("target_posts",),
+        "03_user_history": ("user_history",),
+        "04_train": ("train_mlp", "train_two_tower"),
+        "05_evaluate": ("evaluate",),
+    }
+
+
+def test_get_stage_input_folders_is_derived_from_stage_order():
+    assert cli._get_stage_input_folders() == {
+        "01_get_data": [],
+        "02_target_posts": ["01_get_data"],
+        "03_user_history": ["01_get_data", "02_target_posts"],
+        "04_train": ["01_get_data", "02_target_posts", "03_user_history"],
+        "05_evaluate": ["01_get_data", "02_target_posts", "03_user_history", "04_train"],
+    }
+
+
 def test_resolve_stage_dependencies_for_train_follows_latest_downstream_lineage(tmp_path):
     artifacts_dir = Path(tmp_path) / "artifacts"
     run_dir = Path(tmp_path) / "runs" / "run1"
