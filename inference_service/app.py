@@ -96,8 +96,10 @@ class UserTowerPredictRequest(BaseModel):
     @model_validator(mode="after")
     def _validate_history(self) -> "UserTowerPredictRequest":
         he = self.history_embeddings
-        if not isinstance(he, list) or len(he) == 0:
-            raise ValueError("'history_embeddings' must be a non-empty list")
+
+        # An empty-list is ok - will be handled as a zero-length-history.
+        if isinstance(he, list) and len(he) == 0:
+            return self
 
         # Determine shape: [T, D] vs [B, T, D]
         if isinstance(he[0], list) and len(he[0]) > 0 and not isinstance(he[0][0], list):
