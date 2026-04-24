@@ -5,6 +5,12 @@ import pytest
 
 import cli
 from utils.pipeline.core import Context
+from utils.pipeline.dependencies import (
+    get_stage_folder_to_keys,
+    get_stage_input_folders,
+    resolve_stage_dependencies_for_run,
+    validate_explicit_prior_pin_consistency,
+)
 
 
 def _make_stage_output(
@@ -73,7 +79,7 @@ def test_resolve_prior_spec_raises_if_missing(tmp_path):
 
 
 def test_get_stage_folder_to_keys_is_derived_from_registry():
-    assert cli._get_stage_folder_to_keys() == {
+    assert get_stage_folder_to_keys() == {
         "01_get_data": ("get_data",),
         "02_target_posts": ("target_posts",),
         "03_user_history": ("user_history",),
@@ -83,7 +89,7 @@ def test_get_stage_folder_to_keys_is_derived_from_registry():
 
 
 def test_get_stage_input_folders_is_derived_from_stage_order():
-    assert cli._get_stage_input_folders() == {
+    assert get_stage_input_folders() == {
         "01_get_data": [],
         "02_target_posts": ["01_get_data"],
         "03_user_history": ["01_get_data", "02_target_posts"],
@@ -123,7 +129,7 @@ def test_resolve_stage_dependencies_for_train_follows_latest_downstream_lineage(
 
     ctx = Context(run_dir=run_dir, artifacts_dir=artifacts_dir, runs_dir=Path(tmp_path) / "runs", use_latest=True)
 
-    resolved = cli._resolve_stage_dependencies_for_run(
+    resolved = resolve_stage_dependencies_for_run(
         ctx=ctx,
         consumer_stage_folder="04_train",
     )
@@ -169,7 +175,7 @@ def test_resolve_stage_dependencies_raises_on_misaligned_explicit_pins(tmp_path)
     ctx.prior_outputs["03_user_history"] = user_history_new
 
     with pytest.raises(ValueError, match="Misaligned inputs for stage '04_train'"):
-        cli._resolve_stage_dependencies_for_run(
+        resolve_stage_dependencies_for_run(
             ctx=ctx,
             consumer_stage_folder="04_train",
         )
@@ -210,7 +216,7 @@ def test_resolve_stage_dependencies_for_evaluate_infers_inputs_from_train_manife
 
     ctx = Context(run_dir=run_dir, artifacts_dir=artifacts_dir, runs_dir=Path(tmp_path) / "runs", use_latest=True)
 
-    resolved = cli._resolve_stage_dependencies_for_run(
+    resolved = resolve_stage_dependencies_for_run(
         ctx=ctx,
         consumer_stage_folder="05_evaluate",
     )
@@ -242,4 +248,4 @@ def test_validate_explicit_prior_pin_consistency_raises_on_misaligned_stage1_sta
     ctx.prior_outputs["02_target_posts"] = target_posts_new
 
     with pytest.raises(ValueError, match="Explicit prior pins are inconsistent"):
-        cli._validate_explicit_prior_pin_consistency(ctx)
+        validate_explicit_prior_pin_consistency(ctx)
