@@ -3,10 +3,12 @@ import struct
 import zlib
 
 import pytest
+import shared
 
 from shared.input_data_helpers import (
     _decompress_and_unpack_embedding,
     _extract_compressed_embedding_vector_from_struct,
+    classify_history_embeddings_shape,
     get_embedding_dim_for_known_model,
     get_expanded_embedding_vector,
     get_padded_embedding_history_and_mask,
@@ -36,6 +38,13 @@ def test_get_embedding_value_for_model_list_or_tuple_items():
         ["target", "y"],
     ]
     assert _extract_compressed_embedding_vector_from_struct(embeddings_lists, "target") == "y"
+
+    embeddings_mixed = [
+        None,
+        ["too-short"],
+        ("target", "y", "extra"),
+    ]
+    assert _extract_compressed_embedding_vector_from_struct(embeddings_mixed, "target") == "y"
 
 
 def test_get_embedding_value_for_model_object_items():
@@ -118,6 +127,22 @@ def test_get_padded_embedding_history_and_mask_raises_on_embed_dim_mismatch():
         get_padded_embedding_history_and_mask([[1.0, 2.0, 3.0]], max_history_len=2, embed_dim=2)
 
 
+def test_classify_history_embeddings_shape_covers_public_shapes():
+    assert classify_history_embeddings_shape([]) == "single_empty"
+    assert classify_history_embeddings_shape([[]]) == "single_empty"
+    assert classify_history_embeddings_shape([[1.0, 2.0], [3.0, 4.0]]) == "single_history"
+    assert classify_history_embeddings_shape([[], [[1.0, 2.0]]]) == "batched_history"
+    assert classify_history_embeddings_shape([[[1.0, 2.0]], [[3.0, 4.0]]]) == "batched_history"
+
+
+def test_classify_history_embeddings_shape_rejects_invalid_inputs():
+    with pytest.raises(ValueError, match="history_embeddings must be a list"):
+        classify_history_embeddings_shape("not-a-list")
+
+    with pytest.raises(ValueError, match="history_embeddings must be a list of lists"):
+        classify_history_embeddings_shape([1.0, 2.0])
+
+
 def test_get_padded_embedding_history_and_mask_batched_accepts_single_empty_history():
     padded, mask = get_padded_embedding_history_and_mask_batched(
         [],
@@ -156,6 +181,16 @@ def test_get_padded_embedding_history_and_mask_batched_accepts_batched_histories
     ]
 
 
+def test_get_padded_embedding_history_and_mask_batched_accepts_single_nested_empty_history():
+    padded, mask = get_padded_embedding_history_and_mask_batched(
+        [[]],
+        max_history_len=2,
+        embed_dim=2,
+    )
+    assert padded == [[[0.0, 0.0], [0.0, 0.0]]]
+    assert mask == [[False, False]]
+
+
 def test_get_padded_embedding_history_and_mask_batched_rejects_non_list_top_level():
     with pytest.raises(ValueError, match="history_embeddings must be a list"):
         get_padded_embedding_history_and_mask_batched(
@@ -173,3 +208,20 @@ def test_get_padded_embedding_history_and_mask_batched_rejects_top_level_non_lis
             embed_dim=2,
         )
 
+
+def test_shared_package_re_exports_public_helpers():
+    assert shared.__all__ == [
+        "get_expanded_embedding_vector",
+        "get_padded_embedding_history_and_mask",
+        "get_padded_embedding_history_and_mask_batched",
+        "get_embedding_dim_for_known_model",
+        "classify_history_embeddings_shape",
+    ]
+    assert shared.get_expanded_embedding_vector is get_expanded_embedding_vector
+    assert shared.get_padded_embedding_history_and_mask is get_padded_embedding_history_and_mask
+    assert (
+        shared.get_padded_embedding_history_and_mask_batched
+        is get_padded_embedding_history_and_mask_batched
+    )
+    assert shared.get_embedding_dim_for_known_model is get_embedding_dim_for_known_model
+    assert shared.classify_history_embeddings_shape is classify_history_embeddings_shape
