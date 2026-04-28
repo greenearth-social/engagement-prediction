@@ -32,11 +32,24 @@ Variables (bash-evalable):
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import shlex
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
+
+
+def _json_default(obj: Any) -> Any:
+    """JSON encoder fallback: coerce date/datetime to ISO strings.
+
+    PyYAML's safe_load converts bare date-looking scalars (e.g. 2026-03-01)
+    to datetime.date objects.  We stringify them here so that extra_cli_args
+    values round-trip correctly through JSON even when they look like dates.
+    """
+    if isinstance(obj, (datetime.date, datetime.datetime)):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 try:
     import yaml  # type: ignore
@@ -167,7 +180,7 @@ def emit_vars(cfg: Dict[str, Any], sweep_root: Path, plan_path: Path) -> None:
     print(f"PATIENCE={int(cfg.get('patience', DEFAULTS['patience']))}")
     print(f"MAX_PARALLEL_MLP={int(cfg.get('max_parallel_mlp', DEFAULTS['max_parallel_mlp']))}")
     extra = cfg.get("extra_cli_args", [])
-    print(f"EXTRA_CLI_ARGS={shlex.quote(json.dumps(extra))}")
+    print(f"EXTRA_CLI_ARGS={shlex.quote(json.dumps(extra, default=_json_default))}")
 
 
 def main() -> int:

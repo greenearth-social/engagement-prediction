@@ -21,8 +21,9 @@
 sweep_name: 01_cross_arch_validation
 
 # Path to a Stage 1 ingestion run (relative to eng_pred_repo or absolute).
-# UPDATE THIS to the GPU machine's actual ingestion run before launching.
-ingestion_run: outputs/20260316_164800
+# Points at the April 2026 ingestion (Apr 1-28, 100k users, 500 likes/user).
+# UPDATE the timestamp suffix once Stage 1 finishes on the GPU machine.
+ingestion_run: outputs/FILL_IN_AFTER_INGESTION
 
 caps:
   - null
@@ -40,7 +41,16 @@ batch_size: 4096
 patience: 20
 max_parallel_mlp: 2
 
-# Optional CLI passthrough for the prep stages (Stage 2 + Stage 3).
-# Useful e.g. to override --val-start or --holdout-start without editing
-# the cli.py defaults.
-extra_cli_args: []
+# CLI passthrough for the prep stages (Stage 2 + Stage 3).
+# --train-start is required when starting mid-pipeline (posts_start / likes_start
+# are not populated because Stage 1 is not re-run).
+# Split dates for Apr 1-28 window: val = 12 days before end, holdout = 7 days before end.
+extra_cli_args:
+  - --train-start
+  - 2026-04-01
+  - --val-start
+  - 2026-04-16
+  - --holdout-start
+  - 2026-04-21
+  - --holdout-user-fraction
+  - 0.5
