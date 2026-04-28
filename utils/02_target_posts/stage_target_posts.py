@@ -45,6 +45,7 @@ from utils.helpers import (
     parse_one_ts,
     parse_one_ts_strict
 )
+from utils.likes_cap import apply_per_user_random_cap
 from utils.memory_helpers import log_memory_checkpoint
 
 STAGE_NAME_FOR_LOGGING = '02_TARGET_POSTS'
@@ -497,6 +498,38 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'emb_idx': int
     })
 
+    # Optional Stage-2 effective likes cap.  Applied to the canonical
+    # likes_core LazyFrame BEFORE forming any positive/negative pairs so that
+    # both the positive set and the per-user "already liked" filter (used for
+    # negative sampling) are computed on the capped subset.  This keeps the
+    # cap consistent with what Stage 3 will see.
+    effective_likes_cap = getattr(args, "effective_likes_cap", None)
+    effective_likes_cap_seed = getattr(args, "effective_likes_cap_seed", None)
+    if effective_likes_cap_seed is None:
+        effective_likes_cap_seed = int(getattr(args, "cap_random_seed", 42))
+    if effective_likes_cap is not None and effective_likes_cap > 0:
+        n_likes_pre_cap = likes_core_lf.select(pl.len()).collect(engine="streaming").item()
+        likes_core_lf = apply_per_user_random_cap(
+            likes_core_lf,
+            int(effective_likes_cap),
+            int(effective_likes_cap_seed),
+        )
+        n_likes_post_cap = likes_core_lf.select(pl.len()).collect(engine="streaming").item()
+        logger.info(
+            f"Applied effective_likes_cap={effective_likes_cap} "
+            f"(seed={effective_likes_cap_seed}): "
+            f"{n_likes_pre_cap:,} -> {n_likes_post_cap:,} likes."
+        )
+        context.tracker.log_single_value(
+            'Target Posts - Effective Likes Cap', int(effective_likes_cap)
+        )
+        context.tracker.log_single_value(
+            'Target Posts - Likes After Effective Cap', int(n_likes_post_cap)
+        )
+    else:
+        n_likes_pre_cap = None
+        n_likes_post_cap = None
+
     log_memory_checkpoint('stage_start', logger)
     log_operation_start('Generate target posts dataset from likes and posts', STAGE_NAME_FOR_LOGGING, logger)
     target_posts_lf: pl.LazyFrame = _get_target_posts(args, posts_core_lf, likes_core_lf, logger, context)
@@ -534,7 +567,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"stage: target_posts",
         f"runtime_seconds: {time.time()-t0:.2f}",
         f"inputs: posts_core, likes_core",
+        f"effective_likes_cap: {effective_likes_cap}",
+        f"effective_likes_cap_seed: {effective_likes_cap_seed}",
     ]
+    if n_likes_pre_cap is not None:
+        info_lines.append(f"likes_before_effective_cap: {n_likes_pre_cap}")
+        info_lines.append(f"likes_after_effective_cap: {n_likes_post_cap}")
     (out_dir / 'stage_info.txt').write_text('\n'.join(info_lines) + '\n')
 
     return {

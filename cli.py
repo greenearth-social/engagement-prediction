@@ -43,6 +43,13 @@ DEFAULTS: Dict[str, Any] = {
     "min_likes_per_user": 2,  # Stage 1: minimum likes for user inclusion
     "negative_posts_sample": 100000,  # Stage 1: random posts for negative cases
     "cap_random_seed": 42,
+    # Stages 2 & 3: optional additional per-user cap applied AFTER Stage 1
+    # ingestion.  When set to an integer, both target_posts and user_history
+    # subsample each user's likes_core rows to at most this many before doing
+    # any downstream work.  Use this to sweep cap levels without re-ingesting
+    # from GCS.  When None, no additional cap is applied (Stage 1 cap stands).
+    "effective_likes_cap": None,
+    "effective_likes_cap_seed": None,  # Falls back to cap_random_seed when None.
     "max_memory_gb": None,  # Stage 1: max memory in GB (None = auto based on percentage)
     "max_memory_pct": 0.75,  # Stage 1: max percentage of available RAM to use
     "memory_check": "full",  # Stage 1: memory check mode (full/ignore/skip)
@@ -499,6 +506,12 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Cap on total liking users to sample (None = no limit)")
     _add_arg_with_default(p_all, "--max-likes-per-user", type=int, default=argparse.SUPPRESS,
                           help_text="Random cap on likes per user in Stage 1 (NOT recency-based)")
+    _add_arg_with_default(p_all, "--effective-likes-cap", type=int, default=argparse.SUPPRESS,
+                          help_text="Optional additional per-user cap applied at Stages 2 & 3 (target_posts, user_history). "
+                          "Lets cap sweeps reuse a single Stage 1 ingestion. None = no additional cap.")
+    _add_arg_with_default(p_all, "--effective-likes-cap-seed", type=int, default=argparse.SUPPRESS,
+                          help_text="Seed for --effective-likes-cap hashing. None = inherit --cap-random-seed. "
+                          "Reuse the same seed across sweep cells so tighter caps are nested subsets of looser caps.")
     _add_arg_with_default(p_all, "--negative-posts-sample", type=int, default=argparse.SUPPRESS,
                           help_text="Number of random posts to sample for negative cases in Stage 1")
     _add_arg_with_default(p_all, "--cap-random-seed", type=int, default=argparse.SUPPRESS,

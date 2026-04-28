@@ -1,0 +1,52 @@
+# Sweep 02 — full cap × architecture matrix (DRAFT, do not run until 01 passes)
+#
+# Goal: ROADMAP Stage 1 + Stage 2 main matrix.  Sweep a wide range of
+# per-user caps to test whether aggressive downsampling reduces or removes
+# the model-amplification bias documented in REPORT.md, and whether the
+# pattern generalises across model architectures.
+#
+# Cells: 6 caps × 2 architectures × 3 seeds = 36 training runs + 6 prep runs.
+#
+# IMPORTANT: this sweep requires a Stage 1 ingestion that was performed at a
+# wide-enough cap to support cap=100.  Confirm with the project lead before
+# launching that --max-likes-per-user during ingestion was >= 200 (ideally
+# unset / very large).  If it was 100, only the cap_inf cells will be valid;
+# the others will be no-ops because the data was already capped at 100.
+#
+# Pre-registration: see jobs/0001_cap_arch_sweep.md for the predicted shapes.
+# Predicted (from REPORT.md):
+#   - sentiment / political / arbitrary-text traits: monotonic decline in
+#     model-amplification as cap tightens (high-volume likers had outsized
+#     influence).
+#   - hate / sexual / moderation traits: flat-to-noisy across caps (these
+#     biases looked driven by signal, not representation).
+#   - Topic biases: mixed; entertainment topics decline, hard-news may not.
+# Negative control: post-text-length-bin pseudo-trait should show ~zero
+# model amplification at every cap (validates that the diagnostic is
+# correctly null-calibrated).
+
+sweep_name: 02_cap_arch_full
+
+# UPDATE THIS to the GPU machine's wide-cap ingestion run before launching.
+ingestion_run: outputs/20260316_164800
+
+caps:
+  - null   # no effective cap (uses Stage 1's --max-likes-per-user as-is)
+  - 100
+  - 50
+  - 20
+  - 10
+  - 5
+
+architectures:
+  - {model_type: mlp,        user_encoder: summarized,      user_summarization: ema, ema_alpha: 0.1}
+  - {model_type: two-tower,  user_encoder: cross_attention}
+
+seeds: [1, 2, 3]
+
+epochs: 100
+batch_size: 4096
+patience: 20
+max_parallel_mlp: 2
+
+extra_cli_args: []

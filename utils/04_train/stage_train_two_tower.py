@@ -916,6 +916,13 @@ def run(context: Context, args) -> Dict[str, Any]:
         "epochs": epochs,
         "patience": patience,
         "random_seed": random_seed,
+        "effective_likes_cap": getattr(args, "effective_likes_cap", None),
+        "effective_likes_cap_seed": (
+            getattr(args, "effective_likes_cap_seed", None)
+            if getattr(args, "effective_likes_cap_seed", None) is not None
+            else getattr(args, "cap_random_seed", None)
+        ),
+        "max_likes_per_user": getattr(args, "max_likes_per_user", None),
         "train_samples": len(train_dataset),
         "val_samples": len(val_dataset),
         "train_metrics": train_eval["metrics"],

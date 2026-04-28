@@ -29,6 +29,7 @@ import time
 
 from utils.pipeline.core import select_prior_output, Context
 from utils.helpers import get_stage_logger, log_operation_start, validate_dataframe_schema, load_parquet_from_prior, TIMESTAMP_COL_NAME
+from utils.likes_cap import apply_per_user_random_cap
 from utils.memory_helpers import MemoryTracker
 
 
@@ -356,6 +357,25 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     validate_dataframe_schema(likes_lf, likes_schema)
     logger.info("✓ likes_core schema validated")
 
+    # Optional Stage-3 effective likes cap.  Applied to likes_core BEFORE the
+    # per-target prior-likes join so that the user history seen by the model
+    # reflects the same capped subset as Stage 2's target_posts.  Using the
+    # same seed across cells in a sweep guarantees nested subsets.
+    effective_likes_cap: Optional[int] = getattr(args, "effective_likes_cap", None)
+    effective_likes_cap_seed: Optional[int] = getattr(args, "effective_likes_cap_seed", None)
+    if effective_likes_cap_seed is None:
+        effective_likes_cap_seed = int(getattr(args, "cap_random_seed", 42))
+    if effective_likes_cap is not None and effective_likes_cap > 0:
+        likes_lf = apply_per_user_random_cap(
+            likes_lf,
+            int(effective_likes_cap),
+            int(effective_likes_cap_seed),
+        )
+        logger.info(
+            f"Applied effective_likes_cap={effective_likes_cap} "
+            f"(seed={effective_likes_cap_seed}) before building user history."
+        )
+
     log_operation_start('Load target_posts', 'STAGE_03_USER_HISTORY', logger)
     targets_lf: pl.LazyFrame = load_parquet_from_prior(prior_target_posts_dir, "target_posts_")
 
@@ -444,6 +464,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"stage: user_history",
         f"runtime_seconds: {runtime:.2f}",
         f"settings: max_prior_likes={max_prior_likes}, history_buffer_hours={history_buffer_hours}",
+        f"settings: effective_likes_cap={effective_likes_cap}, effective_likes_cap_seed={effective_likes_cap_seed}",
         f"inputs: likes_core ({n_likes:,}), target_posts ({n_targets:,})",
         f"outputs: user_history_directory ({n_output:,} entries)",
         f"stats: with_history={n_with_history:,}, empty_history={n_empty_history:,}",

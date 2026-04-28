@@ -1,0 +1,46 @@
+# Sweep 01 — cross-architecture validation
+#
+# Goal: validate that the cap-sweep harness works end-to-end and answer the
+# very first cross-architecture question for the bias-research agenda:
+# do MLP and two-tower models agree on the qualitative shape and rough
+# magnitude of like-creation biases at the existing default cap?
+#
+# Cells: 1 cap × 2 architectures × 2 seeds = 4 training runs + 1 prep run.
+# This is a small enough run that it should complete in roughly the same
+# wall-clock time as one cycle of run_training_sweep.sh.
+#
+# Success criterion (see ROADMAP §1):
+#   - bias_by_trait parquet/JSON artifacts land in
+#     <ingestion_run>/sweep_01_cross_arch_validation/cap_inf/04_train/<run_tag>/evals/<ts>/bias_summary_export/
+#     for all 4 cells (manually copied back to
+#     260428_like_biases/artifacts/01_cross_arch_validation/).
+#   - Sentiment/hate/sexual/topic biases agree in sign across architectures
+#     and within seeds; magnitudes within ~30%.
+#   - Negative-control checks (see ROADMAP §1) pass.
+
+sweep_name: 01_cross_arch_validation
+
+# Path to a Stage 1 ingestion run (relative to eng_pred_repo or absolute).
+# UPDATE THIS to the GPU machine's actual ingestion run before launching.
+ingestion_run: outputs/20260316_164800
+
+caps:
+  - null
+
+architectures:
+  - {model_type: mlp,        user_encoder: summarized,      user_summarization: ema, ema_alpha: 0.1}
+  - {model_type: two-tower,  user_encoder: cross_attention}
+
+seeds: [1, 2]
+
+# Training hyperparameters (must match the GPU machine's known-good defaults
+# from the existing run_training_sweep.sh).
+epochs: 100
+batch_size: 4096
+patience: 20
+max_parallel_mlp: 2
+
+# Optional CLI passthrough for the prep stages (Stage 2 + Stage 3).
+# Useful e.g. to override --val-start or --holdout-start without editing
+# the cli.py defaults.
+extra_cli_args: []

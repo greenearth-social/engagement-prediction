@@ -422,22 +422,14 @@ def _apply_per_user_random_cap(
     max_likes_per_user: int,
     random_seed: int
 ) -> pl.LazyFrame:
-    if max_likes_per_user <= 0:
-        return likes_lf
-    # Add deterministic pseudo-random order per user, then keep top-K
-    # Hash (did, subject_uri) together to get independent randomization per user
-    # (hashing subject_uri alone would create correlation across users)
-    return (
-        likes_lf
-        .with_columns(
-            pl.concat_str([pl.col('did'), pl.col('subject_uri')]).hash(seed=random_seed).alias('_rand_key')
-        ).with_columns(
-            pl.col('_rand_key').rank('ordinal').over('did').alias('_rand_order')
-        ).filter(
-            pl.col('_rand_order') <= max_likes_per_user
-        ).drop(
-            ['_rand_key', '_rand_order']
-        )
+    # Thin shim over the shared helper so other stages can re-apply the same
+    # cap with the same seed and get strictly nested subsets.
+    from utils.likes_cap import apply_per_user_random_cap
+
+    return apply_per_user_random_cap(
+        likes_lf,
+        max_likes_per_user,
+        random_seed,
     )
 
 
