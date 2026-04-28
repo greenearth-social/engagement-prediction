@@ -335,9 +335,9 @@ def _compute_trait_decomposition(
     if pool_sd < 1e-12:
         return None
 
-    up_list: List[float] = []
-    ma_list: List[float] = []
-    me_list: List[float] = []
+    pref_list: List[float] = []
+    amp_list: List[float] = []
+    excess_list: List[float] = []
     did_list: List[str] = []
 
     for did in eligible_dids:
@@ -351,34 +351,34 @@ def _compute_trait_decomposition(
         actual_mean = float(np.nanmean(actual))
         feed_mean = float(np.nanmean(feed))
 
-        up_list.append((actual_mean - pool_mean) / pool_sd)
-        ma_list.append((feed_mean - actual_mean) / pool_sd)
-        me_list.append((feed_mean - pool_mean) / pool_sd)
+        pref_list.append((actual_mean - pool_mean) / pool_sd)
+        amp_list.append((feed_mean - actual_mean) / pool_sd)
+        excess_list.append((feed_mean - pool_mean) / pool_sd)
         did_list.append(did)
 
-    if len(up_list) < 10:
+    if len(pref_list) < 10:
         return None
 
-    up = np.array(up_list)
-    ma = np.array(ma_list)
-    me = np.array(me_list)
+    pref = np.array(pref_list)
+    amp = np.array(amp_list)
+    excess = np.array(excess_list)
 
     def _effect(arr: np.ndarray) -> Tuple[float, float]:
         sd = float(np.std(arr, ddof=1))
         d = float(np.mean(arr)) / sd if sd > 1e-12 else 0.0
         return d, float(ttest_1samp(arr, 0.0).pvalue)
 
-    d_pref, p_pref = _effect(up)
-    d_amp, p_amp = _effect(ma)
-    d_excess, p_excess = _effect(me)
+    d_pref, p_pref = _effect(pref)
+    d_amp, p_amp = _effect(amp)
+    d_excess, p_excess = _effect(excess)
 
     return TraitDecompResult(
-        user_pref_std=up,
-        model_amp_std=ma,
-        model_excess_std=me,
+        user_pref_std=pref,
+        model_amp_std=amp,
+        model_excess_std=excess,
         pool_sd=pool_sd,
         pool_mean=pool_mean,
-        n_users=len(up),
+        n_users=len(pref),
         cohen_d_pref=d_pref,
         cohen_d_amp=d_amp,
         cohen_d_excess=d_excess,
@@ -1503,42 +1503,42 @@ class SyntheticFeedModule(EvalModule):
             )
 
         for gname in group_names:
-            gt: Dict[str, TraitDecompResult] = {}
+            group_traits: Dict[str, TraitDecompResult] = {}
             for label in group_labels.get(gname, []):
                 key = f"{gname}::{label}"
                 if key in trait_results:
-                    gt[label] = trait_results[key]
-            if gt:
+                    group_traits[label] = trait_results[key]
+            if group_traits:
                 plot_paths.append(
                     str(_plot_group_decomposition(
-                        gname, gt, out_dir, standardize=True,
+                        gname, group_traits, out_dir, standardize=True,
                     ))
                 )
                 plot_paths.append(
                     str(_plot_group_decomposition(
-                        gname, gt, out_dir, standardize=False,
+                        gname, group_traits, out_dir, standardize=False,
                     ))
                 )
                 detail_path, shared_ylim = _plot_group_prevalence_detail(
-                    gname, gt, is_high, pct_hi_str, out_dir,
+                    gname, group_traits, is_high, pct_hi_str, out_dir,
                 )
                 prev_path, _ = _plot_group_prevalence(
-                    gname, gt, out_dir, ylim=shared_ylim,
+                    gname, group_traits, out_dir, ylim=shared_ylim,
                 )
                 plot_paths.append(str(prev_path))
                 plot_paths.append(str(detail_path))
 
-                scatter_path = _plot_user_scatter(gname, gt, out_dir)
+                scatter_path = _plot_user_scatter(gname, group_traits, out_dir)
                 if scatter_path is not None:
                     plot_paths.append(str(scatter_path))
 
-                kde_path = _plot_over_serving_kde(gname, gt, out_dir)
+                kde_path = _plot_over_serving_kde(gname, group_traits, out_dir)
                 if kde_path is not None:
                     plot_paths.append(str(kde_path))
 
                 if gname in _SUBSET_TRAITS:
                     sub_name, sub_keep = _SUBSET_TRAITS[gname]
-                    sub_gt = {k: v for k, v in gt.items() if k in sub_keep}
+                    sub_gt = {k: v for k, v in group_traits.items() if k in sub_keep}
                     if sub_gt:
                         sub_detail, sub_ylim = _plot_group_prevalence_detail(
                             sub_name, sub_gt, is_high, pct_hi_str, out_dir,
@@ -1552,9 +1552,9 @@ class SyntheticFeedModule(EvalModule):
                 if gname in _TOP_N_SUBSETS:
                     sub_name, top_n = _TOP_N_SUBSETS[gname]
                     top_keys = sorted(
-                        gt.keys(), key=lambda t: gt[t].pool_mean, reverse=True
+                        group_traits.keys(), key=lambda t: group_traits[t].pool_mean, reverse=True
                     )[:top_n]
-                    sub_gt = {k: gt[k] for k in top_keys}
+                    sub_gt = {k: group_traits[k] for k in top_keys}
                     if sub_gt:
                         sub_detail, sub_ylim = _plot_group_prevalence_detail(
                             sub_name, sub_gt, is_high, pct_hi_str, out_dir,
