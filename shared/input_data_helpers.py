@@ -177,6 +177,7 @@ HistoryEmbeddingsShape = Literal["single_empty", "single_history", "batched_hist
 
 
 def classify_history_embeddings_shape(history_embeddings: Any) -> HistoryEmbeddingsShape:
+    """Classify the nesting pattern used for one or more users' history embeddings."""
     if not isinstance(history_embeddings, list):
         raise ValueError("history_embeddings must be a list")
     if len(history_embeddings) == 0:
@@ -193,6 +194,7 @@ def classify_history_embeddings_shape(history_embeddings: Any) -> HistoryEmbeddi
 
 
 def _normalize_empty_user_history(user_history: list[Any]) -> list[list[float]]:
+    """Collapse common empty-history sentinels into a plain empty list."""
     if len(user_history) == 0:
         return []
     if len(user_history) == 1 and isinstance(user_history[0], list) and len(user_history[0]) == 0:
@@ -203,12 +205,19 @@ def _normalize_empty_user_history(user_history: list[Any]) -> list[list[float]]:
 def _normalize_history_embeddings_to_batch(
     history_embeddings: Any,
 ) -> list[list[list[float]]]:
+    """
+    Normalize supported history input shapes into a batched ``[B, T, D]``-style list.
+
+    This lets the batching helper accept either a single user's history or a batch
+    of histories without duplicating the padding logic.
+    """
     shape = classify_history_embeddings_shape(history_embeddings)
 
     match shape:
         case "single_empty":
             return [[]]
         case "single_history":
+            # Wrap a single user's history in an outer batch dimension.
             return [history_embeddings]
         case "batched_history":
             return [
@@ -222,6 +231,13 @@ def get_padded_embedding_history_and_mask_batched(
     max_history_len: int, 
     embed_dim: int,
 ) -> Tuple[List[List[List[float]]], List[List[float]]]:
+    """
+    Pad and mask one or more users' embedding histories.
+
+    Accepts either a single history or a batch of histories, normalizes the input
+    to a batched form, and then applies the single-history padding helper to each
+    user independently.
+    """
     batch_history_embeddings = _normalize_history_embeddings_to_batch(history_embeddings)
     batch_padded_history_embeddings = []
     batch_history_mask = []
