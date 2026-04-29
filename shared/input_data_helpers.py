@@ -181,16 +181,41 @@ def classify_history_embeddings_shape(history_embeddings: Any) -> HistoryEmbeddi
     if not isinstance(history_embeddings, list):
         raise ValueError("history_embeddings must be a list")
     if len(history_embeddings) == 0:
-        return "single_empty"
-    if not isinstance(history_embeddings[0], list):
+        return "single_empty" # []
+
+    if not all(isinstance(user_history, list) for user_history in history_embeddings):
         raise ValueError("history_embeddings must be a list of lists")
+
     if len(history_embeddings[0]) == 0:
         if len(history_embeddings) == 1:
-            return "single_empty"
-        return "batched_history"
+            return "single_empty" # [ [] ]
+        if not all(
+            len(user_history) == 0 or isinstance(user_history[0], list)
+            for user_history in history_embeddings
+        ):
+            raise ValueError(
+                "batched history_embeddings must be a list of user histories"
+            )
+        return "batched_history" # [ [ [ float, float, ... ], [ float, float, ... ], ... ], ... ]
+
     if isinstance(history_embeddings[0][0], list):
-        return "batched_history"
-    return "single_history"
+        if not all(
+            len(user_history) == 0 or isinstance(user_history[0], list)
+            for user_history in history_embeddings
+        ):
+            raise ValueError(
+                "batched history_embeddings must be a list of user histories"
+            )
+        return "batched_history" # [ [ [ float, float, ... ], [ float, float, ... ], ... ], ... ]
+
+    if any(
+        len(user_history) > 0 and isinstance(user_history[0], list)
+        for user_history in history_embeddings[1:]
+    ):
+        raise ValueError(
+            "history_embeddings must not mix single-history and batched-history shapes"
+        )
+    return "single_history" # [ [ float, float, ... ], [ float, float, ... ], ... ]
 
 
 def _normalize_empty_user_history(user_history: list[Any]) -> list[list[float]]:

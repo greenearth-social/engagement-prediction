@@ -209,6 +209,15 @@ def test_get_padded_embedding_history_and_mask_batched_rejects_top_level_non_lis
         )
 
 
+def test_get_padded_embedding_history_and_mask_batched_rejects_mixed_batch_shapes():
+    with pytest.raises(ValueError, match="batched history_embeddings must be a list of user histories"):
+        get_padded_embedding_history_and_mask_batched(
+            [[], [1.0, 2.0]],
+            max_history_len=3,
+            embed_dim=2,
+        )
+
+
 def test_shared_package_re_exports_public_helpers():
     assert shared.__all__ == [
         "get_expanded_embedding_vector",
