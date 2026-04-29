@@ -1,0 +1,41 @@
+# Sweep 00 -- pipeline validation (smoke test)
+#
+# Purpose: verify the cap x arch sweep harness runs end-to-end --
+#   Stage 2 prep, Stage 3 user_history, Stage 4 train, Stage 5 eval,
+#   and the z_bias_summary_export module -- without errors.
+#
+# Uses the existing 20260316_164800 ingestion (Feb 20 - Mar 16 data)
+# with a temporal split adapted to that window.  2 epochs / patience 1
+# so training finishes in minutes.  Run this before starting a full
+# ingestion + production sweep.
+
+sweep_name: 00_pipeline_validation
+
+ingestion_run: outputs/20260316_164800
+
+caps:
+  - null
+
+architectures:
+  - {model_type: mlp, user_encoder: summarized, user_summarization: ema, ema_alpha: 0.1}
+
+seeds: [1]
+
+epochs: 2
+batch_size: 4096
+patience: 1
+max_parallel_mlp: 1
+
+# Dates adapted to the Feb 20 - Mar 16 data window:
+#   train  : 2026-02-20 – 2026-03-04
+#   val    : 2026-03-04 – 2026-03-10
+#   holdout: 2026-03-10 – end
+extra_cli_args:
+  - --train-start
+  - 2026-02-20
+  - --val-start
+  - 2026-03-04
+  - --holdout-start
+  - 2026-03-10
+  - --holdout-user-fraction
+  - 0.5
