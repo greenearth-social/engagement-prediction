@@ -39,7 +39,18 @@ seeds: [1, 2]
 epochs: 100
 batch_size: 4096
 patience: 20
-max_parallel_mlp: 2
+
+# NOTE (2026-04-30): set to 1 after the first launch attempt OOMed during
+# the *holdout-prediction* sub-phase of Stage 4.  Two parallel cli.py
+# processes each tried to materialise the 3.08M-row holdout_unseen_users
+# SummarizedEngagementDataset (~25 GB/process footprint), exhausting the
+# 102 GB box even though epoch training itself ran fine at parallelism 2.
+# Running one cell at a time gives the holdout-pred step the whole box.
+# See 260428_like_biases/jobs/0004_sweep01_holdout_oom.md for the full
+# analysis.  For sweep 02's 36-cell scale we will restore parallelism
+# once the `--skip-holdout-pred` flag + sequential Phase C.5 land
+# (rung 3 of the 0004 plan).
+max_parallel_mlp: 1
 
 # CLI passthrough for the prep stages (Stage 2 + Stage 3).
 # --train-start is required when starting mid-pipeline (posts_start / likes_start
