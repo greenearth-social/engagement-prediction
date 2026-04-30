@@ -24,12 +24,14 @@ import json
 import copy
 
 from utils.pipeline import registry as reg
+from utils.pipeline.dependencies import (
+    pin_lineage_aligned_inputs,
+    validate_explicit_prior_pin_consistency,
+)
 from utils.experiment_tracking import build_experiment_tracker
 from utils.pipeline.core import (
     Context,
     generate_run_timestamp,
-    DEFAULT_ARTIFACTS_DIR,
-    DEFAULT_RUNS_DIR,
     LINEAGE_FILENAME,
     new_pipeline_run_dir,
     ensure_pipeline_run_dir,
@@ -577,6 +579,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
         ctx.prior_outputs["03_user_history"] = prior_03_user_history
     if prior_04_train is not None:
         ctx.prior_outputs["04_train"] = prior_04_train
+    validate_explicit_prior_pin_consistency(ctx)
     
     model_type = args.model_type
 
@@ -651,6 +654,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
             }
             label = label_map.get(key, f"Stage {idx+1}: {key}…")
             print(f"\n[{idx+1}/5] ▶️  {label}")
+            pin_lineage_aligned_inputs(ctx, key, stage_folder)
             reg.run_stage(key, ctx, args)
     finally:
         ctx.tracker.close()
