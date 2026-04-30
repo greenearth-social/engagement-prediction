@@ -1092,12 +1092,15 @@ def _load_inferences_core_polars(
 
     # Decode the JSON struct column.  We do this in Series mode (rather than
     # Expr mode) because Series.str.json_decode auto-infers the schema from
-    # the full column with no arguments.  The previous two-step approach
-    # sampled only the first 100 non-null rows; if a rarely-set nested field
-    # was null in every one of those sampled rows but non-null somewhere
-    # later, decoding raised ``error deserializing value "..." as null``.
+    # Series.str.json_decode scans `infer_schema_length` rows (default 100)
+    # to build the JSON struct schema.  Some inference rows carry an extra
+    # ``_truncated`` field on the external-description sub-structs that is
+    # absent in the first 100 non-null rows.  When a later row includes it,
+    # Polars raises "extra field in struct data: _truncated".  Passing
+    # ``infer_schema_length=None`` forces a full-column scan so the schema
+    # always includes every field present anywhere in the column.
     if len(inferences_df) > 0:
-        decoded = inferences_df["inferences"].str.json_decode()
+        decoded = inferences_df["inferences"].str.json_decode(infer_schema_length=None)
         inferences_df = inferences_df.with_columns(decoded.alias("inferences"))
 
     n_posts_core = len(posts_core_df)
