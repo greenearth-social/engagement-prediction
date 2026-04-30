@@ -1,28 +1,20 @@
 import base64
 import struct
-import sys
-import types
 import zlib
 
 import pytest
+import shared
 
 from shared.input_data_helpers import (
     _decompress_and_unpack_embedding,
     _extract_compressed_embedding_vector_from_struct,
-    _is_embedding_struct,
+    classify_history_embeddings_shape,
     get_embedding_dim_for_known_model,
     get_expanded_embedding_vector,
     get_padded_embedding_history_and_mask,
-    get_user_tower_input_from_single_raw_history_embeddings,
-    query_user_tower_with_processed_history_embeddings,
-    get_user_tower_input_from_raw_history_embeddings,
+    get_padded_embedding_history_and_mask_batched,
 )
 
-
-def _encode_embedding(vec: list[float]) -> str:
-    raw = struct.pack(f"<{len(vec)}f", *vec)
-    compressed = zlib.compress(raw)
-    return base64.b85encode(compressed).decode()
 
 def test_get_embedding_value_for_model_dicts():
     embeddings = [
@@ -46,6 +38,13 @@ def test_get_embedding_value_for_model_list_or_tuple_items():
         ["target", "y"],
     ]
     assert _extract_compressed_embedding_vector_from_struct(embeddings_lists, "target") == "y"
+
+    embeddings_mixed = [
+        None,
+        ["too-short"],
+        ("target", "y", "extra"),
+    ]
+    assert _extract_compressed_embedding_vector_from_struct(embeddings_mixed, "target") == "y"
 
 
 def test_get_embedding_value_for_model_object_items():
@@ -128,227 +127,110 @@ def test_get_padded_embedding_history_and_mask_raises_on_embed_dim_mismatch():
         get_padded_embedding_history_and_mask([[1.0, 2.0, 3.0]], max_history_len=2, embed_dim=2)
 
 
-def test_is_embedding_struct_heuristics():
-    assert _is_embedding_struct([{"key": "a", "value": "b"}]) is True
-    assert _is_embedding_struct([("a", "b")]) is True
-    assert _is_embedding_struct([["a", "b"]]) is True
-
-    class _Item:
-        def __init__(self):
-            self.key = "a"
-            self.value = "b"
-
-    assert _is_embedding_struct([_Item()]) is True
-    assert _is_embedding_struct([]) is False
-    assert _is_embedding_struct(None) is False
-    assert _is_embedding_struct([{"nope": 1}]) is False
-    assert _is_embedding_struct(["a"]) is False
+def test_classify_history_embeddings_shape_covers_public_shapes():
+    assert classify_history_embeddings_shape([]) == "single_empty"
+    assert classify_history_embeddings_shape([[]]) == "single_empty"
+    assert classify_history_embeddings_shape([[1.0, 2.0], [3.0, 4.0]]) == "single_history"
+    assert classify_history_embeddings_shape([[], [[1.0, 2.0]]]) == "batched_history"
+    assert classify_history_embeddings_shape([[[1.0, 2.0]], [[3.0, 4.0]]]) == "batched_history"
 
 
-def test_get_user_tower_input_filters_padding_and_mask():
-    embedding_model = "model_b"
+def test_classify_history_embeddings_shape_rejects_invalid_inputs():
+    with pytest.raises(ValueError, match="history_embeddings must be a list"):
+        classify_history_embeddings_shape("not-a-list")
 
-    raw_history_embeddings = [
-        [
-            {"key": "other", "value": _encode_embedding([9.9])},
-            {"key": embedding_model, "value": _encode_embedding([0.1, 0.2, 0.3])},
-        ],
-        [{"key": "other", "value": _encode_embedding([1.0, 2.0, 3.0])}],  # missing model -> dropped
-        None,  # dropped
-        [{"key": embedding_model, "value": _encode_embedding([0.4, 0.5, 0.6])}],
-    ]
-
-    padded, mask = get_user_tower_input_from_single_raw_history_embeddings(
-        raw_history_embeddings=raw_history_embeddings,
-        embedding_model=embedding_model,
-        max_history_len=4,
-        embed_dim=3,
-    )
-
-    assert padded.shape == (4, 3)
-    assert padded.dtype == "float32"
-    assert mask.shape == (4,)
-    assert mask.dtype == bool
-
-    assert padded[0].tolist() == pytest.approx([0.1, 0.2, 0.3], rel=1e-6, abs=1e-6)
-    assert padded[1].tolist() == pytest.approx([0.4, 0.5, 0.6], rel=1e-6, abs=1e-6)
-    assert padded[2].tolist() == pytest.approx([0.0, 0.0, 0.0], rel=0, abs=0)
-    assert padded[3].tolist() == pytest.approx([0.0, 0.0, 0.0], rel=0, abs=0)
-
-    assert mask.tolist() == [True, True, False, False]
+    with pytest.raises(ValueError, match="history_embeddings must be a list of lists"):
+        classify_history_embeddings_shape([1.0, 2.0])
 
 
-def test_get_user_tower_input_truncates_to_max_history_len():
-    embedding_model = "model_b"
-    raw_history_embeddings = [
-        [{"key": embedding_model, "value": _encode_embedding([float(i), float(i + 1), float(i + 2)])}]
-        for i in range(10, 15)
-    ]
-
-    padded, mask = get_user_tower_input_from_single_raw_history_embeddings(
-        raw_history_embeddings=raw_history_embeddings,
-        embedding_model=embedding_model,
+def test_get_padded_embedding_history_and_mask_batched_accepts_single_empty_history():
+    padded, mask = get_padded_embedding_history_and_mask_batched(
+        [],
         max_history_len=3,
-        embed_dim=3,
+        embed_dim=2,
     )
-
-    assert padded.shape == (3, 3)
-    assert mask.tolist() == [True, True, True]
-    assert padded[0].tolist() == pytest.approx([10.0, 11.0, 12.0], rel=1e-6, abs=1e-6)
-    assert padded[1].tolist() == pytest.approx([11.0, 12.0, 13.0], rel=1e-6, abs=1e-6)
-    assert padded[2].tolist() == pytest.approx([12.0, 13.0, 14.0], rel=1e-6, abs=1e-6)
+    assert padded == [[[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]]
+    assert mask == [[False, False, False]]
 
 
-def test_get_user_tower_input_raises_on_embed_dim_mismatch():
-    embedding_model = "model_b"
-    raw_history_embeddings = [
-        [{"key": embedding_model, "value": _encode_embedding([1.0, 2.0])}],
+def test_get_padded_embedding_history_and_mask_batched_accepts_single_history():
+    padded, mask = get_padded_embedding_history_and_mask_batched(
+        [[1.0, 2.0], [3.0, 4.0]],
+        max_history_len=3,
+        embed_dim=2,
+    )
+    assert padded == [[[1.0, 2.0], [3.0, 4.0], [0.0, 0.0]]]
+    assert mask == [[True, True, False]]
+
+
+def test_get_padded_embedding_history_and_mask_batched_accepts_batched_histories_and_normalizes_empty_entries():
+    padded, mask = get_padded_embedding_history_and_mask_batched(
+        [[], [[1.0, 2.0], [3.0, 4.0]], [[]]],
+        max_history_len=3,
+        embed_dim=2,
+    )
+    assert padded == [
+        [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+        [[1.0, 2.0], [3.0, 4.0], [0.0, 0.0]],
+        [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+    ]
+    assert mask == [
+        [False, False, False],
+        [True, True, False],
+        [False, False, False],
     ]
 
-    with pytest.raises(ValueError, match="embed_dim"):
-        get_user_tower_input_from_single_raw_history_embeddings(
-            raw_history_embeddings=raw_history_embeddings,
-            embedding_model=embedding_model,
-            max_history_len=3,
-            embed_dim=3,
-        )
 
-
-def test_get_user_tower_input_all_missing_returns_zeros():
-    embedding_model = "model_b"
-    raw_history_embeddings = [
-        None,
-        [{"key": "other", "value": _encode_embedding([9.9, 9.8, 9.7])}],
-    ]
-
-    padded, mask = get_user_tower_input_from_single_raw_history_embeddings(
-        raw_history_embeddings=raw_history_embeddings,
-        embedding_model=embedding_model,
+def test_get_padded_embedding_history_and_mask_batched_accepts_single_nested_empty_history():
+    padded, mask = get_padded_embedding_history_and_mask_batched(
+        [[]],
         max_history_len=2,
-        embed_dim=3,
+        embed_dim=2,
     )
+    assert padded == [[[0.0, 0.0], [0.0, 0.0]]]
+    assert mask == [[False, False]]
 
-    assert padded.tolist() == [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
-    assert mask.tolist() == [False, False]
 
-
-def test_get_user_tower_input_raises_on_non_zlib_embedding():
-    embedding_model = "model_b"
-    raw = struct.pack("<3f", 0.1, 0.2, 0.3)
-    not_compressed = base64.b85encode(raw).decode()
-    raw_history_embeddings = [[{"key": embedding_model, "value": not_compressed}]]
-
-    with pytest.raises(zlib.error):
-        get_user_tower_input_from_single_raw_history_embeddings(
-            raw_history_embeddings=raw_history_embeddings,
-            embedding_model=embedding_model,
+def test_get_padded_embedding_history_and_mask_batched_rejects_non_list_top_level():
+    with pytest.raises(ValueError, match="history_embeddings must be a list"):
+        get_padded_embedding_history_and_mask_batched(
+            "not-a-list",
             max_history_len=3,
-            embed_dim=3,
+            embed_dim=2,
         )
 
 
-def test_query_user_tower_with_processed_history_embeddings_success(monkeypatch):
-    inference_url = "http://example.test/predict"
-    padded = [[[0.0, 0.0], [1.0, 1.0]]]
-    mask = [[True, False]]
-
-    class _Resp:
-        status_code = 200
-        text = "ok"
-
-        def json(self):
-            return {"outputs": [[0.1, 0.2]]}
-
-    def _post(url, json, timeout):
-        assert url == inference_url
-        assert json == {"history_embeddings": padded, "history_mask": mask}
-        assert timeout == 30
-        return _Resp()
-
-    requests_mod = types.ModuleType("requests")
-    requests_mod.post = _post  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "requests", requests_mod)
-
-    out = query_user_tower_with_processed_history_embeddings(padded, mask, inference_url)
-    assert out == [[0.1, 0.2]]
+def test_get_padded_embedding_history_and_mask_batched_rejects_top_level_non_list_entries():
+    with pytest.raises(ValueError, match="history_embeddings must be a list of lists"):
+        get_padded_embedding_history_and_mask_batched(
+            [1.0, 2.0],
+            max_history_len=3,
+            embed_dim=2,
+        )
 
 
-def test_query_user_tower_with_processed_history_embeddings_non_200(monkeypatch):
-    inference_url = "http://example.test/predict"
-
-    class _Resp:
-        status_code = 500
-        text = "boom"
-
-        def json(self):
-            return {"outputs": []}
-
-    requests_mod = types.ModuleType("requests")
-    requests_mod.post = lambda *_args, **_kwargs: _Resp()  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "requests", requests_mod)
-
-    with pytest.raises(ValueError, match="status code 500"):
-        query_user_tower_with_processed_history_embeddings([[[0.0]]], [[True]], inference_url)
+def test_get_padded_embedding_history_and_mask_batched_rejects_mixed_batch_shapes():
+    with pytest.raises(ValueError, match="batched history_embeddings must be a list of user histories"):
+        get_padded_embedding_history_and_mask_batched(
+            [[], [1.0, 2.0]],
+            max_history_len=3,
+            embed_dim=2,
+        )
 
 
-def test_query_user_tower_with_processed_history_embeddings_invalid_json(monkeypatch):
-    inference_url = "http://example.test/predict"
-
-    class _Resp:
-        status_code = 200
-        text = "<html>not json</html>"
-
-        def json(self):
-            raise ValueError("no json")
-
-    requests_mod = types.ModuleType("requests")
-    requests_mod.post = lambda *_args, **_kwargs: _Resp()  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "requests", requests_mod)
-
-    with pytest.raises(ValueError, match="not valid JSON"):
-        query_user_tower_with_processed_history_embeddings([[[0.0]]], [[True]], inference_url)
-
-
-def test_get_user_tower_input_from_raw_history_embeddings_single_and_batched():
-    embedding_model = "model_b"
-    max_history_len = 3
-    embed_dim = 3
-
-    raw_single = [
-        [{"key": embedding_model, "value": _encode_embedding([0.1, 0.2, 0.3])}],
-        [{"key": embedding_model, "value": _encode_embedding([0.4, 0.5, 0.6])}],
+def test_shared_package_re_exports_public_helpers():
+    assert shared.__all__ == [
+        "get_expanded_embedding_vector",
+        "get_padded_embedding_history_and_mask",
+        "get_padded_embedding_history_and_mask_batched",
+        "get_embedding_dim_for_known_model",
+        "classify_history_embeddings_shape",
     ]
-
-    padded_single, mask_single = get_user_tower_input_from_raw_history_embeddings(
-        raw_single, embedding_model, max_history_len, embed_dim
+    assert shared.get_expanded_embedding_vector is get_expanded_embedding_vector
+    assert shared.get_padded_embedding_history_and_mask is get_padded_embedding_history_and_mask
+    assert (
+        shared.get_padded_embedding_history_and_mask_batched
+        is get_padded_embedding_history_and_mask_batched
     )
-    assert mask_single == [[True, True, False]]
-    assert padded_single[0][0] == pytest.approx([0.1, 0.2, 0.3], rel=1e-6, abs=1e-6)
-    assert padded_single[0][1] == pytest.approx([0.4, 0.5, 0.6], rel=1e-6, abs=1e-6)
-    assert padded_single[0][2] == pytest.approx([0.0, 0.0, 0.0], rel=0, abs=0)
-
-    raw_batched = [
-        raw_single,
-        None,  # should turn into all-zero padded history and all-false mask
-    ]
-    padded_batched, mask_batched = get_user_tower_input_from_raw_history_embeddings(
-        raw_batched, embedding_model, max_history_len, embed_dim
-    )
-    assert len(padded_batched) == 2
-    assert mask_batched[0] == [True, True, False]
-    assert mask_batched[1] == [False, False, False]
-    assert padded_batched[1] == [[0.0, 0.0, 0.0]] * max_history_len
-
-
-def test_get_user_tower_input_from_raw_history_embeddings_rejects_invalid_batched_shape():
-    with pytest.raises(ValueError, match="Invalid batched input"):
-        get_user_tower_input_from_raw_history_embeddings(
-            [[123]], embedding_model="model_b", max_history_len=3, embed_dim=3
-        )
-
-
-def test_get_user_tower_input_from_raw_history_embeddings_rejects_empty():
-    with pytest.raises(ValueError, match="non-empty list"):
-        get_user_tower_input_from_raw_history_embeddings(
-            [], embedding_model="model_b", max_history_len=3, embed_dim=3
-        )
+    assert shared.get_embedding_dim_for_known_model is get_embedding_dim_for_known_model
+    assert shared.classify_history_embeddings_shape is classify_history_embeddings_shape
