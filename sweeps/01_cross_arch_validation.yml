@@ -23,7 +23,7 @@ sweep_name: 01_cross_arch_validation
 # Path to a Stage 1 ingestion run (relative to eng_pred_repo or absolute).
 # Points at the April 2026 ingestion (Apr 1-28, 100k users, 500 likes/user).
 # UPDATE the timestamp suffix once Stage 1 finishes on the GPU machine.
-ingestion_run: outputs/FILL_IN_AFTER_INGESTION
+ingestion_run: outputs/20260429_143355
 
 caps:
   - null
