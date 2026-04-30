@@ -1090,15 +1090,15 @@ def _load_inferences_core_polars(
         .collect(engine="streaming")
     )
 
-    # Decode the JSON struct column.  We use ``infer_schema_length=None`` to
-    # scan the entire column when inferring the struct schema; sampling only
-    # the first 100 rows (as we used to) caused failures when a rarely-set
-    # nested field was null in every sampled row but non-null in some later
-    # row, producing ``error deserializing value "..." as null``.
+    # Decode the JSON struct column.  We do this in Series mode (rather than
+    # Expr mode) because Series.str.json_decode auto-infers the schema from
+    # the full column with no arguments.  The previous two-step approach
+    # sampled only the first 100 non-null rows; if a rarely-set nested field
+    # was null in every one of those sampled rows but non-null somewhere
+    # later, decoding raised ``error deserializing value "..." as null``.
     if len(inferences_df) > 0:
-        inferences_df = inferences_df.with_columns(
-            pl.col("inferences").str.json_decode(infer_schema_length=None)
-        )
+        decoded = inferences_df["inferences"].str.json_decode()
+        inferences_df = inferences_df.with_columns(decoded.alias("inferences"))
 
     n_posts_core = len(posts_core_df)
     n_matched = len(inferences_df)
