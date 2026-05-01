@@ -305,49 +305,6 @@ def _log_and_plot_history_distribution(
     logger.info(f"✓ Saved history distribution plot to {plot_path.name}")
 
 
-def _generate_author_idx_mapping(
-    directory_df: pl.DataFrame, 
-    likes_lf: pl.LazyFrame, 
-    logger: logging.Logger
-) -> pl.DataFrame:
-    """
-    Build a train-time mapping from embedding index to dense author index.
-
-    The mapping is intentionally restricted to embedding indices that appear in
-    the training split's prior history. This prevents validation/test-only
-    authors from expanding the author vocabulary seen during training.
-
-    ``author_occurrence_count`` counts how many total prior-history positions in
-    the training split resolve to a given author. This is not the number of
-    unique emb_idx values; repeated appearances of the same emb_idx in train
-    history contribute multiple counts.
-
-    Returns:
-        DataFrame with columns
-        [emb_idx, author_did, author_idx, author_occurrence_count], where
-        author_idx is a dense UInt32 id derived from author_did.
-    """
-    unique_emb_indices_df = directory_df.filter(
-        pl.col("split") == "train"
-    ).select(
-        pl.col("prior_emb_indices").explode().drop_nulls().alias("emb_idx")
-    ).group_by("emb_idx").agg(pl.len().alias("emb_idx_count"))
-    
-    logger.info(f"Unique embedding indices in training history: {len(unique_emb_indices_df):,}")
-    
-    author_idx_df = unique_emb_indices_df.join(
-        likes_lf.select("emb_idx", "author_did").unique().collect(),
-        on="emb_idx",
-    ).with_columns(
-        pl.col("author_did").rank("dense").cast(pl.UInt32).alias("author_idx"),
-        pl.col("emb_idx_count").sum().over("author_did").alias("author_occurrence_count")
-    ).drop("emb_idx_count")
-
-    logger.info(f"Unique embedding indices after joining to likes_core: {len(author_idx_df):,}")
-
-    return author_idx_df
-
-
 def _add_author_indices_to_history(
     directory_df: pl.DataFrame,
     author_idx_df: pl.DataFrame,
@@ -473,6 +430,19 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     validate_dataframe_schema(targets_lf, targets_schema)
     logger.info("✓ target_posts schema validated")
 
+    log_operation_start('Load author_idx', 'STAGE_03_USER_HISTORY', logger)
+    author_idx_lf: pl.LazyFrame = load_parquet_from_prior(prior_target_posts_dir, "author_idx_")
+
+    # Validate author idx schema
+    author_idx_schema = {
+        "emb_idx": int,
+        "author_did": str,
+        "author_train_count": int,
+        "author_idx": int,
+    }
+    validate_dataframe_schema(author_idx_lf, author_idx_schema)
+    logger.info("✓ author_idx schema validated")
+
     mem_tracker.checkpoint("after_load_inputs", quiet=True)
 
     # Log input sizes (collect counts efficiently)
@@ -504,11 +474,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # Log and plot the per-user history distribution before/after capping
     _log_and_plot_history_distribution(directory_df, max_prior_likes, out_dir, logger)
 
-    author_idx_df = _generate_author_idx_mapping(directory_df, likes_lf, logger)
-    author_output_path = out_dir / f"author_idx_mapping_{out_dir.name}.parquet"
-    author_idx_df.write_parquet(author_output_path, compression="zstd")
-
-    user_history_df = _add_author_indices_to_history(directory_df, author_idx_df, logger)
+    user_history_df = _add_author_indices_to_history(directory_df, author_idx_lf.collect(), logger)
 
     # Select only the required output columns (drop analysis columns)
     user_history_df = user_history_df.select(["target_did", "like_uri", "prior_emb_indices", "prior_author_indices"])
