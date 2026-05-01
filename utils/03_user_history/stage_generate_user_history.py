@@ -160,7 +160,7 @@ def _build_user_history_directory(
     # though (target_did, like_uri) is the official join key.  Downstream
     # consumers should join on the key columns, but positional alignment can be
     # relied upon as an optimization if needed.
-    all_target_keys = targets_indexed.select(["target_idx", "target_did", "like_uri", "seen_at", "split"])
+    all_target_keys = targets_indexed.select(["target_idx", "target_did", "like_uri", "seen_at"])
     directory_lf = all_target_keys.join(
         directory_lf,
         on="target_idx",
@@ -171,7 +171,7 @@ def _build_user_history_directory(
         .otherwise(pl.col("prior_emb_indices").cast(pl.List(pl.UInt32)))
         .alias("prior_emb_indices"),
         pl.col("raw_prior_count").fill_null(0),
-    ).select(["target_did", "like_uri", "seen_at", "prior_emb_indices", "raw_prior_count", "split"])
+    ).select(["target_did", "like_uri", "seen_at", "prior_emb_indices", "raw_prior_count"])
 
     return directory_lf
 
