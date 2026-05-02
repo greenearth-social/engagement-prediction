@@ -45,7 +45,14 @@ CONFIG_PATH_ABS="$(cd "$(dirname "$CONFIG_PATH")" && pwd)/$(basename "$CONFIG_PA
 
 # ── Parse YAML via Python helper ───────────────────────────────────────
 TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
+SIDECAR_PID=""
+cleanup() {
+  if [[ -n "${SIDECAR_PID}" ]]; then
+    kill "$SIDECAR_PID" 2>/dev/null || true
+  fi
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
 PLAN_PATH="$TMP_DIR/plan.tsv"
 
 # We need INGESTION_RUN and SWEEP_NAME first to compute SWEEP_ROOT.
@@ -104,6 +111,19 @@ log "═════════════════════════
 # canonical record of what we ran lives next to the artifacts.
 cp "$CONFIG_PATH_ABS" "$SWEEP_ROOT/config.yml"
 cp "$PLAN_PATH" "$SWEEP_ROOT/plan.tsv"
+
+# ── Memory sidecar ─────────────────────────────────────────────────────
+# Launches a background process that snapshots `free -h` + top-RSS
+# processes every 30 s into $LOG_DIR/mem_<ts>.log.  See
+# 260428_like_biases/jobs/0006_sweep02_memory_prep.md for context.
+# Killed on EXIT via the cleanup trap above.
+if [[ -x "$SCRIPT_DIR/scripts/mem_sidecar.sh" ]]; then
+  "$SCRIPT_DIR/scripts/mem_sidecar.sh" "$LOG_DIR" 30 &
+  SIDECAR_PID=$!
+  log "Memory sidecar PID: $SIDECAR_PID -> $LOG_DIR/mem_*.log"
+else
+  log "Memory sidecar script not found/executable; continuing without it."
+fi
 
 # ── Helper: extract a JSON arg into bash ──────────────────────────────
 json_get() {
@@ -200,7 +220,7 @@ run_train_cell() {
   local CMD=(
     python3 cli.py
     --output-dir "$CELL_DIR"
-    --start-from train --stop-after evaluate
+    --start-from train
     --model-type "$MODEL_TYPE"
     --run-tag "$RUN_TAG"
     --random-seed "$SEED"
@@ -208,6 +228,15 @@ run_train_cell() {
     --batch-size "$BATCH_SIZE_LOCAL"
     --patience "$PATIENCE_LOCAL"
   )
+
+  # When skip_holdout_pred_during_train is active, stop at train so Stage 5 eval
+  # does not run before Phase C.5 has produced the holdout parquets.
+  # Stage 5 eval (Phase D) becomes a manual step to run after Phase C.5 completes.
+  if [[ "${SKIP_HOLDOUT_PRED_DURING_TRAIN:-0}" == "1" ]]; then
+    CMD+=(--stop-after train --skip-holdout-pred)
+  else
+    CMD+=(--stop-after evaluate)
+  fi
 
   if [[ -n "$USER_ENCODER" ]]; then
     CMD+=(--user-encoder "$USER_ENCODER")
@@ -309,6 +338,55 @@ while IFS=$'\t' read -r KIND PHASE CAP_LABEL CELL_DIR RUN_TAG SEED JSON_ARGS; do
   fi
   rm -f "$STATUS_FILE"
 done < "$PLAN_PATH"
+
+# ── Phase C.5: Holdout prediction (sequential) ────────────────────────
+# Only runs when --skip-holdout-pred was passed during training (else the
+# train stages already wrote predictions/holdout_*.parquet).  Sequential
+# across all cells to keep RSS bounded; idempotent — skips cells that
+# already have holdout parquets.
+if [[ "${SKIP_HOLDOUT_PRED_DURING_TRAIN:-0}" == "1" ]]; then
+  log ""
+  log "╔══════════════════════════════════════════════════════════════╗"
+  log "║  Phase C.5: Holdout prediction (sequential)                 ║"
+  log "╚══════════════════════════════════════════════════════════════╝"
+
+  HOLDOUT_OK=0
+  HOLDOUT_FAIL=0
+  HOLDOUT_SKIPPED=0
+  while IFS=$'\t' read -r KIND PHASE CAP_LABEL CELL_DIR RUN_TAG SEED JSON_ARGS; do
+    [[ "$KIND" != "TRAIN" ]] && continue
+
+    # Resolve the actual training cell directory (timestamp-prefixed).
+    TRAIN_CELL_DIR="$(ls -dt "$CELL_DIR/04_train"/*_"${RUN_TAG}" 2>/dev/null | head -1 || true)"
+    if [[ -z "$TRAIN_CELL_DIR" || ! -d "$TRAIN_CELL_DIR" ]]; then
+      log "[$CAP_LABEL/$RUN_TAG] holdout-pred SKIP — no train cell dir found"
+      (( HOLDOUT_SKIPPED++ )) || true
+      continue
+    fi
+
+    PRED_PARQ="$TRAIN_CELL_DIR/predictions/holdout_unseen_users.parquet"
+    if [[ -f "$PRED_PARQ" ]]; then
+      log "[$CAP_LABEL/$RUN_TAG] holdout-pred already present, skipping"
+      (( HOLDOUT_SKIPPED++ )) || true
+      continue
+    fi
+
+    HOLDOUT_LOG="$LOG_DIR/holdout_${CAP_LABEL}_${RUN_TAG}.log"
+    log "[$CAP_LABEL/$RUN_TAG] Running holdout-pred -> $HOLDOUT_LOG"
+    if python3 scripts/run_holdout_pred.py "$TRAIN_CELL_DIR" > "$HOLDOUT_LOG" 2>&1; then
+      log "[$CAP_LABEL/$RUN_TAG] holdout-pred ✓"
+      (( HOLDOUT_OK++ )) || true
+    else
+      log "[$CAP_LABEL/$RUN_TAG] holdout-pred ✗ (see $HOLDOUT_LOG)"
+      (( HOLDOUT_FAIL++ )) || true
+    fi
+  done < "$PLAN_PATH"
+
+  log "Phase C.5 complete: ok=$HOLDOUT_OK skipped=$HOLDOUT_SKIPPED failed=$HOLDOUT_FAIL"
+  if (( HOLDOUT_FAIL > 0 )); then
+    (( FAILED += HOLDOUT_FAIL )) || true
+  fi
+fi
 
 # ── Summary ────────────────────────────────────────────────────────────
 TOTAL=$(( N_MLP + N_TT ))

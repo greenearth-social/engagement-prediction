@@ -97,6 +97,12 @@ DEFAULTS: Dict[str, Any] = {
     "no_plots": False,
     "no_save_model": False,
     "disable_progress": False,  # Disable progress bars during training
+    # Stage 4 - skip holdout prediction during training (memory protection at sweep scale).
+    # When True, training stages save the checkpoint + train/val predictions but do NOT
+    # materialize the holdout SummarizedEngagementDataset / generate
+    # predictions/holdout_*.parquet.  Generate them post-hoc via
+    # scripts/run_holdout_pred.py (sequentially, to keep RSS bounded).
+    "skip_holdout_pred": False,
     # Stage 4 (train) - DataLoader settings
     "num_dataloader_workers": 4,
     "dataloader_pin_memory": True,
@@ -618,6 +624,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Skip saving model checkpoints")
     _add_arg_with_default(p_all, "--disable-progress", action="store_true", default=argparse.SUPPRESS,
                           help_text="Disable progress bars during training")
+    _add_arg_with_default(p_all, "--skip-holdout-pred", action="store_true", default=argparse.SUPPRESS,
+                          help_text="Skip the holdout-prediction sub-phase of training "
+                                    "(memory protection at sweep scale; generate holdout "
+                                    "parquets later via scripts/run_holdout_pred.py)")
     # Stage 4 (train) - DataLoader settings
     _add_arg_with_default(p_all, "--num-dataloader-workers", type=int, default=argparse.SUPPRESS,
                           help_text="Number of DataLoader worker processes")
