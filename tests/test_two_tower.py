@@ -8,7 +8,9 @@ import torch.nn as nn
 stage_train_two_tower = importlib.import_module("utils.04_train.stage_train_two_tower")
 PostTower = stage_train_two_tower.PostTower
 TwoTowerModel = stage_train_two_tower.TwoTowerModel
-HistoryAuthorFeatureEncoder = stage_train_two_tower.HistoryAuthorFeatureEncoder
+PostAuthorFeatureEncoder = stage_train_two_tower.PostAuthorFeatureEncoder
+HistoryAuthorUserTowerWrapper = stage_train_two_tower.HistoryAuthorUserTowerWrapper
+PostAuthorPostTowerWrapper = stage_train_two_tower.PostAuthorPostTowerWrapper
 
 
 # =============================================================================
@@ -1012,8 +1014,8 @@ def test_two_tower_different_num_heads():
         assert scores.shape == (batch_size,)
 
 
-def test_history_author_feature_encoder_zeroes_padding_row():
-    encoder = HistoryAuthorFeatureEncoder(
+def test_post_author_feature_encoder_zeroes_padding_row():
+    encoder = PostAuthorFeatureEncoder(
         post_embedding_dim=16,
         author_table_num_rows=8,
         author_embedding_dim=4,
@@ -1024,7 +1026,7 @@ def test_history_author_feature_encoder_zeroes_padding_row():
     assert torch.any(encoder.author_embedding.weight[1] != 0)
 
 
-def test_two_tower_author_embeddings_only_affect_user_history_path():
+def test_two_tower_author_embeddings_affect_user_and_target_post_paths():
     model = TwoTowerModel(
         post_embedding_dim=16,
         shared_dim=8,
@@ -1050,14 +1052,19 @@ def test_two_tower_author_embeddings_only_affect_user_history_path():
     history_mask = torch.tensor([[True, True, False], [True, True, True]])
     history_author_indices = torch.tensor([[2, 3, 0], [4, 1, 5]], dtype=torch.long)
     post_embeddings = torch.randn(batch_size, 16)
+    target_author_indices = torch.tensor([2, 5], dtype=torch.long)
 
     user_without_authors = model.user_tower(history_embeddings, history_mask)
     user_with_authors = model.encode_user(history_embeddings, history_mask, history_author_indices)
-    post_direct = model.encode_post(post_embeddings)
+    post_without_authors = model.post_tower(post_embeddings)
+    post_with_authors = model.encode_post(post_embeddings, target_author_indices)
+
+    assert model.post_author_feature_encoder is not None
     post_forward = model.post_tower(post_embeddings)
 
     assert not torch.allclose(user_without_authors, user_with_authors)
-    assert torch.allclose(post_direct, post_forward)
+    assert not torch.allclose(post_without_authors, post_with_authors)
+    assert torch.allclose(post_without_authors, post_forward)
 
 
 def test_two_tower_author_dropout_only_remaps_supported_rows():
@@ -1083,16 +1090,121 @@ def test_two_tower_author_dropout_only_remaps_supported_rows():
 
     history_embeddings = torch.randn(1, 4, 8)
     history_author_indices = torch.tensor([[0, 1, 2, 5]], dtype=torch.long)
-    fused = model.history_author_feature_encoder(history_embeddings, history_author_indices)
+    assert model.post_author_feature_encoder is not None
+    fused = model.post_author_feature_encoder(history_embeddings, history_author_indices)
 
-    remapped = model.history_author_feature_encoder.author_embedding(
+    remapped = model.post_author_feature_encoder.author_embedding(
         torch.tensor([[0, 1, 1, 1]], dtype=torch.long)
     )
-    expected = model.history_author_feature_encoder.fusion_layer(
+    expected = model.post_author_feature_encoder.fusion_layer(
         torch.cat([history_embeddings, remapped], dim=-1)
     )
 
     assert torch.allclose(fused, expected)
+
+
+def test_two_tower_author_embeddings_require_target_author_indices():
+    model = TwoTowerModel(
+        post_embedding_dim=8,
+        shared_dim=4,
+        user_hidden_dim=16,
+        post_hidden_dim=8,
+        num_attention_heads=4,
+        num_attention_layers=1,
+        max_history_len=4,
+        dropout_rate=0.0,
+        similarity_temperature=1.0,
+        user_encoder_type="cross_attention",
+        use_post_encoder=True,
+        l2_normalize_embeddings=False,
+        use_author_embedding_table=True,
+        author_table_num_rows=6,
+        author_embedding_dim=3,
+        author_unknown_dropout_rate=0.0,
+    )
+
+    with pytest.raises(RuntimeError, match="target_author_indices"):
+        model.encode_post(torch.randn(2, 8))
+
+
+def test_two_tower_compute_loss_and_preds_with_author_embeddings():
+    model = TwoTowerModel(
+        post_embedding_dim=8,
+        shared_dim=4,
+        user_hidden_dim=16,
+        post_hidden_dim=8,
+        num_attention_heads=4,
+        num_attention_layers=1,
+        max_history_len=4,
+        dropout_rate=0.0,
+        similarity_temperature=1.0,
+        user_encoder_type="cross_attention",
+        use_post_encoder=True,
+        l2_normalize_embeddings=False,
+        use_author_embedding_table=True,
+        author_table_num_rows=6,
+        author_embedding_dim=3,
+        author_unknown_dropout_rate=0.0,
+    )
+
+    batch_size = 3
+    batch = {
+        "history_embeddings": torch.randn(batch_size, 4, 8),
+        "history_mask": torch.ones(batch_size, 4, dtype=torch.bool),
+        "target_post_embedding": torch.randn(batch_size, 8),
+        "history_author_indices": torch.tensor(
+            [[2, 3, 0, 0], [4, 1, 5, 0], [1, 1, 1, 1]],
+            dtype=torch.long,
+        ),
+        "target_post_author_idx": torch.tensor([2, 5, 1], dtype=torch.long),
+        "label": torch.tensor([1.0, 0.0, 1.0]),
+    }
+
+    loss, scores = model.compute_loss_and_preds(batch, device="cpu", embed_dim=8)
+
+    assert loss.shape == ()
+    assert torch.isfinite(loss)
+    assert scores.shape == (batch_size,)
+
+
+def test_author_enabled_tower_wrappers_are_torchscriptable():
+    model = TwoTowerModel(
+        post_embedding_dim=8,
+        shared_dim=4,
+        user_hidden_dim=16,
+        post_hidden_dim=8,
+        num_attention_heads=4,
+        num_attention_layers=1,
+        max_history_len=4,
+        dropout_rate=0.0,
+        similarity_temperature=1.0,
+        user_encoder_type="cross_attention",
+        use_post_encoder=True,
+        l2_normalize_embeddings=False,
+        use_author_embedding_table=True,
+        author_table_num_rows=6,
+        author_embedding_dim=3,
+        author_unknown_dropout_rate=0.0,
+    )
+    model.eval()
+
+    history_embeddings = torch.randn(2, 4, 8)
+    history_mask = torch.ones(2, 4, dtype=torch.bool)
+    history_author_indices = torch.tensor([[2, 3, 0, 0], [4, 1, 5, 0]], dtype=torch.long)
+    post_embeddings = torch.randn(2, 8)
+    target_author_indices = torch.tensor([2, 5], dtype=torch.long)
+
+    user_wrapper = HistoryAuthorUserTowerWrapper(model)
+    post_wrapper = PostAuthorPostTowerWrapper(model)
+
+    assert user_wrapper.post_author_feature_encoder is model.post_author_feature_encoder
+    assert post_wrapper.post_author_feature_encoder is model.post_author_feature_encoder
+
+    scripted_user = torch.jit.script(user_wrapper)
+    scripted_post = torch.jit.script(post_wrapper)
+
+    assert scripted_user(history_embeddings, history_mask, history_author_indices).shape == (2, 4)
+    assert scripted_post(post_embeddings, target_author_indices).shape == (2, 4)
 
 
 def test_two_tower_rejects_author_embeddings_for_summarized_encoder():

@@ -233,8 +233,8 @@ class L2NormalizedPostTower(nn.Module):
         return F.normalize(embeddings, p=2.0, dim=-1, eps=self.eps)
 
 
-class HistoryAuthorFeatureEncoder(nn.Module):
-    """Fuse history post content embeddings with per-author embeddings."""
+class PostAuthorFeatureEncoder(nn.Module):
+    """Fuse post content embeddings with per-author embeddings."""
 
     def __init__(
         self,
@@ -273,10 +273,9 @@ class HistoryAuthorFeatureEncoder(nn.Module):
 
     def forward(
         self,
-        history_embeddings: torch.Tensor,
-        history_author_indices: torch.Tensor,
+        post_embeddings: torch.Tensor,
+        author_indices: torch.Tensor,
     ) -> torch.Tensor:
-        author_indices = history_author_indices
         if self.training and self.author_unknown_dropout_rate > 0.0:
             eligible = author_indices > self.author_unk_idx
             if torch.any(eligible):
@@ -291,7 +290,7 @@ class HistoryAuthorFeatureEncoder(nn.Module):
                 )
 
         author_embeddings = self.author_embedding(author_indices)
-        fused_inputs = torch.cat([history_embeddings, author_embeddings], dim=-1)
+        fused_inputs = torch.cat([post_embeddings, author_embeddings], dim=-1)
         return self.fusion_layer(fused_inputs)
 
 
@@ -300,9 +299,9 @@ class HistoryAuthorUserTowerWrapper(nn.Module):
 
     def __init__(self, model: TwoTowerModel):
         super().__init__()
-        if model.history_author_feature_encoder is None:
+        if model.post_author_feature_encoder is None:
             raise ValueError("HistoryAuthorUserTowerWrapper requires author embeddings to be enabled")
-        self.history_author_feature_encoder = model.history_author_feature_encoder
+        self.post_author_feature_encoder = model.post_author_feature_encoder
         self.user_tower = model.user_tower
 
     def forward(
@@ -311,7 +310,7 @@ class HistoryAuthorUserTowerWrapper(nn.Module):
         history_mask: torch.Tensor,
         history_author_indices: torch.Tensor,
     ) -> torch.Tensor:
-        fused_history_embeddings = self.history_author_feature_encoder(
+        fused_history_embeddings = self.post_author_feature_encoder(
             history_embeddings,
             history_author_indices,
         )
@@ -320,6 +319,28 @@ class HistoryAuthorUserTowerWrapper(nn.Module):
             0.0,
         )
         return self.user_tower(fused_history_embeddings, history_mask)
+
+
+class PostAuthorPostTowerWrapper(nn.Module):
+    """Exportable post tower that includes target-post author fusion."""
+
+    def __init__(self, model: TwoTowerModel):
+        super().__init__()
+        if model.post_author_feature_encoder is None:
+            raise ValueError("PostAuthorPostTowerWrapper requires author embeddings to be enabled")
+        self.post_author_feature_encoder = model.post_author_feature_encoder
+        self.post_tower = model.post_tower
+
+    def forward(
+        self,
+        post_embeddings: torch.Tensor,
+        target_author_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        fused_post_embeddings = self.post_author_feature_encoder(
+            post_embeddings,
+            target_author_indices,
+        )
+        return self.post_tower(fused_post_embeddings)
 
 
 # =============================================================================
@@ -400,7 +421,7 @@ class TwoTowerModel(nn.Module):
         self.use_post_encoder = use_post_encoder
         self.l2_normalize_embeddings = bool(l2_normalize_embeddings)
         self.use_author_embedding_table = bool(use_author_embedding_table)
-        self.history_author_feature_encoder: Optional[HistoryAuthorFeatureEncoder] = None
+        self.post_author_feature_encoder: Optional[PostAuthorFeatureEncoder] = None
 
         if self.use_author_embedding_table:
             if user_encoder_type == "summarized":
@@ -409,7 +430,7 @@ class TwoTowerModel(nn.Module):
                 raise ValueError("author_table_num_rows must be provided and >= 2 when use_author_embedding_table is True")
             if author_embedding_dim is None or author_embedding_dim <= 0:
                 raise ValueError("author_embedding_dim must be provided and positive when use_author_embedding_table is True")
-            self.history_author_feature_encoder = HistoryAuthorFeatureEncoder(
+            self.post_author_feature_encoder = PostAuthorFeatureEncoder(
                 post_embedding_dim=post_embedding_dim,
                 author_table_num_rows=author_table_num_rows,
                 author_embedding_dim=author_embedding_dim,
@@ -495,9 +516,9 @@ class TwoTowerModel(nn.Module):
         """
         fused_history_embeddings = history_embeddings
         if self.use_author_embedding_table:
-            if history_author_indices is None or self.history_author_feature_encoder is None:
+            if history_author_indices is None or self.post_author_feature_encoder is None:
                 raise RuntimeError("history_author_indices are required when use_author_embedding_table is True")
-            fused_history_embeddings = self.history_author_feature_encoder(
+            fused_history_embeddings = self.post_author_feature_encoder(
                 history_embeddings,
                 history_author_indices,
             )
@@ -507,11 +528,17 @@ class TwoTowerModel(nn.Module):
             )
         return self.user_tower(fused_history_embeddings, history_mask)
 
-    def encode_post(self, post_embeddings: torch.Tensor) -> torch.Tensor:
+    def encode_post(
+        self,
+        post_embeddings: torch.Tensor,
+        target_author_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Encode post embeddings into shared space representation.
         
         Args:
             post_embeddings: Raw post embeddings [batch, input_dim]
+            target_author_indices: Author embedding table rows [batch], required
+                when author embeddings are enabled.
         
         Returns:
             Post vectors for dot product scoring.
@@ -519,7 +546,15 @@ class TwoTowerModel(nn.Module):
                 - otherwise: [batch, post_embedding_dim] (identity)
             When `l2_normalize_embeddings=True`, outputs are L2-normalized.
         """
-        return self.post_tower(post_embeddings)
+        fused_post_embeddings = post_embeddings
+        if self.use_author_embedding_table:
+            if target_author_indices is None or self.post_author_feature_encoder is None:
+                raise RuntimeError("target_author_indices are required when use_author_embedding_table is True")
+            fused_post_embeddings = self.post_author_feature_encoder(
+                post_embeddings,
+                target_author_indices,
+            )
+        return self.post_tower(fused_post_embeddings)
 
     def forward(
         self,
@@ -527,6 +562,7 @@ class TwoTowerModel(nn.Module):
         history_mask: torch.Tensor,
         post_embeddings: torch.Tensor,
         history_author_indices: Optional[torch.Tensor] = None,
+        target_author_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute engagement scores via dot product in shared space.
         
@@ -541,12 +577,16 @@ class TwoTowerModel(nn.Module):
                   at position 0 (and optionally padded to seq_len > 1).
             history_mask: History validity mask [batch, seq_len] (optional in summarized mode)
             post_embeddings: Target post embeddings [batch, input_dim]
+            history_author_indices: Author table rows aligned with history items,
+                required when author embeddings are enabled.
+            target_author_indices: Author table rows for target posts, required
+                when author embeddings are enabled.
         
         Returns:
             Raw engagement scores [batch] (logits before sigmoid)
         """
         user_emb = self.encode_user(history_embeddings, history_mask, history_author_indices)
-        post_emb = self.encode_post(post_embeddings)
+        post_emb = self.encode_post(post_embeddings, target_author_indices)
         
         similarity_score = (user_emb * post_emb).sum(dim=-1)
         return similarity_score / self.similarity_temperature
@@ -583,6 +623,7 @@ class TwoTowerModel(nn.Module):
             Apply sigmoid(scores) to get probabilities.
         """
         history_author_indices = None
+        target_author_indices = None
         # unpack inputs
         if self.user_encoder_type == "summarized":
             features = batch["features"].to(device, non_blocking=True) # [B, embed_dim*2]
@@ -602,9 +643,16 @@ class TwoTowerModel(nn.Module):
             post_embeddings = batch["target_post_embedding"].to(device, non_blocking=True) # [B, embed_dim]
             if self.use_author_embedding_table:
                 history_author_indices = batch["history_author_indices"].to(device, dtype=torch.long, non_blocking=True)
+                target_author_indices = batch["target_post_author_idx"].to(device, dtype=torch.long, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
 
-        scores = self.forward(history_embeddings, history_mask, post_embeddings, history_author_indices)
+        scores = self.forward(
+            history_embeddings,
+            history_mask,
+            post_embeddings,
+            history_author_indices,
+            target_author_indices,
+        )
         loss = F.binary_cross_entropy_with_logits(scores, labels.float())
         return loss, scores
 
@@ -916,7 +964,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         raise ValueError("use_author_embedding_table is not supported with user_encoder_type='summarized'")
     if use_author_embedding_table and author_idx_mapping_df is None:
         raise FileNotFoundError(
-            "author_idx_mapping artifact was not found in 03_user_history output, but --use-author-embedding-table was enabled."
+            "author_idx artifact was not found in 02_target_posts output, but --use-author-embedding-table was enabled."
         )
     author_idx_to_table_row = None
     author_table_num_rows = 0
@@ -1131,7 +1179,11 @@ def run(context: Context, args) -> Dict[str, Any]:
 
         torchscript_post_name = "engagement_post_tower"
         torchscript_post_path = checkpoints_dir / f"{torchscript_post_name}.pt"
-        torch.jit.script(trained_model.post_tower.cpu()).save(torchscript_post_path)
+        if use_author_embedding_table:
+            post_tower_export = PostAuthorPostTowerWrapper(trained_model.cpu())
+        else:
+            post_tower_export = trained_model.post_tower.cpu()
+        torch.jit.script(post_tower_export).save(torchscript_post_path)
         post_model_id = context.tracker.log_artifact(name=f"{torchscript_post_name}", path=torchscript_post_path)
         logger.info(f"Post tower model id: {post_model_id}")
 
