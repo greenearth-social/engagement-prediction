@@ -355,12 +355,13 @@ class BaseAttentionEncoder(nn.Module, ABC):
       - adding learnable positional embeddings that encode *recency*
       - pooling a variable-length sequence into a fixed-size vector via:
           (1) learned-query attention pooling (content-aware)
-          (2) masked mean pooling (coverage / stability)
+          (2) masked mean pooling over content-only projected embeddings
+              (coverage / stability)
       - projecting pooled features into a final `output_dim` representation
 
-    Subclasses are responsible for defining the "sequence modeling" portion between
-    positional encoding and pooling (e.g., a TransformerEncoder stack, or no
-    self-attention at all).
+    Subclasses are responsible for defining the "sequence modeling" portion after
+    positional encoding (e.g., a TransformerEncoder stack, or no self-attention at
+    all) before attention pooling.
 
     Mask conventions:
       - Public `forward()` expects `history_mask` where **True means valid**.
@@ -390,11 +391,11 @@ class BaseAttentionEncoder(nn.Module, ABC):
 
         Notes:
             - Positional embeddings are learnable (not sinusoidal) and are applied
-              after the input projection.
+              after the input projection and content-only mean pooling.
             - The positional scheme is *recency-flipped*: position 0 corresponds to
               the most recent item (see `_forward_up_to_pos_embed`).
             - The final projection expects concatenated pooled features of size
-              `2 * hidden_dim` (attention pooled + mean pooled).
+              `2 * hidden_dim` (attention pooled + content-only mean pooled).
         """
         super().__init__()
         self.input_dim = input_dim
@@ -444,18 +445,22 @@ class BaseAttentionEncoder(nn.Module, ABC):
         self,
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
         history_mask: Optional[torch.Tensor],  # [B, seq_len] True = valid
-    ) -> Tuple[int, int, torch.Tensor, torch.Tensor]:
-        """Project inputs, normalize mask, and add (recency-flipped) positional embeddings.
+    ) -> Tuple[int, int, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prepare projected history, content mean, and position-encoded sequence.
 
         This helper performs the common "front half" of every attention-based encoder:
           1) ensure we have a boolean validity mask on the right device
           2) project raw input embeddings into `hidden_dim`
-          3) add a learnable positional embedding for each sequence position
+          3) inject a learnable content-space token for empty histories
+          4) compute masked mean pooling before positional embeddings are added
+          5) add a learnable positional embedding for each sequence position
 
         The positional embedding indexing is intentionally **flipped** so that the
         earliest positions in the tensor (index 0, 1, 2, ...) represent *more recent*
         events. This matches the typical "most recent first" intuition and allows
         the model to learn a consistent recency prior independent of padding.
+        Mean pooling is computed before positional embeddings are added so it remains
+        a content-only coverage signal.
 
         Args:
             history_embeddings: Padded input sequence tensor `[B, seq_len, input_dim]`.
@@ -464,11 +469,14 @@ class BaseAttentionEncoder(nn.Module, ABC):
                 all positions are treated as valid.
 
         Returns:
-            A 4-tuple `(B, seq_len, history_mask, x)` where:
+            A 5-tuple `(B, seq_len, history_mask, x, mean_pooled)` where:
               - `B` and `seq_len` are extracted from the input for convenience.
               - `history_mask` is a boolean tensor on the same device as inputs.
               - `x` is the projected + position-encoded representation
                 `[B, seq_len, hidden_dim]`.
+              - `mean_pooled` is the masked mean over projected content embeddings,
+                before positional embeddings are added, with the cold-start token
+                included for empty-history rows.
         """
         B, seq_len, _ = history_embeddings.shape
         if seq_len == 0:
@@ -484,34 +492,37 @@ class BaseAttentionEncoder(nn.Module, ABC):
         # Project embeddings to hidden dimension
         x = self.input_projection(history_embeddings)
 
-        # Add positional information (flipped: position 0 = most recent)
-        # `positions` indexes into the learnable table `self.positional_embedding`.
-        # We clamp to `max_seq_len - 1` so that longer sequences reuse the "oldest"
-        # available positional embedding rather than indexing out of range.
-        positions = torch.arange(seq_len, device=device)
-        positions = (self.max_seq_len - 1) - positions.clamp(max=self.max_seq_len - 1)
-        pos_emb = self.positional_embedding(positions)
-        x = x + pos_emb.unsqueeze(0)  # Broadcast across batch
-
         # Cold-start handling: if an example has no valid history items, inject a
         # learnable token at position 0 and mark it as valid so downstream
         # pooling/self-attention has something to attend to.
         has_any = history_mask.any(dim=1)  # [B]
-        if has_any.all().item():
-            return B, seq_len, history_mask, x
-        inject = ~has_any  # [B], True where history is empty
-        inject_f = inject.to(dtype=x.dtype).unsqueeze(1)  # [B, 1]
+        if not has_any.all().item():
+            inject = ~has_any  # [B], True where history is empty
+            inject_f = inject.to(dtype=x.dtype).unsqueeze(1)  # [B, 1]
 
-        # Mark position 0 as valid for empty-history rows.
-        history_mask = history_mask.clone()
-        history_mask[:, 0] = history_mask[:, 0] | inject
+            # Mark position 0 as valid for empty-history rows.
+            history_mask = history_mask.clone()
+            history_mask[:, 0] = history_mask[:, 0] | inject
 
-        # Overwrite x at position 0 for empty-history rows with the learnable token.
-        token0 = (self.empty_history_embedding + pos_emb[0]).unsqueeze(0)  # [1, hidden]
-        x = x.clone()
-        x0 = x[:, 0, :]  # [B, hidden]
-        x[:, 0, :] = x0 * (1.0 - inject_f) + token0.expand(B, -1) * inject_f
-        return B, seq_len, history_mask, x
+            # Overwrite x at position 0 for empty-history rows with the learnable token.
+            token0 = self.empty_history_embedding.unsqueeze(0)  # [1, hidden]
+            x = x.clone()
+            x0 = x[:, 0, :]  # [B, hidden]
+            x[:, 0, :] = x0 * (1.0 - inject_f) + token0.expand(B, -1) * inject_f
+
+        # ─── Mean pooling (masked) ───
+        mean_pooled = self._forward_mean_pooled(x, history_mask)
+
+        # Add positional information (flipped: position 0 = most recent)
+        # `positions` indexes into the learnable table `self.positional_embedding`.
+        # We clamp to `max_seq_len - 1` so that longer sequences reuse the "oldest"
+        # available positional embedding rather than indexing out of range.
+        positions = torch.arange(seq_len, device=history_embeddings.device)
+        positions = (self.max_seq_len - 1) - positions.clamp(max=self.max_seq_len - 1)
+        pos_emb = self.positional_embedding(positions)
+        x = x + pos_emb.unsqueeze(0)  # Broadcast across batch
+
+        return B, seq_len, history_mask, x, mean_pooled
 
     def _forward_attention_pooled(
         self, 
@@ -570,7 +581,9 @@ class BaseAttentionEncoder(nn.Module, ABC):
         """Compute a masked mean over the sequence dimension.
 
         Mean pooling acts as a robust "coverage" baseline: every valid item
-        contributes equally, and padding contributes zero.
+        contributes equally, and padding contributes zero. Callers that want a
+        content-only mean should pass projected embeddings before positional
+        embeddings are added.
 
         Args:
             x: Sequence representations `[B, seq_len, hidden_dim]`.
@@ -598,11 +611,11 @@ class BaseAttentionEncoder(nn.Module, ABC):
         """Encode a padded history sequence into a fixed-size representation.
 
         Subclasses should:
-          1) call `_forward_up_to_pos_embed()` to obtain projected + position-encoded `x`
+          1) call `_forward_up_to_pos_embed()` to obtain position-encoded `x`
+             and content-only `mean_pooled`
           2) optionally apply a sequence model (e.g. TransformerEncoder) using the
              appropriate key-padding mask convention
-          3) pool the sequence into one or more fixed vectors (often using
-             `_forward_attention_pooled()` and `_forward_mean_pooled()`)
+          3) pool the position-aware sequence, often using `_forward_attention_pooled()`
           4) project pooled features to `[B, output_dim]`
 
         Args:
@@ -699,18 +712,23 @@ class TransformerDualPoolingEncoder(BaseAttentionEncoder):
     
     Architecture:
         1. Input projection: Raw embeddings -> hidden_dim
-        2. Positional encoding: Explicit recency signal (position 0 = most recent)
-        3. Transformer encoder: Multi-head self-attention captures inter-post relationships
-        4. Dual pooling: 
-           - Learned-query attention pooling (adaptive, content-aware)
-           - Mean pooling (robust, aggregates all information)
-        5. Output projection: Combined pooled features -> output_dim
+        2. Content-only mean pooling: Robust coverage baseline
+        3. Positional encoding: Explicit recency signal (position 0 = most recent)
+        4. Transformer encoder: Multi-head self-attention captures inter-post relationships
+        5. Learned-query attention pooling over the transformer output
+        6. Output projection: Combined pooled features -> output_dim
+
+    Dual pooling:
+        - Learned-query attention pooling is adaptive, content-aware, and
+          recency-aware through positional embeddings and transformer context.
+        - Mean pooling is computed before positional embeddings are added, so it
+          remains a content-only coverage signal.
     
     Design rationale:
         - Self-attention allows the model to identify complementary/contradictory
           preferences within a user's history
-        - Dual pooling combines adaptive focus (attention) with comprehensive
-          coverage (mean), providing robustness
+        - Dual pooling combines adaptive focus (attention) with comprehensive,
+          content-only coverage (mean), providing robustness
         - Flipped positional embeddings ensure position 0 = most recent, matching
           the recency-biased intuition of hand-crafted summarizers
     
@@ -780,7 +798,7 @@ class TransformerDualPoolingEncoder(BaseAttentionEncoder):
         Returns:
             User representations [batch, output_dim]
         """
-        B, seq_len, history_mask, x = self._forward_up_to_pos_embed(history_embeddings, history_mask)
+        B, seq_len, history_mask, x, mean_pooled = self._forward_up_to_pos_embed(history_embeddings, history_mask)
 
         # Pass through custom transformer layers.
         # `attn_mask_inv` uses PyTorch convention: True = ignore.
@@ -791,9 +809,6 @@ class TransformerDualPoolingEncoder(BaseAttentionEncoder):
         # ─── Attention-weighted pooling ───
         # Use learned query to compute content-aware weights over sequence
         attention_pooled = self._forward_attention_pooled(B, x, attn_mask_inv, seq_len)
-        
-        # ─── Mean pooling (masked) ───
-        mean_pooled = self._forward_mean_pooled(x, history_mask)
 
         # Concatenate both pooling strategies and project to output dimension
         combined = torch.cat([attention_pooled, mean_pooled], dim=-1)
@@ -816,16 +831,16 @@ class CrossAttentionPoolingEncoder(BaseAttentionEncoder):
         that capture inter-post relationships. Instead, relies on:
         - Input projection + positional encoding to embed history
         - Single learned-query cross-attention to aggregate
-        - Mean pooling for stability
+        - Content-only mean pooling for stability
     
     This trades off some modeling capacity (can't capture complex inter-post
     dependencies) for efficiency gains.
     
     Architecture:
         1. Input projection: Raw embeddings -> hidden_dim
-        2. Positional encoding: Explicit recency signal
-        3. Cross-attention pooling: Single learned query attends to projected history
-        4. Mean pooling: Robust baseline aggregation
+        2. Content-only mean pooling: Robust baseline aggregation
+        3. Positional encoding: Explicit recency signal
+        4. Cross-attention pooling: Single learned query attends to position-aware history
         5. Output projection: Combined features -> output_dim
     
     Complexity:
@@ -870,7 +885,7 @@ class CrossAttentionPoolingEncoder(BaseAttentionEncoder):
         Returns:
             User representations [batch, output_dim]
         """
-        B, seq_len, history_mask, x = self._forward_up_to_pos_embed(history_embeddings, history_mask)
+        B, seq_len, history_mask, x, mean_pooled = self._forward_up_to_pos_embed(history_embeddings, history_mask)
 
         # ─── KEY DIFFERENCE: No TransformerEncoder here ───
         # We skip the expensive self-attention layers that capture inter-post
@@ -880,9 +895,6 @@ class CrossAttentionPoolingEncoder(BaseAttentionEncoder):
         # Learned query attends directly to the projected, position-encoded history
         attn_mask_inv = ~history_mask  # PyTorch convention: True = ignore
         attention_pooled = self._forward_attention_pooled(B, x, attn_mask_inv, seq_len)
-        
-        # ─── Mean pooling (masked) ───
-        mean_pooled = self._forward_mean_pooled(x, history_mask)
 
         # Concatenate both pooling strategies and project to output dimension
         combined = torch.cat([attention_pooled, mean_pooled], dim=-1)
