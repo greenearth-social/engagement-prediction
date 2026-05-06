@@ -444,7 +444,7 @@ class BaseAttentionEncoder(nn.Module, ABC):
         self,
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
         history_mask: Optional[torch.Tensor],  # [B, seq_len] True = valid
-    ) -> Tuple[int, int, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[int, int, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project inputs, normalize mask, and add (recency-flipped) positional embeddings.
 
         This helper performs the common "front half" of every attention-based encoder:
@@ -484,34 +484,37 @@ class BaseAttentionEncoder(nn.Module, ABC):
         # Project embeddings to hidden dimension
         x = self.input_projection(history_embeddings)
 
-        # Add positional information (flipped: position 0 = most recent)
-        # `positions` indexes into the learnable table `self.positional_embedding`.
-        # We clamp to `max_seq_len - 1` so that longer sequences reuse the "oldest"
-        # available positional embedding rather than indexing out of range.
-        positions = torch.arange(seq_len, device=device)
-        positions = (self.max_seq_len - 1) - positions.clamp(max=self.max_seq_len - 1)
-        pos_emb = self.positional_embedding(positions)
-        x = x + pos_emb.unsqueeze(0)  # Broadcast across batch
-
         # Cold-start handling: if an example has no valid history items, inject a
         # learnable token at position 0 and mark it as valid so downstream
         # pooling/self-attention has something to attend to.
         has_any = history_mask.any(dim=1)  # [B]
-        if has_any.all().item():
-            return B, seq_len, history_mask, x
-        inject = ~has_any  # [B], True where history is empty
-        inject_f = inject.to(dtype=x.dtype).unsqueeze(1)  # [B, 1]
+        if not has_any.all().item():
+            inject = ~has_any  # [B], True where history is empty
+            inject_f = inject.to(dtype=x.dtype).unsqueeze(1)  # [B, 1]
 
-        # Mark position 0 as valid for empty-history rows.
-        history_mask = history_mask.clone()
-        history_mask[:, 0] = history_mask[:, 0] | inject
+            # Mark position 0 as valid for empty-history rows.
+            history_mask = history_mask.clone()
+            history_mask[:, 0] = history_mask[:, 0] | inject
 
-        # Overwrite x at position 0 for empty-history rows with the learnable token.
-        token0 = (self.empty_history_embedding + pos_emb[0]).unsqueeze(0)  # [1, hidden]
-        x = x.clone()
-        x0 = x[:, 0, :]  # [B, hidden]
-        x[:, 0, :] = x0 * (1.0 - inject_f) + token0.expand(B, -1) * inject_f
-        return B, seq_len, history_mask, x
+            # Overwrite x at position 0 for empty-history rows with the learnable token.
+            token0 = self.empty_history_embedding.unsqueeze(0)  # [1, hidden]
+            x = x.clone()
+            x0 = x[:, 0, :]  # [B, hidden]
+            x[:, 0, :] = x0 * (1.0 - inject_f) + token0.expand(B, -1) * inject_f
+
+        # ─── Mean pooling (masked) ───
+        mean_pooled = self._forward_mean_pooled(x, history_mask)
+
+        # Add positional information (flipped: position 0 = most recent)
+        # `positions` indexes into the learnable table `self.positional_embedding`.
+        # We clamp to `max_seq_len - 1` so that longer sequences reuse the "oldest"
+        # available positional embedding rather than indexing out of range.
+        positions = torch.arange(seq_len, device=history_embeddings.device)
+        positions = (self.max_seq_len - 1) - positions.clamp(max=self.max_seq_len - 1)
+        pos_emb = self.positional_embedding(positions)
+        x = x + pos_emb.unsqueeze(0)  # Broadcast across batch
+
+        return B, seq_len, history_mask, x, mean_pooled
 
     def _forward_attention_pooled(
         self, 
@@ -780,7 +783,7 @@ class TransformerDualPoolingEncoder(BaseAttentionEncoder):
         Returns:
             User representations [batch, output_dim]
         """
-        B, seq_len, history_mask, x = self._forward_up_to_pos_embed(history_embeddings, history_mask)
+        B, seq_len, history_mask, x, mean_pooled = self._forward_up_to_pos_embed(history_embeddings, history_mask)
 
         # Pass through custom transformer layers.
         # `attn_mask_inv` uses PyTorch convention: True = ignore.
@@ -791,9 +794,6 @@ class TransformerDualPoolingEncoder(BaseAttentionEncoder):
         # ─── Attention-weighted pooling ───
         # Use learned query to compute content-aware weights over sequence
         attention_pooled = self._forward_attention_pooled(B, x, attn_mask_inv, seq_len)
-        
-        # ─── Mean pooling (masked) ───
-        mean_pooled = self._forward_mean_pooled(x, history_mask)
 
         # Concatenate both pooling strategies and project to output dimension
         combined = torch.cat([attention_pooled, mean_pooled], dim=-1)
@@ -870,7 +870,7 @@ class CrossAttentionPoolingEncoder(BaseAttentionEncoder):
         Returns:
             User representations [batch, output_dim]
         """
-        B, seq_len, history_mask, x = self._forward_up_to_pos_embed(history_embeddings, history_mask)
+        B, seq_len, history_mask, x, mean_pooled = self._forward_up_to_pos_embed(history_embeddings, history_mask)
 
         # ─── KEY DIFFERENCE: No TransformerEncoder here ───
         # We skip the expensive self-attention layers that capture inter-post
@@ -880,9 +880,6 @@ class CrossAttentionPoolingEncoder(BaseAttentionEncoder):
         # Learned query attends directly to the projected, position-encoded history
         attn_mask_inv = ~history_mask  # PyTorch convention: True = ignore
         attention_pooled = self._forward_attention_pooled(B, x, attn_mask_inv, seq_len)
-        
-        # ─── Mean pooling (masked) ───
-        mean_pooled = self._forward_mean_pooled(x, history_mask)
 
         # Concatenate both pooling strategies and project to output dimension
         combined = torch.cat([attention_pooled, mean_pooled], dim=-1)
