@@ -124,6 +124,87 @@ from utils.helpers import (
 from shared.input_data_helpers import get_padded_embedding_history_and_mask
 
 
+PAD_IDX = 0
+UNK_IDX = 1
+
+
+def _map_raw_idx_to_table_row(
+    raw_idx: Any,
+    idx_to_table_row: np.ndarray,
+) -> int:
+    """Translate a raw Stage 2 embedding index into the model table row."""
+    if raw_idx is None:
+        return UNK_IDX
+    try:
+        if raw_idx != raw_idx:  # NaN
+            return UNK_IDX
+    except TypeError:
+        pass
+    raw_idx_int = int(raw_idx)
+    if 0 <= raw_idx_int < len(idx_to_table_row):
+        return int(idx_to_table_row[raw_idx_int])
+    return UNK_IDX
+
+
+def build_target_user_table_lookup(
+    target_user_idx_mapping_df: pl.DataFrame,
+    min_target_user_support: int,
+) -> Tuple[np.ndarray, int]:
+    """Map Stage 2 target_user indices to final embedding-table rows.
+
+    Returns a pair ``(target_user_idx_to_table_row, target_user_table_num_rows)``.
+
+    These represent two different index spaces:
+
+    - ``target_user_idx_to_table_row`` is a lookup array keyed by raw Stage 2
+      ``target_user_idx`` values. It only needs entries for raw target_user ids that may
+      appear in the history artifact. Missing or out-of-range lookups are
+      handled downstream as ``UNK_IDX``.
+    - ``target_user_table_num_rows`` is the size of the actual embedding table used
+      at training time. That table always reserves row ``0`` for padding and
+      row ``1`` for unknown target_users, so it must be at least ``2`` even when no
+      supported target_users survive filtering.
+    """
+    if min_target_user_support < 1:
+        raise ValueError("min_target_user_support must be >= 1")
+    required_cols = {"target_user_idx", "target_user_train_count"}
+    missing_cols = required_cols.difference(target_user_idx_mapping_df.columns)
+    if missing_cols:
+        missing = ", ".join(sorted(missing_cols))
+        raise ValueError(f"target_user_idx_mapping_df is missing required columns: {missing}")
+
+    if len(target_user_idx_mapping_df) == 0:
+        # Empty Stage 2 mapping means there are no known raw target_user_idx values
+        # to translate. The lookup therefore only needs a dummy slot, while the
+        # embedding table still needs PAD=0 and UNK=1 rows.
+        target_user_idx_to_table_row = np.full(1, UNK_IDX, dtype=np.uint32)
+        target_user_table_num_rows = 2
+        return target_user_idx_to_table_row, target_user_table_num_rows
+
+    max_target_user_idx = int(target_user_idx_mapping_df["target_user_idx"].max()) # type: ignore
+    if max_target_user_idx < 1:
+        raise ValueError("target_user_idx values must start at 1")
+
+    target_user_idx_to_table_row = np.full(max_target_user_idx + 1, UNK_IDX, dtype=np.uint32)
+    supported_df = target_user_idx_mapping_df.filter(
+        pl.col("target_user_train_count") >= int(min_target_user_support)
+    )
+    if len(supported_df) == 0:
+        # Keep the full raw-target_user lookup shape so in-range Stage 2 target_user_idx
+        # values still resolve deterministically to UNK after support filtering.
+        target_user_table_num_rows = 2
+        return target_user_idx_to_table_row, target_user_table_num_rows
+
+    supported_target_user_indices = supported_df["target_user_idx"].to_numpy().astype(np.int64)
+    target_user_idx_to_table_row[supported_target_user_indices] = (supported_target_user_indices + 1).astype(np.uint32)
+    # Table row layout:
+    #   0 -> PAD
+    #   1 -> UNK
+    #   raw target_user_idx N -> row N + 1 when that target_user survives filtering
+    target_user_table_num_rows = int(supported_target_user_indices.max()) + 2
+    return target_user_idx_to_table_row, target_user_table_num_rows
+
+
 # ---------------------------------------------------------------------------
 # User Summarizer strategies
 # ---------------------------------------------------------------------------
@@ -908,7 +989,7 @@ class CrossAttentionPoolingEncoder(BaseAttentionEncoder):
 def load_training_data(
     context: Context,
     logger: Optional[logging.Logger] = None,
-) -> Tuple[np.ndarray, pl.DataFrame, pl.DataFrame, int]:
+) -> Tuple[np.ndarray, pl.DataFrame, pl.DataFrame, Optional[pl.DataFrame], int]:
     """Locate and load the three upstream pipeline artifacts needed for training.
     
     This function abstracts away the complexity of finding prior stage outputs,
@@ -929,17 +1010,19 @@ def load_training_data(
         logger: Optional logger for progress reporting
     
     Returns:
-        Tuple of (embeddings_mmap, target_posts_df, history_df, embed_dim):
+        Tuple of (embeddings_mmap, target_posts_df, history_df, target_user_idx_mapping_df,embed_dim):
             - embeddings_mmap: Read-only numpy memmap [n_posts, D]
             - target_posts_df: Polars DataFrame with split, like_emb_idx, neg_emb_idx
             - history_df: Polars DataFrame with target_did, like_uri, prior_emb_indices
+            - target_user_idx_mapping_df: Optional Polars DataFrame with Stage 2
+              target_user_idx / target_user_train_count metadata
             - embed_dim: Integer embedding dimensionality D
     
     Raises:
         FileNotFoundError: If any required artifact cannot be located
         
     Example:
-        >>> embeddings, targets, history, dim = load_training_data(
+        >>> embeddings, targets, history, target_user_idx_mapping, dim = load_training_data(
         ...     context=context,
         ...     logger=logger
         ... )
@@ -968,6 +1051,13 @@ def load_training_data(
     target_posts_df = load_parquet_from_prior(target_posts_dir, "target_posts_").collect()
     logger.info(f"Loaded target_posts: {len(target_posts_df):,} rows")
 
+    try:
+        target_user_idx_mapping_df = load_parquet_from_prior(target_posts_dir, "target_user_idx_").collect()
+        logger.info(f"Loaded target_user_idx: {len(target_user_idx_mapping_df):,} rows")
+    except FileNotFoundError:
+        target_user_idx_mapping_df = None
+        logger.info("No target_user_idx artifact found in target_posts stage output")
+
     # --- 3. User history from 03_user_history (or legacy 02_featurize) ---
     # Contains the (most-recent-first-ordered) list of post indices each user engaged with
     log_operation_start("Locate user_history", "DATALOADERS", logger)
@@ -975,7 +1065,7 @@ def load_training_data(
     history_df = load_parquet_from_prior(history_dir, "history_posts_").collect()
     logger.info(f"Loaded user_history: {len(history_df):,} rows")
 
-    return embeddings_mmap, target_posts_df, history_df, embed_dim
+    return embeddings_mmap, target_posts_df, history_df, target_user_idx_mapping_df, embed_dim
 
 
 def _resolve_prior(
@@ -1033,8 +1123,10 @@ def _prepare_split_data(
     target_posts_df: pl.DataFrame,
     history_df: pl.DataFrame,
     split: str,
+    use_target_user_embedding_table: bool = False,
+    target_user_idx_to_table_row: Optional[np.ndarray] = None,
     logger: Optional[logging.Logger] = None,
-) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[str], List[str], List[str]]:
+) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[str], List[str], List[str], Optional[np.ndarray]]:
     """Filter data to a single split and return aligned numpy arrays.
     
     This internal helper performs the core data preparation logic shared by both
@@ -1056,7 +1148,7 @@ def _prepare_split_data(
     
     Returns:
         Tuple of (like_emb_idx, neg_emb_idx, prior_emb_indices_list, 
-                  target_dids, like_uris, neg_uris):
+                  target_dids, like_uris, neg_uris, target_user_indices_list):
         
         - like_emb_idx: Indices into embeddings memmap for positive posts [N]
         - neg_emb_idx: Indices into embeddings memmap for negative posts [N]
@@ -1066,6 +1158,7 @@ def _prepare_split_data(
         - target_dids: User IDs as string array [N]
         - like_uris: Liked post URIs as string array [N]
         - neg_uris: Non-liked post URIs as string array [N]
+        - target_user_indices_list: Optional list of N integers mapping to user embedding table rows (if used)
         
         Where N = number of target posts in the requested split (after filtering).
     
@@ -1086,12 +1179,26 @@ def _prepare_split_data(
     target_dids = joined["target_did"].to_list()
     like_uris = joined["like_uri"].to_list()
     neg_uris = joined["neg_uri"].to_list()
+    target_user_idx = None
 
     # Convert Polars List[UInt32] column to Python list of numpy arrays
     # This allows each user to have a different history length (variable-length)
     # while still supporting fast numpy indexing into the embeddings memmap
     prior_col = joined["prior_emb_indices"]
     prior_emb_indices_list: List[np.ndarray] = []
+
+    if use_target_user_embedding_table and target_user_idx_to_table_row is None:
+        raise ValueError("target_user_idx_to_table_row must be provided when author embeddings are enabled")
+
+    if use_target_user_embedding_table:
+        if 'target_user_idx' not in joined.columns:
+            raise ValueError(f"target_posts_df must contain target_user_idx column when target_user embeddings are enabled")
+        assert target_user_idx_to_table_row is not None
+        target_user_idx = np.array([
+            _map_raw_idx_to_table_row(raw_idx, target_user_idx_to_table_row)
+            for raw_idx in joined["target_user_idx"].to_list()
+        ], dtype=np.uint32)
+
     for row_val in prior_col.to_list():
         if row_val is None or len(row_val) == 0:
             # Users with no history get an empty array (will become zero vector
@@ -1100,7 +1207,7 @@ def _prepare_split_data(
         else:
             prior_emb_indices_list.append(np.array(row_val, dtype=np.uint32))
 
-    return like_emb_idx, neg_emb_idx, prior_emb_indices_list, target_dids, like_uris, neg_uris
+    return like_emb_idx, neg_emb_idx, prior_emb_indices_list, target_dids, like_uris, neg_uris, target_user_idx
 
 
 # ---------------------------------------------------------------------------
@@ -1188,7 +1295,8 @@ class SummarizedEngagementDataset(Dataset):
             self.target_dids,
             self.like_uris,
             self.neg_uris,
-        ) = _prepare_split_data(target_posts_df, history_df, split, logger)
+            _,
+        ) = _prepare_split_data(target_posts_df, history_df, split, logger=logger)
 
         self._n_rows = len(like_emb_idx)
 
@@ -1336,6 +1444,7 @@ class SequenceEngagementDataset(Dataset):
             - "history_embeddings": Padded sequence [max_seq_len, D]
             - "history_mask": Boolean mask [max_seq_len], True = valid position
             - "target_post_embedding": Target post embedding [D]
+            - "target_user_idx": Optional target user row for user embeddings
             - "label": Binary label (1.0 for positive, 0.0 for negative)
             - "user_id": User ID string
             - "post_id": Post URI string (or "neg_uri" for negatives)
@@ -1349,6 +1458,8 @@ class SequenceEngagementDataset(Dataset):
         split: str,
         max_history_len: int,
         embed_dim: int,
+        use_target_user_embedding_table: bool = False,
+        target_user_idx_to_table_row: Optional[np.ndarray] = None,
         logger: Optional[logging.Logger] = None,
     ):
         # Store memmap reference for on-the-fly sequence loading
@@ -1364,7 +1475,15 @@ class SequenceEngagementDataset(Dataset):
             self.target_dids,
             self.like_uris,
             self.neg_uris,
-        ) = _prepare_split_data(target_posts_df, history_df, split, logger)
+            self.target_user_indices,
+        ) = _prepare_split_data(
+            target_posts_df,
+            history_df,
+            split,
+            use_target_user_embedding_table,
+            target_user_idx_to_table_row,
+            logger
+        )
 
         self._n_rows = len(like_emb_idx)
 
@@ -1409,6 +1528,8 @@ class SequenceEngagementDataset(Dataset):
                 - "history_embeddings": [max_seq_len, D] padded/truncated history
                 - "history_mask": [max_seq_len] boolean, True = valid position
                 - "target_post_embedding": [D] target post embedding
+                - "target_post_embedding": Target post embedding [D]
+                - "target_user_idx": Optional target user row for user embeddings
                 - "label": 1.0 for positive, 0.0 for negative
                 - "user_id": User identifier string
                 - "post_id": Post URI (or "neg_uri" for negatives)
@@ -1434,7 +1555,7 @@ class SequenceEngagementDataset(Dataset):
             label = 0.0
             post_id = self.neg_uris[row_idx]
 
-        return {
+        output = {
             "history_embeddings": torch.from_numpy(padded),  # [max_seq, D]
             "history_mask": torch.from_numpy(mask),  # [max_seq]
             "target_post_embedding": post_vec,
@@ -1442,6 +1563,12 @@ class SequenceEngagementDataset(Dataset):
             "user_id": self.target_dids[row_idx],
             "post_id": post_id,
         }
+        if self.target_user_indices is not None:
+            output["target_user_idx"] = torch.tensor(
+                self.target_user_indices[row_idx], dtype=torch.long
+            )
+        return output
+    
 
 
 # ---------------------------------------------------------------------------
