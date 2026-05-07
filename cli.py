@@ -97,6 +97,10 @@ DEFAULTS: Dict[str, Any] = {
     "attention_dropout": 0.1,  # Dropout rate for attention-based user encoders
     "l2_normalize_embeddings": False,
     "similarity_temperature": 1.0,
+    "use_target_user_embedding_table": False,
+    "target_user_embedding_dim": 32,
+    "min_target_user_support": 5,
+    "target_user_unknown_dropout_rate": 0.1,
     "epochs": 300,
     "batch_size": 256,
     "learning_rate": 0.001,
@@ -596,6 +600,19 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
             + f"Allowed values: {allowed}"
         )
     
+    use_target_user_embedding_table = bool(args.use_target_user_embedding_table)
+    if use_target_user_embedding_table:
+        if model_type != "two-tower":
+            raise ValueError("--use-target-user-embedding-table is only supported for --model-type 'two-tower'.")
+        if user_encoder == "summarized":
+            raise ValueError("--use-target-user-embedding-table is not supported with --user-encoder 'summarized'.")
+        if int(args.target_user_embedding_dim) <= 0:
+            raise ValueError("--target-user-embedding-dim must be positive.")
+        if int(args.min_target_user_support) < 1:
+            raise ValueError("--min-target-user-support must be >= 1.")
+        if not 0.0 <= float(args.target_user_unknown_dropout_rate) < 1.0:
+            raise ValueError("--target-user-unknown-dropout-rate must be in [0, 1).")
+
     # Override train stage key if --model-type is specified
     train_key = _get_train_key(model_type)
     stage_order = _get_stage_order_for_model_type(train_key)
@@ -777,6 +794,15 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Enable or disable L2 normalization on two-tower user/post embeddings before similarity scoring")
     _add_arg_with_default(p_all, "--similarity-temperature", type=float, default=argparse.SUPPRESS,
                           help_text="Temperature used to scale cosine-similarity logits in the two-tower model")
+    _add_arg_with_default(p_all, "--use-target-user-embedding-table",
+                          action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
+                          help_text="Enable a trainable target-user embedding table for history posts in the two-tower model")
+    _add_arg_with_default(p_all, "--target-user-embedding-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="Embedding dimension for the two-tower history target-user embedding table")
+    _add_arg_with_default(p_all, "--min-target-user-support", type=int, default=argparse.SUPPRESS,
+                          help_text="Minimum train-history target-user occurrence count required for a dedicated embedding row")
+    _add_arg_with_default(p_all, "--target-user-unknown-dropout-rate", type=float, default=argparse.SUPPRESS,
+                          help_text="Training-time probability of replacing a supported history target-user with the UNK row")
     # Stage 5 options (shared)
     _add_arg_with_default(p_all, "--epochs", type=int, default=argparse.SUPPRESS,
                           help_text="Training epochs")

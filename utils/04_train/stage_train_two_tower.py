@@ -118,6 +118,9 @@ from utils.helpers import (
     set_random_seeds,
 )
 from utils.dataloaders import (
+    PAD_IDX,
+    UNK_IDX,
+    build_target_user_table_lookup,
     load_training_data,
     SequenceEngagementDataset,
     SummarizedEngagementDataset,
@@ -207,8 +210,8 @@ class L2NormalizedUserTower(nn.Module):
         self.enabled = bool(enabled)
         self.eps = float(eps)
 
-    def forward(self, history_embeddings: torch.Tensor, history_mask: torch.Tensor) -> torch.Tensor:
-        embeddings = self.tower(history_embeddings, history_mask)
+    def forward(self, history_embeddings: torch.Tensor, history_mask: torch.Tensor, target_user_idx: Optional[torch.Tensor]) -> torch.Tensor:
+        embeddings = self.tower(history_embeddings, history_mask, target_user_idx)
         if not self.enabled:
             return embeddings
         return F.normalize(embeddings, p=2.0, dim=-1, eps=self.eps)
@@ -293,6 +296,10 @@ class TwoTowerModel(nn.Module):
         similarity_temperature: float,
         user_encoder_type: str,
         use_post_encoder: bool,
+        use_target_user_embedding_table: bool,
+        target_user_table_num_rows: Optional[int] = None,
+        target_user_embedding_dim: Optional[int] = None,
+        target_user_unknown_dropout_rate: float = 0.0,
     ):
         super().__init__()
         self.shared_dim = shared_dim
@@ -303,6 +310,7 @@ class TwoTowerModel(nn.Module):
         self.user_encoder_type = user_encoder_type
         self.use_post_encoder = use_post_encoder
         self.l2_normalize_embeddings = bool(l2_normalize_embeddings)
+        self.use_target_user_embedding_table = use_target_user_embedding_table
 
         # Instantiate user tower based on encoder type
         if user_encoder_type == "cross_attention":
@@ -312,6 +320,10 @@ class TwoTowerModel(nn.Module):
                 output_dim=shared_dim,
                 max_seq_len=max_history_len,
                 dropout_rate=dropout_rate,
+                use_target_user_embedding_table=use_target_user_embedding_table,
+                target_user_table_num_rows=target_user_table_num_rows,
+                target_user_embedding_dim=target_user_embedding_dim,
+                target_user_unknown_dropout_rate=target_user_unknown_dropout_rate,
             )
         elif user_encoder_type == "full_transformer":
             raw_user_tower = TransformerDualPoolingEncoder(
@@ -322,6 +334,10 @@ class TwoTowerModel(nn.Module):
                 num_attention_layers=num_attention_layers,
                 max_seq_len=max_history_len,
                 dropout_rate=dropout_rate,
+                use_target_user_embedding_table=use_target_user_embedding_table,
+                target_user_table_num_rows=target_user_table_num_rows,
+                target_user_embedding_dim=target_user_embedding_dim,
+                target_user_unknown_dropout_rate=target_user_unknown_dropout_rate,
             )
         elif user_encoder_type == "summarized":
             # In "summarized" mode, the dataset provides the user vector directly
@@ -365,7 +381,7 @@ class TwoTowerModel(nn.Module):
         self.post_tower = L2NormalizedPostTower(raw_post_tower, enabled=self.l2_normalize_embeddings)
 
 
-    def encode_user(self, history_embeddings: torch.Tensor, history_mask: torch.Tensor) -> torch.Tensor:
+    def encode_user(self, history_embeddings: torch.Tensor, history_mask: torch.Tensor, target_user_idx: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Encode user engagement history into shared space representation.
         
         Args:
@@ -376,7 +392,7 @@ class TwoTowerModel(nn.Module):
             User vectors in shared space [batch, shared_dim].
             When `l2_normalize_embeddings=True`, these are unit-length.
         """
-        return self.user_tower(history_embeddings, history_mask)
+        return self.user_tower(history_embeddings, history_mask, target_user_idx)
 
     def encode_post(self, post_embeddings: torch.Tensor) -> torch.Tensor:
         """Encode post embeddings into shared space representation.
@@ -397,6 +413,7 @@ class TwoTowerModel(nn.Module):
         history_embeddings: torch.Tensor,
         history_mask: torch.Tensor,
         post_embeddings: torch.Tensor,
+        target_user_idx: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute engagement scores via dot product in shared space.
         
@@ -415,7 +432,7 @@ class TwoTowerModel(nn.Module):
         Returns:
             Raw engagement scores [batch] (logits before sigmoid)
         """
-        user_emb = self.encode_user(history_embeddings, history_mask)
+        user_emb = self.encode_user(history_embeddings, history_mask, target_user_idx)
         post_emb = self.encode_post(post_embeddings)
         
         similarity_score = (user_emb * post_emb).sum(dim=-1)
@@ -452,6 +469,8 @@ class TwoTowerModel(nn.Module):
             Returns raw scores (not probabilities) for flexibility in evaluation.
             Apply sigmoid(scores) to get probabilities.
         """
+        target_user_idx = None
+
         # unpack inputs
         if self.user_encoder_type == "summarized":
             features = batch["features"].to(device, non_blocking=True) # [B, embed_dim*2]
@@ -469,9 +488,11 @@ class TwoTowerModel(nn.Module):
             history_embeddings = batch["history_embeddings"].to(device, non_blocking=True) # [B, seq_len, embed_dim]
             history_mask = batch["history_mask"].to(device, non_blocking=True) # [B, seq_len]
             post_embeddings = batch["target_post_embedding"].to(device, non_blocking=True) # [B, embed_dim]
+            if self.use_target_user_embedding_table:
+                target_user_idx = batch["target_user_idx"].to(device, dtype=torch.long, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
 
-        scores = self.forward(history_embeddings, history_mask, post_embeddings)
+        scores = self.forward(history_embeddings, history_mask, post_embeddings, target_user_idx)
         loss = F.binary_cross_entropy_with_logits(scores, labels.float())
         return loss, scores
 
@@ -744,7 +765,7 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # --- load data from prior stages ---
     log_operation_start("Load training data from prior stages", STAGE_LOG_NAME, logger)
-    embeddings_mmap, target_posts_df, history_df, embed_dim = load_training_data(
+    embeddings_mmap, target_posts_df, history_df, target_user_idx_mapping_df, embed_dim = load_training_data(
         context, logger=logger,
     )
     log_prior_stage_inputs(context, logger)
@@ -774,6 +795,32 @@ def run(context: Context, args) -> Dict[str, Any]:
     lr_scheduler_patience = int(args.lr_scheduler_patience)
     gradient_clip_max_norm = float(args.gradient_clip_max_norm)
     eval_holdout_type = str(args.eval_holdout_type)
+    use_target_user_embedding_table = bool(args.use_target_user_embedding_table)
+    target_user_embedding_dim = int(args.target_user_embedding_dim)
+    min_target_user_support = int(args.min_target_user_support)
+    target_user_unknown_dropout_rate = float(args.target_user_unknown_dropout_rate)
+
+    if use_target_user_embedding_table and user_encoder_type == "summarized":
+        raise ValueError("use_target_user_embedding_table is not supported with user_encoder_type='summarized'")
+    if use_target_user_embedding_table and target_user_idx_mapping_df is None:
+        raise FileNotFoundError(
+            "target_user_idx artifact was not found in 02_target_posts output, but --use-target_user-embedding-table was enabled."
+        )
+    target_user_idx_to_table_row = None
+    target_user_table_num_rows = 0
+    if use_target_user_embedding_table:
+        if target_user_idx_mapping_df is None:
+            raise FileNotFoundError("target_user_idx_mapping_df is required when use_target_user_embedding_table is True")
+        target_user_idx_to_table_row, target_user_table_num_rows = build_target_user_table_lookup(
+            target_user_idx_mapping_df=target_user_idx_mapping_df,
+            min_target_user_support=min_target_user_support,
+        )
+        logger.info(
+            "target_user embedding table enabled: "
+            f"min_target_user_support={min_target_user_support}, "
+            f"target_user_embedding_dim={target_user_embedding_dim}, "
+            f"target_user_table_num_rows={target_user_table_num_rows}"
+        )
 
     # Worker settings
     num_workers = int(args.num_dataloader_workers)
@@ -800,11 +847,17 @@ def run(context: Context, args) -> Dict[str, Any]:
     else:
         train_dataset = SequenceEngagementDataset(
             embeddings_mmap, target_posts_df, history_df, split="train",
-            max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
+            max_history_len=max_history_len, embed_dim=embed_dim, 
+            use_target_user_embedding_table=use_target_user_embedding_table,
+            target_user_idx_to_table_row=target_user_idx_to_table_row,
+            logger=logger,
         )
         val_dataset = SequenceEngagementDataset(
             embeddings_mmap, target_posts_df, history_df, split="val",
-            max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
+            max_history_len=max_history_len, embed_dim=embed_dim,
+            use_target_user_embedding_table=use_target_user_embedding_table,
+            target_user_idx_to_table_row=target_user_idx_to_table_row,
+            logger=logger,
         )
 
     # Create data loaders using centralized helper
@@ -834,6 +887,10 @@ def run(context: Context, args) -> Dict[str, Any]:
         similarity_temperature=similarity_temperature,
         user_encoder_type=user_encoder_type,
         use_post_encoder=use_post_encoder,
+        use_target_user_embedding_table=use_target_user_embedding_table,
+        target_user_table_num_rows=target_user_table_num_rows if use_target_user_embedding_table else None,
+        target_user_embedding_dim=target_user_embedding_dim if use_target_user_embedding_table else None,
+        target_user_unknown_dropout_rate=target_user_unknown_dropout_rate,
     )
 
     if (not use_post_encoder) and (user_encoder_type == "summarized"):
@@ -926,6 +983,13 @@ def run(context: Context, args) -> Dict[str, Any]:
         "dropout_rate": dropout_rate,
         "l2_normalize_embeddings": l2_normalize_embeddings,
         "similarity_temperature": similarity_temperature,
+        "use_target_user_embedding_table": use_target_user_embedding_table,
+        "target_user_embedding_dim": target_user_embedding_dim if use_target_user_embedding_table else None,
+        "min_target_user_support": min_target_user_support if use_target_user_embedding_table else None,
+        "target_user_unknown_dropout_rate": target_user_unknown_dropout_rate if use_target_user_embedding_table else None,
+        "target_user_table_num_rows": target_user_table_num_rows if use_target_user_embedding_table else None,
+        "target_user_pad_idx": PAD_IDX,
+        "target_user_unk_idx": UNK_IDX,
     }
     if save_model:
         model_path = checkpoints_dir / f"two_tower_{timestamp}.pth"
@@ -986,7 +1050,10 @@ def run(context: Context, args) -> Dict[str, Any]:
             else:
                 holdout_dataset = SequenceEngagementDataset(
                     embeddings_mmap, target_posts_df, history_df, split=split_name,
-                    max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
+                    max_history_len=max_history_len, embed_dim=embed_dim,
+                    use_target_user_embedding_table=use_target_user_embedding_table,
+                    target_user_idx_to_table_row=target_user_idx_to_table_row,
+                    logger=logger,
                 )
             if len(holdout_dataset) == 0:
                 logger.info(f"No rows for split '{split_name}', skipping.")

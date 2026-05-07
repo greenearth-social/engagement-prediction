@@ -457,6 +457,10 @@ class BaseAttentionEncoder(nn.Module, ABC):
         output_dim: int,
         max_seq_len: int,
         dropout_rate: float,
+        use_target_user_embedding_table: bool,
+        target_user_table_num_rows: Optional[int] = None,
+        target_user_embedding_dim: Optional[int] = None,
+        target_user_unknown_dropout_rate: float = 0.0,
     ):
         """Construct shared layers used by attention-based history encoders.
 
@@ -483,6 +487,7 @@ class BaseAttentionEncoder(nn.Module, ABC):
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         self.max_seq_len = max_seq_len
+        self.use_target_user_embedding_table = bool(use_target_user_embedding_table)
 
         # Project raw embeddings to transformer hidden dimension
         self.input_projection = nn.Sequential(
@@ -503,9 +508,31 @@ class BaseAttentionEncoder(nn.Module, ABC):
         # which would otherwise yield identical Two-Tower scores across posts.
         self.empty_history_embedding = nn.Parameter(torch.randn(hidden_dim) * 0.02)
 
+        # mean pool vector and cross attention vector
+        output_projection_input_dim = hidden_dim * 2
+
+        if self.use_target_user_embedding_table:
+            if target_user_table_num_rows is None or target_user_table_num_rows < 2:
+                raise ValueError("target_user_table_num_rows must be provided and >= 2 when use_target_user_embedding_table is True")
+            if target_user_embedding_dim is None or target_user_embedding_dim <= 0:
+                raise ValueError("target_user_embedding_dim must be provided and positive when use_target_user_embedding_table is True")
+            
+            self.target_user_embedding_dim = target_user_embedding_dim
+            self.target_user_unk_idx = UNK_IDX
+            self.target_user_pad_idx = PAD_IDX
+            self.target_user_unknown_dropout_rate = target_user_unknown_dropout_rate            
+            
+            self.target_user_embedding_table = nn.Embedding(
+                num_embeddings=target_user_table_num_rows,
+                embedding_dim=target_user_embedding_dim,
+                padding_idx=self.target_user_pad_idx,
+            )
+            
+            output_projection_input_dim += self.target_user_embedding_dim
+
         # Project concatenated dual-pooled features to final output dimension
         self.output_projection = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),  # 2x because we concatenate two pooling outputs
+            nn.Linear(output_projection_input_dim, hidden_dim),  # 2x because we concatenate two pooling outputs
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout_rate),
@@ -521,6 +548,11 @@ class BaseAttentionEncoder(nn.Module, ABC):
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Embedding):
                 nn.init.normal_(m.weight, mean=0, std=0.02)
+        
+        if self.use_target_user_embedding_table:
+            nn.init.xavier_uniform_(self.target_user_embedding_table.weight)
+            with torch.no_grad():
+                self.target_user_embedding_table.weight[self.target_user_pad_idx].zero_()
 
     def _forward_up_to_pos_embed(
         self,
@@ -682,12 +714,31 @@ class BaseAttentionEncoder(nn.Module, ABC):
         count = mask_expanded.sum(dim=1).clamp(min=1)
         mean_pooled = sum_x / count
         return mean_pooled
+    
+    def _forward_target_user_embedding(
+        self,
+        target_user_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.training and self.target_user_unknown_dropout_rate > 0.0:
+            eligible = target_user_idx > self.target_user_unk_idx
+            if torch.any(eligible):
+                dropout_mask = torch.rand(
+                    target_user_idx.shape,
+                    device=target_user_idx.device,
+                ) < self.target_user_unknown_dropout_rate
+                target_user_idx = torch.where(
+                    eligible & dropout_mask,
+                    torch.full_like(target_user_idx, self.target_user_unk_idx),
+                    target_user_idx,
+                )
+        return self.target_user_embedding_table(target_user_idx)  # [batch, target_user_embedding_dim]
 
     @abstractmethod
     def forward(
         self,
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
         history_mask: torch.Tensor,  # [B, seq_len] True = valid
+        target_user_idx: torch.Tensor, # [B]
     ) -> torch.Tensor:
         """Encode a padded history sequence into a fixed-size representation.
 
@@ -841,8 +892,22 @@ class TransformerDualPoolingEncoder(BaseAttentionEncoder):
         num_attention_layers: int,
         max_seq_len: int,
         dropout_rate: float,
+        use_target_user_embedding_table: bool,
+        target_user_table_num_rows: Optional[int] = None,
+        target_user_embedding_dim: Optional[int] = None,
+        target_user_unknown_dropout_rate: float = 0.0,
     ):
-        super().__init__(input_dim, hidden_dim, output_dim, max_seq_len, dropout_rate)
+        super().__init__(
+            input_dim,
+            hidden_dim,
+            output_dim,
+            max_seq_len,
+            dropout_rate,
+            use_target_user_embedding_table,
+            target_user_table_num_rows,
+            target_user_embedding_dim,
+            target_user_unknown_dropout_rate,
+        )
         if hidden_dim % num_attention_heads != 0:
             raise ValueError(
                 f"hidden_dim ({hidden_dim}) must be divisible by num_attention_heads ({num_attention_heads})"
@@ -869,6 +934,7 @@ class TransformerDualPoolingEncoder(BaseAttentionEncoder):
         self,
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
         history_mask: torch.Tensor,  # [B, seq_len] True = valid
+        target_user_idx: torch.Tensor, # [B]
     ) -> torch.Tensor:
         """Encode user history into fixed-size representation.
         
@@ -893,6 +959,13 @@ class TransformerDualPoolingEncoder(BaseAttentionEncoder):
 
         # Concatenate both pooling strategies and project to output dimension
         combined = torch.cat([attention_pooled, mean_pooled], dim=-1)
+
+        if self.use_target_user_embedding_table:
+            if target_user_idx is None or self.target_user_embedding_table is None:
+                raise RuntimeError("target_user_idx is required when use_target_user_embedding_table is True")
+            target_user_embedding = self._forward_target_user_embedding(target_user_idx)
+            combined = torch.cat([attention_pooled, mean_pooled, target_user_embedding], dim=-1)
+
         return self.output_projection(combined)
 
 
@@ -947,15 +1020,29 @@ class CrossAttentionPoolingEncoder(BaseAttentionEncoder):
         hidden_dim: int,
         output_dim: int,
         max_seq_len: int,
-        dropout_rate: float,
+        dropout_rate: float,use_target_user_embedding_table: bool,
+        target_user_table_num_rows: Optional[int] = None,
+        target_user_embedding_dim: Optional[int] = None,
+        target_user_unknown_dropout_rate: float = 0.0,
     ):
-        super().__init__(input_dim, hidden_dim, output_dim, max_seq_len, dropout_rate)
+        super().__init__(
+            input_dim,
+            hidden_dim,
+            output_dim,
+            max_seq_len,
+            dropout_rate,
+            use_target_user_embedding_table,
+            target_user_table_num_rows,
+            target_user_embedding_dim,
+            target_user_unknown_dropout_rate,
+        )
         self._init_weights()
 
     def forward(
         self,
         history_embeddings: torch.Tensor,  # [B, seq_len, input_dim]
         history_mask: torch.Tensor,  # [B, seq_len] True = valid
+        target_user_idx: Optional[torch.Tensor] = None, # [B] 
     ) -> torch.Tensor:
         """Encode user history into fixed-size representation.
         
@@ -979,6 +1066,13 @@ class CrossAttentionPoolingEncoder(BaseAttentionEncoder):
 
         # Concatenate both pooling strategies and project to output dimension
         combined = torch.cat([attention_pooled, mean_pooled], dim=-1)
+
+        if self.use_target_user_embedding_table:
+            if target_user_idx is None or self.target_user_embedding_table is None:
+                raise RuntimeError("target_user_idx is required when use_target_user_embedding_table is True")
+            target_user_embedding = self._forward_target_user_embedding(target_user_idx)
+            combined = torch.cat([attention_pooled, mean_pooled, target_user_embedding], dim=-1)
+
         return self.output_projection(combined)
 
 
