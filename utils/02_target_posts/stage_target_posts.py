@@ -28,7 +28,7 @@ Outputs under <run_dir>/target_posts/<timestamp>/:
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 import argparse
 import hashlib
 import polars as pl
@@ -339,9 +339,9 @@ def _user_is_holdout(did: str, seed: int, fraction: float) -> bool:
 
 def _apply_splits(
     args: argparse.Namespace,
-    lf: pl.LazyFrame,
+    target_posts_lf: pl.LazyFrame,
     logger: logging.Logger,
-) -> pl.LazyFrame:
+) -> Tuple[pl.LazyFrame, pl.LazyFrame]:
     """Assign ``split`` column with two distinct holdout sets.
 
     **holdout_unseen_users** – rows for users selected by a deterministic
@@ -388,7 +388,7 @@ def _apply_splits(
         )
 
     holdout_users_lf = (
-        lf
+        target_posts_lf
         .select("target_did")
         .unique()
         .with_columns(
@@ -419,7 +419,7 @@ def _apply_splits(
         f"(fraction={holdout_fraction}, seed={holdout_seed})"
     )
 
-    lf = lf.join(holdout_users_lf, on="target_did", how="left")
+    target_posts_lf = target_posts_lf.join(holdout_users_lf, on="target_did", how="left")
     is_holdout_user = pl.col("is_holdout_user").fill_null(False)
     before_end = (pl.col(ts_col) < pl.lit(holdout_end)) if holdout_end is not None else pl.lit(True)
 
@@ -461,7 +461,26 @@ def _apply_splits(
         .alias("split")
     )
 
-    return lf.with_columns(split_expr).drop("is_holdout_user")
+    target_posts_lf = target_posts_lf.with_columns(split_expr).drop("is_holdout_user")
+    
+    # ============================================================
+    # Create user index map
+    # ============================================================
+
+    target_posts_train_lf = target_posts_lf.filter(pl.col("split") == "train")
+    target_user_idx_lf = (
+        target_posts_train_lf
+        .group_by('target_did')
+        .agg(pl.count().alias("target_user_train_count"))
+        .with_columns(
+            pl.col("target_did").rank("dense").cast(pl.UInt32).alias("target_user_idx")
+        )
+    )
+
+    # join back to target posts 
+    target_posts_lf = target_posts_lf.join(target_user_idx_lf, on="target_did", how="left")
+
+    return target_posts_lf, target_user_idx_lf
 
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
@@ -496,6 +515,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     log_operation_start('Generate target posts dataset from likes and posts', STAGE_NAME_FOR_LOGGING, logger)
     target_posts_lf: pl.LazyFrame = _get_target_posts(args, posts_core_lf, likes_core_lf, logger, context)
+    target_posts_lf, target_user_idx_lf = _apply_splits(args, target_posts_lf, logger)
     validate_dataframe_schema(target_posts_lf, {
         'target_did': str,
         'seen_at': datetime,
@@ -505,13 +525,16 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'neg_uri': str,
         'neg_emb_idx': int,
         'neg_author_did': str,
+        'target_user_idx': int,
+        'split': str,
     })
-
-    target_posts_lf = _apply_splits(args, target_posts_lf, logger)
 
     # Write out result (streaming to avoid full materialization in memory)
     target_posts_output_path = out_dir / f"target_posts_{out_dir.name}.parquet"
     target_posts_lf.sink_parquet(target_posts_output_path)
+
+    target_user_idx_output_path = out_dir / f"target_user_idx_{out_dir.name}.parquet"
+    target_user_idx_lf.sink_parquet(target_user_idx_output_path)
 
     # Log split counts from the written file
     split_counts = (
