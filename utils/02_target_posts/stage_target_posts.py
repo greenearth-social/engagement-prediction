@@ -468,28 +468,24 @@ def _apply_splits(
     # ============================================================
 
     target_posts_train_lf = target_posts_lf.filter(pl.col("split") == "train")
-    author_emb_idx_lf = (
+    author_idx_lf = (
         pl
         .concat([
-            target_posts_train_lf.select([
-                pl.col('like_emb_idx').alias('emb_idx'),
-                pl.col('like_author_did').alias('author_did'),
-            ]),
-            target_posts_train_lf.select([
-                pl.col('neg_emb_idx').alias('emb_idx'),
-                pl.col('neg_author_did').alias('author_did'),
-            ]),
+            target_posts_train_lf
+            .group_by("like_author_did")
+            .agg(pl.count().alias("author_train_count"))
+            .rename({"like_author_did": "author_did"}),
+            target_posts_train_lf
+            .group_by("neg_author_did")
+            .agg(pl.count().alias("author_train_count"))
+            .rename({"neg_author_did": "author_did"}),
         ])
-        .group_by(['emb_idx', 'author_did'])
-        .agg(pl.count().alias("emb_author_train_count"))
+        .group_by(['author_did'])
+        .agg(pl.sum("author_train_count"))
         .with_columns(
-            pl.sum("emb_author_train_count").over("author_did").alias("author_train_count"),
             pl.col("author_did").rank("dense").cast(pl.UInt32).alias("author_idx")
         )
-        .drop("emb_author_train_count")
     )
-
-    author_idx_lf = author_emb_idx_lf.select(['author_did', 'author_idx']).unique()
 
     # join back to target posts 
     target_posts_lf = (
@@ -501,6 +497,7 @@ def _apply_splits(
             how="left",
         )
         .rename({"author_idx": "like_author_idx"})
+        .drop("author_train_count")
         .join(
             author_idx_lf,
             left_on="neg_author_did",
@@ -508,9 +505,10 @@ def _apply_splits(
             how="left",
         )
         .rename({"author_idx": "neg_author_idx"})
+        .drop("author_train_count")
     )
 
-    return target_posts_lf, author_emb_idx_lf
+    return target_posts_lf, author_idx_lf
 
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
