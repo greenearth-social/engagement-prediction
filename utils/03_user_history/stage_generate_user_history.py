@@ -4,20 +4,22 @@
 Stage 3: Generate User History Directory
 
 Creates a directory-style artifact that maps each target row to a list of prior
-liked post embedding indices and author indices, enabling efficient on-the-fly
-embedding retrieval during training and stable author-history features.
+liked post embedding indices and, when author metadata is available, author
+indices. This enables efficient on-the-fly embedding retrieval during training
+and stable author-history features.
 
 Inputs:
 - likes_core_*.parquet from 01_get_data: Contains
-  {did, subject_uri, record_created_at, emb_idx, author_did}
+  {did, subject_uri, record_created_at, emb_idx}
 - target_posts_*.parquet from 02_target_posts: Wide format with
   {target_did, seen_at, like_uri, like_emb_idx, ..., neg_uri, neg_emb_idx, ..., split}
-- author_idx_*.parquet from 02_target_posts: Author index mapping with
+- author_idx_*.parquet from 02_target_posts, when available: Author index mapping with
   {emb_idx, author_did, author_train_count, author_idx}
 
 Outputs under <run_dir>/03_user_history/<timestamp>/:
 - history_posts_<timestamp>.parquet:
-  {target_did, like_uri, prior_emb_indices, prior_author_indices}
+  {target_did, like_uri, prior_emb_indices} and, when author_idx is available,
+  {prior_author_indices}
   where prior_emb_indices is a List[UInt32] of embedding indices sorted by recency (most recent first),
   prior_author_indices is a List[UInt32] aligned element-wise with
   prior_emb_indices, and rows where the user has no prior likes in the dataset
@@ -361,6 +363,23 @@ def _add_author_indices_to_history(
     return user_history_df
 
 
+def _prepare_user_history_output(
+    directory_df: pl.DataFrame,
+    author_idx_df: Optional[pl.DataFrame],
+    logger: logging.Logger,
+) -> pl.DataFrame:
+    """Select the persisted history columns, adding author history when available."""
+    base_columns = ["target_did", "like_uri", "prior_emb_indices"]
+    if author_idx_df is None:
+        logger.info("No author_idx artifact found; writing legacy history output without prior_author_indices")
+        return directory_df.select(base_columns)
+
+    return (
+        _add_author_indices_to_history(directory_df, author_idx_df, logger)
+        .select([*base_columns, "prior_author_indices"])
+    )
+
+
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     """
     Stage 3: Generate user history directory.
@@ -412,7 +431,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         TIMESTAMP_COL_NAME: pl.Datetime,
         "subject_uri": str,
         "emb_idx": int,
-        "author_did": str,
     }
     validate_dataframe_schema(likes_lf, likes_schema)
     logger.info("✓ likes_core schema validated")
@@ -429,18 +447,23 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     validate_dataframe_schema(targets_lf, targets_schema)
     logger.info("✓ target_posts schema validated")
 
-    log_operation_start('Load author_idx', 'STAGE_03_USER_HISTORY', logger)
-    author_idx_lf: pl.LazyFrame = load_parquet_from_prior(prior_target_posts_dir, "author_idx_")
+    log_operation_start('Load author_idx (optional)', 'STAGE_03_USER_HISTORY', logger)
+    author_idx_lf: Optional[pl.LazyFrame]
+    try:
+        author_idx_lf = load_parquet_from_prior(prior_target_posts_dir, "author_idx_")
 
-    # Validate author idx schema
-    author_idx_schema = {
-        "emb_idx": int,
-        "author_did": str,
-        "author_train_count": int,
-        "author_idx": int,
-    }
-    validate_dataframe_schema(author_idx_lf, author_idx_schema)
-    logger.info("✓ author_idx schema validated")
+        # Validate author idx schema
+        author_idx_schema = {
+            "emb_idx": int,
+            "author_did": str,
+            "author_train_count": int,
+            "author_idx": int,
+        }
+        validate_dataframe_schema(author_idx_lf, author_idx_schema)
+        logger.info("✓ author_idx schema validated")
+    except FileNotFoundError:
+        author_idx_lf = None
+        logger.info("No author_idx artifact found; prior_author_indices will not be written")
 
     mem_tracker.checkpoint("after_load_inputs", quiet=True)
 
@@ -473,10 +496,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # Log and plot the per-user history distribution before/after capping
     _log_and_plot_history_distribution(directory_df, max_prior_likes, out_dir, logger)
 
-    user_history_df = _add_author_indices_to_history(directory_df, author_idx_lf.collect(), logger)
-
-    # Select only the required output columns (drop analysis columns)
-    user_history_df = user_history_df.select(["target_did", "like_uri", "prior_emb_indices", "prior_author_indices"])
+    # Select only the required output columns (drop analysis columns). Author
+    # history is optional so older Stage 2 outputs can still feed Stage 3 when
+    # the Stage 4 author embedding feature is not being used.
+    author_idx_df = author_idx_lf.collect() if author_idx_lf is not None else None
+    user_history_df = _prepare_user_history_output(directory_df, author_idx_df, logger)
     user_history_output_path = out_dir / f"history_posts_{out_dir.name}.parquet"
     user_history_df.write_parquet(user_history_output_path, compression="zstd")
 

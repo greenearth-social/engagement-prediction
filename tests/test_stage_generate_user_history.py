@@ -52,6 +52,12 @@ def add_author_indices_to_history(stage_module):
     return stage_module._add_author_indices_to_history
 
 
+@pytest.fixture
+def prepare_user_history_output(stage_module):
+    """Shortcut to the production _prepare_user_history_output function."""
+    return stage_module._prepare_user_history_output
+
+
 def _make_test_logger() -> logging.Logger:
     """Create a simple logger for tests."""
     logger = logging.getLogger("test_user_history")
@@ -579,6 +585,61 @@ def test_add_author_indices_to_history_handles_empty_mapping(add_author_indices_
 
     assert result["prior_emb_indices"][0].to_list() == [10, 20]
     assert result["prior_author_indices"][0].to_list() == [None, None]
+
+
+def test_prepare_user_history_output_omits_author_history_when_mapping_is_absent(
+    prepare_user_history_output,
+):
+    """Legacy Stage 2 outputs without author_idx should still produce usable history."""
+    logger = _make_test_logger()
+
+    directory_df = pl.DataFrame({
+        "target_did": ["u1"],
+        "like_uri": ["at://u1/like/1"],
+        "seen_at": [datetime(2024, 1, 2, 0, 0)],
+        "prior_emb_indices": [[10, 20]],
+        "raw_prior_count": [2],
+    }).with_columns(
+        pl.col("prior_emb_indices").cast(pl.List(pl.UInt32))
+    )
+
+    result = prepare_user_history_output(directory_df, None, logger)
+
+    assert result.columns == ["target_did", "like_uri", "prior_emb_indices"]
+    assert "prior_author_indices" not in result.columns
+    assert result["prior_emb_indices"][0].to_list() == [10, 20]
+
+
+def test_prepare_user_history_output_adds_author_history_when_mapping_is_present(
+    prepare_user_history_output,
+):
+    """New Stage 2 outputs should still add prior_author_indices."""
+    logger = _make_test_logger()
+
+    directory_df = pl.DataFrame({
+        "target_did": ["u1"],
+        "like_uri": ["at://u1/like/1"],
+        "seen_at": [datetime(2024, 1, 2, 0, 0)],
+        "prior_emb_indices": [[10, 20]],
+        "raw_prior_count": [2],
+    }).with_columns(
+        pl.col("prior_emb_indices").cast(pl.List(pl.UInt32))
+    )
+    author_idx_df = pl.DataFrame({
+        "emb_idx": [10, 20],
+        "author_did": ["author_a", "author_b"],
+        "author_idx": pl.Series([1, 2], dtype=pl.UInt32),
+    })
+
+    result = prepare_user_history_output(directory_df, author_idx_df, logger)
+
+    assert result.columns == [
+        "target_did",
+        "like_uri",
+        "prior_emb_indices",
+        "prior_author_indices",
+    ]
+    assert result["prior_author_indices"][0].to_list() == [1, 2]
 
 
 # ---------------------------------------------------------------------------
