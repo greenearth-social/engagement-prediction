@@ -480,9 +480,10 @@ def _apply_splits(
             .agg(pl.count().alias("author_train_count"))
             .rename({"neg_author_did": "author_did"}),
         ])
-        .group_by(['author_did'])
+        .group_by("author_did")
         .agg(pl.sum("author_train_count"))
-        .with_row_index(name="author_idx")
+        .sort("author_did")
+        .with_row_index(name="author_idx", offset=1)
     )
 
     # join back to target posts 
