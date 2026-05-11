@@ -21,6 +21,7 @@ from typing import Any, Dict, Optional, Callable, List, Iterable
 import json
 import subprocess
 import uuid
+from zoneinfo import ZoneInfo
 
 
 from ..experiment_tracking import ExperimentTracker, NoOpExperimentTracker
@@ -32,6 +33,7 @@ ROOT = UTILS_DIR.parent
 
 
 RUN_TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
+RUN_TIMESTAMP_TIMEZONE = ZoneInfo("America/Los_Angeles")
 DEFAULT_ARTIFACTS_DIR = ROOT / "artifacts"
 DEFAULT_RUNS_DIR = ROOT / "runs"
 LINEAGE_FILENAME = "lineage.json"
@@ -40,8 +42,8 @@ STAGE_RESOLVED_CONFIG_FILENAME = "resolved_config.json"
 
 
 def generate_run_timestamp() -> str:
-    # Keep consistent with historical CLI naming (local time, second resolution).
-    return datetime.now().strftime(RUN_TIMESTAMP_FORMAT)
+    # Keep artifact names independent of the host machine timezone.
+    return datetime.now(RUN_TIMESTAMP_TIMEZONE).strftime(RUN_TIMESTAMP_FORMAT)
 
 def _short_uuid(n: int = 8) -> str:
     return uuid.uuid4().hex[:n]
