@@ -294,15 +294,17 @@ class PostAuthorFeatureEncoder(nn.Module):
         return self.fusion_layer(fused_inputs)
 
 
-class HistoryAuthorUserTowerWrapper(nn.Module):
-    """Exportable user tower that includes history author fusion."""
+class AuthorAwareUserTower(nn.Module):
+    """User tower that fuses history post embeddings with author embeddings."""
 
-    def __init__(self, model: TwoTowerModel):
+    def __init__(
+        self,
+        post_author_feature_encoder: PostAuthorFeatureEncoder,
+        user_tower: nn.Module,
+    ):
         super().__init__()
-        if model.post_author_feature_encoder is None:
-            raise ValueError("HistoryAuthorUserTowerWrapper requires author embeddings to be enabled")
-        self.post_author_feature_encoder = model.post_author_feature_encoder
-        self.user_tower = model.user_tower
+        self.post_author_feature_encoder = post_author_feature_encoder
+        self.user_tower = user_tower
 
     def forward(
         self,
@@ -321,15 +323,17 @@ class HistoryAuthorUserTowerWrapper(nn.Module):
         return self.user_tower(fused_history_embeddings, history_mask)
 
 
-class PostAuthorPostTowerWrapper(nn.Module):
-    """Exportable post tower that includes target-post author fusion."""
+class AuthorAwarePostTower(nn.Module):
+    """Post tower that fuses target post embeddings with author embeddings."""
 
-    def __init__(self, model: TwoTowerModel):
+    def __init__(
+        self,
+        post_author_feature_encoder: PostAuthorFeatureEncoder,
+        post_tower: nn.Module,
+    ):
         super().__init__()
-        if model.post_author_feature_encoder is None:
-            raise ValueError("PostAuthorPostTowerWrapper requires author embeddings to be enabled")
-        self.post_author_feature_encoder = model.post_author_feature_encoder
-        self.post_tower = model.post_tower
+        self.post_author_feature_encoder = post_author_feature_encoder
+        self.post_tower = post_tower
 
     def forward(
         self,
@@ -459,7 +463,7 @@ class TwoTowerModel(nn.Module):
         self.use_post_encoder = use_post_encoder
         self.l2_normalize_embeddings = bool(l2_normalize_embeddings)
         self.use_author_embedding_table = bool(use_author_embedding_table)
-        self.post_author_feature_encoder: Optional[PostAuthorFeatureEncoder] = None
+        post_author_feature_encoder: Optional[PostAuthorFeatureEncoder] = None
 
         if self.use_author_embedding_table:
             if user_encoder_type == "summarized":
@@ -468,7 +472,7 @@ class TwoTowerModel(nn.Module):
                 raise ValueError("author_table_num_rows must be provided and >= 2 when use_author_embedding_table is True")
             if author_embedding_dim is None or author_embedding_dim <= 0:
                 raise ValueError("author_embedding_dim must be provided and positive when use_author_embedding_table is True")
-            self.post_author_feature_encoder = PostAuthorFeatureEncoder(
+            post_author_feature_encoder = PostAuthorFeatureEncoder(
                 post_embedding_dim=post_embedding_dim,
                 author_table_num_rows=author_table_num_rows,
                 author_embedding_dim=author_embedding_dim,
@@ -532,9 +536,24 @@ class TwoTowerModel(nn.Module):
         else:
             raw_post_tower = nn.Identity()
 
-        self.user_tower = L2NormalizedUserTower(raw_user_tower, enabled=self.l2_normalize_embeddings)
-        self.post_tower = L2NormalizedPostTower(raw_post_tower, enabled=self.l2_normalize_embeddings)
+        base_user_tower = L2NormalizedUserTower(raw_user_tower, enabled=self.l2_normalize_embeddings)
+        base_post_tower = L2NormalizedPostTower(raw_post_tower, enabled=self.l2_normalize_embeddings)
 
+        if self.use_author_embedding_table:
+            if post_author_feature_encoder is None:
+                raise RuntimeError("post_author_feature_encoder must be initialized when author embeddings are enabled")
+            self.user_tower = AuthorAwareUserTower(post_author_feature_encoder, base_user_tower)
+            self.post_tower = AuthorAwarePostTower(post_author_feature_encoder, base_post_tower)
+        else:
+            self.user_tower = base_user_tower
+            self.post_tower = base_post_tower
+
+    @property
+    def post_author_feature_encoder(self) -> Optional[PostAuthorFeatureEncoder]:
+        """Return the shared author fusion module when author-aware towers are enabled."""
+        if isinstance(self.user_tower, AuthorAwareUserTower):
+            return self.user_tower.post_author_feature_encoder
+        return None
 
     def encode_user(
         self,
@@ -552,19 +571,11 @@ class TwoTowerModel(nn.Module):
             User vectors in shared space [batch, shared_dim].
             When `l2_normalize_embeddings=True`, these are unit-length.
         """
-        fused_history_embeddings = history_embeddings
         if self.use_author_embedding_table:
-            if history_author_indices is None or self.post_author_feature_encoder is None:
+            if history_author_indices is None:
                 raise RuntimeError("history_author_indices are required when use_author_embedding_table is True")
-            fused_history_embeddings = self.post_author_feature_encoder(
-                history_embeddings,
-                history_author_indices,
-            )
-            fused_history_embeddings = fused_history_embeddings.masked_fill(
-                ~history_mask.unsqueeze(-1),
-                0.0,
-            )
-        return self.user_tower(fused_history_embeddings, history_mask)
+            return self.user_tower(history_embeddings, history_mask, history_author_indices)
+        return self.user_tower(history_embeddings, history_mask)
 
     def encode_post(
         self,
@@ -584,15 +595,11 @@ class TwoTowerModel(nn.Module):
                 - otherwise: [batch, post_embedding_dim] (identity)
             When `l2_normalize_embeddings=True`, outputs are L2-normalized.
         """
-        fused_post_embeddings = post_embeddings
         if self.use_author_embedding_table:
-            if target_author_indices is None or self.post_author_feature_encoder is None:
+            if target_author_indices is None:
                 raise RuntimeError("target_author_indices are required when use_author_embedding_table is True")
-            fused_post_embeddings = self.post_author_feature_encoder(
-                post_embeddings,
-                target_author_indices,
-            )
-        return self.post_tower(fused_post_embeddings)
+            return self.post_tower(post_embeddings, target_author_indices)
+        return self.post_tower(post_embeddings)
 
     def forward(
         self,
@@ -1227,23 +1234,16 @@ def run(context: Context, args) -> Dict[str, Any]:
 
         # Save TorchScript file, which is the format needed for ClearML serving
         # Save the post and user towers separately
+        trained_model = trained_model.cpu()
         torchscript_user_name = "engagement_user_tower"
         torchscript_user_path = checkpoints_dir / f"{torchscript_user_name}.pt"
-        if use_author_embedding_table:
-            user_tower_export = HistoryAuthorUserTowerWrapper(trained_model.cpu())
-        else:
-            user_tower_export = trained_model.user_tower.cpu()
-        torch.jit.script(user_tower_export).save(torchscript_user_path)
+        torch.jit.script(trained_model.user_tower).save(torchscript_user_path)
         user_model_id = context.tracker.log_artifact(name=f"{torchscript_user_name}", path=torchscript_user_path)
         logger.info(f"User tower model id: {user_model_id}")
 
         torchscript_post_name = "engagement_post_tower"
         torchscript_post_path = checkpoints_dir / f"{torchscript_post_name}.pt"
-        if use_author_embedding_table:
-            post_tower_export = PostAuthorPostTowerWrapper(trained_model.cpu())
-        else:
-            post_tower_export = trained_model.post_tower.cpu()
-        torch.jit.script(post_tower_export).save(torchscript_post_path)
+        torch.jit.script(trained_model.post_tower).save(torchscript_post_path)
         post_model_id = context.tracker.log_artifact(name=f"{torchscript_post_name}", path=torchscript_post_path)
         logger.info(f"Post tower model id: {post_model_id}")
 

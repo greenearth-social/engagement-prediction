@@ -10,8 +10,8 @@ stage_train_two_tower = importlib.import_module("utils.04_train.stage_train_two_
 PostTower = stage_train_two_tower.PostTower
 TwoTowerModel = stage_train_two_tower.TwoTowerModel
 PostAuthorFeatureEncoder = stage_train_two_tower.PostAuthorFeatureEncoder
-HistoryAuthorUserTowerWrapper = stage_train_two_tower.HistoryAuthorUserTowerWrapper
-PostAuthorPostTowerWrapper = stage_train_two_tower.PostAuthorPostTowerWrapper
+AuthorAwareUserTower = stage_train_two_tower.AuthorAwareUserTower
+AuthorAwarePostTower = stage_train_two_tower.AuthorAwarePostTower
 build_author_serving_mapping = stage_train_two_tower.build_author_serving_mapping
 
 
@@ -1108,13 +1108,15 @@ def test_two_tower_author_embeddings_affect_user_and_target_post_paths():
     post_embeddings = torch.randn(batch_size, 16)
     target_author_indices = torch.tensor([2, 5], dtype=torch.long)
 
-    user_without_authors = model.user_tower(history_embeddings, history_mask)
+    assert isinstance(model.user_tower, AuthorAwareUserTower)
+    assert isinstance(model.post_tower, AuthorAwarePostTower)
+    user_without_authors = model.user_tower.user_tower(history_embeddings, history_mask)
     user_with_authors = model.encode_user(history_embeddings, history_mask, history_author_indices)
-    post_without_authors = model.post_tower(post_embeddings)
+    post_without_authors = model.post_tower.post_tower(post_embeddings)
     post_with_authors = model.encode_post(post_embeddings, target_author_indices)
 
     assert model.post_author_feature_encoder is not None
-    post_forward = model.post_tower(post_embeddings)
+    post_forward = model.post_tower.post_tower(post_embeddings)
 
     assert not torch.allclose(user_without_authors, user_with_authors)
     assert not torch.allclose(post_without_authors, post_with_authors)
@@ -1221,7 +1223,7 @@ def test_two_tower_compute_loss_and_preds_with_author_embeddings():
     assert scores.shape == (batch_size,)
 
 
-def test_author_enabled_tower_wrappers_are_torchscriptable():
+def test_author_enabled_towers_are_torchscriptable():
     model = TwoTowerModel(
         post_embedding_dim=8,
         shared_dim=4,
@@ -1248,14 +1250,13 @@ def test_author_enabled_tower_wrappers_are_torchscriptable():
     post_embeddings = torch.randn(2, 8)
     target_author_indices = torch.tensor([2, 5], dtype=torch.long)
 
-    user_wrapper = HistoryAuthorUserTowerWrapper(model)
-    post_wrapper = PostAuthorPostTowerWrapper(model)
+    assert isinstance(model.user_tower, AuthorAwareUserTower)
+    assert isinstance(model.post_tower, AuthorAwarePostTower)
+    assert model.user_tower.post_author_feature_encoder is model.post_author_feature_encoder
+    assert model.post_tower.post_author_feature_encoder is model.post_author_feature_encoder
 
-    assert user_wrapper.post_author_feature_encoder is model.post_author_feature_encoder
-    assert post_wrapper.post_author_feature_encoder is model.post_author_feature_encoder
-
-    scripted_user = torch.jit.script(user_wrapper)
-    scripted_post = torch.jit.script(post_wrapper)
+    scripted_user = torch.jit.script(model.user_tower)
+    scripted_post = torch.jit.script(model.post_tower)
 
     assert scripted_user(history_embeddings, history_mask, history_author_indices).shape == (2, 4)
     assert scripted_post(post_embeddings, target_author_indices).shape == (2, 4)
