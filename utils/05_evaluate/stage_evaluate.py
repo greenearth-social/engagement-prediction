@@ -27,14 +27,13 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import pandas as pd
 import polars as pl
 
-from utils.pipeline.core import Context
+from utils.pipeline.core import Context, generate_run_timestamp
 from utils.helpers import get_stage_logger, log_operation_start, log_prior_stage_inputs
 from utils.dataloaders import filter_split_and_join_history, load_training_data
 
@@ -300,7 +299,7 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # Step 1: Load training data from prior stages (target_posts + history for metadata)
     log_operation_start('Load training data from prior stages', STAGE_LOG_NAME, logger)
-    _, target_posts_df, history_df, embed_dim = load_training_data(
+    _, target_posts_df, history_df, _, embed_dim = load_training_data(
         context, logger=logger,
     )
     log_prior_stage_inputs(context, logger)
@@ -346,7 +345,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     logger.info(f"Computed metadata for {len(user_metadata_df)} users")
 
     # Step 4: Create EvalContext
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = generate_run_timestamp()
 
     eval_config: Dict[str, Any] = {
         'batch_size': eval_batch_size,

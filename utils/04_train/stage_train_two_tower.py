@@ -118,6 +118,9 @@ from utils.helpers import (
     set_random_seeds,
 )
 from utils.dataloaders import (
+    AUTHOR_PAD_IDX,
+    AUTHOR_UNK_IDX,
+    build_author_table_lookup,
     load_training_data,
     SequenceEngagementDataset,
     SummarizedEngagementDataset,
@@ -230,6 +233,158 @@ class L2NormalizedPostTower(nn.Module):
         return F.normalize(embeddings, p=2.0, dim=-1, eps=self.eps)
 
 
+class PostAuthorFeatureEncoder(nn.Module):
+    """Fuse post content embeddings with per-author embeddings."""
+
+    def __init__(
+        self,
+        post_embedding_dim: int,
+        author_table_num_rows: int,
+        author_embedding_dim: int,
+        author_unknown_dropout_rate: float,
+    ):
+        super().__init__()
+        if author_table_num_rows < 2:
+            raise ValueError("author_table_num_rows must be at least 2")
+        if author_embedding_dim <= 0:
+            raise ValueError("author_embedding_dim must be positive")
+        if not 0.0 <= author_unknown_dropout_rate <= 1.0:
+            raise ValueError("author_unknown_dropout_rate must be in [0, 1]")
+
+        self.author_pad_idx = AUTHOR_PAD_IDX
+        self.author_unk_idx = AUTHOR_UNK_IDX
+        self.author_unknown_dropout_rate = float(author_unknown_dropout_rate)
+        self.author_embedding = nn.Embedding(
+            num_embeddings=author_table_num_rows,
+            embedding_dim=author_embedding_dim,
+            padding_idx=self.author_pad_idx,
+        )
+        nn.init.xavier_uniform_(self.author_embedding.weight)
+        with torch.no_grad():
+            self.author_embedding.weight[self.author_pad_idx].zero_()
+
+        self.fusion_layer = nn.Linear(
+            post_embedding_dim + author_embedding_dim,
+            post_embedding_dim,
+        )
+        nn.init.xavier_uniform_(self.fusion_layer.weight)
+        if self.fusion_layer.bias is not None:
+            nn.init.zeros_(self.fusion_layer.bias)
+
+    def forward(
+        self,
+        post_embeddings: torch.Tensor,
+        author_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.training and self.author_unknown_dropout_rate > 0.0:
+            eligible = author_indices > self.author_unk_idx
+            if torch.any(eligible):
+                dropout_mask = torch.rand(
+                    author_indices.shape,
+                    device=author_indices.device,
+                ) < self.author_unknown_dropout_rate
+                author_indices = torch.where(
+                    eligible & dropout_mask,
+                    torch.full_like(author_indices, self.author_unk_idx),
+                    author_indices,
+                )
+
+        author_embeddings = self.author_embedding(author_indices)
+        fused_inputs = torch.cat([post_embeddings, author_embeddings], dim=-1)
+        return self.fusion_layer(fused_inputs)
+
+
+class AuthorAwareUserTower(nn.Module):
+    """User tower that fuses history post embeddings with author embeddings."""
+
+    def __init__(
+        self,
+        post_author_feature_encoder: PostAuthorFeatureEncoder,
+        user_tower: nn.Module,
+    ):
+        super().__init__()
+        self.post_author_feature_encoder = post_author_feature_encoder
+        self.user_tower = user_tower
+
+    def forward(
+        self,
+        history_embeddings: torch.Tensor,
+        history_mask: torch.Tensor,
+        history_author_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        fused_history_embeddings = self.post_author_feature_encoder(
+            history_embeddings,
+            history_author_indices,
+        )
+        fused_history_embeddings = fused_history_embeddings.masked_fill(
+            ~history_mask.unsqueeze(-1),
+            0.0,
+        )
+        return self.user_tower(fused_history_embeddings, history_mask)
+
+
+class AuthorAwarePostTower(nn.Module):
+    """Post tower that fuses target post embeddings with author embeddings."""
+
+    def __init__(
+        self,
+        post_author_feature_encoder: PostAuthorFeatureEncoder,
+        post_tower: nn.Module,
+    ):
+        super().__init__()
+        self.post_author_feature_encoder = post_author_feature_encoder
+        self.post_tower = post_tower
+
+    def forward(
+        self,
+        post_embeddings: torch.Tensor,
+        target_author_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        fused_post_embeddings = self.post_author_feature_encoder(
+            post_embeddings,
+            target_author_indices,
+        )
+        return self.post_tower(fused_post_embeddings)
+
+
+def build_author_serving_mapping(
+    author_idx_mapping_df: pl.DataFrame,
+    author_idx_to_table_row: np.ndarray,
+) -> pl.DataFrame:
+    """Build the supported author DID -> embedding-table row artifact for serving."""
+    required_cols = {"author_did", "author_idx", "author_train_count"}
+    missing_cols = required_cols.difference(author_idx_mapping_df.columns)
+    if missing_cols:
+        missing = ", ".join(sorted(missing_cols))
+        raise ValueError(f"author_idx_mapping_df is missing required columns: {missing}")
+
+    mapping_df = (
+        author_idx_mapping_df
+        .select(["author_did", "author_idx", "author_train_count"])
+        .unique()
+        .sort("author_idx")
+    )
+    author_table_rows: List[int] = []
+    for raw_author_idx in mapping_df["author_idx"].to_list():
+        if raw_author_idx is None:
+            author_table_rows.append(AUTHOR_UNK_IDX)
+            continue
+        raw_author_idx_int = int(raw_author_idx)
+        if 0 <= raw_author_idx_int < len(author_idx_to_table_row):
+            author_table_rows.append(int(author_idx_to_table_row[raw_author_idx_int]))
+        else:
+            author_table_rows.append(AUTHOR_UNK_IDX)
+
+    return (
+        mapping_df
+        .with_columns(
+            pl.Series("author_table_row", author_table_rows, dtype=pl.UInt32),
+        )
+        .filter(pl.col("author_table_row") > AUTHOR_UNK_IDX)
+        .select(["author_did", "author_idx", "author_train_count", "author_table_row"])
+    )
+
+
 # =============================================================================
 # Two-Tower Engagement Model
 # =============================================================================
@@ -293,6 +448,10 @@ class TwoTowerModel(nn.Module):
         similarity_temperature: float,
         user_encoder_type: str,
         use_post_encoder: bool,
+        use_author_embedding_table: bool = False,
+        author_table_num_rows: Optional[int] = None,
+        author_embedding_dim: Optional[int] = None,
+        author_unknown_dropout_rate: float = 0.0,
     ):
         super().__init__()
         self.shared_dim = shared_dim
@@ -303,6 +462,22 @@ class TwoTowerModel(nn.Module):
         self.user_encoder_type = user_encoder_type
         self.use_post_encoder = use_post_encoder
         self.l2_normalize_embeddings = bool(l2_normalize_embeddings)
+        self.use_author_embedding_table = bool(use_author_embedding_table)
+        post_author_feature_encoder: Optional[PostAuthorFeatureEncoder] = None
+
+        if self.use_author_embedding_table:
+            if user_encoder_type == "summarized":
+                raise ValueError("use_author_embedding_table is not supported with user_encoder_type='summarized'")
+            if author_table_num_rows is None or author_table_num_rows < 2:
+                raise ValueError("author_table_num_rows must be provided and >= 2 when use_author_embedding_table is True")
+            if author_embedding_dim is None or author_embedding_dim <= 0:
+                raise ValueError("author_embedding_dim must be provided and positive when use_author_embedding_table is True")
+            post_author_feature_encoder = PostAuthorFeatureEncoder(
+                post_embedding_dim=post_embedding_dim,
+                author_table_num_rows=author_table_num_rows,
+                author_embedding_dim=author_embedding_dim,
+                author_unknown_dropout_rate=author_unknown_dropout_rate,
+            )
 
         # Instantiate user tower based on encoder type
         if user_encoder_type == "cross_attention":
@@ -361,11 +536,31 @@ class TwoTowerModel(nn.Module):
         else:
             raw_post_tower = nn.Identity()
 
-        self.user_tower = L2NormalizedUserTower(raw_user_tower, enabled=self.l2_normalize_embeddings)
-        self.post_tower = L2NormalizedPostTower(raw_post_tower, enabled=self.l2_normalize_embeddings)
+        base_user_tower = L2NormalizedUserTower(raw_user_tower, enabled=self.l2_normalize_embeddings)
+        base_post_tower = L2NormalizedPostTower(raw_post_tower, enabled=self.l2_normalize_embeddings)
 
+        if self.use_author_embedding_table:
+            if post_author_feature_encoder is None:
+                raise RuntimeError("post_author_feature_encoder must be initialized when author embeddings are enabled")
+            self.user_tower = AuthorAwareUserTower(post_author_feature_encoder, base_user_tower)
+            self.post_tower = AuthorAwarePostTower(post_author_feature_encoder, base_post_tower)
+        else:
+            self.user_tower = base_user_tower
+            self.post_tower = base_post_tower
 
-    def encode_user(self, history_embeddings: torch.Tensor, history_mask: torch.Tensor) -> torch.Tensor:
+    @property
+    def post_author_feature_encoder(self) -> Optional[PostAuthorFeatureEncoder]:
+        """Return the shared author fusion module when author-aware towers are enabled."""
+        if isinstance(self.user_tower, AuthorAwareUserTower):
+            return self.user_tower.post_author_feature_encoder
+        return None
+
+    def encode_user(
+        self,
+        history_embeddings: torch.Tensor,
+        history_mask: torch.Tensor,
+        history_author_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Encode user engagement history into shared space representation.
         
         Args:
@@ -376,13 +571,23 @@ class TwoTowerModel(nn.Module):
             User vectors in shared space [batch, shared_dim].
             When `l2_normalize_embeddings=True`, these are unit-length.
         """
+        if self.use_author_embedding_table:
+            if history_author_indices is None:
+                raise RuntimeError("history_author_indices are required when use_author_embedding_table is True")
+            return self.user_tower(history_embeddings, history_mask, history_author_indices)
         return self.user_tower(history_embeddings, history_mask)
 
-    def encode_post(self, post_embeddings: torch.Tensor) -> torch.Tensor:
+    def encode_post(
+        self,
+        post_embeddings: torch.Tensor,
+        target_author_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Encode post embeddings into shared space representation.
         
         Args:
             post_embeddings: Raw post embeddings [batch, input_dim]
+            target_author_indices: Author embedding table rows [batch], required
+                when author embeddings are enabled.
         
         Returns:
             Post vectors for dot product scoring.
@@ -390,6 +595,10 @@ class TwoTowerModel(nn.Module):
                 - otherwise: [batch, post_embedding_dim] (identity)
             When `l2_normalize_embeddings=True`, outputs are L2-normalized.
         """
+        if self.use_author_embedding_table:
+            if target_author_indices is None:
+                raise RuntimeError("target_author_indices are required when use_author_embedding_table is True")
+            return self.post_tower(post_embeddings, target_author_indices)
         return self.post_tower(post_embeddings)
 
     def forward(
@@ -397,6 +606,8 @@ class TwoTowerModel(nn.Module):
         history_embeddings: torch.Tensor,
         history_mask: torch.Tensor,
         post_embeddings: torch.Tensor,
+        history_author_indices: Optional[torch.Tensor] = None,
+        target_author_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute engagement scores via dot product in shared space.
         
@@ -411,12 +622,16 @@ class TwoTowerModel(nn.Module):
                   at position 0 (and optionally padded to seq_len > 1).
             history_mask: History validity mask [batch, seq_len] (optional in summarized mode)
             post_embeddings: Target post embeddings [batch, input_dim]
+            history_author_indices: Author table rows aligned with history items,
+                required when author embeddings are enabled.
+            target_author_indices: Author table rows for target posts, required
+                when author embeddings are enabled.
         
         Returns:
             Raw engagement scores [batch] (logits before sigmoid)
         """
-        user_emb = self.encode_user(history_embeddings, history_mask)
-        post_emb = self.encode_post(post_embeddings)
+        user_emb = self.encode_user(history_embeddings, history_mask, history_author_indices)
+        post_emb = self.encode_post(post_embeddings, target_author_indices)
         
         similarity_score = (user_emb * post_emb).sum(dim=-1)
         return similarity_score / self.similarity_temperature
@@ -452,6 +667,8 @@ class TwoTowerModel(nn.Module):
             Returns raw scores (not probabilities) for flexibility in evaluation.
             Apply sigmoid(scores) to get probabilities.
         """
+        history_author_indices = None
+        target_author_indices = None
         # unpack inputs
         if self.user_encoder_type == "summarized":
             features = batch["features"].to(device, non_blocking=True) # [B, embed_dim*2]
@@ -469,9 +686,18 @@ class TwoTowerModel(nn.Module):
             history_embeddings = batch["history_embeddings"].to(device, non_blocking=True) # [B, seq_len, embed_dim]
             history_mask = batch["history_mask"].to(device, non_blocking=True) # [B, seq_len]
             post_embeddings = batch["target_post_embedding"].to(device, non_blocking=True) # [B, embed_dim]
+            if self.use_author_embedding_table:
+                history_author_indices = batch["history_author_indices"].to(device, dtype=torch.long, non_blocking=True)
+                target_author_indices = batch["target_post_author_idx"].to(device, dtype=torch.long, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
 
-        scores = self.forward(history_embeddings, history_mask, post_embeddings)
+        scores = self.forward(
+            history_embeddings,
+            history_mask,
+            post_embeddings,
+            history_author_indices,
+            target_author_indices,
+        )
         loss = F.binary_cross_entropy_with_logits(scores, labels.float())
         return loss, scores
 
@@ -744,7 +970,7 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # --- load data from prior stages ---
     log_operation_start("Load training data from prior stages", STAGE_LOG_NAME, logger)
-    embeddings_mmap, target_posts_df, history_df, embed_dim = load_training_data(
+    embeddings_mmap, target_posts_df, history_df, author_idx_mapping_df, embed_dim = load_training_data(
         context, logger=logger,
     )
     log_prior_stage_inputs(context, logger)
@@ -774,6 +1000,38 @@ def run(context: Context, args) -> Dict[str, Any]:
     lr_scheduler_patience = int(args.lr_scheduler_patience)
     gradient_clip_max_norm = float(args.gradient_clip_max_norm)
     eval_holdout_type = str(args.eval_holdout_type)
+    use_author_embedding_table = bool(args.use_author_embedding_table)
+    author_embedding_dim = int(args.author_embedding_dim)
+    min_author_support = int(args.min_author_support)
+    author_unknown_dropout_rate = float(args.author_unknown_dropout_rate)
+
+    if use_author_embedding_table and user_encoder_type == "summarized":
+        raise ValueError("use_author_embedding_table is not supported with user_encoder_type='summarized'")
+    if use_author_embedding_table and author_idx_mapping_df is None:
+        raise FileNotFoundError(
+            "author_idx artifact was not found in 02_target_posts output, but --use-author-embedding-table was enabled."
+        )
+    author_idx_to_table_row = None
+    author_table_num_rows = 0
+    author_serving_mapping_df = None
+    if use_author_embedding_table:
+        if author_idx_mapping_df is None:
+            raise FileNotFoundError("author_idx_mapping_df is required when use_author_embedding_table is True")
+        author_idx_to_table_row, author_table_num_rows = build_author_table_lookup(
+            author_idx_mapping_df=author_idx_mapping_df,
+            min_author_support=min_author_support,
+        )
+        author_serving_mapping_df = build_author_serving_mapping(
+            author_idx_mapping_df=author_idx_mapping_df,
+            author_idx_to_table_row=author_idx_to_table_row,
+        )
+        logger.info(
+            "Author embedding table enabled: "
+            f"min_author_support={min_author_support}, "
+            f"author_embedding_dim={author_embedding_dim}, "
+            f"author_table_num_rows={author_table_num_rows}, "
+            f"serving_mapping_rows={len(author_serving_mapping_df)}"
+        )
 
     # Worker settings
     num_workers = int(args.num_dataloader_workers)
@@ -800,11 +1058,17 @@ def run(context: Context, args) -> Dict[str, Any]:
     else:
         train_dataset = SequenceEngagementDataset(
             embeddings_mmap, target_posts_df, history_df, split="train",
-            max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
+            max_history_len=max_history_len, embed_dim=embed_dim,
+            use_author_embedding_table=use_author_embedding_table,
+            author_idx_to_table_row=author_idx_to_table_row,
+            logger=logger,
         )
         val_dataset = SequenceEngagementDataset(
             embeddings_mmap, target_posts_df, history_df, split="val",
-            max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
+            max_history_len=max_history_len, embed_dim=embed_dim,
+            use_author_embedding_table=use_author_embedding_table,
+            author_idx_to_table_row=author_idx_to_table_row,
+            logger=logger,
         )
 
     # Create data loaders using centralized helper
@@ -834,6 +1098,10 @@ def run(context: Context, args) -> Dict[str, Any]:
         similarity_temperature=similarity_temperature,
         user_encoder_type=user_encoder_type,
         use_post_encoder=use_post_encoder,
+        use_author_embedding_table=use_author_embedding_table,
+        author_table_num_rows=author_table_num_rows if use_author_embedding_table else None,
+        author_embedding_dim=author_embedding_dim if use_author_embedding_table else None,
+        author_unknown_dropout_rate=author_unknown_dropout_rate,
     )
 
     if (not use_post_encoder) and (user_encoder_type == "summarized"):
@@ -912,6 +1180,11 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # --- save model ---
     model_path = None
+    author_table_mapping_path = (
+        checkpoints_dir / "author_table_mapping.parquet"
+        if use_author_embedding_table and save_model
+        else None
+    )
     config = {
         "model_type": "two_tower",
         "user_encoder_type": user_encoder_type,
@@ -926,6 +1199,14 @@ def run(context: Context, args) -> Dict[str, Any]:
         "dropout_rate": dropout_rate,
         "l2_normalize_embeddings": l2_normalize_embeddings,
         "similarity_temperature": similarity_temperature,
+        "use_author_embedding_table": use_author_embedding_table,
+        "author_embedding_dim": author_embedding_dim if use_author_embedding_table else None,
+        "min_author_support": min_author_support if use_author_embedding_table else None,
+        "author_unknown_dropout_rate": author_unknown_dropout_rate if use_author_embedding_table else None,
+        "author_table_num_rows": author_table_num_rows if use_author_embedding_table else None,
+        "author_pad_idx": AUTHOR_PAD_IDX,
+        "author_unk_idx": AUTHOR_UNK_IDX,
+        "author_table_mapping_path": str(author_table_mapping_path) if author_table_mapping_path else None,
     }
     if save_model:
         model_path = checkpoints_dir / f"two_tower_{timestamp}.pth"
@@ -941,17 +1222,28 @@ def run(context: Context, args) -> Dict[str, Any]:
         )
         logger.info(f"Model saved to: {model_path}")
 
+        if use_author_embedding_table:
+            if author_serving_mapping_df is None or author_table_mapping_path is None:
+                raise RuntimeError("author_serving_mapping_df is required when author embeddings are enabled")
+            author_serving_mapping_df.write_parquet(author_table_mapping_path, compression="zstd")
+            author_mapping_id = context.tracker.log_artifact(
+                name="author_table_mapping",
+                path=author_table_mapping_path,
+            )
+            logger.info(f"Author table mapping artifact id: {author_mapping_id}")
+
         # Save TorchScript file, which is the format needed for ClearML serving
         # Save the post and user towers separately
+        trained_model = trained_model.cpu()
         torchscript_user_name = "engagement_user_tower"
         torchscript_user_path = checkpoints_dir / f"{torchscript_user_name}.pt"
-        torch.jit.script(trained_model.user_tower.cpu()).save(torchscript_user_path)
+        torch.jit.script(trained_model.user_tower).save(torchscript_user_path)
         user_model_id = context.tracker.log_artifact(name=f"{torchscript_user_name}", path=torchscript_user_path)
         logger.info(f"User tower model id: {user_model_id}")
 
         torchscript_post_name = "engagement_post_tower"
         torchscript_post_path = checkpoints_dir / f"{torchscript_post_name}.pt"
-        torch.jit.script(trained_model.post_tower.cpu()).save(torchscript_post_path)
+        torch.jit.script(trained_model.post_tower).save(torchscript_post_path)
         post_model_id = context.tracker.log_artifact(name=f"{torchscript_post_name}", path=torchscript_post_path)
         logger.info(f"Post tower model id: {post_model_id}")
 
@@ -986,7 +1278,10 @@ def run(context: Context, args) -> Dict[str, Any]:
             else:
                 holdout_dataset = SequenceEngagementDataset(
                     embeddings_mmap, target_posts_df, history_df, split=split_name,
-                    max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
+                    max_history_len=max_history_len, embed_dim=embed_dim,
+                    use_author_embedding_table=use_author_embedding_table,
+                    author_idx_to_table_row=author_idx_to_table_row,
+                    logger=logger,
                 )
             if len(holdout_dataset) == 0:
                 logger.info(f"No rows for split '{split_name}', skipping.")
@@ -1068,5 +1363,6 @@ def run(context: Context, args) -> Dict[str, Any]:
         "artifacts": {
             "model_path": str(model_path) if model_path else None,
             "training_config": str(out_dir / "training_config.json"),
+            "author_table_mapping_path": str(author_table_mapping_path) if author_table_mapping_path else None,
         },
     }

@@ -84,14 +84,18 @@ def _make_likes(
     timestamps: list[datetime],
     subject_uris: list[str],
     emb_idxs: list[int],
+    author_dids: list[str] | None = None,
 ) -> pl.LazyFrame:
     """Build a minimal likes LazyFrame."""
-    return pl.DataFrame({
+    data = {
         "did": dids,
         "record_created_at": timestamps,
         "subject_uri": subject_uris,
         "emb_idx": emb_idxs,
-    }).lazy()
+    }
+    if author_dids is not None:
+        data["author_did"] = author_dids
+    return pl.DataFrame(data).lazy()
 
 
 # --- Tests ---
@@ -450,6 +454,104 @@ def test_directory_raw_prior_count(build_history):
 
     # raw_prior_count should reflect the uncapped count (5)
     assert result["raw_prior_count"][0] == 5
+
+
+# ---------------------------------------------------------------------------
+# prior_author_indices tests
+# ---------------------------------------------------------------------------
+
+
+def test_directory_author_indices_preserve_order_and_unknowns(build_history):
+    """Author indices should align with prior_emb_indices and keep unknown authors."""
+    logger = _make_test_logger()
+
+    likes_lf = _make_likes(
+        ["u1", "u1", "u1"],
+        [
+            datetime(2024, 1, 1, 10, 0),
+            datetime(2024, 1, 1, 11, 0),
+            datetime(2024, 1, 1, 12, 0),
+        ],
+        ["p1", "p2", "p3"],
+        [100, 200, 300],
+        author_dids=["author_a", "author_missing", "author_c"],
+    )
+    author_idx_lf = pl.DataFrame({
+        "author_did": ["author_a", "author_c"],
+        "author_idx": pl.Series([1, 3], dtype=pl.UInt32),
+        "author_train_count": [5, 7],
+    }).lazy()
+    targets_lf = _make_targets(
+        ["u1"], ["at://u1/like/4"], [datetime(2024, 1, 1, 13, 0)],
+    )
+
+    result = build_history(
+        targets_lf=targets_lf,
+        likes_lf=likes_lf,
+        max_prior_likes=None,
+        logger=logger,
+        author_idx_lf=author_idx_lf,
+    ).collect()
+
+    assert result["prior_emb_indices"][0].to_list() == [300, 200, 100]
+    assert result["prior_author_indices"][0].to_list() == [3, None, 1]
+    assert result["raw_prior_count"][0] == 3
+
+
+def test_directory_author_indices_empty_for_no_history(build_history):
+    """Rows with no prior likes should get empty author history lists."""
+    logger = _make_test_logger()
+
+    likes_lf = _make_likes(
+        ["u1"],
+        [datetime(2024, 1, 2, 10, 0)],
+        ["p1"],
+        [100],
+        author_dids=["author_a"],
+    )
+    author_idx_lf = pl.DataFrame({
+        "author_did": ["author_a"],
+        "author_idx": pl.Series([1], dtype=pl.UInt32),
+        "author_train_count": [5],
+    }).lazy()
+    targets_lf = _make_targets(
+        ["u1"], ["at://u1/like/0"], [datetime(2024, 1, 1, 13, 0)],
+    )
+
+    result = build_history(
+        targets_lf=targets_lf,
+        likes_lf=likes_lf,
+        max_prior_likes=None,
+        logger=logger,
+        author_idx_lf=author_idx_lf,
+    ).collect()
+
+    assert result["prior_emb_indices"][0].to_list() == []
+    assert result["prior_author_indices"][0].to_list() == []
+
+
+def test_directory_without_author_mapping_omits_author_history(build_history):
+    """Legacy inputs should not emit prior_author_indices."""
+    logger = _make_test_logger()
+
+    likes_lf = _make_likes(
+        ["u1"],
+        [datetime(2024, 1, 1, 10, 0)],
+        ["p1"],
+        [100],
+    )
+    targets_lf = _make_targets(
+        ["u1"], ["at://u1/like/2"], [datetime(2024, 1, 1, 13, 0)],
+    )
+
+    result = build_history(
+        targets_lf=targets_lf,
+        likes_lf=likes_lf,
+        max_prior_likes=None,
+        logger=logger,
+    ).collect()
+
+    assert "prior_author_indices" not in result.columns
 
 
 # ---------------------------------------------------------------------------

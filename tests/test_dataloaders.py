@@ -6,11 +6,14 @@ import torch
 from torch.utils.data import DataLoader
 
 from utils.dataloaders import (
+    AUTHOR_PAD_IDX,
+    AUTHOR_UNK_IDX,
     SummarizedEngagementDataset,
     SequenceEngagementDataset,
     SummarizedUserTower,
     TransformerDualPoolingEncoder,
     CrossAttentionPoolingEncoder,
+    build_author_table_lookup,
     create_data_loaders,
     MeanSummarizer,
 )
@@ -37,6 +40,8 @@ def mock_target_posts_df():
         "neg_uri": [f"neg{i}" for i in range(12)],
         "like_emb_idx": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
         "neg_emb_idx": [20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
+        "like_author_idx": [1, 2, 3, None, 99, 1, 2, 3, 1, 2, 3, 99],
+        "neg_author_idx": [3, 2, 1, 99, None, 3, 2, 1, 3, 2, 1, None],
     })
 
 
@@ -342,6 +347,145 @@ def test_sequence_dataset_positive_negative_labeling(mock_embeddings_mmap, mock_
         
         # Different target posts
         assert not torch.equal(pos["target_post_embedding"], neg["target_post_embedding"])
+
+
+def test_build_author_table_lookup_applies_support_threshold():
+    author_idx_mapping_df = pl.DataFrame({
+        "author_idx": pl.Series([1, 2, 3], dtype=pl.UInt32),
+        "author_train_count": [10, 3, 5],
+    })
+
+    author_idx_to_table_row, author_table_num_rows = build_author_table_lookup(
+        author_idx_mapping_df=author_idx_mapping_df,
+        min_author_support=5,
+    )
+
+    assert author_idx_to_table_row.tolist() == [AUTHOR_UNK_IDX, 2, AUTHOR_UNK_IDX, 4]
+    assert author_table_num_rows == 5
+
+
+def test_build_author_table_lookup_empty_mapping_still_reserves_pad_and_unk_rows():
+    author_idx_mapping_df = pl.DataFrame({
+        "author_idx": pl.Series([], dtype=pl.UInt32),
+        "author_train_count": pl.Series([], dtype=pl.UInt32),
+    })
+
+    author_idx_to_table_row, author_table_num_rows = build_author_table_lookup(
+        author_idx_mapping_df=author_idx_mapping_df,
+        min_author_support=5,
+    )
+
+    # No raw Stage 2 author_idx values exist, so the lookup only needs a dummy
+    # slot. The actual embedding table still needs PAD=0 and UNK=1 rows.
+    assert author_idx_to_table_row.tolist() == [AUTHOR_UNK_IDX]
+    assert author_table_num_rows == 2
+
+
+def test_build_author_table_lookup_all_unsupported_authors_map_to_unk():
+    author_idx_mapping_df = pl.DataFrame({
+        "author_idx": pl.Series([1, 2, 3], dtype=pl.UInt32),
+        "author_train_count": [1, 2, 3],
+    })
+
+    author_idx_to_table_row, author_table_num_rows = build_author_table_lookup(
+        author_idx_mapping_df=author_idx_mapping_df,
+        min_author_support=5,
+    )
+
+    assert author_idx_to_table_row.tolist() == [AUTHOR_UNK_IDX, AUTHOR_UNK_IDX, AUTHOR_UNK_IDX, AUTHOR_UNK_IDX]
+    assert author_table_num_rows == 2
+
+
+def test_sequence_dataset_returns_history_author_indices_when_enabled(mock_embeddings_mmap, mock_target_posts_df):
+    history_df = pl.DataFrame({
+        "target_did": [f"user{i}" for i in range(12)],
+        "like_uri": [f"post{i}" for i in range(12)],
+        "prior_emb_indices": [
+            [40, 41, 42],
+            [43, 44],
+            [],
+            [45, 46, 47, 48, 49],
+            [50],
+            [51, 52, 53, 54],
+            [55, 56],
+            [57],
+            [58, 59, 60],
+            [],
+            [61, 62, 63, 64, 65, 66],
+            [67, 68],
+        ],
+        "prior_author_indices": [
+            [1, 2, None],
+            [2, 1],
+            [],
+            [3, 3, 2, 99, None],
+            [1],
+            [2, 2, 2, 2],
+            [1, 1],
+            [2],
+            [3, 3, 3],
+            [],
+            [1, 2, 3, None, 99, 1],
+            [2, 2],
+        ],
+    })
+    author_idx_mapping_df = pl.DataFrame({
+        "author_idx": pl.Series([1, 2, 3], dtype=pl.UInt32),
+        "author_train_count": [8, 2, 5],
+    })
+    author_idx_to_table_row, _ = build_author_table_lookup(
+        author_idx_mapping_df=author_idx_mapping_df,
+        min_author_support=5,
+    )
+
+    dataset = SequenceEngagementDataset(
+        embeddings_mmap=mock_embeddings_mmap,
+        target_posts_df=mock_target_posts_df,
+        history_df=history_df,
+        split="train",
+        max_history_len=5,
+        embed_dim=64,
+        use_author_embedding_table=True,
+        author_idx_to_table_row=author_idx_to_table_row,
+    )
+
+    sample = dataset[0]
+    assert "history_author_indices" in sample
+    assert sample["history_author_indices"].shape == (5,)
+    assert sample["history_author_indices"].dtype == torch.int64
+    assert sample["history_author_indices"][:3].tolist() == [2, AUTHOR_UNK_IDX, AUTHOR_UNK_IDX]
+    assert sample["history_author_indices"][3:].tolist() == [AUTHOR_PAD_IDX, AUTHOR_PAD_IDX]
+    assert sample["target_post_author_idx"].item() == 2
+
+    neg_sample = dataset[1]
+    assert neg_sample["target_post_author_idx"].item() == 4
+
+    unsupported_pos_author = dataset[2]
+    assert unsupported_pos_author["target_post_author_idx"].item() == AUTHOR_UNK_IDX
+
+    missing_pos_author = dataset[6]
+    assert missing_pos_author["target_post_author_idx"].item() == AUTHOR_UNK_IDX
+
+
+def test_sequence_dataset_requires_target_author_columns_when_author_table_enabled(
+    mock_embeddings_mmap,
+    mock_target_posts_df,
+    mock_history_df,
+):
+    author_idx_to_table_row = np.array([AUTHOR_UNK_IDX, 2], dtype=np.uint32)
+    target_posts_without_author_cols = mock_target_posts_df.drop(["like_author_idx", "neg_author_idx"])
+
+    with pytest.raises(ValueError, match="like_author_idx"):
+        SequenceEngagementDataset(
+            embeddings_mmap=mock_embeddings_mmap,
+            target_posts_df=target_posts_without_author_cols,
+            history_df=mock_history_df.with_columns(pl.col("prior_emb_indices").alias("prior_author_indices")),
+            split="train",
+            max_history_len=5,
+            embed_dim=64,
+            use_author_embedding_table=True,
+            author_idx_to_table_row=author_idx_to_table_row,
+        )
 
 
 # =============================================================================

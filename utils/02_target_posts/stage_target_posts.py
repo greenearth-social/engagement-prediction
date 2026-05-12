@@ -22,13 +22,13 @@ Inputs:
 
 Outputs under <run_dir>/target_posts/<timestamp>/:
 - target_posts_<timestamp>.parquet
+- author_idx_<timestamp>.parquet
 - stage_info.txt
 - stage.log
 """
 
 from __future__ import annotations
-from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 import argparse
 import hashlib
 import polars as pl
@@ -339,9 +339,9 @@ def _user_is_holdout(did: str, seed: int, fraction: float) -> bool:
 
 def _apply_splits(
     args: argparse.Namespace,
-    lf: pl.LazyFrame,
+    target_posts_lf: pl.LazyFrame,
     logger: logging.Logger,
-) -> pl.LazyFrame:
+) -> Tuple[pl.LazyFrame, pl.LazyFrame]:
     """Assign ``split`` column with two distinct holdout sets.
 
     **holdout_unseen_users** – rows for users selected by a deterministic
@@ -388,7 +388,7 @@ def _apply_splits(
         )
 
     holdout_users_lf = (
-        lf
+        target_posts_lf
         .select("target_did")
         .unique()
         .with_columns(
@@ -419,7 +419,7 @@ def _apply_splits(
         f"(fraction={holdout_fraction}, seed={holdout_seed})"
     )
 
-    lf = lf.join(holdout_users_lf, on="target_did", how="left")
+    target_posts_lf = target_posts_lf.join(holdout_users_lf, on="target_did", how="left")
     is_holdout_user = pl.col("is_holdout_user").fill_null(False)
     before_end = (pl.col(ts_col) < pl.lit(holdout_end)) if holdout_end is not None else pl.lit(True)
 
@@ -461,7 +461,53 @@ def _apply_splits(
         .alias("split")
     )
 
-    return lf.with_columns(split_expr).drop("is_holdout_user")
+    target_posts_lf = target_posts_lf.with_columns(split_expr).drop("is_holdout_user")
+
+    # ============================================================
+    # Create author index map
+    # ============================================================
+
+    target_posts_train_lf = target_posts_lf.filter(pl.col("split") == "train")
+    author_idx_lf = (
+        pl
+        .concat([
+            target_posts_train_lf
+            .group_by("like_author_did")
+            .agg(pl.count().alias("author_train_count"))
+            .rename({"like_author_did": "author_did"}),
+            target_posts_train_lf
+            .group_by("neg_author_did")
+            .agg(pl.count().alias("author_train_count"))
+            .rename({"neg_author_did": "author_did"}),
+        ])
+        .group_by("author_did")
+        .agg(pl.sum("author_train_count"))
+        .sort("author_did")
+        .with_row_index(name="author_idx", offset=1)
+    )
+
+    # join back to target posts 
+    target_posts_lf = (
+        target_posts_lf
+        .join(
+            author_idx_lf,
+            left_on="like_author_did",
+            right_on="author_did",
+            how="left",
+        )
+        .rename({"author_idx": "like_author_idx"})
+        .drop("author_train_count")
+        .join(
+            author_idx_lf,
+            left_on="neg_author_did",
+            right_on="author_did",
+            how="left",
+        )
+        .rename({"author_idx": "neg_author_idx"})
+        .drop("author_train_count")
+    )
+
+    return target_posts_lf, author_idx_lf
 
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
@@ -496,22 +542,27 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     log_operation_start('Generate target posts dataset from likes and posts', STAGE_NAME_FOR_LOGGING, logger)
     target_posts_lf: pl.LazyFrame = _get_target_posts(args, posts_core_lf, likes_core_lf, logger, context)
+    target_posts_lf, author_idx_lf = _apply_splits(args, target_posts_lf, logger)
     validate_dataframe_schema(target_posts_lf, {
         'target_did': str,
         'seen_at': datetime,
         'like_uri': str,
         'like_emb_idx': int,
         'like_author_did': str,
+        'like_author_idx': int,
         'neg_uri': str,
         'neg_emb_idx': int,
         'neg_author_did': str,
+        'neg_author_idx': int,
+        'split': str,
     })
-
-    target_posts_lf = _apply_splits(args, target_posts_lf, logger)
 
     # Write out result (streaming to avoid full materialization in memory)
     target_posts_output_path = out_dir / f"target_posts_{out_dir.name}.parquet"
     target_posts_lf.sink_parquet(target_posts_output_path)
+
+    author_idx_output_path = out_dir / f"author_idx_{out_dir.name}.parquet"
+    author_idx_lf.sink_parquet(author_idx_output_path)
 
     # Log split counts from the written file
     split_counts = (
@@ -535,6 +586,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     return {
         'output_dir': out_dir,
         'artifacts': {
-            'user_summary_path': str(target_posts_output_path),
+            'target_posts_path': str(target_posts_output_path),
+            'author_idx_path': str(author_idx_output_path),
         }
     }

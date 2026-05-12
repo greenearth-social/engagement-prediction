@@ -1,27 +1,34 @@
 #!/usr/bin/env python3
 
 """
-Stage 2: Generate User History Directory
+Stage 3: Generate User History Directory
 
 Creates a directory-style artifact that maps each target row to a list of prior
-liked post embedding indices, enabling efficient on-the-fly embedding retrieval
-during training.
+liked post embedding indices and, when author metadata is available, author
+indices. This enables efficient on-the-fly embedding retrieval during training
+and stable author-history features.
 
 Inputs:
-- likes_core_*.parquet from 01_get_data: Contains {did, subject_uri, record_created_at, emb_idx}
+- likes_core_*.parquet from 01_get_data: Contains
+  {did, subject_uri, record_created_at, emb_idx}
 - target_posts_*.parquet from 02_target_posts: Wide format with
   {target_did, seen_at, like_uri, like_emb_idx, ..., neg_uri, neg_emb_idx, ..., split}
+- author_idx_*.parquet from 02_target_posts, when available: Author index mapping with
+  {emb_idx, author_did, author_train_count, author_idx}
 
-Outputs under <run_dir>/02_featurize/<timestamp>/:
-- history_posts_<timestamp>.parquet: {target_did, like_uri, prior_emb_indices}
+Outputs under <run_dir>/03_user_history/<timestamp>/:
+- history_posts_<timestamp>.parquet:
+  {target_did, like_uri, prior_emb_indices} and, when author_idx is available,
+  {prior_author_indices}
   where prior_emb_indices is a List[UInt32] of embedding indices sorted by recency (most recent first),
-  indexed on (target_did, like_uri) so there is one history per (user, like-event) pair.
-  Rows where the user has no prior likes in the dataset get an empty list.
+  prior_author_indices is a List[UInt32] aligned element-wise with
+  prior_emb_indices, and rows where the user has no prior likes in the dataset
+  get empty lists.
 """
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional
 import argparse
 import logging
 import polars as pl
@@ -45,6 +52,7 @@ def _build_user_history_directory(
     max_prior_likes: Optional[int],
     logger: logging.Logger,
     history_buffer_hours: Optional[float] = None,
+    author_idx_lf: Optional[pl.LazyFrame] = None,
 ) -> pl.LazyFrame:
     """
     Build a directory mapping each target (user, like-event) to prior liked embedding indices.
@@ -97,11 +105,24 @@ def _build_user_history_directory(
 
     # Rename likes columns to avoid collision after join
     # We need: did (join key), record_created_at (for filtering/sorting), emb_idx (the result)
-    likes_renamed = likes_lf.select([
+    likes_cols = [
         pl.col("did"),
         pl.col(TIMESTAMP_COL_NAME).alias("like_ts"),
         pl.col("emb_idx").alias("like_emb_idx"),
-    ])
+    ]
+
+    if author_idx_lf is not None:
+        likes_renamed = likes_lf.select(likes_cols + [pl.col("author_did")])
+        likes_renamed = (
+            likes_renamed
+            .join(
+                author_idx_lf.select("author_did", "author_idx"),
+                on="author_did",
+                how="left",
+            )
+        )
+    else:
+        likes_renamed = likes_lf.select(likes_cols)
 
     # Join targets with likes on user identity
     # This creates one row per (target, like) pair for each user
@@ -116,34 +137,36 @@ def _build_user_history_directory(
     # This ensures we only include prior history, not future likes.
     if history_buffer_hours is not None and history_buffer_hours > 0:
         buffer_us = int(history_buffer_hours * 3_600_000_000)  # hours → microseconds
-        cutoff = pl.col("seen_at") - pl.duration(microseconds=buffer_us)
+        cutoff_expr = pl.col("seen_at") - pl.duration(microseconds=buffer_us)
         logger.info(f"  Applying history buffer of {history_buffer_hours}h (like_ts < seen_at - {history_buffer_hours}h)")
     else:
-        cutoff = pl.col("seen_at")
+        cutoff_expr = pl.col("seen_at")
 
     prior_likes = joined.filter(
-        pl.col("like_ts") < cutoff
+        pl.col("like_ts") < cutoff_expr
     )
 
-    # Build aggregation expression: sort by recency (descending) and optionally cap
-    # The result is a list of emb_idx values, most recent first
-    agg_expr = (
-        pl.col("like_emb_idx")
-        .sort_by(pl.col("like_ts"), descending=True)
-    )
-
-    if max_prior_likes is not None and max_prior_likes > 0:
-        agg_expr = agg_expr.head(max_prior_likes)
-        logger.info(f"  Capping prior likes to {max_prior_likes} per target")
-    else:
-        logger.info("  No cap on prior likes (using all available history)")
+    def _get_agg_expr(col_name: str):
+        # Build aggregation expression: sort by recency (descending) and optionally cap
+        # The result is a list of emb_idx values, most recent first
+        agg_expr = (
+            pl.col(col_name)
+            .sort_by(pl.col("like_ts"), descending=True)
+        )
+        if max_prior_likes is not None and max_prior_likes > 0:
+            agg_expr = agg_expr.head(max_prior_likes)
+        return agg_expr
+    
+    agg_exprs = [
+        _get_agg_expr("like_emb_idx").alias("prior_emb_indices"),
+        pl.len().alias("raw_prior_count"),
+    ]
+    if author_idx_lf is not None:
+        agg_exprs += [_get_agg_expr("author_idx").alias("prior_author_indices")]
 
     # Group by integer target_idx (cheap) and collect prior emb_idx as list.
     # Also compute raw (uncapped) count for distribution analysis.
-    directory_lf = prior_likes.group_by("target_idx").agg(
-        agg_expr.alias("prior_emb_indices"),
-        pl.len().alias("raw_prior_count"),
-    )
+    directory_lf = prior_likes.group_by("target_idx").agg(agg_exprs)
 
     # Left-join back to ensure every target row appears, including those with
     # no prior likes (e.g. a user's first like in the dataset).
@@ -165,7 +188,17 @@ def _build_user_history_directory(
         .otherwise(pl.col("prior_emb_indices").cast(pl.List(pl.UInt32)))
         .alias("prior_emb_indices"),
         pl.col("raw_prior_count").fill_null(0),
-    ).select(["target_did", "like_uri", "seen_at", "prior_emb_indices", "raw_prior_count"])
+    )
+    output_columns = ["target_did", "like_uri", "seen_at", "prior_emb_indices", "raw_prior_count"]
+    if author_idx_lf is not None:
+        directory_lf = directory_lf.with_columns(
+            pl.when(pl.col("prior_author_indices").is_null())
+            .then(pl.lit([]).cast(pl.List(pl.UInt32)))
+            .otherwise(pl.col("prior_author_indices").cast(pl.List(pl.UInt32)))
+            .alias("prior_author_indices"),
+        )
+        output_columns.insert(4, "prior_author_indices")
+    directory_lf = directory_lf.select(output_columns)
 
     return directory_lf
 
@@ -366,6 +399,23 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     validate_dataframe_schema(targets_lf, targets_schema)
     logger.info("✓ target_posts schema validated")
 
+    log_operation_start('Load author_idx (optional)', 'STAGE_03_USER_HISTORY', logger)
+    author_idx_lf: Optional[pl.LazyFrame]
+    try:
+        author_idx_lf = load_parquet_from_prior(prior_target_posts_dir, "author_idx_")
+
+        # Validate author idx schema
+        author_idx_schema = {
+            "author_did": str,
+            "author_train_count": int,
+            "author_idx": int,
+        }
+        validate_dataframe_schema(author_idx_lf, author_idx_schema)
+        logger.info("✓ author_idx schema validated")
+    except FileNotFoundError:
+        author_idx_lf = None
+        logger.info("No author_idx artifact found; prior_author_indices will not be written")
+
     mem_tracker.checkpoint("after_load_inputs", quiet=True)
 
     # Log input sizes (collect counts efficiently)
@@ -382,13 +432,13 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         max_prior_likes=max_prior_likes,
         logger=logger,
         history_buffer_hours=history_buffer_hours,
+        author_idx_lf=author_idx_lf,
     )
 
     mem_tracker.checkpoint("after_build_history", quiet=True)
 
     # === Write output ===
     log_operation_start('Write user history directory', 'STAGE_03_USER_HISTORY', logger)
-    output_path = out_dir / f"history_posts_{out_dir.name}.parquet"
 
     # Collect using the streaming engine so that the intermediate fan-out join
     # is processed in batches rather than fully materialised in memory.
@@ -398,10 +448,15 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # Log and plot the per-user history distribution before/after capping
     _log_and_plot_history_distribution(directory_df, max_prior_likes, out_dir, logger)
 
-    # Select only the required output columns (drop analysis columns)
-    directory_df = directory_df.select(["target_did", "like_uri", "prior_emb_indices"])
-
-    directory_df.write_parquet(output_path, compression="zstd")
+    # Select only the required persisted output columns. Author history is
+    # optional so older Stage 2 outputs can still feed Stage 3 when the Stage 4
+    # author embedding feature is not being used.
+    output_columns = ["target_did", "like_uri", "prior_emb_indices"]
+    if author_idx_lf is not None:
+        output_columns.append("prior_author_indices")
+    user_history_df = directory_df.select(output_columns)
+    user_history_output_path = out_dir / f"history_posts_{out_dir.name}.parquet"
+    user_history_df.write_parquet(user_history_output_path, compression="zstd")
 
     n_output = len(directory_df)
 
@@ -427,7 +482,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     mem_tracker.checkpoint("after_write_output", quiet=True)
 
-    logger.info(f"✓ Wrote {n_output:,} directory entries to {output_path.name}")
+    logger.info(f"✓ Wrote {n_output:,} directory entries to {user_history_output_path.name}")
     logger.info(f"  With history: {n_with_history:,} ({100*n_with_history/n_output:.1f}%)")
     logger.info(f"  Empty history: {n_empty_history:,} ({100*n_empty_history/n_output:.1f}%)")
     logger.info(f"  Prior likes per target: mean={mean_prior:.1f}, min={min_prior}, max={max_prior}")
@@ -454,6 +509,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     return {
         'output_dir': out_dir,
         'artifacts': {
-            'user_history_directory_path': str(output_path),
+            'user_history_directory_path': str(user_history_output_path),
         }
     }

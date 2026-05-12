@@ -4,7 +4,20 @@ import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 
-from utils.pipeline.core import Context, generate_run_timestamp, select_prior_output, list_stage_outputs
+import utils.pipeline.core as pipeline_core
+from utils.pipeline.core import Context, select_prior_output, list_stage_outputs
+
+
+def test_generate_run_timestamp_uses_los_angeles_time(monkeypatch):
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            fixed_utc = datetime(2026, 5, 11, 1, 30, 0, tzinfo=timezone.utc)
+            return fixed_utc.astimezone(tz) if tz is not None else fixed_utc.replace(tzinfo=None)
+
+    monkeypatch.setattr(pipeline_core, "datetime", FixedDateTime)
+
+    assert pipeline_core.generate_run_timestamp() == "20260510_183000"
 
 
 def test_select_prior_output_prefers_latest(tmp_path):
@@ -123,9 +136,3 @@ def test_new_stage_dir_rejects_mismatched_stage_folder_when_active(tmp_path):
         assert False, "Expected ValueError for mismatched stage folder"
     except ValueError as e:
         assert "mismatch" in str(e).lower()
-
-
-def test_generate_run_timestamp_uses_us_pacific_time():
-    dt_utc = datetime(2026, 1, 15, 8, 30, 45, tzinfo=timezone.utc)
-
-    assert generate_run_timestamp(dt_utc) == "20260115_003045"
