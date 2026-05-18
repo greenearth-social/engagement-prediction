@@ -74,6 +74,28 @@ def test_negative_samples_per_hour_replaces_old_negative_posts_sample(tmp_path):
         cli._merge_args_with_config(raw)
 
 
+def test_user_sampling_args_replace_old_names(tmp_path):
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--max-trainval-users", "123", "--max-unseen-eval-users", "45"])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.max_trainval_users == 123
+    assert merged.max_unseen_eval_users == 45
+    assert "max_liking_users" not in cli.DEFAULTS
+    assert "holdout_user_fraction" not in cli.DEFAULTS
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--max-liking-users", "123"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--holdout-user-fraction", "0.2"])
+
+    config_path = Path(tmp_path) / "old_sampling.yml"
+    config_path.write_text("max_liking_users: 123\nholdout_user_fraction: 0.2\n")
+    raw = parser.parse_args(["--config", str(config_path)])
+    with pytest.raises(ValueError):
+        cli._merge_args_with_config(raw)
+
+
 def test_background_effective_config_preserves_no_post_encoder(tmp_path):
     parser = cli.build_parser()
     raw = parser.parse_args(["--no-post-encoder"])
@@ -185,7 +207,7 @@ def test_merge_args_with_config_accepts_prior_pins(tmp_path):
         textwrap.dedent(
             """
             prior_01_get_data: 20260101_000000_deadbeef
-            prior_02_target_posts: 20260102_000000_cafebabe
+            prior_03_user_history: 20260102_000000_cafebabe
             """
         ).strip()
         + "\n"
@@ -196,4 +218,4 @@ def test_merge_args_with_config_accepts_prior_pins(tmp_path):
     merged = cli._merge_args_with_config(raw)
 
     assert merged.prior_01_get_data == "20260101_000000_deadbeef"
-    assert merged.prior_02_target_posts == "20260102_000000_cafebabe"
+    assert merged.prior_03_user_history == "20260102_000000_cafebabe"

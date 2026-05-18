@@ -34,7 +34,7 @@ def _make_stage_output(
 def test_resolve_prior_spec_resolves_stage_run_id(tmp_path):
     output_root = Path(tmp_path) / "out"
     artifacts_dir = output_root / "artifacts"
-    stage_folder = "02_target_posts"
+    stage_folder = "03_user_history"
     stage_run_id = "20260102_000000_abcd1234"
     target = artifacts_dir / stage_folder / stage_run_id
     target.mkdir(parents=True)
@@ -81,7 +81,6 @@ def test_resolve_prior_spec_raises_if_missing(tmp_path):
 def test_get_stage_folder_to_keys_is_derived_from_registry():
     assert get_stage_folder_to_keys() == {
         "01_get_data": ("get_data",),
-        "02_target_posts": ("target_posts",),
         "03_user_history": ("user_history",),
         "04_train": ("train_mlp", "train_two_tower"),
         "05_evaluate": ("evaluate",),
@@ -91,10 +90,9 @@ def test_get_stage_folder_to_keys_is_derived_from_registry():
 def test_get_stage_input_folders_is_derived_from_stage_order():
     assert get_stage_input_folders() == {
         "01_get_data": [],
-        "02_target_posts": ["01_get_data"],
-        "03_user_history": ["01_get_data", "02_target_posts"],
-        "04_train": ["01_get_data", "02_target_posts", "03_user_history"],
-        "05_evaluate": ["01_get_data", "02_target_posts", "03_user_history", "04_train"],
+        "03_user_history": ["01_get_data"],
+        "04_train": ["01_get_data", "03_user_history"],
+        "05_evaluate": ["01_get_data", "03_user_history", "04_train"],
     }
 
 
@@ -105,26 +103,17 @@ def test_resolve_stage_dependencies_for_train_follows_latest_downstream_lineage(
 
     get_data_old = _make_stage_output(artifacts_dir, "01_get_data", "20260101_000000_oldget")
     get_data_new = _make_stage_output(artifacts_dir, "01_get_data", "20260105_000000_newget")
-    target_posts_old = _make_stage_output(
-        artifacts_dir,
-        "02_target_posts",
-        "20260102_000000_oldtarget",
-        inputs={"01_get_data": str(get_data_old)},
-    )
     _make_stage_output(
-        artifacts_dir,
-        "02_target_posts",
-        "20260106_000000_newtarget",
-        inputs={"01_get_data": str(get_data_new)},
-    )
-    user_history_old = _make_stage_output(
         artifacts_dir,
         "03_user_history",
         "20260103_000000_oldhistory",
-        inputs={
-            "01_get_data": str(get_data_old),
-            "02_target_posts": str(target_posts_old),
-        },
+        inputs={"01_get_data": str(get_data_old)},
+    )
+    user_history_new = _make_stage_output(
+        artifacts_dir,
+        "03_user_history",
+        "20260106_000000_newhistory",
+        inputs={"01_get_data": str(get_data_new)},
     )
 
     ctx = Context(run_dir=run_dir, artifacts_dir=artifacts_dir, runs_dir=Path(tmp_path) / "runs", use_latest=True)
@@ -135,9 +124,8 @@ def test_resolve_stage_dependencies_for_train_follows_latest_downstream_lineage(
     )
 
     assert resolved == {
-        "01_get_data": get_data_old.resolve(),
-        "02_target_posts": target_posts_old.resolve(),
-        "03_user_history": user_history_old.resolve(),
+        "01_get_data": get_data_new.resolve(),
+        "03_user_history": user_history_new.resolve(),
     }
 
 
@@ -148,30 +136,21 @@ def test_resolve_stage_dependencies_raises_on_misaligned_explicit_pins(tmp_path)
 
     get_data_old = _make_stage_output(artifacts_dir, "01_get_data", "20260101_000000_oldget")
     get_data_new = _make_stage_output(artifacts_dir, "01_get_data", "20260104_000000_newget")
-    target_posts_old = _make_stage_output(
+    _make_stage_output(
         artifacts_dir,
-        "02_target_posts",
-        "20260102_000000_oldtarget",
+        "03_user_history",
+        "20260102_000000_oldhistory",
         inputs={"01_get_data": str(get_data_old)},
-    )
-    target_posts_new = _make_stage_output(
-        artifacts_dir,
-        "02_target_posts",
-        "20260105_000000_newtarget",
-        inputs={"01_get_data": str(get_data_new)},
     )
     user_history_new = _make_stage_output(
         artifacts_dir,
         "03_user_history",
         "20260106_000000_newhistory",
-        inputs={
-            "01_get_data": str(get_data_new),
-            "02_target_posts": str(target_posts_new),
-        },
+        inputs={"01_get_data": str(get_data_new)},
     )
 
     ctx = Context(run_dir=run_dir, artifacts_dir=artifacts_dir, runs_dir=Path(tmp_path) / "runs", use_latest=True)
-    ctx.prior_outputs["02_target_posts"] = target_posts_old
+    ctx.prior_outputs["01_get_data"] = get_data_old
     ctx.prior_outputs["03_user_history"] = user_history_new
 
     with pytest.raises(ValueError, match="Misaligned inputs for stage '04_train'"):
@@ -188,20 +167,11 @@ def test_resolve_stage_dependencies_for_evaluate_infers_inputs_from_train_manife
 
     get_data_old = _make_stage_output(artifacts_dir, "01_get_data", "20260101_000000_oldget")
     _make_stage_output(artifacts_dir, "01_get_data", "20260109_000000_newget")
-    target_posts_old = _make_stage_output(
-        artifacts_dir,
-        "02_target_posts",
-        "20260102_000000_oldtarget",
-        inputs={"01_get_data": str(get_data_old)},
-    )
     user_history_old = _make_stage_output(
         artifacts_dir,
         "03_user_history",
         "20260103_000000_oldhistory",
-        inputs={
-            "01_get_data": str(get_data_old),
-            "02_target_posts": str(target_posts_old),
-        },
+        inputs={"01_get_data": str(get_data_old)},
     )
     train_old = _make_stage_output(
         artifacts_dir,
@@ -209,7 +179,6 @@ def test_resolve_stage_dependencies_for_evaluate_infers_inputs_from_train_manife
         "20260104_000000_oldtrain",
         inputs={
             "01_get_data": str(get_data_old),
-            "02_target_posts": str(target_posts_old),
             "03_user_history": str(user_history_old),
         },
     )
@@ -223,29 +192,28 @@ def test_resolve_stage_dependencies_for_evaluate_infers_inputs_from_train_manife
 
     assert resolved == {
         "01_get_data": get_data_old.resolve(),
-        "02_target_posts": target_posts_old.resolve(),
         "03_user_history": user_history_old.resolve(),
         "04_train": train_old.resolve(),
     }
 
 
-def test_validate_explicit_prior_pin_consistency_raises_on_misaligned_stage1_stage2_pins(tmp_path):
+def test_validate_explicit_prior_pin_consistency_raises_on_misaligned_stage1_history_pins(tmp_path):
     artifacts_dir = Path(tmp_path) / "artifacts"
     run_dir = Path(tmp_path) / "runs" / "run1"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     get_data_old = _make_stage_output(artifacts_dir, "01_get_data", "20260101_000000_oldget")
     get_data_new = _make_stage_output(artifacts_dir, "01_get_data", "20260104_000000_newget")
-    target_posts_new = _make_stage_output(
+    user_history_new = _make_stage_output(
         artifacts_dir,
-        "02_target_posts",
-        "20260105_000000_newtarget",
+        "03_user_history",
+        "20260105_000000_newhistory",
         inputs={"01_get_data": str(get_data_new)},
     )
 
     ctx = Context(run_dir=run_dir, artifacts_dir=artifacts_dir, runs_dir=Path(tmp_path) / "runs", use_latest=True)
     ctx.prior_outputs["01_get_data"] = get_data_old
-    ctx.prior_outputs["02_target_posts"] = target_posts_new
+    ctx.prior_outputs["03_user_history"] = user_history_new
 
     with pytest.raises(ValueError, match="Explicit prior pins are inconsistent"):
         validate_explicit_prior_pin_consistency(ctx)
