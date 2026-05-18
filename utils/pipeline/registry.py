@@ -15,7 +15,6 @@ from .core import ROOT, Context, load_run_callable
 # Stage specs: stage_key -> (relative_file_path_from_root, stage_folder_name)
 STAGE_SPECS: Dict[str, Tuple[str, str]] = {
     'get_data':        ("utils/01_get_data/stage_get_data.py",                  "01_get_data"),
-    'target_posts':    ("utils/02_target_posts/stage_target_posts.py",          "02_target_posts"),
     'user_history':    ("utils/03_user_history/stage_generate_user_history.py",  "03_user_history"),
     'train_mlp':       ("utils/04_train/stage_train_mlp.py",                    "04_train"),
     'train_two_tower': ("utils/04_train/stage_train_two_tower.py",              "04_train"),
@@ -50,4 +49,3 @@ def run_stage(stage_name: str, context: Context, args) -> Dict[str, object]:
         argv=getattr(args, "_argv", None),
     )
     return result
-

@@ -55,6 +55,17 @@ def _write_posts_parquet(tmp_path, rows):
     return path
 
 
+def _split_kwargs(**overrides):
+    kwargs = dict(
+        train_start="2024-01-01T00:00:00",
+        val_start="2024-01-03T00:00:00",
+        holdout_start=None,
+        holdout_end=None,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
 def _make_posts_rows(embedding_model):
     return [
         {
@@ -109,10 +120,12 @@ def test_load_likes_filters_time_and_min_likes(tmp_path, stage_get_data_module):
         start_str="2024-01-02T00:00:00",
         end_str="2024-01-04T00:00:00",
         paths=[str(likes_path)],
-        max_liking_users=None,
+        max_trainval_users=None,
+        max_unseen_eval_users=0,
         max_likes_per_user=0,
         min_likes_per_user=2,
         random_seed=123,
+        **_split_kwargs(),
         logger=logger,
     )
 
@@ -120,6 +133,11 @@ def test_load_likes_filters_time_and_min_likes(tmp_path, stage_get_data_module):
     assert likes_df["did"].unique().to_list() == ["user_a"]
     assert likes_df.schema["record_created_at"] == pl.Datetime
     assert likes_df.schema["like_hour_bucket"] == pl.Datetime
+    splits_by_uri = {
+        row["subject_uri"]: row["split"]
+        for row in likes_df.select(["subject_uri", "split"]).iter_rows(named=True)
+    }
+    assert splits_by_uri == {"post:1": "train", "post:2": "val"}
     assert likes_df['did'].n_unique() == 1
     buckets_by_uri = {
         row["subject_uri"]: row["like_hour_bucket"]
@@ -143,10 +161,12 @@ def test_load_likes_per_user_cap(tmp_path, stage_get_data_module):
         start_str="2024-01-01T00:00:00",
         end_str="2024-01-03T00:00:00",
         paths=[str(likes_path)],
-        max_liking_users=None,
+        max_trainval_users=None,
+        max_unseen_eval_users=0,
         max_likes_per_user=2,
         min_likes_per_user=0,
         random_seed=42,
+        **_split_kwargs(),
         logger=logger,
     )
 
@@ -154,30 +174,117 @@ def test_load_likes_per_user_cap(tmp_path, stage_get_data_module):
     assert likes_df.filter(pl.col("did") == "user_b").height == 1
 
 
-def test_get_sampled_users_deterministic(stage_get_data_module):
+def test_get_sampled_user_cohorts_deterministic_and_disjoint(stage_get_data_module):
     likes_rows = [
         {"did": f"user_{i}", "subject_uri": f"post:{i}", "record_created_at": "2024-01-02T00:00:00"}
         for i in range(10)
     ]
     likes_lf = pl.DataFrame(likes_rows).lazy()
 
-    first, *_ = stage_get_data_module._get_sampled_users_with_min_likes(
+    first, *_ = stage_get_data_module._get_sampled_user_cohorts_with_min_likes(
         likes_lf=likes_lf,
         min_likes_per_user=1,
-        max_liking_users=5,
+        max_trainval_users=5,
+        max_unseen_eval_users=3,
         random_seed=7,
     )
-    second, *_ = stage_get_data_module._get_sampled_users_with_min_likes(
+    second, *_ = stage_get_data_module._get_sampled_user_cohorts_with_min_likes(
         likes_lf=likes_lf,
         min_likes_per_user=1,
-        max_liking_users=5,
+        max_trainval_users=5,
+        max_unseen_eval_users=3,
         random_seed=7,
     )
 
-    first_set = set(first["did"].to_list())
-    second_set = set(second["did"].to_list())
-    assert first_set == second_set
-    assert len(first_set) <= 5
+    assert set(first["did"].to_list()) == set(second["did"].to_list())
+    trainval = set(first.filter(pl.col("_user_cohort") == "trainval")["did"].to_list())
+    unseen = set(first.filter(pl.col("_user_cohort") == "unseen_eval")["did"].to_list())
+    assert len(trainval) == 5
+    assert len(unseen) == 3
+    assert trainval.isdisjoint(unseen)
+
+
+def test_load_likes_unseen_eval_discards_train_window_and_labels_splits(tmp_path, stage_get_data_module):
+    likes_rows = []
+    for user_idx in range(8):
+        for ts in [
+            "2024-01-02T00:00:00",
+            "2024-01-04T00:00:00",
+            "2024-01-06T00:00:00",
+        ]:
+            likes_rows.append({
+                "did": f"user_{user_idx}",
+                "subject_uri": f"post:{user_idx}:{ts}",
+                "record_created_at": ts,
+            })
+    likes_path = _write_likes_parquet(tmp_path, likes_rows)
+    logger = logging.getLogger("test_stage_get_data.unseen_splits")
+
+    likes_df, stats = stage_get_data_module._load_likes_core_polars(
+        start_str="2024-01-01T00:00:00",
+        end_str="2024-01-07T00:00:00",
+        paths=[str(likes_path)],
+        max_trainval_users=3,
+        max_unseen_eval_users=2,
+        max_likes_per_user=0,
+        min_likes_per_user=1,
+        random_seed=99,
+        **_split_kwargs(
+            val_start="2024-01-03T00:00:00",
+            holdout_start="2024-01-05T00:00:00",
+        ),
+        logger=logger,
+    )
+
+    assert stats["n_trainval_users_sampled"] == 3
+    assert stats["n_unseen_eval_users_sampled"] == 2
+    assert set(likes_df["split"].unique().to_list()) == {
+        "train",
+        "val",
+        "holdout_seen_users",
+        "val_unseen_users",
+        "holdout_unseen_users",
+    }
+    unseen_users = set(
+        likes_df
+        .filter(pl.col("split").is_in(["val_unseen_users", "holdout_unseen_users"]))
+        ["did"]
+        .unique()
+        .to_list()
+    )
+    unseen_train_rows = likes_df.filter(
+        pl.col("did").is_in(unseen_users)
+        & (pl.col("split") == "train")
+    )
+    assert unseen_train_rows.height == 0
+
+
+def test_load_likes_holdout_end_filters_rows(tmp_path, stage_get_data_module):
+    likes_rows = [
+        {"did": "user_a", "subject_uri": "post:1", "record_created_at": "2024-01-02T00:00:00"},
+        {"did": "user_a", "subject_uri": "post:2", "record_created_at": "2024-01-04T00:00:00"},
+        {"did": "user_a", "subject_uri": "post:3", "record_created_at": "2024-01-06T00:00:00"},
+    ]
+    likes_path = _write_likes_parquet(tmp_path, likes_rows)
+    logger = logging.getLogger("test_stage_get_data.holdout_end")
+
+    likes_df, _ = stage_get_data_module._load_likes_core_polars(
+        start_str="2024-01-01T00:00:00",
+        end_str="2024-01-07T00:00:00",
+        paths=[str(likes_path)],
+        max_trainval_users=None,
+        max_unseen_eval_users=0,
+        max_likes_per_user=0,
+        min_likes_per_user=1,
+        random_seed=99,
+        **_split_kwargs(
+            holdout_start="2024-01-05T00:00:00",
+            holdout_end="2024-01-05T00:00:00",
+        ),
+        logger=logger,
+    )
+
+    assert set(likes_df["subject_uri"].to_list()) == {"post:1", "post:2"}
 
 
 def test_load_posts_random_sample_all_metadata_only(tmp_path, stage_get_data_module):

@@ -23,11 +23,12 @@ Pass 1 - Count likes per user (streaming):
   - Scan all likes parquet files (no batching) and apply --likes-start/--likes-end.
   - Count total likes and per-user like counts.
   - Pre-filter users with fewer than --min-likes-per-user.
-  - If --max-liking-users is set, hash-sample eligible users
+  - Hash-sample disjoint train/val and unseen-eval user cohorts
     using --cap-random-seed (deterministic).
 
 Pass 2 - Filter likes to sampled users (streaming):
-  - Semi-join likes to the sampled user list.
+  - Join likes to the compact sampled user cohort table.
+  - Drop unseen-eval users' train-window likes before materialization.
 
 Per-user random cap (--max-likes-per-user):
   - For each user, hash-rank subject_uri with the seed and keep top-K.
@@ -35,6 +36,7 @@ Per-user random cap (--max-likes-per-user):
 
 Finalization:
   - Keep did, subject_uri, record_created_at (convert to UTC datetime if needed).
+  - Add split labels directly to likes_core.
   - Collect a final in-memory likes_core_df for downstream steps and stats.
 
 PHASE 2: Posts Filtering (_load_posts_core_polars) - NO EMBEDDINGS
@@ -95,7 +97,7 @@ OUTPUTS
 ================================================================================
 
 Under <run_dir>/01_get_data/<timestamp>/:
-  - likes_core_*.parquet: did, subject_uri, record_created_at, like_hour_bucket, emb_idx
+  - likes_core_*.parquet: did, subject_uri, record_created_at, like_hour_bucket, split, emb_idx
   - posts_core_*.parquet: at_uri, did, record_text, is_liked, in_random_sample, negative_hour_bucket, emb_idx
   - embeddings_*.npy: memmap file, shape (n_posts, embed_dim), dtype float32
   - summary.json: full filtering statistics and parameters
@@ -133,6 +135,7 @@ from utils.helpers import (
     parse_one_ts,
     validate_dataframe_schema,
     apply_time_filter,
+    TIMESTAMP_COL_NAME,
 )
 from utils.memory_helpers import (
     check_data_load_safe,
@@ -369,13 +372,36 @@ def _plot_data_density_histogram(
         logger.warning(f"Failed to create data density histogram: {e}")
         return {}
 
-# This function is used to sample users with at least min_likes_per_user likes, and then randomly sample max_liking_users users from the eligible pool
-def _get_sampled_users_with_min_likes(
+def _get_train_start(
+    train_start: Optional[str],
+    posts_start: Optional[str],
+    likes_start: Optional[str],
+) -> str:
+    """
+    Resolve the training window start date, falling back to posts_start and likes_start
+    if not explicitly specified.
+    """
+    if train_start is not None:
+        return train_start
+    if posts_start is not None:
+        return posts_start
+    if likes_start is not None:
+        return likes_start
+    raise ValueError("Could not infer train window start from input arguments!")
+
+
+def _cap_user_table(user_lf: pl.LazyFrame, max_users: Optional[int], hash_col: str) -> pl.LazyFrame:
+    if max_users is None:
+        return user_lf
+    if max_users <= 0:
+        return user_lf.head(0)
+    return user_lf.sort([hash_col, "did"]).head(max_users)
+
+
+def _get_eligible_user_counts_lf(
     likes_lf: pl.LazyFrame,
     min_likes_per_user: int,
-    max_liking_users: Optional[int],
-    random_seed: int
-) -> Tuple[pl.DataFrame, int, int, int]:
+) -> Tuple[pl.LazyFrame, int, int, int]:
     # get total user and like count
     likes_summary_df = likes_lf.select(
         pl.col('did').n_unique().alias('user_count'),
@@ -401,17 +427,100 @@ def _get_sampled_users_with_min_likes(
         .collect(engine="streaming")
         .item()
     )
-    # ===== Sample users if cap is set =====
-    if max_liking_users is not None and n_users_eligible > max_liking_users:
-        threshold_hash = _compute_random_sample_threshold(n_users_eligible, max_liking_users)
-        user_counts_lf = (
-            user_counts_lf.with_columns(
-                pl.col("did").hash(seed=random_seed).alias("_hash_key"),
-            ).filter(
-                pl.col("_hash_key") <= threshold_hash
-            )
+    return user_counts_lf, n_users_initial, n_likes_initial, n_users_eligible
+
+
+def _get_sampled_user_cohorts_with_min_likes(
+    likes_lf: pl.LazyFrame,
+    min_likes_per_user: int,
+    max_trainval_users: Optional[int],
+    max_unseen_eval_users: Optional[int],
+    random_seed: int
+) -> Tuple[pl.DataFrame, int, int, int, int, int]:
+    user_counts_lf, n_users_initial, n_likes_initial, n_users_eligible = _get_eligible_user_counts_lf(
+        likes_lf,
+        min_likes_per_user,
+    )
+    eligible_lf = user_counts_lf.with_columns(
+        pl.concat_str([pl.lit("trainval:"), pl.col("did")]).hash(seed=random_seed).alias("_trainval_hash"),
+        pl.concat_str([pl.lit("unseen_eval:"), pl.col("did")]).hash(seed=random_seed).alias("_unseen_eval_hash"),
+    )
+
+    trainval_lf = (
+        _cap_user_table(eligible_lf, max_trainval_users, "_trainval_hash")
+        .select(["did", "like_count"])
+        .with_columns(pl.lit("trainval").alias("_user_cohort"))
+    )
+    unseen_eval_lf = (
+        eligible_lf
+        .join(trainval_lf.select("did"), on="did", how="anti")
+    )
+    unseen_eval_lf = (
+        _cap_user_table(unseen_eval_lf, max_unseen_eval_users, "_unseen_eval_hash")
+        .select(["did", "like_count"])
+        .with_columns(pl.lit("unseen_eval").alias("_user_cohort"))
+    )
+
+    sampled_users_df = pl.concat([trainval_lf, unseen_eval_lf]).collect(engine="streaming")
+    n_trainval_users = sampled_users_df.filter(pl.col("_user_cohort") == "trainval").height
+    n_unseen_eval_users = sampled_users_df.filter(pl.col("_user_cohort") == "unseen_eval").height
+    return (
+        sampled_users_df,
+        n_users_initial,
+        n_likes_initial,
+        n_users_eligible,
+        n_trainval_users,
+        n_unseen_eval_users,
+    )
+
+
+def _apply_split_labels(
+    likes_lf: pl.LazyFrame,
+    train_start: str,
+    val_start: str,
+    holdout_start: Optional[str],
+) -> pl.LazyFrame:
+    is_trainval = pl.col("_user_cohort") == "trainval"
+    is_unseen_eval = pl.col("_user_cohort") == "unseen_eval"
+
+    train_window = (
+        is_trainval
+        & (pl.col(TIMESTAMP_COL_NAME) >= pl.lit(train_start))
+        & (pl.col(TIMESTAMP_COL_NAME) < pl.lit(val_start))
+    )
+    if holdout_start is not None:
+        val_window = (
+            is_trainval
+            & (pl.col(TIMESTAMP_COL_NAME) >= pl.lit(val_start))
+            & (pl.col(TIMESTAMP_COL_NAME) < pl.lit(holdout_start))
         )
-    return user_counts_lf.select("did").collect(engine="streaming"), n_users_initial, n_likes_initial, n_users_eligible
+        seen_holdout_window = is_trainval & (pl.col(TIMESTAMP_COL_NAME) >= pl.lit(holdout_start))
+        unseen_val_window = (
+            is_unseen_eval
+            & (pl.col(TIMESTAMP_COL_NAME) >= pl.lit(val_start))
+            & (pl.col(TIMESTAMP_COL_NAME) < pl.lit(holdout_start))
+        )
+        unseen_holdout_window = is_unseen_eval & (pl.col(TIMESTAMP_COL_NAME) >= pl.lit(holdout_start))
+    else:
+        val_window = is_trainval & (pl.col(TIMESTAMP_COL_NAME) >= pl.lit(val_start))
+        seen_holdout_window = pl.lit(False)
+        unseen_val_window = is_unseen_eval & (pl.col(TIMESTAMP_COL_NAME) >= pl.lit(val_start))
+        unseen_holdout_window = pl.lit(False)
+
+    return likes_lf.with_columns(
+        pl.when(train_window)
+        .then(pl.lit("train"))
+        .when(val_window)
+        .then(pl.lit("val"))
+        .when(seen_holdout_window)
+        .then(pl.lit("holdout_seen_users"))
+        .when(unseen_val_window)
+        .then(pl.lit("val_unseen_users"))
+        .when(unseen_holdout_window)
+        .then(pl.lit("holdout_unseen_users"))
+        .otherwise(None)
+        .alias("split")
+    )
 
 
 def _apply_per_user_random_cap(
@@ -443,10 +552,15 @@ def _load_likes_core_polars(
     end_str: Optional[str],
     paths: List[str],
     *,
-    max_liking_users: Optional[int],
+    max_trainval_users: Optional[int],
+    max_unseen_eval_users: Optional[int],
     max_likes_per_user: int,
     min_likes_per_user: int,
     random_seed: int,
+    train_start: str,
+    val_start: str,
+    holdout_start: Optional[str],
+    holdout_end: Optional[str],
     logger: logging.Logger,
 ) -> Tuple[pl.DataFrame, Dict[str, Any]]:
     """
@@ -455,8 +569,8 @@ def _load_likes_core_polars(
     High-level flow:
     1. Streamed pass: count likes per user
     2. Pre-filter users who don't meet min_likes_per_user
-    3. Sample users from eligible pool (if cap is set)
-    4. Streamed pass: keep only likes from sampled users
+    3. Sample disjoint train/val and unseen-eval users from eligible pool
+    4. Streamed pass: keep only usable likes from sampled users
     5. Apply per-user random caps (NOT recency-based)
     6. Verify min-likes threshold (handles edge cases from per-user caps)
     
@@ -470,16 +584,38 @@ def _load_likes_core_polars(
     
     raw_lf = pl.scan_parquet(paths)
     base_lf = apply_time_filter(raw_lf, start_str, end_str)
+    train_start_dt = parse_one_ts(train_start)
+    val_start_dt = parse_one_ts(val_start)
+    holdout_start_dt = parse_one_ts(holdout_start)
+    parse_one_ts(holdout_end)
+    if train_start_dt is None:
+        raise ValueError("Training window start not supplied in input arguments!")
+    if val_start_dt is None:
+        raise ValueError("Validation window start not supplied in input arguments!")
+    if val_start_dt <= train_start_dt:
+        raise ValueError("Train start date is greater than or equal to val start date!")
+    if holdout_start_dt is not None and holdout_start_dt <= val_start_dt:
+        raise ValueError("holdout_start must be after val_start")
+    if holdout_start_dt is None and holdout_end is not None:
+        raise ValueError("Must supply holdout_start if holdout_end is specified")
 
     # ===== PASS 1: Filter users =====
     logger.info("Pass 1: Counting likes per user (streaming)...")
 
-    # Filter users by min likes and then sample down to max liking users
+    # Filter users by min likes and then sample disjoint train/val and unseen-eval cohorts.
     # n_users_eligible is the number of users that had the minimum number of likes, before we randomly sample
-    sampled_users_df, n_users_initial, n_likes_initial, n_users_eligible = _get_sampled_users_with_min_likes(
+    (
+        sampled_users_df,
+        n_users_initial,
+        n_likes_initial,
+        n_users_eligible,
+        n_trainval_users,
+        n_unseen_eval_users,
+    ) = _get_sampled_user_cohorts_with_min_likes(
         base_lf, 
         min_likes_per_user,
-        max_liking_users,
+        max_trainval_users,
+        max_unseen_eval_users,
         random_seed
     )
     logger.info(f"Pass 1 complete: {n_likes_initial:,} likes from {n_users_initial:,} users")
@@ -497,14 +633,39 @@ def _load_likes_core_polars(
     stats['n_users_eligible_for_sampling'] = n_users_eligible
     stats['n_users_excluded_min_likes'] = n_users_filtered
     stats['n_users_sampled'] = n_users_sampled
+    stats['n_trainval_users_sampled'] = n_trainval_users
+    stats['n_unseen_eval_users_sampled'] = n_unseen_eval_users
     logger.info(
-        f"Sampled {n_users_sampled:,} liking users "
+        f"Sampled {n_trainval_users:,} train/val users and "
+        f"{n_unseen_eval_users:,} unseen-eval users "
         f"({100*n_users_sampled/n_users_eligible:.1f}% of eligible)"
     )
     
     # ===== PASS 2: Filter likes to sampled users (lazy) =====
     logger.info("Pass 2: Filtering likes to sampled users")
-    likes_lf = base_lf.join(sampled_users_df.lazy(), on='did', how='semi')
+    likes_lf = base_lf.join(
+        sampled_users_df.select(["did", "_user_cohort"]).lazy(),
+        on='did',
+        how='inner',
+    )
+    before_end = (pl.col(TIMESTAMP_COL_NAME) < holdout_end) if holdout_end is not None else pl.lit(True)
+    likes_lf = likes_lf.filter(
+        before_end
+        & (
+            ((pl.col("_user_cohort") == "trainval") & (pl.col(TIMESTAMP_COL_NAME) >= train_start))
+            | ((pl.col("_user_cohort") == "unseen_eval") & (pl.col(TIMESTAMP_COL_NAME) >= val_start))
+        )
+    )
+    likes_lf = _apply_split_labels(likes_lf, train_start, val_start, holdout_start)
+    n_null_splits = (
+        likes_lf
+        .filter(pl.col("split").is_null())
+        .select(pl.len())
+        .collect(engine="streaming")
+        .item()
+    )
+    if n_null_splits > 0:
+        raise ValueError(f"Found {n_null_splits:,} likes with null split after split labeling")
     
     # Compute counts per user before per-user cap
     counts_pre_cap_df = (
@@ -538,7 +699,12 @@ def _load_likes_core_polars(
     if max_likes_per_user > 0 and n_after_user_sample > 0:
         likes_lf = _apply_per_user_random_cap(likes_lf, max_likes_per_user, random_seed)
     
-    likes_df = likes_lf.select(['did', 'subject_uri', 'record_created_at']).unique().collect(engine="streaming")
+    likes_df = (
+        likes_lf
+        .select(['did', 'subject_uri', TIMESTAMP_COL_NAME, 'split'])
+        .unique()
+        .collect(engine="streaming")
+    )
 
     # Compute post-cap counts
     n_after_cap = likes_df.height
@@ -548,12 +714,12 @@ def _load_likes_core_polars(
 
     # Convert record_created_at to datetime if it exists and is not already datetime
     schema = likes_df.schema
-    if 'record_created_at' in schema and schema['record_created_at'] != pl.Datetime:
+    if TIMESTAMP_COL_NAME in schema and schema[TIMESTAMP_COL_NAME] != pl.Datetime:
         likes_df = likes_df.with_columns(
-            pl.col('record_created_at').str.to_datetime(time_zone="UTC").alias('record_created_at')
+            pl.col(TIMESTAMP_COL_NAME).str.to_datetime(time_zone="UTC").alias(TIMESTAMP_COL_NAME)
         )
     likes_df = likes_df.with_columns(
-        pl.col('record_created_at').dt.truncate("1h").alias('like_hour_bucket')
+        pl.col(TIMESTAMP_COL_NAME).dt.truncate("1h").alias('like_hour_bucket')
     )
 
     stats['n_likes_final'] = n_after_cap
@@ -619,7 +785,7 @@ def _load_posts_core_polars(
     logger.info(f"n_posts_total: {n_posts_total:,}")
 
     # Metadata columns only - NO embeddings during filtering
-    cols_metadata = ["at_uri", "record_created_at", "did", "record_text"]
+    cols_metadata = ["at_uri", TIMESTAMP_COL_NAME, "did", "record_text"]
     posts_schema = posts_lf.collect_schema()
     _validate_posts_record_created_at_schema(posts_schema)
     bucket_sample_rates_df = _get_hourly_sample_rates_df(
@@ -648,9 +814,9 @@ def _load_posts_core_polars(
 
     # Convert timestamps after sampling so the full posts scan can stay string-based.
     schema = posts_core_df.schema
-    if 'record_created_at' in schema and schema['record_created_at'] != pl.Datetime:
+    if TIMESTAMP_COL_NAME in schema and schema[TIMESTAMP_COL_NAME] != pl.Datetime:
         posts_core_df = posts_core_df.with_columns(
-            pl.col('record_created_at').str.to_datetime(time_zone="UTC").alias('record_created_at')
+            pl.col(TIMESTAMP_COL_NAME).str.to_datetime(time_zone="UTC").alias(TIMESTAMP_COL_NAME)
         )
     posts_core_df = posts_core_df.with_columns(
         pl.col('negative_hour_bucket').cast(pl.Utf8).str.to_datetime(time_zone="UTC").alias('negative_hour_bucket')
@@ -664,7 +830,7 @@ def _load_posts_core_polars(
         'at_uri': str,
         'in_random_sample': bool,
         'did': str,
-        'record_created_at': 'datetime',
+        TIMESTAMP_COL_NAME: 'datetime',
         'record_text': str,
         'is_liked': bool,
         'negative_hour_bucket': 'datetime',
@@ -723,7 +889,7 @@ def _compute_random_sample_threshold(n_rows_total: int, n_sample: int) -> int:
 
 
 def _validate_posts_record_created_at_schema(schema: pl.Schema) -> None:
-    dtype = schema.get("record_created_at")
+    dtype = schema.get(TIMESTAMP_COL_NAME)
     if dtype not in (pl.String, pl.Utf8):
         raise ValueError(
             "Expected posts record_created_at to be stored as a string timestamp for streaming hourly sampling; "
@@ -745,7 +911,7 @@ def _get_hourly_sample_rates_df(
     bucket_counts_df = (
         posts_lf
         .select(
-            _hour_bucket_key_expr("record_created_at").alias("_hour_bucket_key")
+            _hour_bucket_key_expr(TIMESTAMP_COL_NAME).alias("_hour_bucket_key")
         )
         .group_by("_hour_bucket_key")
         .len()
@@ -784,7 +950,7 @@ def _build_posts_candidate_lf(
         .select(cols_metadata)
         # Compute a deterministic pseudo-random hash value for each post URI (for sampling)
         .with_columns(
-            _hour_bucket_key_expr("record_created_at").alias("_hour_bucket_key"),
+            _hour_bucket_key_expr(TIMESTAMP_COL_NAME).alias("_hour_bucket_key"),
             (pl.col("at_uri").hash(seed=random_seed).cast(pl.Float64) / float(2**64 - 1)).alias("_hash_score"),
         )
         .join(bucket_sample_rates_df.lazy(), on="_hour_bucket_key", how="left")
@@ -833,13 +999,20 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     posts_end = args.posts_end
     likes_start = args.likes_start
     likes_end = args.likes_end
-    max_liking_users = args.max_liking_users
-    if max_liking_users is not None:
-        max_liking_users = int(max_liking_users)
+    max_trainval_users = args.max_trainval_users
+    if max_trainval_users is not None:
+        max_trainval_users = int(max_trainval_users)
+    max_unseen_eval_users = args.max_unseen_eval_users
+    if max_unseen_eval_users is not None:
+        max_unseen_eval_users = int(max_unseen_eval_users)
     max_likes_per_user = int(args.max_likes_per_user)
     min_likes_per_user = int(args.min_likes_per_user)
     negative_samples_per_hour = int(args.negative_samples_per_hour)
     cap_random_seed = int(args.cap_random_seed)
+    train_start = _get_train_start(args.train_start, posts_start, likes_start)
+    val_start = args.val_start
+    holdout_start = args.holdout_start
+    holdout_end = args.holdout_end
     embedding_model = args.embedding_model
     skip_embeddings = args.skip_embeddings
     memory_check = str(args.memory_check)  # "full", "ignore", or "skip"
@@ -869,11 +1042,16 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         memory_check=memory_check,
         max_memory_gb=max_memory_gb,
         max_memory_pct=max_memory_pct,
-        max_liking_users=max_liking_users,
+        max_trainval_users=max_trainval_users,
+        max_unseen_eval_users=max_unseen_eval_users,
         max_likes_per_user=max_likes_per_user,
         min_likes_per_user=min_likes_per_user,
         negative_samples_per_hour=negative_samples_per_hour,
         cap_random_seed=cap_random_seed,
+        train_start=train_start,
+        val_start=val_start,
+        holdout_start=holdout_start,
+        holdout_end=holdout_end,
         embedding_model=embedding_model,
         skip_embeddings=skip_embeddings,
     )
@@ -884,8 +1062,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     likes_schema = {
         'did': str,
         'subject_uri': str,
-        'record_created_at': 'datetime',
+        TIMESTAMP_COL_NAME: 'datetime',
         'like_hour_bucket': 'datetime',
+        'split': str,
         'emb_idx': int,  # NEW: index for memmap lookup
         'author_did': str,
     }
@@ -896,7 +1075,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'at_uri': str,
         'in_random_sample': bool,
         'did': str,
-        'record_created_at': 'datetime',
+        TIMESTAMP_COL_NAME: 'datetime',
         'record_text': str,
         'is_liked': bool,
         'negative_hour_bucket': 'datetime',
@@ -933,11 +1112,16 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'likes_start': likes_start,
         'likes_end': likes_end,
         'parameters': {
-            'max_liking_users': max_liking_users,
+            'max_trainval_users': max_trainval_users,
+            'max_unseen_eval_users': max_unseen_eval_users,
             'max_likes_per_user': max_likes_per_user,
             'min_likes_per_user': min_likes_per_user,
             'negative_samples_per_hour': negative_samples_per_hour,
             'cap_random_seed': cap_random_seed,
+            'train_start': train_start,
+            'val_start': val_start,
+            'holdout_start': holdout_start,
+            'holdout_end': holdout_end,
             'embedding_model': embedding_model,
             'skip_embeddings': skip_embeddings,
         },
@@ -959,8 +1143,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     info_lines = [
         f"stage: get_data",
         f"runtime_seconds: {runtime:.2f}",
-        f"settings: max_liking_users={max_liking_users}, max_likes_per_user={max_likes_per_user}, "
-        f"min_likes_per_user={min_likes_per_user}, negative_samples_per_hour={negative_samples_per_hour}, "
+        f"settings: max_trainval_users={max_trainval_users}, max_unseen_eval_users={max_unseen_eval_users}, "
+        f"max_likes_per_user={max_likes_per_user}, min_likes_per_user={min_likes_per_user}, "
+        f"negative_samples_per_hour={negative_samples_per_hour}, "
         f"skip_embeddings={skip_embeddings}",
         f"inputs: GCS bucket={gcs_bucket}",
         f"N_likes_core: {n_likes}",
@@ -1148,11 +1333,16 @@ def _run_greenearth_pipeline(
     memory_check: str,
     max_memory_gb: Optional[float],
     max_memory_pct: float,
-    max_liking_users: Optional[int],
+    max_trainval_users: Optional[int],
+    max_unseen_eval_users: Optional[int],
     max_likes_per_user: int,
     min_likes_per_user: int,
     negative_samples_per_hour: int,
     cap_random_seed: int,
+    train_start: str,
+    val_start: Optional[str],
+    holdout_start: Optional[str],
+    holdout_end: Optional[str],
     embedding_model: str,
     skip_embeddings: bool,
 ) -> Tuple[pl.DataFrame, pl.DataFrame, Path, Path, Optional[Path], int, Dict[str, Any]]:
@@ -1218,7 +1408,7 @@ def _run_greenearth_pipeline(
             embedding_dim=embedding_dim_for_estimate,
             max_memory_gb=max_memory_gb,
             max_memory_pct=max_memory_pct,
-            max_liking_users=max_liking_users,
+            max_liking_users=max_trainval_users,
             max_likes_per_user=max_likes_per_user,
             min_likes_per_user=min_likes_per_user,
             negative_samples_per_hour=negative_samples_per_hour,
@@ -1241,10 +1431,15 @@ def _run_greenearth_pipeline(
         start_str=likes_start,
         end_str=likes_end,
         paths=likes_paths,
-        max_liking_users=max_liking_users,
+        max_trainval_users=max_trainval_users,
+        max_unseen_eval_users=max_unseen_eval_users,
         max_likes_per_user=max_likes_per_user,
         min_likes_per_user=min_likes_per_user,
         random_seed=cap_random_seed,
+        train_start=train_start,
+        val_start=val_start,
+        holdout_start=holdout_start,
+        holdout_end=holdout_end,
         logger=logger,
     )
     all_stats['likes'] = likes_stats
@@ -1445,8 +1640,8 @@ def _run_greenearth_pipeline(
             logger.info(f"Memory estimation accuracy: actual peak {actual_peak:.3f} GB vs estimated {estimated_peak:.2f} GB ({accuracy_pct:.1f}%)")
     
     # Log comprehensive attrition report
-    max_liking_users_for_report = max_liking_users if max_liking_users is not None else 0
-    _log_data_attrition_report(all_stats, memory_estimate, min_likes_per_user, max_likes_per_user, max_liking_users_for_report, logger)
+    max_trainval_users_for_report = max_trainval_users if max_trainval_users is not None else 0
+    _log_data_attrition_report(all_stats, memory_estimate, min_likes_per_user, max_likes_per_user, max_trainval_users_for_report, logger)
     
     return likes_core_df, posts_core_df, likes_core_path, posts_core_path, embeddings_path, embed_dim, all_stats
 
@@ -1475,17 +1670,16 @@ def _filter_likes_after_post_join(
     # Re-verify min-likes per user
     n_users_removed_by_join_verify = 0
     if min_likes_per_user > 0:
-        # Filter users by min likes
-        # (no need to use the max_liking_users functionality)
-        # Returns: (sampled_users_df, n_users_total, n_likes_total, n_users_eligible)
-        sampled_users_df, n_users_before_min_likes, _, _ = _get_sampled_users_with_min_likes(
+        # Filter users by min likes; sampling cohorts are preserved from the
+        # earlier pass, so this only re-verifies the threshold after post joins.
+        valid_users_lf, n_users_before_min_likes, _, _ = _get_eligible_user_counts_lf(
             likes_lf=likes_core_df.lazy(),
             min_likes_per_user=min_likes_per_user,
-            max_liking_users=None,
-            random_seed=random_seed
         )
 
-        n_users_after_join_verify = sampled_users_df.height
+        valid_users_df = valid_users_lf.select("did").collect(engine="streaming")
+
+        n_users_after_join_verify = valid_users_df.height
         n_users_removed_by_join_verify = n_users_before_min_likes - n_users_after_join_verify
 
         if n_users_removed_by_join_verify > 0:
@@ -1494,7 +1688,7 @@ def _filter_likes_after_post_join(
                 f"({n_users_removed_by_join_verify:,} removed due to insufficient likes after join)"
             )
             # Filter likes to only users who still meet threshold
-            valid_user_dids = set(sampled_users_df['did'].to_list())
+            valid_user_dids = set(valid_users_df['did'].to_list())
             likes_core_df = likes_core_df.filter(
                 pl.col('did').is_in(valid_user_dids)
             )
@@ -1517,7 +1711,7 @@ def _log_data_attrition_report(
     memory_estimate: Optional[Dict[str, Any]],
     min_likes_per_user: int,
     max_likes_per_user: int,
-    max_liking_users: int,
+    max_trainval_users: int,
     logger,
 ) -> None:
     """
@@ -1617,9 +1811,9 @@ def _log_data_attrition_report(
         logger.info(f"{'2. Min-likes pre-filter (>=' + str(min_likes_per_user) + ')':<45} {fmt(n_users_eligible):>12} {'(n/a)':>15} {'':>10}")
     
     # 3. User sampling
-    if max_liking_users > 0 and n_users_eligible > 0:
+    if max_trainval_users > 0 and n_users_eligible > 0:
         sample_pct = pct(n_users_sampled, n_users_eligible)
-        logger.info(f"{'3. User sampling (' + fmt(max_liking_users) + ')':<45} {fmt(n_users_sampled):>12} {'(n/a)':>15} {'':>10}")
+        logger.info(f"{'3. User sampling (' + fmt(max_trainval_users) + ' train/val cap)':<45} {fmt(n_users_sampled):>12} {'(n/a)':>15} {'':>10}")
         logger.info(f"{'   - Retained':<45} {f'{sample_pct:.1f}%':>12} {'':>15} {'':>10}")
     else:
         logger.info(f"{'3. User sampling (no cap)':<45} {fmt(n_users_sampled):>12} {'(n/a)':>15} {'':>10}")
