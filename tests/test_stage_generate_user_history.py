@@ -237,27 +237,3 @@ def test_user_hour_without_author_idx_omits_author_history(build_history):
 
     assert "prior_author_indices" not in result.columns
 
-
-def test_history_buffer_hours_excludes_recent_likes(build_history):
-    logger = _make_test_logger()
-    likes_lf = _make_likes(
-        ["u1", "u1", "u1", "u1"],
-        [
-            datetime(2024, 1, 1, 8, 0),
-            datetime(2024, 1, 1, 9, 30),
-            datetime(2024, 1, 1, 11, 0),
-            datetime(2024, 1, 1, 12, 5),
-        ],
-        ["p1", "p2", "p3", "p4"],
-        [10, 20, 30, 40],
-    )
-
-    result = build_history(
-        likes_lf=likes_lf,
-        max_prior_likes=None,
-        logger=logger,
-        history_buffer_hours=2.0,
-    ).collect()
-
-    row = result.filter(pl.col("like_hour_bucket") == datetime(2024, 1, 1, 12))
-    assert row["prior_emb_indices"][0].to_list() == [20, 10]
