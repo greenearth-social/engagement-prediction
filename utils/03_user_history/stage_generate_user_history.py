@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 
 """
-Stage 3: Generate User History Directory
+Stage 3: Generate User-Hour History Directory
 
-Creates a directory-style artifact that maps each target row to a list of prior
-liked post embedding indices and, when author metadata is available, author
-indices. This enables efficient on-the-fly embedding retrieval during training
-and stable author-history features.
+Creates a directory-style artifact that maps each (user, like-hour bucket) to a
+list of prior liked post embedding indices and, when author metadata is
+available, author indices. This enables efficient on-the-fly embedding retrieval
+during training and stable author-history features.
 
 Inputs:
 - likes_core_*.parquet from 01_get_data: Contains
-  {did, subject_uri, record_created_at, emb_idx}
-- author_idx_*.parquet from 02_target_posts, when available: Author index mapping with
-  {emb_idx, author_did, author_train_count, author_idx}
+  {did, subject_uri, record_created_at, like_hour_bucket, emb_idx, author_idx}
+- author_idx_*.parquet from 01_get_data, when available: Author index mapping with
+  {author_did, author_train_count, author_idx}
 
 Outputs under <run_dir>/03_user_history/<timestamp>/:
 - history_posts_<timestamp>.parquet:
-  {target_did, like_uri, prior_emb_indices} and, when author_idx is available,
+  {did, like_hour_bucket, prior_emb_indices} and, when author_idx is available,
   {prior_author_indices}
   where prior_emb_indices is a List[UInt32] of embedding indices sorted by recency (most recent first),
   prior_author_indices is a List[UInt32] aligned element-wise with
-  prior_emb_indices, and rows where the user has no prior likes in the dataset
-  get empty lists.
+  prior_emb_indices, and user-hour rows where the user has no prior likes in
+  the dataset get empty lists.
 """
 
 from __future__ import annotations
@@ -36,7 +36,6 @@ from utils.pipeline.core import Context
 from utils.helpers import (
     get_stage_logger,
     log_operation_start,
-    log_prior_stage_inputs,
     validate_dataframe_schema,
     load_parquet_from_prior,
     TIMESTAMP_COL_NAME,
@@ -48,45 +47,29 @@ def _build_user_history_directory(
     likes_lf: pl.LazyFrame,
     max_prior_likes: Optional[int],
     logger: logging.Logger,
-    author_idx_lf: Optional[pl.LazyFrame] = None,
 ) -> pl.LazyFrame:
     """
-    Build a directory mapping each target (user, like-event) to prior liked embedding indices.
-
-    The target posts use a wide format where each row represents a (user, like-event)
-    training pair.  The user history depends only on the user (target_did) and the
-    event timestamp (seen_at), so a single history list is produced per pair.
-    The output is indexed on (target_did, like_uri).
-
-    Internally, the heavy join/filter/group_by operations use an integer target_idx
-    to avoid carrying expensive string columns (like_uri) through the fan-out join.
-    The string keys are mapped back only at the end.
+    Build a directory mapping each (user, like-hour bucket) to prior liked embedding indices.
 
     Uses vectorized Polars operations for efficiency:
-    1. Assign integer target_idx to each target row
-    2. Join with likes on user (target_did == did) carrying only target_idx
-    3. Filter to likes that occurred before the target timestamp (seen_at),
-       optionally with a buffer period subtracted from seen_at
-    4. Group by target_idx and collect emb_idx values sorted by recency
-    5. Left-join back to ensure every target appears (empty list for no history)
-    6. Map target_idx back to (target_did, like_uri) for the final output
+    1. Get distinct user-hour pairs from likes_core
+    2. Join each pair to that user's likes
+    3. Filter to likes that occurred before the hour bucket
+    4. Group by (did, like_hour_bucket) and collect emb_idx values sorted by recency
+    5. Left-join back to ensure every user-hour appears, including empty histories
 
     Args:
-        targets_lf: LazyFrame with at least columns [target_did, seen_at, like_uri, ...]
-        likes_lf: LazyFrame with columns [did, subject_uri, record_created_at, emb_idx]
+        likes_lf: LazyFrame with columns [did, like_hour_bucket, record_created_at, emb_idx]
         max_prior_likes: Optional cap on prior likes per target (None = no cap)
         logger: Logger instance
-        history_buffer_hours: Optional buffer in hours to subtract from seen_at when
-            determining prior likes.  When set, a like must satisfy
-            ``like_ts < seen_at - buffer`` instead of ``like_ts < seen_at``.
-            Useful for simulating information delay or avoiding leakage near the
-            boundary.  None or 0 means no buffer (original behaviour).
 
     Returns:
-        LazyFrame with columns [target_did, like_uri, seen_at, prior_emb_indices, raw_prior_count]
+        LazyFrame with columns [did, like_hour_bucket, prior_emb_indices, raw_prior_count]
         where raw_prior_count is the uncapped number of prior likes (for distribution analysis).
     """
     logger.info("Building user history directory...")
+    likes_schema = likes_lf.collect_schema()
+    include_author_idx = "author_idx" in likes_schema
 
     user_bucket_pairs_lf = (
         likes_lf
@@ -96,15 +79,18 @@ def _build_user_history_directory(
 
     # Join targets with likes on user identity
     # This creates one row per (target, like) pair for each user
+    likes_cols = ['did', TIMESTAMP_COL_NAME, 'emb_idx']
+    if include_author_idx:
+        likes_cols.append('author_idx')
     pairs_with_prior_likes_lf = (
         user_bucket_pairs_lf
         .join(
-            likes_lf.select(['did', TIMESTAMP_COL_NAME, 'emb_idx', 'author_idx']),
+            likes_lf.select(likes_cols),
             on="did",
             how="left"
         )
         .filter(pl.col(TIMESTAMP_COL_NAME) < pl.col("like_hour_bucket"))
-    ) # [did, like_hour_bucket, record_created_at, emb_idx, author_idx]
+    ) # [did, like_hour_bucket, record_created_at, emb_idx, (author_idx)]
 
     def _get_agg_expr(col_name: str):
         # Build aggregation expression: sort by recency (descending) and optionally cap
@@ -121,15 +107,19 @@ def _build_user_history_directory(
         _get_agg_expr("emb_idx").alias("prior_emb_indices"),
         pl.len().alias("raw_prior_count"),
     ]
-    if author_idx_lf is not None:
+    if include_author_idx:
         agg_exprs += [_get_agg_expr("author_idx").alias("prior_author_indices")]
 
     # Group by integer target_idx (cheap) and collect prior emb_idx as list.
     # Also compute raw (uncapped) count for distribution analysis.
-    pairs_with_history_list_lf = (
+    history_lists_lf = (
         pairs_with_prior_likes_lf
         .group_by(["did", "like_hour_bucket"])
         .agg(agg_exprs)
+    )
+    pairs_with_history_list_lf = (
+        user_bucket_pairs_lf
+        .join(history_lists_lf, on=["did", "like_hour_bucket"], how="left")
         .with_columns(
             pl.when(pl.col("prior_emb_indices").is_null())
             .then(pl.lit([]).cast(pl.List(pl.UInt32)))
@@ -137,9 +127,9 @@ def _build_user_history_directory(
             .alias("prior_emb_indices"),
             pl.col("raw_prior_count").fill_null(0),
         )
-    ) # [did, like_hour_bucket, prior_emb_indices, raw_prior_count, prior_author_indices]
+    ) # [did, like_hour_bucket, prior_emb_indices, raw_prior_count, (prior_author_indices)]
     
-    if author_idx_lf is not None:
+    if include_author_idx:
         pairs_with_history_list_lf = (
             pairs_with_history_list_lf
             .with_columns(
@@ -148,7 +138,7 @@ def _build_user_history_directory(
                 .otherwise(pl.col("prior_author_indices").cast(pl.List(pl.UInt32)))
                 .alias("prior_author_indices"),
             )
-        )
+        ) # [did, like_hour_bucket, prior_emb_indices, raw_prior_count, (prior_author_indices)]
 
     return pairs_with_history_list_lf
 
@@ -310,10 +300,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     if max_prior_likes is not None and max_prior_likes <= 0:
         max_prior_likes = None  # Treat 0 or negative as "no cap"
 
-    history_buffer_hours: Optional[float] = args.history_buffer_hours
-    if history_buffer_hours is not None and history_buffer_hours <= 0:
-        history_buffer_hours = None  # Treat 0 or negative as "no buffer"
-
     # === Load data ===
     log_operation_start('Load likes_core from prior stage', 'STAGE_03_USER_HISTORY', logger)
     likes_lf: pl.LazyFrame = load_parquet_from_prior(prior_get_data, "likes_core_")
@@ -328,23 +314,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     validate_dataframe_schema(likes_lf, likes_schema)
     logger.info("✓ likes_core schema validated")
 
-    log_operation_start('Load author_idx (optional)', 'STAGE_03_USER_HISTORY', logger)
-    author_idx_lf: Optional[pl.LazyFrame]
-    try:
-        author_idx_lf = load_parquet_from_prior(prior_get_data, "author_idx_")
-
-        # Validate author idx schema
-        author_idx_schema = {
-            "author_did": str,
-            "author_train_count": int,
-            "author_idx": int,
-        }
-        validate_dataframe_schema(author_idx_lf, author_idx_schema)
-        logger.info("✓ author_idx schema validated")
-    except FileNotFoundError:
-        author_idx_lf = None
-        logger.info("No author_idx artifact found; prior_author_indices will not be written")
-
     mem_tracker.checkpoint("after_load_inputs", quiet=True)
 
     # Log input sizes (collect counts efficiently)
@@ -358,7 +327,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         likes_lf=likes_lf,
         max_prior_likes=max_prior_likes,
         logger=logger,
-        author_idx_lf=author_idx_lf,
     )
 
     mem_tracker.checkpoint("after_build_history", quiet=True)
@@ -407,7 +375,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     info_lines = [
         f"stage: user_history",
         f"runtime_seconds: {runtime:.2f}",
-        f"settings: max_prior_likes={max_prior_likes}, history_buffer_hours={history_buffer_hours}",
+        f"settings: max_prior_likes={max_prior_likes}",
         f"inputs: likes_core ({n_likes:,})",
         f"outputs: user_history_directory ({n_output:,} entries)",
         f"stats: with_history={n_with_history:,}, empty_history={n_empty_history:,}",

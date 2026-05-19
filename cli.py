@@ -74,7 +74,6 @@ DEFAULTS: Dict[str, Any] = {
     "skip_embeddings": False,
     # Stage 1 split labels / Stage 3 history
     "max_prior_likes": None,  # Stage 3: cap on prior likes per target for user history (None = no cap)
-    "history_buffer_hours": None,  # Stage 3: buffer in hours between seen_at and prior-like cutoff (None = no buffer)
     "train_start": None,
     "val_start": None,
     "holdout_start": None,
@@ -730,8 +729,6 @@ def build_parser() -> argparse.ArgumentParser:
     # Stage 1 split / Stage 3 options
     _add_arg_with_default(p_all, "--max-prior-likes", type=int, default=argparse.SUPPRESS,
                           help_text="Cap on prior likes per target in Stage 3 user history (None = no cap, keeps all prior likes)")
-    _add_arg_with_default(p_all, "--history-buffer-hours", type=float, default=argparse.SUPPRESS,
-                          help_text="Buffer in hours subtracted from seen_at when determining prior likes for user history (None = no buffer)")
     _add_arg_with_default(p_all, "--train-start", type=str, default=argparse.SUPPRESS,
                           help_text="ISO date string for start of training dataset window")
     _add_arg_with_default(p_all, "--val-start", type=str, default=argparse.SUPPRESS,
