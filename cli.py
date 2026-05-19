@@ -591,6 +591,8 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
         )
 
     use_author_embedding_table = bool(args.use_author_embedding_table)
+    if int(args.min_author_support) < 1:
+        raise ValueError("--min-author-support must be >= 1.")
     if use_author_embedding_table:
         if model_type != "two-tower":
             raise ValueError("--use-author-embedding-table is only supported for --model-type 'two-tower'.")
@@ -598,8 +600,6 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
             raise ValueError("--use-author-embedding-table is not supported with --user-encoder 'summarized'.")
         if int(args.author_embedding_dim) <= 0:
             raise ValueError("--author-embedding-dim must be positive.")
-        if int(args.min_author_support) < 1:
-            raise ValueError("--min-author-support must be >= 1.")
         if not 0.0 <= float(args.author_unknown_dropout_rate) < 1.0:
             raise ValueError("--author-unknown-dropout-rate must be in [0, 1).")
 

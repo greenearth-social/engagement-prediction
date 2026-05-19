@@ -130,6 +130,22 @@ def test_mlp_allows_cross_attention_user_encoder():
     assert merged.user_encoder in cli.VALID_USER_ENCODERS_BY_MODEL_TYPE[merged.model_type]
 
 
+def test_min_author_support_must_be_positive_even_without_author_table(tmp_path):
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--min-author-support", "0", "--stop-after", "get_data"])
+    merged = cli._merge_args_with_config(raw)
+    merged.output_dir = str(tmp_path)
+    ctx = cli.Context(
+        run_dir=Path(tmp_path) / "runs" / "run",
+        artifacts_dir=Path(tmp_path) / "artifacts",
+        runs_dir=Path(tmp_path) / "runs",
+        pipeline_run_id="run",
+    )
+
+    with pytest.raises(ValueError, match="min-author-support"):
+        cli.cmd__run_all_exec(merged, ctx)
+
+
 def test_background_effective_config_preserves_no_l2_normalize_embeddings(tmp_path):
     parser = cli.build_parser()
     raw = parser.parse_args(["--no-l2-normalize-embeddings"])
