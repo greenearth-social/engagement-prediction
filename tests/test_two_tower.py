@@ -1102,15 +1102,11 @@ def test_build_author_serving_mapping_exports_final_table_rows():
     author_idx_mapping_df = pl.DataFrame({
         "emb_idx": [10, 11, 20, 30],
         "author_did": ["author_a", "author_a", "author_b", "author_c"],
-        "author_idx": pl.Series([1, 1, 2, 3], dtype=pl.UInt32),
+        "author_idx": pl.Series([2, 2, 3, 4], dtype=pl.UInt32),
         "author_train_count": [5, 5, 2, 7],
     })
-    author_idx_to_table_row = torch.tensor([1, 2, 1, 4], dtype=torch.int64).numpy()
 
-    result = build_author_serving_mapping(
-        author_idx_mapping_df=author_idx_mapping_df,
-        author_idx_to_table_row=author_idx_to_table_row,
-    )
+    result = build_author_serving_mapping(author_idx_mapping_df=author_idx_mapping_df)
 
     assert result.columns == [
         "author_did",
@@ -1121,33 +1117,42 @@ def test_build_author_serving_mapping_exports_final_table_rows():
     assert result.to_dicts() == [
         {
             "author_did": "author_a",
-            "author_idx": 1,
+            "author_idx": 2,
             "author_train_count": 5,
             "author_table_row": 2,
         },
         {
-            "author_did": "author_c",
+            "author_did": "author_b",
             "author_idx": 3,
+            "author_train_count": 2,
+            "author_table_row": 3,
+        },
+        {
+            "author_did": "author_c",
+            "author_idx": 4,
             "author_train_count": 7,
             "author_table_row": 4,
         },
     ]
 
 
-def test_build_author_serving_mapping_omits_out_of_range_author():
+def test_build_author_serving_mapping_omits_reserved_rows():
     author_idx_mapping_df = pl.DataFrame({
-        "author_did": ["author_missing"],
-        "author_idx": pl.Series([9], dtype=pl.UInt32),
-        "author_train_count": [10],
+        "author_did": ["author_unknown", "author_real"],
+        "author_idx": pl.Series([1, 2], dtype=pl.UInt32),
+        "author_train_count": [10, 11],
     })
-    author_idx_to_table_row = torch.tensor([1, 2], dtype=torch.int64).numpy()
 
-    result = build_author_serving_mapping(
-        author_idx_mapping_df=author_idx_mapping_df,
-        author_idx_to_table_row=author_idx_to_table_row,
-    )
+    result = build_author_serving_mapping(author_idx_mapping_df=author_idx_mapping_df)
 
-    assert result.is_empty()
+    assert result.to_dicts() == [
+        {
+            "author_did": "author_real",
+            "author_idx": 2,
+            "author_train_count": 11,
+            "author_table_row": 2,
+        },
+    ]
 
 
 def test_two_tower_author_embeddings_affect_user_and_target_post_paths():

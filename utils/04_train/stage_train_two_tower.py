@@ -122,15 +122,13 @@ from utils.helpers import (
 from utils.dataloaders import (
     AUTHOR_PAD_IDX,
     AUTHOR_UNK_IDX,
-    build_author_table_lookup,
-    load_training_data,
-    SequenceEngagementDataset,
-    SummarizedEngagementDataset,
+    BucketedEngagementDataset,
+    create_bucketed_data_loaders,
+    get_author_table_num_rows,
+    load_bucketed_training_data,
     SummarizedUserTower,
     TransformerDualPoolingEncoder,
     CrossAttentionPoolingEncoder,
-    create_data_loaders,
-    get_summarizer,
 )
 
 STAGE_LOG_NAME = "STAGE_04_TRAIN_TWO_TOWER"
@@ -351,7 +349,6 @@ class AuthorAwarePostTower(nn.Module):
 
 def build_author_serving_mapping(
     author_idx_mapping_df: pl.DataFrame,
-    author_idx_to_table_row: np.ndarray,
 ) -> pl.DataFrame:
     """Build the supported author DID -> embedding-table row artifact for serving."""
     required_cols = {"author_did", "author_idx", "author_train_count"}
@@ -366,21 +363,10 @@ def build_author_serving_mapping(
         .unique()
         .sort("author_idx")
     )
-    author_table_rows: List[int] = []
-    for raw_author_idx in mapping_df["author_idx"].to_list():
-        if raw_author_idx is None:
-            author_table_rows.append(AUTHOR_UNK_IDX)
-            continue
-        raw_author_idx_int = int(raw_author_idx)
-        if 0 <= raw_author_idx_int < len(author_idx_to_table_row):
-            author_table_rows.append(int(author_idx_to_table_row[raw_author_idx_int]))
-        else:
-            author_table_rows.append(AUTHOR_UNK_IDX)
-
     return (
         mapping_df
         .with_columns(
-            pl.Series("author_table_row", author_table_rows, dtype=pl.UInt32),
+            pl.col("author_idx").fill_null(AUTHOR_UNK_IDX).cast(pl.UInt32).alias("author_table_row"),
         )
         .filter(pl.col("author_table_row") > AUTHOR_UNK_IDX)
         .select(["author_did", "author_idx", "author_train_count", "author_table_row"])
@@ -1168,7 +1154,7 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # --- load data from prior stages ---
     log_operation_start("Load training data from prior stages", STAGE_LOG_NAME, logger)
-    embeddings_mmap, target_posts_df, history_df, author_idx_mapping_df, embed_dim = load_training_data(
+    embeddings_mmap, likes_core_df, posts_core_df, history_df, author_idx_mapping_df, embed_dim = load_bucketed_training_data(
         context, logger=logger,
     )
     log_prior_stage_inputs(context, logger)
@@ -1200,33 +1186,28 @@ def run(context: Context, args) -> Dict[str, Any]:
     eval_holdout_type = str(args.eval_holdout_type)
     use_author_embedding_table = bool(args.use_author_embedding_table)
     author_embedding_dim = int(args.author_embedding_dim)
-    min_author_support = int(args.min_author_support)
     author_unknown_dropout_rate = float(args.author_unknown_dropout_rate)
     metrics_top_ks = list(args.metrics_top_ks)
 
+    if user_encoder_type == "summarized":
+        raise ValueError("Bucketed training does not support user_encoder_type='summarized'")
     if use_author_embedding_table and user_encoder_type == "summarized":
         raise ValueError("use_author_embedding_table is not supported with user_encoder_type='summarized'")
     if use_author_embedding_table and author_idx_mapping_df is None:
         raise FileNotFoundError(
-            "author_idx artifact was not found in 02_target_posts output, but --use-author-embedding-table was enabled."
+            "author_idx artifact was not found in 01_get_data output, but --use-author-embedding-table was enabled."
         )
-    author_idx_to_table_row = None
     author_table_num_rows = 0
     author_serving_mapping_df = None
     if use_author_embedding_table:
         if author_idx_mapping_df is None:
             raise FileNotFoundError("author_idx_mapping_df is required when use_author_embedding_table is True")
-        author_idx_to_table_row, author_table_num_rows = build_author_table_lookup(
-            author_idx_mapping_df=author_idx_mapping_df,
-            min_author_support=min_author_support,
-        )
+        author_table_num_rows = get_author_table_num_rows(author_idx_mapping_df)
         author_serving_mapping_df = build_author_serving_mapping(
             author_idx_mapping_df=author_idx_mapping_df,
-            author_idx_to_table_row=author_idx_to_table_row,
         )
         logger.info(
             "Author embedding table enabled: "
-            f"min_author_support={min_author_support}, "
             f"author_embedding_dim={author_embedding_dim}, "
             f"author_table_num_rows={author_table_num_rows}, "
             f"serving_mapping_rows={len(author_serving_mapping_df)}"
@@ -1240,58 +1221,37 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # --- datasets ---
     log_operation_start("Create datasets", STAGE_LOG_NAME, logger)
-    if user_encoder_type == "summarized":
-        # get summarizer
-        summarizer_name = args.user_summarization
-        ema_alpha = float(args.ema_alpha)
-        summarizer = get_summarizer(summarizer_name, ema_alpha=ema_alpha)
-        
-        train_dataset = SummarizedEngagementDataset(
-            embeddings_mmap, target_posts_df, history_df, split="train", 
-            summarizer=summarizer, embed_dim=embed_dim, logger=logger,
-        )
-        val_dataset = SummarizedEngagementDataset(
-            embeddings_mmap, target_posts_df, history_df, split="val", 
-            summarizer=summarizer, embed_dim=embed_dim, logger=logger,
-        )
-        val_unseen_dataset = SummarizedEngagementDataset(
-            embeddings_mmap, target_posts_df, history_df, split="val_unseen_users", 
-            summarizer=summarizer, embed_dim=embed_dim, logger=logger,
-        )
-    else:
-        train_dataset = SequenceEngagementDataset(
-            embeddings_mmap, target_posts_df, history_df, split="train",
-            max_history_len=max_history_len, embed_dim=embed_dim,
-            use_author_embedding_table=use_author_embedding_table,
-            author_idx_to_table_row=author_idx_to_table_row,
-            logger=logger,
-        )
-        val_dataset = SequenceEngagementDataset(
-            embeddings_mmap, target_posts_df, history_df, split="val",
-            max_history_len=max_history_len, embed_dim=embed_dim,
-            use_author_embedding_table=use_author_embedding_table,
-            author_idx_to_table_row=author_idx_to_table_row,
-            logger=logger,
-        )
-        val_unseen_dataset = SequenceEngagementDataset(
-            embeddings_mmap, target_posts_df, history_df, split="val_unseen_users",
-            max_history_len=max_history_len, embed_dim=embed_dim,
-            use_author_embedding_table=use_author_embedding_table,
-            author_idx_to_table_row=author_idx_to_table_row,
-            logger=logger,
-        )
+    train_dataset = BucketedEngagementDataset(
+        embeddings_mmap, likes_core_df, posts_core_df, history_df, split="train",
+        max_history_len=max_history_len, embed_dim=embed_dim,
+        use_author_embedding_table=use_author_embedding_table,
+        logger=logger,
+    )
+    val_dataset = BucketedEngagementDataset(
+        embeddings_mmap, likes_core_df, posts_core_df, history_df, split="val",
+        max_history_len=max_history_len, embed_dim=embed_dim,
+        use_author_embedding_table=use_author_embedding_table,
+        logger=logger,
+    )
+    val_unseen_dataset = BucketedEngagementDataset(
+        embeddings_mmap, likes_core_df, posts_core_df, history_df, split="val_unseen_users",
+        max_history_len=max_history_len, embed_dim=embed_dim,
+        use_author_embedding_table=use_author_embedding_table,
+        logger=logger,
+    )
 
     # Create data loaders using centralized helper
-    train_loader, val_loader, val_unseen_loader, _ = create_data_loaders(
+    train_loader, val_loader, val_unseen_loader, _ = create_bucketed_data_loaders(
         train_dataset, val_dataset, val_unseen_dataset, batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
+        seed=random_seed,
     )
 
     logger.info(f"Post embedding dim: {embed_dim}")
-    logger.info(f"Train items: {len(train_dataset)}, Val items: {len(val_dataset)}")
+    logger.info(f"Train user-hour rows: {len(train_dataset)}, Val user-hour rows: {len(val_dataset)}")
 
     # --- create model ---
     log_operation_start(f"Create two-tower model (user_encoder={user_encoder_type})", STAGE_LOG_NAME, logger)
@@ -1413,7 +1373,6 @@ def run(context: Context, args) -> Dict[str, Any]:
         "similarity_temperature": similarity_temperature,
         "use_author_embedding_table": use_author_embedding_table,
         "author_embedding_dim": author_embedding_dim if use_author_embedding_table else None,
-        "min_author_support": min_author_support if use_author_embedding_table else None,
         "author_unknown_dropout_rate": author_unknown_dropout_rate if use_author_embedding_table else None,
         "author_table_num_rows": author_table_num_rows if use_author_embedding_table else None,
         "author_pad_idx": AUTHOR_PAD_IDX,
@@ -1482,30 +1441,24 @@ def run(context: Context, args) -> Dict[str, Any]:
     for holdout_type in ["unseen_users", "seen_users"]:
         split_name = f"holdout_{holdout_type}"
         try:
-            if user_encoder_type == "summarized":
-                holdout_dataset = SummarizedEngagementDataset(
-                    embeddings_mmap, target_posts_df, history_df, split=split_name,
-                    summarizer=summarizer, embed_dim=embed_dim, logger=logger,
-                )
-            else:
-                holdout_dataset = SequenceEngagementDataset(
-                    embeddings_mmap, target_posts_df, history_df, split=split_name,
-                    max_history_len=max_history_len, embed_dim=embed_dim,
-                    use_author_embedding_table=use_author_embedding_table,
-                    author_idx_to_table_row=author_idx_to_table_row,
-                    logger=logger,
-                )
+            holdout_dataset = BucketedEngagementDataset(
+                embeddings_mmap, likes_core_df, posts_core_df, history_df, split=split_name,
+                max_history_len=max_history_len, embed_dim=embed_dim,
+                use_author_embedding_table=use_author_embedding_table,
+                logger=logger,
+            )
             if len(holdout_dataset) == 0:
                 logger.info(f"No rows for split '{split_name}', skipping.")
                 continue
             log_operation_start(f"Holdout evaluation ({holdout_type})", STAGE_LOG_NAME, logger)
-            _, _, _, holdout_loader = create_data_loaders(
+            _, _, _, holdout_loader = create_bucketed_data_loaders(
                 train_dataset, val_dataset, val_unseen_dataset, batch_size,  # train/val loaders unused here
                 holdout_dataset=holdout_dataset,
                 num_workers=num_workers,
                 pin_memory=pin_memory,
                 persistent_workers=persistent_workers,
                 prefetch_factor=prefetch_factor,
+                seed=random_seed,
             )
             holdout_eval = _evaluate_two_tower_model(trained_model, holdout_loader, device, embed_dim)
             split_metrics = holdout_eval["metrics"]
