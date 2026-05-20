@@ -1098,7 +1098,7 @@ def test_post_author_feature_encoder_zeroes_padding_row():
     assert torch.any(encoder.author_embedding.weight[1] != 0)
 
 
-def test_build_author_serving_mapping_exports_final_table_rows():
+def test_build_author_serving_mapping_exports_author_idx():
     author_idx_mapping_df = pl.DataFrame({
         "emb_idx": [10, 11, 20, 30],
         "author_did": ["author_a", "author_a", "author_b", "author_c"],
@@ -1112,26 +1112,22 @@ def test_build_author_serving_mapping_exports_final_table_rows():
         "author_did",
         "author_idx",
         "author_train_count",
-        "author_table_row",
     ]
     assert result.to_dicts() == [
         {
             "author_did": "author_a",
             "author_idx": 2,
             "author_train_count": 5,
-            "author_table_row": 2,
         },
         {
             "author_did": "author_b",
             "author_idx": 3,
             "author_train_count": 2,
-            "author_table_row": 3,
         },
         {
             "author_did": "author_c",
             "author_idx": 4,
             "author_train_count": 7,
-            "author_table_row": 4,
         },
     ]
 
@@ -1150,7 +1146,6 @@ def test_build_author_serving_mapping_omits_reserved_rows():
             "author_did": "author_real",
             "author_idx": 2,
             "author_train_count": 11,
-            "author_table_row": 2,
         },
     ]
 

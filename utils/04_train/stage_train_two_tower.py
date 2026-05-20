@@ -350,7 +350,7 @@ class AuthorAwarePostTower(nn.Module):
 def build_author_serving_mapping(
     author_idx_mapping_df: pl.DataFrame,
 ) -> pl.DataFrame:
-    """Build the supported author DID -> embedding-table row artifact for serving."""
+    """Build the supported author DID -> author_idx artifact for serving."""
     required_cols = {"author_did", "author_idx", "author_train_count"}
     missing_cols = required_cols.difference(author_idx_mapping_df.columns)
     if missing_cols:
@@ -365,11 +365,8 @@ def build_author_serving_mapping(
     )
     return (
         mapping_df
-        .with_columns(
-            pl.col("author_idx").fill_null(AUTHOR_UNK_IDX).cast(pl.UInt32).alias("author_table_row"),
-        )
-        .filter(pl.col("author_table_row") > AUTHOR_UNK_IDX)
-        .select(["author_did", "author_idx", "author_train_count", "author_table_row"])
+        .filter(pl.col("author_idx") > AUTHOR_UNK_IDX)
+        .select(["author_did", "author_idx", "author_train_count"])
     )
 
 
@@ -574,7 +571,7 @@ class TwoTowerModel(nn.Module):
         
         Args:
             post_embeddings: Raw post embeddings [batch, input_dim]
-            target_author_indices: Author embedding table rows [batch], required
+            target_author_indices: author_idx values [batch], required
                 when author embeddings are enabled.
         
         Returns:
@@ -610,9 +607,9 @@ class TwoTowerModel(nn.Module):
                   at position 0 (and optionally padded to seq_len > 1).
             history_mask: History validity mask [batch, seq_len] (optional in summarized mode)
             post_embeddings: Target post embeddings [batch, input_dim]
-            history_author_indices: Author table rows aligned with history items,
+            history_author_indices: author_idx values aligned with history items,
                 required when author embeddings are enabled.
-            target_author_indices: Author table rows for target posts, required
+            target_author_indices: author_idx values for target posts, required
                 when author embeddings are enabled.
         
         Returns:
