@@ -114,7 +114,7 @@ DEFAULTS: Dict[str, Any] = {
     "no_plots": False,
     "no_save_model": False,
     "disable_progress": False,  # Disable progress bars during training
-    "metrics_top_ks": [10, 50, 100],
+    "metrics_top_ks": [30],
     # Stage 4 (train) - DataLoader settings
     "num_dataloader_workers": 4,
     "dataloader_pin_memory": True,
