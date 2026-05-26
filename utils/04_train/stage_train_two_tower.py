@@ -651,6 +651,23 @@ def _empty_rank_metric_sums(metrics_top_ks: list[int]) -> Dict[str, float]:
     return metric_sums
 
 
+def _calc_baseline_rank_metrics_for_batch(
+    labels: torch.Tensor,
+    metrics_top_ks: list[int],
+    generator: Optional[torch.Generator] = None,
+) -> Tuple[Dict[str, float], int]:
+    """Calculate rank metrics for a random baseline (random candidate order) for one [users, candidates] batch."""
+    if labels.dim() != 2:
+        raise RuntimeError("labels must have shape [num_users, num_candidates]")
+    random_scores = torch.rand(
+        labels.shape,
+        dtype=labels.dtype,
+        device=labels.device,
+        generator=generator,
+    )
+    return _rank_metric_sums_for_batch(random_scores, labels, metrics_top_ks)
+
+
 def _rank_metric_sums_for_batch(
     scores: torch.Tensor,
     labels: torch.Tensor,
@@ -720,6 +737,7 @@ def _run_one_epoch(
     embed_dim: int,
     gradient_clip_max_norm: float,
     metrics_top_ks: list[int],
+    calc_baseline_metrics: bool,
 ):
     if train:
         model.train()
@@ -728,6 +746,9 @@ def _run_one_epoch(
 
     loss_sum = torch.zeros((), device=device)
     batches = 0
+    baseline_metric_sums = _empty_rank_metric_sums(metrics_top_ks)
+    baseline_metric_user_count = 0
+    baseline_generator: Optional[torch.Generator] = None
     metric_sums = _empty_rank_metric_sums(metrics_top_ks)
     metric_user_count = 0
 
@@ -738,6 +759,20 @@ def _run_one_epoch(
 
             loss, scores = model.compute_loss_and_preds(batch, device, embed_dim)
             labels = batch["label_matrix"].to(device, dtype=torch.float32, non_blocking=True)
+
+            if calc_baseline_metrics:
+                if baseline_generator is None:
+                    baseline_generator = torch.Generator(device=labels.device)
+                    baseline_generator.manual_seed(0)
+                baseline_batch_metric_sums, baseline_batch_metric_user_count = _calc_baseline_rank_metrics_for_batch(
+                    labels,
+                    metrics_top_ks,
+                    baseline_generator,
+                )
+                baseline_metric_user_count += baseline_batch_metric_user_count
+                for key, value in baseline_batch_metric_sums.items():
+                    baseline_metric_sums[key] += value
+
             batch_metric_sums, batch_metric_user_count = _rank_metric_sums_for_batch(
                 scores.detach(),
                 labels,
@@ -751,13 +786,15 @@ def _run_one_epoch(
 
             loss_sum += loss.detach()
             batches += 1
+
             metric_user_count += batch_metric_user_count
             for key, value in batch_metric_sums.items():
                 metric_sums[key] += value
 
     loss = (loss_sum / max(batches, 1)).item()
+    baseline_metrics_dict = _finalize_rank_metrics(baseline_metric_sums, baseline_metric_user_count)
     metrics_dict = _finalize_rank_metrics(metric_sums, metric_user_count)
-    return loss, metrics_dict
+    return loss, metrics_dict, baseline_metrics_dict
 
 
 # =============================================================================
@@ -807,7 +844,8 @@ def train_two_tower_model(
     best_state_dict = None
 
     for epoch in tqdm(range(epochs), desc="Training epochs", disable=disable_progress):
-        train_loss, train_metrics_dict = _run_one_epoch(
+        calc_baseline_metrics: bool = epoch == 0
+        train_loss, train_metrics_dict, train_baseline_metrics_dict = _run_one_epoch(
             train=True,
             split_name="Train",
             model=model,
@@ -818,9 +856,10 @@ def train_two_tower_model(
             embed_dim=embed_dim,
             gradient_clip_max_norm=gradient_clip_max_norm,
             metrics_top_ks=metrics_top_ks,
+            calc_baseline_metrics=calc_baseline_metrics,
         )
 
-        val_loss, val_metrics_dict = _run_one_epoch(
+        val_loss, val_metrics_dict, val_baseline_metrics_dict = _run_one_epoch(
             train=False,
             split_name="Validation",
             model=model,
@@ -831,9 +870,10 @@ def train_two_tower_model(
             embed_dim=embed_dim,
             gradient_clip_max_norm=gradient_clip_max_norm,
             metrics_top_ks=metrics_top_ks,
+            calc_baseline_metrics=calc_baseline_metrics,
         )
 
-        val_unseen_loss, val_unseen_metrics_dict = _run_one_epoch(
+        val_unseen_loss, val_unseen_metrics_dict, val_unseen_baseline_metrics_dict = _run_one_epoch(
             train=False,
             split_name="Validation Unseen Users",
             model=model,
@@ -844,6 +884,7 @@ def train_two_tower_model(
             embed_dim=embed_dim,
             gradient_clip_max_norm=gradient_clip_max_norm,
             metrics_top_ks=metrics_top_ks,
+            calc_baseline_metrics=calc_baseline_metrics,
         )
 
         train_primary_metric = float(train_metrics_dict[primary_metric_name])
@@ -930,6 +971,43 @@ def train_two_tower_model(
                     value=float(val_unseen_metrics_dict[f"recall@{k}"]),
                     iteration=iteration,
                 )
+                if calc_baseline_metrics:
+                    experiment_tracker.log_scalar(
+                        title=f"Baseline NDCG@{k}",
+                        series=f"Train Baseline NDCG@{k}",
+                        value=float(train_baseline_metrics_dict[f"ndcg@{k}"]),
+                        iteration=iteration,
+                    )
+                    experiment_tracker.log_scalar(
+                        title=f"Baseline NDCG@{k}",
+                        series=f"Validation NDCG@{k}",
+                        value=float(val_baseline_metrics_dict[f"ndcg@{k}"]),
+                        iteration=iteration,
+                    )
+                    experiment_tracker.log_scalar(
+                        title=f"Baseline NDCG@{k}",
+                        series=f"Validation Unseen Users NDCG@{k}",
+                        value=float(val_unseen_baseline_metrics_dict[f"ndcg@{k}"]),
+                        iteration=iteration,
+                    )
+                    experiment_tracker.log_scalar(
+                        title=f"Baseline Recall@{k}",
+                        series=f"Train Recall@{k}",
+                        value=float(train_baseline_metrics_dict[f"recall@{k}"]),
+                        iteration=iteration,
+                    )
+                    experiment_tracker.log_scalar(
+                        title=f"Baseline Recall@{k}",
+                        series=f"Validation Recall@{k}",
+                        value=float(val_baseline_metrics_dict[f"recall@{k}"]),
+                        iteration=iteration,
+                    )
+                    experiment_tracker.log_scalar(
+                        title=f"Baseline Recall@{k}",
+                        series=f"Validation Unseen Users Recall@{k}",
+                        value=float(val_unseen_baseline_metrics_dict[f"recall@{k}"]),
+                        iteration=iteration,
+                    )
 
         scheduler.step(val_primary_metric)
 

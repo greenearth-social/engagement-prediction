@@ -16,6 +16,7 @@ AuthorAwareUserTower = stage_train_two_tower.AuthorAwareUserTower
 AuthorAwarePostTower = stage_train_two_tower.AuthorAwarePostTower
 _rank_metric_sums_for_batch = stage_train_two_tower._rank_metric_sums_for_batch
 _finalize_rank_metrics = stage_train_two_tower._finalize_rank_metrics
+_run_one_epoch = stage_train_two_tower._run_one_epoch
 
 
 # =============================================================================
@@ -43,6 +44,89 @@ def test_rank_metric_sums_for_batch_matches_macro_rank_metrics():
     assert metrics["dcg@2"] == pytest.approx((1.0 + discount_2 + discount_2) / 2.0)
     assert metrics["ndcg@2"] == pytest.approx((1.0 + discount_2) / 2.0)
     assert metrics["recall@2"] == pytest.approx(1.0)
+
+
+class DummyTwoTowerForEpoch(nn.Module):
+    def compute_loss_and_preds(self, batch, device, embed_dim):
+        labels = batch["label_matrix"].to(device, dtype=torch.float32)
+        return torch.zeros((), device=device), labels
+
+
+def test_run_one_epoch_baseline_metrics_do_not_advance_global_torch_rng():
+    model = DummyTwoTowerForEpoch()
+    dataloader = [{
+        "label_matrix": torch.tensor([
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+        ]),
+    }]
+
+    torch.manual_seed(1234)
+    expected_next_random = torch.rand(5)
+
+    torch.manual_seed(1234)
+    _run_one_epoch(
+        train=False,
+        split_name="Validation",
+        model=model,
+        device="cpu",
+        dataloader=dataloader,
+        optimizer=None,
+        disable_progress=True,
+        embed_dim=0,
+        gradient_clip_max_norm=0.0,
+        metrics_top_ks=[1, 2],
+        calc_baseline_metrics=True,
+    )
+    actual_next_random = torch.rand(5)
+
+    assert actual_next_random == pytest.approx(expected_next_random)
+
+
+def test_run_one_epoch_accumulates_baseline_metric_user_count(monkeypatch):
+    model = DummyTwoTowerForEpoch()
+    dataloader = [
+        {"label_matrix": torch.ones((2, 3), dtype=torch.float32)},
+        {"label_matrix": torch.ones((3, 3), dtype=torch.float32)},
+    ]
+
+    def fake_baseline_metrics(labels, metrics_top_ks, generator=None):
+        user_count = labels.shape[0]
+        return {
+            f"dcg@{k}": float(user_count)
+            for k in metrics_top_ks
+        } | {
+            f"ndcg@{k}": float(user_count)
+            for k in metrics_top_ks
+        } | {
+            f"recall@{k}": float(user_count)
+            for k in metrics_top_ks
+        }, user_count
+
+    monkeypatch.setattr(stage_train_two_tower, "_calc_baseline_rank_metrics_for_batch", fake_baseline_metrics)
+
+    _, _, baseline_metrics = _run_one_epoch(
+        train=False,
+        split_name="Validation",
+        model=model,
+        device="cpu",
+        dataloader=dataloader,
+        optimizer=None,
+        disable_progress=True,
+        embed_dim=0,
+        gradient_clip_max_norm=0.0,
+        metrics_top_ks=[1, 2],
+        calc_baseline_metrics=True,
+    )
+
+    assert baseline_metrics == {
+        "dcg@1": pytest.approx(1.0),
+        "dcg@2": pytest.approx(1.0),
+        "ndcg@1": pytest.approx(1.0),
+        "ndcg@2": pytest.approx(1.0),
+        "recall@1": pytest.approx(1.0),
+        "recall@2": pytest.approx(1.0),
+    }
 
 def test_post_tower_initialization():
     """Test PostTower initializes correctly."""
