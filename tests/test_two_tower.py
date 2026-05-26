@@ -15,6 +15,7 @@ PostAuthorFeatureEncoder = stage_train_two_tower.PostAuthorFeatureEncoder
 AuthorAwareUserTower = stage_train_two_tower.AuthorAwareUserTower
 AuthorAwarePostTower = stage_train_two_tower.AuthorAwarePostTower
 _rank_metric_sums_for_batch = stage_train_two_tower._rank_metric_sums_for_batch
+_calc_baseline_rank_metrics_for_batch = stage_train_two_tower._calc_baseline_rank_metrics_for_batch
 _finalize_rank_metrics = stage_train_two_tower._finalize_rank_metrics
 _run_one_epoch = stage_train_two_tower._run_one_epoch
 
@@ -24,16 +25,12 @@ _run_one_epoch = stage_train_two_tower._run_one_epoch
 # =============================================================================
 
 def test_rank_metric_sums_for_batch_matches_macro_rank_metrics():
-    scores = torch.tensor([
-        [0.9, 0.8, 0.1],
-        [0.9, 0.8, 0.7],
-    ])
-    labels = torch.tensor([
+    ranked_labels = torch.tensor([
         [1.0, 1.0, 0.0],
         [0.0, 1.0, 0.0],
     ])
 
-    metric_sums, user_count = _rank_metric_sums_for_batch(scores, labels, [1, 2])
+    metric_sums, user_count = _rank_metric_sums_for_batch(ranked_labels, [1, 2])
     metrics = _finalize_rank_metrics(metric_sums, user_count)
 
     discount_2 = 1.0 / math.log2(3.0)
@@ -44,6 +41,29 @@ def test_rank_metric_sums_for_batch_matches_macro_rank_metrics():
     assert metrics["dcg@2"] == pytest.approx((1.0 + discount_2 + discount_2) / 2.0)
     assert metrics["ndcg@2"] == pytest.approx((1.0 + discount_2) / 2.0)
     assert metrics["recall@2"] == pytest.approx(1.0)
+
+
+def test_baseline_rank_metrics_use_expected_random_order_value():
+    labels = torch.tensor([
+        [1.0, 0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+    ])
+
+    metric_sums, user_count = _calc_baseline_rank_metrics_for_batch(labels, [1, 3])
+    metrics = _finalize_rank_metrics(metric_sums, user_count)
+
+    discount_2 = 1.0 / math.log2(3.0)
+    discount_3 = 1.0 / math.log2(4.0)
+    discount_sum_3 = 1.0 + discount_2 + discount_3
+    row_1_ndcg_3 = (0.5 * discount_sum_3) / (1.0 + discount_2)
+    row_2_ndcg_3 = 0.25 * discount_sum_3
+    assert user_count == 2
+    assert metrics["dcg@1"] == pytest.approx((0.5 + 0.25) / 2.0)
+    assert metrics["ndcg@1"] == pytest.approx((0.5 + 0.25) / 2.0)
+    assert metrics["recall@1"] == pytest.approx(0.25)
+    assert metrics["dcg@3"] == pytest.approx((0.5 * discount_sum_3 + 0.25 * discount_sum_3) / 2.0)
+    assert metrics["ndcg@3"] == pytest.approx((row_1_ndcg_3 + row_2_ndcg_3) / 2.0)
+    assert metrics["recall@3"] == pytest.approx(0.75)
 
 
 class DummyTwoTowerForEpoch(nn.Module):
