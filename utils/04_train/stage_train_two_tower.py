@@ -652,33 +652,15 @@ def _empty_rank_metric_sums(metrics_top_ks: list[int]) -> Dict[str, float]:
 
 
 def _calc_baseline_rank_metrics_for_batch(
-    labels: torch.Tensor,
-    metrics_top_ks: list[int],
-    generator: Optional[torch.Generator] = None,
-) -> Tuple[Dict[str, float], int]:
-    """Calculate rank metrics for a random baseline (random candidate order) for one [users, candidates] batch."""
-    if labels.dim() != 2:
-        raise RuntimeError("labels must have shape [num_users, num_candidates]")
-    random_scores = torch.rand(
-        labels.shape,
-        dtype=labels.dtype,
-        device=labels.device,
-        generator=generator,
-    )
-    return _rank_metric_sums_for_batch(random_scores, labels, metrics_top_ks)
-
-
-def _rank_metric_sums_for_batch(
-    scores: torch.Tensor,
-    labels: torch.Tensor,
+    unranked_labels: torch.Tensor,
     metrics_top_ks: list[int],
 ) -> Tuple[Dict[str, float], int]:
-    """Return summed per-user rank metrics for one [users, candidates] batch."""
-    if scores.shape != labels.shape:
-        raise RuntimeError("scores and labels must have matching [num_users, num_candidates] shapes")
+    """Calculate expected rank metrics for a uniformly random candidate order."""
+    if unranked_labels.dim() != 2:
+        raise RuntimeError("unranked_labels must have shape [num_users, num_candidates]")
 
     with torch.no_grad():
-        labels = labels.to(device=scores.device, dtype=torch.float32)
+        labels = unranked_labels.to(dtype=torch.float32)
         total_relevant = labels.sum(dim=1)
         eligible = total_relevant > 0
         eligible_count = int(eligible.sum().item())
@@ -686,20 +668,59 @@ def _rank_metric_sums_for_batch(
         if eligible_count == 0:
             return metric_sums, 0
 
-        scores = scores[eligible]
-        labels = labels[eligible]
+        total_relevant = total_relevant[eligible]
+        num_candidates = labels.size(1)
+        max_k = min(max(metrics_top_ks), num_candidates)
+        discounts = 1.0 / torch.log2(
+            torch.arange(max_k, device=labels.device, dtype=torch.float32) + 2.0
+        )
+        cumulative_discounts = discounts.cumsum(dim=0)
+        relevant_probability = total_relevant / float(num_candidates)
+
+        for k in metrics_top_ks:
+            k_eff = min(k, num_candidates)
+            discount_sum = cumulative_discounts[k_eff - 1]
+            dcg = relevant_probability * discount_sum
+            ideal_counts = total_relevant.clamp(max=k_eff).to(dtype=torch.long)
+            idcg = cumulative_discounts[ideal_counts - 1].clamp(min=1.0e-12)
+            recall = torch.full_like(total_relevant, fill_value=float(k_eff) / float(num_candidates))
+
+            metric_sums[f"dcg@{k}"] = float(dcg.sum().item())
+            metric_sums[f"ndcg@{k}"] = float((dcg / idcg).sum().item())
+            metric_sums[f"recall@{k}"] = float(recall.sum().item())
+
+        return metric_sums, eligible_count
+
+
+
+def _rank_metric_sums_for_batch(
+    ranked_labels: torch.Tensor,
+    metrics_top_ks: list[int],
+) -> Tuple[Dict[str, float], int]:
+    """Return summed per-user rank metrics for one [users, ranked_candidates] batch."""
+    if ranked_labels.dim() != 2:
+        raise RuntimeError("ranked_labels must have shape [num_users, num_candidates]")
+
+    with torch.no_grad():
+        ranked_labels = ranked_labels.to(dtype=torch.float32)
+        total_relevant = ranked_labels.sum(dim=1)
+        eligible = total_relevant > 0
+        eligible_count = int(eligible.sum().item())
+        metric_sums = _empty_rank_metric_sums(metrics_top_ks)
+        if eligible_count == 0:
+            return metric_sums, 0
+
+        ranked_labels = ranked_labels[eligible]
         total_relevant = total_relevant[eligible]
 
-        ranked_indices = torch.argsort(scores, dim=1, descending=True)
-        ranked_labels = torch.gather(labels, dim=1, index=ranked_indices)
-        max_k = min(max(metrics_top_ks), labels.size(1))
+        max_k = min(max(metrics_top_ks), ranked_labels.size(1))
         discounts = 1.0 / torch.log2(
-            torch.arange(max_k, device=scores.device, dtype=torch.float32) + 2.0
+            torch.arange(max_k, device=ranked_labels.device, dtype=torch.float32) + 2.0
         )
         cumulative_discounts = discounts.cumsum(dim=0)
 
         for k in metrics_top_ks:
-            k_eff = min(k, labels.size(1))
+            k_eff = min(k, ranked_labels.size(1))
             top_labels = ranked_labels[:, :k_eff]
             k_discounts = discounts[:k_eff]
             dcg = (top_labels * k_discounts).sum(dim=1)
@@ -748,7 +769,6 @@ def _run_one_epoch(
     batches = 0
     baseline_metric_sums = _empty_rank_metric_sums(metrics_top_ks)
     baseline_metric_user_count = 0
-    baseline_generator: Optional[torch.Generator] = None
     metric_sums = _empty_rank_metric_sums(metrics_top_ks)
     metric_user_count = 0
 
@@ -761,23 +781,17 @@ def _run_one_epoch(
             labels = batch["label_matrix"].to(device, dtype=torch.float32, non_blocking=True)
 
             if calc_baseline_metrics:
-                if baseline_generator is None:
-                    baseline_generator = torch.Generator(device=labels.device)
-                    baseline_generator.manual_seed(0)
                 baseline_batch_metric_sums, baseline_batch_metric_user_count = _calc_baseline_rank_metrics_for_batch(
                     labels,
                     metrics_top_ks,
-                    baseline_generator,
                 )
                 baseline_metric_user_count += baseline_batch_metric_user_count
                 for key, value in baseline_batch_metric_sums.items():
                     baseline_metric_sums[key] += value
 
-            batch_metric_sums, batch_metric_user_count = _rank_metric_sums_for_batch(
-                scores.detach(),
-                labels,
-                metrics_top_ks,
-            )
+            ranked_indices = torch.argsort(scores.detach(), dim=1, descending=True)
+            ranked_labels = torch.gather(labels, dim=1, index=ranked_indices)
+            batch_metric_sums, batch_metric_user_count = _rank_metric_sums_for_batch(ranked_labels, metrics_top_ks)
 
             if train:
                 loss.backward()
@@ -1079,11 +1093,9 @@ def _evaluate_two_tower_model(
         for batch in data_loader:
             loss, scores = model.compute_loss_and_preds(batch, device, embed_dim)
             labels = batch["label_matrix"].to(device, dtype=torch.float32, non_blocking=True)
-            batch_metric_sums, batch_metric_user_count = _rank_metric_sums_for_batch(
-                scores,
-                labels,
-                metrics_top_ks,
-            )
+            ranked_indices = torch.argsort(scores, dim=1, descending=True)
+            ranked_labels = torch.gather(labels, dim=1, index=ranked_indices)
+            batch_metric_sums, batch_metric_user_count = _rank_metric_sums_for_batch(ranked_labels, metrics_top_ks)
 
             loss_sum += loss.detach()
             batches += 1
