@@ -110,6 +110,7 @@ def test_bucketed_batch_sampler_keeps_each_batch_in_one_bucket(bucketed_dataset)
         batch_size=2,
         shuffle=False,
         drop_last=False,
+        seed=0,
     )
 
     batches = list(sampler)
@@ -221,6 +222,9 @@ def test_create_bucketed_data_loaders_returns_iterable_loaders(
         batch_size=2,
         num_workers=0,
         pin_memory=False,
+        persistent_workers=True,
+        prefetch_factor=2,
+        seed=0,
     )
 
     assert isinstance(train_loader, DataLoader)

@@ -882,7 +882,7 @@ class CrossAttentionPoolingEncoder(BaseAttentionEncoder):
 # Shared data-loading helper
 # ---------------------------------------------------------------------------
 
-def _load_pairwise_training_data(
+def load_pairwise_training_data(
     context: Context,
     logger: Optional[logging.Logger] = None,
 ) -> Tuple[np.ndarray, pl.DataFrame, pl.DataFrame, Optional[pl.DataFrame], int]:
@@ -918,7 +918,7 @@ def _load_pairwise_training_data(
         FileNotFoundError: If any required artifact cannot be located
         
     Example:
-        >>> embeddings, targets, history, author_idx_mapping, dim = load_training_data(
+        >>> embeddings, targets, history, author_idx_mapping, dim = load_pairwise_training_data(
         ...     context=context,
         ...     logger=logger
         ... )
@@ -984,7 +984,7 @@ def _resolve_prior(
 # Internal: shared filter + join used by both datasets and evaluation
 # ---------------------------------------------------------------------------
 
-def _filter_pairwise_split_and_join_history(
+def filter_pairwise_split_and_join_history(
     target_posts_df: pl.DataFrame,
     history_df: pl.DataFrame,
     split: str,
@@ -1085,7 +1085,7 @@ def _prepare_split_data(
     if logger is None:
         logger = get_stage_logger("DATALOADERS")
 
-    joined = _filter_pairwise_split_and_join_history(
+    joined = filter_pairwise_split_and_join_history(
         target_posts_df,
         history_df,
         split,
@@ -1165,7 +1165,7 @@ def _prepare_split_data(
 # SummarizedEngagementDataset
 # ---------------------------------------------------------------------------
 
-class _PairwiseSummarizedEngagementDataset(Dataset):
+class PairwiseSummarizedEngagementDataset(Dataset):
     """Fixed-size feature vector dataset: [user_summary || post_embedding].
     
     This dataset represents user engagement history as FIXED-SIZE summary vectors
@@ -1333,7 +1333,7 @@ class _PairwiseSummarizedEngagementDataset(Dataset):
 # SequenceEngagementDataset
 # ---------------------------------------------------------------------------
 
-class _PairwiseSequenceEngagementDataset(Dataset):
+class PairwiseSequenceEngagementDataset(Dataset):
     """Variable-length sequence dataset: padded history + mask + target post embedding.
     
     This dataset represents user engagement history as VARIABLE-LENGTH SEQUENCES
@@ -1552,7 +1552,7 @@ class _PairwiseSequenceEngagementDataset(Dataset):
 # DataLoader factory
 # ---------------------------------------------------------------------------
 
-def _create_pairwise_data_loaders(
+def create_pairwise_data_loaders(
     train_dataset: Dataset,
     val_dataset: Dataset,
     val_unseen_dataset: Dataset,

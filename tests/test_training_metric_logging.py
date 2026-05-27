@@ -185,7 +185,7 @@ def test_train_two_tower_model_logs_epoch_metrics_to_tracker(tmp_path):
 
     assert len(results["history"]["train_ndcg@1"]) == 2
     assert results["primary_metric_name"] == "ndcg@1"
-    assert len(tracker.calls) == 36
+    assert len(tracker.calls) == 48
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train Loss")] == [1, 2]
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Loss")] == [1, 2]
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Unseen Users Loss")] == [1, 2]
@@ -204,3 +204,9 @@ def test_train_two_tower_model_logs_epoch_metrics_to_tracker(tmp_path):
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train Recall@2")] == [1, 2]
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Recall@2")] == [1, 2]
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Unseen Users Recall@2")] == [1, 2]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train Baseline NDCG@1")] == [1]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Baseline NDCG@1")] == [1]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Unseen Users Baseline NDCG@1")] == [1]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train Baseline Recall@1")] == [1]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Baseline Recall@1")] == [1]
+    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Unseen Users Baseline Recall@1")] == [1]

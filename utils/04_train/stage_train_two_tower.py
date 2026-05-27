@@ -994,31 +994,31 @@ def train_two_tower_model(
                     )
                     experiment_tracker.log_scalar(
                         title=f"Baseline NDCG@{k}",
-                        series=f"Validation NDCG@{k}",
+                        series=f"Validation Baseline NDCG@{k}",
                         value=float(val_baseline_metrics_dict[f"ndcg@{k}"]),
                         iteration=iteration,
                     )
                     experiment_tracker.log_scalar(
                         title=f"Baseline NDCG@{k}",
-                        series=f"Validation Unseen Users NDCG@{k}",
+                        series=f"Validation Unseen Users Baseline NDCG@{k}",
                         value=float(val_unseen_baseline_metrics_dict[f"ndcg@{k}"]),
                         iteration=iteration,
                     )
                     experiment_tracker.log_scalar(
                         title=f"Baseline Recall@{k}",
-                        series=f"Train Recall@{k}",
+                        series=f"Train Baseline Recall@{k}",
                         value=float(train_baseline_metrics_dict[f"recall@{k}"]),
                         iteration=iteration,
                     )
                     experiment_tracker.log_scalar(
                         title=f"Baseline Recall@{k}",
-                        series=f"Validation Recall@{k}",
+                        series=f"Validation Baseline Recall@{k}",
                         value=float(val_baseline_metrics_dict[f"recall@{k}"]),
                         iteration=iteration,
                     )
                     experiment_tracker.log_scalar(
                         title=f"Baseline Recall@{k}",
-                        series=f"Validation Unseen Users Recall@{k}",
+                        series=f"Validation Unseen Users Baseline Recall@{k}",
                         value=float(val_unseen_baseline_metrics_dict[f"recall@{k}"]),
                         iteration=iteration,
                     )

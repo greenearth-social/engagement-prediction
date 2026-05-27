@@ -98,14 +98,14 @@ from utils.helpers import (
     set_random_seeds,
 )
 from utils.dataloaders import (
-    load_training_data,
+    load_pairwise_training_data,
     get_summarizer,
-    SummarizedEngagementDataset,
-    SequenceEngagementDataset,
+    PairwiseSummarizedEngagementDataset,
+    PairwiseSequenceEngagementDataset,
     SummarizedUserTower,
     TransformerDualPoolingEncoder,
     CrossAttentionPoolingEncoder,
-    create_data_loaders,
+    create_pairwise_data_loaders,
 )
 
 STAGE_LOG_NAME = "STAGE_04_TRAIN_MLP"
@@ -414,7 +414,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # --- load data from prior stages ---
     log_operation_start("Load training data from prior stages", STAGE_LOG_NAME, logger)
-    embeddings_mmap, target_posts_df, history_df, _, embed_dim = load_training_data(
+    embeddings_mmap, target_posts_df, history_df, _, embed_dim = load_pairwise_training_data(
         context, logger=logger,
     )
     log_prior_stage_inputs(context, logger)
@@ -460,11 +460,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         logger.info(f"User encoder: summarized ({summarizer_name}, ema_alpha={ema_alpha})")
 
         log_operation_start("Create datasets (summarized)", STAGE_LOG_NAME, logger)
-        train_dataset = SummarizedEngagementDataset(
+        train_dataset = PairwiseSummarizedEngagementDataset(
             embeddings_mmap, target_posts_df, history_df, split="train",
             summarizer=summarizer, embed_dim=embed_dim, logger=logger,
         )
-        val_dataset = SummarizedEngagementDataset(
+        val_dataset = PairwiseSummarizedEngagementDataset(
             embeddings_mmap, target_posts_df, history_df, split="val",
             summarizer=summarizer, embed_dim=embed_dim, logger=logger,
         )
@@ -483,7 +483,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             user_encoder_type="summarized",
         )
         
-        train_loader, val_loader, _, _ = create_data_loaders(
+        train_loader, val_loader, _, _ = create_pairwise_data_loaders(
             train_dataset, val_dataset, val_dataset, batch_size,
             num_workers=num_workers,
             pin_memory=pin_memory,
@@ -503,11 +503,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         ema_alpha = 0.0
 
         log_operation_start("Create datasets (sequence)", STAGE_LOG_NAME, logger)
-        train_dataset = SequenceEngagementDataset(
+        train_dataset = PairwiseSequenceEngagementDataset(
             embeddings_mmap, target_posts_df, history_df, split="train",
             max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
         )
-        val_dataset = SequenceEngagementDataset(
+        val_dataset = PairwiseSequenceEngagementDataset(
             embeddings_mmap, target_posts_df, history_df, split="val",
             max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
         )
@@ -525,7 +525,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             user_encoder_type=user_encoder,
         )
 
-        train_loader, val_loader, _, _ = create_data_loaders(
+        train_loader, val_loader, _, _ = create_pairwise_data_loaders(
             train_dataset, val_dataset, val_dataset, batch_size,
             num_workers=num_workers,
             pin_memory=pin_memory,
@@ -698,12 +698,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         split_name = f"holdout_{holdout_type}"
         try:
             if user_encoder == "summarized":
-                holdout_dataset = SummarizedEngagementDataset(
+                holdout_dataset = PairwiseSummarizedEngagementDataset(
                     embeddings_mmap, target_posts_df, history_df, split=split_name,
                     summarizer=summarizer, embed_dim=embed_dim, logger=logger,
                 )
             else:
-                holdout_dataset = SequenceEngagementDataset(
+                holdout_dataset = PairwiseSequenceEngagementDataset(
                     embeddings_mmap, target_posts_df, history_df, split=split_name,
                     max_history_len=max_history_len, embed_dim=embed_dim, logger=logger,
                 )

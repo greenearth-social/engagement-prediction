@@ -35,7 +35,7 @@ import polars as pl
 
 from utils.pipeline.core import Context, generate_run_timestamp
 from utils.helpers import get_stage_logger, log_operation_start, log_prior_stage_inputs
-from utils.dataloaders import filter_split_and_join_history, load_training_data
+from utils.dataloaders import filter_pairwise_split_and_join_history, load_pairwise_training_data
 
 # ---------------------------------------------------------------------------
 # Import evaluation framework
@@ -152,7 +152,7 @@ def _join_holdout_with_history(
     holdout_split: str,
 ) -> pl.DataFrame:
     """Join holdout target rows with history and compute per-row history length."""
-    return filter_split_and_join_history(
+    return filter_pairwise_split_and_join_history(
         target_posts_df, history_df, holdout_split
     ).with_columns(
         pl.col("prior_emb_indices").list.len().alias("num_embedding_likes")
@@ -299,7 +299,7 @@ def run(context: Context, args) -> Dict[str, Any]:
 
     # Step 1: Load training data from prior stages (target_posts + history for metadata)
     log_operation_start('Load training data from prior stages', STAGE_LOG_NAME, logger)
-    _, target_posts_df, history_df, _, embed_dim = load_training_data(
+    _, target_posts_df, history_df, _, embed_dim = load_pairwise_training_data(
         context, logger=logger,
     )
     log_prior_stage_inputs(context, logger)
