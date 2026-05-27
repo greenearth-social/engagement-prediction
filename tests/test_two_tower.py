@@ -18,6 +18,7 @@ _rank_metric_sums_for_batch = stage_train_two_tower._rank_metric_sums_for_batch
 _calc_baseline_rank_metrics_for_batch = stage_train_two_tower._calc_baseline_rank_metrics_for_batch
 _finalize_rank_metrics = stage_train_two_tower._finalize_rank_metrics
 _run_one_epoch = stage_train_two_tower._run_one_epoch
+_evaluate_two_tower_model = stage_train_two_tower._evaluate_two_tower_model
 
 
 # =============================================================================
@@ -70,6 +71,33 @@ class DummyTwoTowerForEpoch(nn.Module):
     def compute_loss_and_preds(self, batch, device, embed_dim):
         labels = batch["label_matrix"].to(device, dtype=torch.float32)
         return torch.zeros((), device=device), labels
+
+
+def test_evaluate_two_tower_model_reports_auc_and_average_precision():
+    model = DummyTwoTowerForEpoch()
+    dataloader = [{
+        "label_matrix": torch.tensor([
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+        ]),
+    }]
+
+    result = _evaluate_two_tower_model(
+        model=model,
+        data_loader=dataloader,
+        device="cpu",
+        embed_dim=0,
+        metrics_top_ks=[1, 2],
+        max_classification_metric_pairs=None,
+    )
+
+    metrics = result["metrics"]
+    assert metrics["auc_roc"] == pytest.approx(1.0)
+    assert metrics["average_precision"] == pytest.approx(1.0)
+    assert metrics["classification_metric_pair_count"] == 6
+    assert metrics["classification_metric_positive_count"] == 3
+    assert metrics["classification_metric_sampled_pair_count"] == 6
+    assert metrics["classification_metric_sampled"] is False
 
 
 def test_run_one_epoch_baseline_metrics_do_not_advance_global_torch_rng():

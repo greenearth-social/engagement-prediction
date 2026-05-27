@@ -97,10 +97,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from contextlib import nullcontext
 from tqdm import tqdm
 
+import numpy as np
 import polars as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.metrics import average_precision_score, roc_auc_score
 from torch.utils.data import DataLoader
 
 from utils.pipeline.core import Context
@@ -125,6 +127,7 @@ from utils.dataloaders import (
 )
 
 STAGE_LOG_NAME = "STAGE_04_TRAIN_TWO_TOWER"
+DEFAULT_MAX_CLASSIFICATION_METRIC_PAIRS = 2_000_000
 
 
 # =============================================================================
@@ -1079,8 +1082,9 @@ def _evaluate_two_tower_model(
     device: str,
     embed_dim: int,
     metrics_top_ks: list[int],
+    max_classification_metric_pairs: Optional[int] = DEFAULT_MAX_CLASSIFICATION_METRIC_PAIRS,
 ) -> Dict[str, Any]:
-    """Evaluate two-tower model with batch-streamed ranking metrics."""
+    """Evaluate two-tower model with streamed ranking metrics and sampled AUC/AP."""
     model = model.to(device)
     model.eval()
 
@@ -1088,6 +1092,12 @@ def _evaluate_two_tower_model(
     batches = 0
     metric_sums = _empty_rank_metric_sums(metrics_top_ks)
     metric_user_count = 0
+    classification_pair_count = 0
+    classification_positive_count = 0
+    metric_labels: Optional[np.ndarray] = None
+    metric_scores: Optional[np.ndarray] = None
+    metric_priorities: Optional[np.ndarray] = None
+    rng = np.random.default_rng(0)
 
     with torch.inference_mode():
         for batch in data_loader:
@@ -1103,9 +1113,51 @@ def _evaluate_two_tower_model(
             for key, value in batch_metric_sums.items():
                 metric_sums[key] += value
 
+            flat_labels = labels.detach().flatten().cpu().numpy().astype(np.int8, copy=False)
+            flat_scores = scores.detach().flatten().cpu().numpy().astype(np.float64, copy=False)
+            classification_pair_count += int(flat_labels.size)
+            classification_positive_count += int(flat_labels.sum())
+            if max_classification_metric_pairs is None:
+                if metric_labels is None:
+                    metric_labels = flat_labels
+                    metric_scores = flat_scores
+                else:
+                    metric_labels = np.concatenate([metric_labels, flat_labels])
+                    metric_scores = np.concatenate([metric_scores, flat_scores])
+            elif max_classification_metric_pairs > 0:
+                flat_priorities = rng.random(flat_labels.size)
+                if metric_labels is None:
+                    metric_labels = flat_labels
+                    metric_scores = flat_scores
+                    metric_priorities = flat_priorities
+                else:
+                    metric_labels = np.concatenate([metric_labels, flat_labels])
+                    metric_scores = np.concatenate([metric_scores, flat_scores])
+                    metric_priorities = np.concatenate([metric_priorities, flat_priorities])
+                if metric_labels.size > max_classification_metric_pairs:
+                    keep_idx = np.argpartition(metric_priorities, max_classification_metric_pairs - 1)[:max_classification_metric_pairs]
+                    metric_labels = metric_labels[keep_idx]
+                    metric_scores = metric_scores[keep_idx]
+                    metric_priorities = metric_priorities[keep_idx]
+
     metrics: Dict[str, Any] = _finalize_rank_metrics(metric_sums, metric_user_count)
     metrics["loss"] = (loss_sum / max(batches, 1)).item()
     metrics["rank_metric_user_count"] = metric_user_count
+    metrics["classification_metric_pair_count"] = classification_pair_count
+    metrics["classification_metric_positive_count"] = classification_positive_count
+    metrics["classification_metric_sampled_pair_count"] = int(metric_labels.size) if metric_labels is not None else 0
+    metrics["classification_metric_sampled"] = (
+        max_classification_metric_pairs is not None
+        and classification_pair_count > max_classification_metric_pairs
+    )
+    if metric_labels is not None and np.unique(metric_labels).size > 1:
+        metrics["auc_roc"] = float(roc_auc_score(metric_labels, metric_scores))
+    else:
+        metrics["auc_roc"] = None
+    if metric_labels is not None and int(metric_labels.sum()) > 0:
+        metrics["average_precision"] = float(average_precision_score(metric_labels, metric_scores))
+    else:
+        metrics["average_precision"] = None
 
     return {
         "metrics": metrics,
@@ -1295,11 +1347,13 @@ def run(context: Context, args) -> Dict[str, Any]:
         if generate_plots:
             logger.info("Skipping two-tower training plots while per-row prediction materialization is disabled")
 
-    # Collect train + val metrics without materializing per-user-candidate predictions
+    # Collect split metrics without materializing per-user-candidate predictions
     train_eval = _evaluate_two_tower_model(trained_model, train_loader, device, embed_dim, metrics_top_ks)
     val_eval = _evaluate_two_tower_model(trained_model, val_loader, device, embed_dim, metrics_top_ks)
+    val_unseen_eval = _evaluate_two_tower_model(trained_model, val_unseen_loader, device, embed_dim, metrics_top_ks)
     logger.info(f"Train metrics: {train_eval['metrics']}")
     logger.info(f"Validation metrics: {val_eval['metrics']}")
+    logger.info(f"Validation unseen users metrics: {val_unseen_eval['metrics']}")
 
     if training_results is not None:
         best_val_metric = training_results["best_val_metric"]
@@ -1317,6 +1371,12 @@ def run(context: Context, args) -> Dict[str, Any]:
                 title=f"Primary Ranking Metric ({primary_metric_name})",
                 series=f"Validation {primary_metric_name}",
                 value=best_val_metric,
+                iteration=0,
+            )
+            context.tracker.log_scalar(
+                title=f"Primary Ranking Metric ({primary_metric_name})",
+                series=f"Validation Unseen Users {primary_metric_name}",
+                value=float(val_unseen_eval["metrics"].get(primary_metric_name, 0.0)),
                 iteration=0,
             )
 
@@ -1421,8 +1481,10 @@ def run(context: Context, args) -> Dict[str, Any]:
         "random_seed": random_seed,
         "train_samples": len(train_dataset),
         "val_samples": len(val_dataset),
+        "val_unseen_samples": len(val_unseen_dataset),
         "train_metrics": train_eval["metrics"],
         "val_metrics": val_eval["metrics"],
+        "val_unseen_metrics": val_unseen_eval["metrics"],
         "holdout_metrics": holdout_metrics,
         "primary_metric_name": primary_metric_name,
         "best_val_metric": best_val_metric,
