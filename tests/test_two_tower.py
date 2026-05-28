@@ -19,6 +19,7 @@ _calc_baseline_rank_metrics_for_batch = stage_train_two_tower._calc_baseline_ran
 _finalize_rank_metrics = stage_train_two_tower._finalize_rank_metrics
 _run_one_epoch = stage_train_two_tower._run_one_epoch
 _evaluate_two_tower_model = stage_train_two_tower._evaluate_two_tower_model
+_ranking_rows_for_batch = stage_train_two_tower._ranking_rows_for_batch
 
 
 # =============================================================================
@@ -98,6 +99,77 @@ def test_evaluate_two_tower_model_reports_auc_and_average_precision():
     assert metrics["classification_metric_positive_count"] == 3
     assert metrics["classification_metric_sampled_pair_count"] == 6
     assert metrics["classification_metric_sampled"] is False
+    assert result["ranking_rows"] == []
+
+
+def test_ranking_rows_for_batch_reports_per_user_matrix_metrics():
+    batch = {
+        "user_id": ["u1", "u2"],
+        "bucket": "2026-05-01T00:00:00Z",
+        "history_mask": torch.tensor([
+            [True, True, False],
+            [True, False, False],
+        ]),
+    }
+    scores = torch.tensor([
+        [0.9, 0.1, 0.8],
+        [0.2, 0.7, 0.1],
+    ])
+    labels = torch.tensor([
+        [1.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0],
+    ])
+
+    rows = _ranking_rows_for_batch(batch, scores, labels, [1, 2])
+
+    assert len(rows) == 2
+    assert rows[0]["did"] == "u1"
+    assert rows[0]["num_embedding_likes"] == 2
+    assert rows[0]["candidate_count"] == 3
+    assert rows[0]["positive_count"] == 2
+    assert rows[0]["positive_rank_min"] == pytest.approx(1.0)
+    assert rows[0]["positive_rank_mean"] == pytest.approx(1.5)
+    assert rows[0]["ndcg@1"] == pytest.approx(1.0)
+    assert rows[0]["recall@1"] == pytest.approx(0.5)
+    assert rows[0]["ndcg@2"] == pytest.approx(1.0)
+    assert rows[0]["recall@2"] == pytest.approx(1.0)
+    assert rows[0]["average_precision"] == pytest.approx(1.0)
+    assert rows[0]["auc_roc"] == pytest.approx(1.0)
+    assert rows[1]["did"] == "u2"
+    assert rows[1]["num_embedding_likes"] == 1
+    assert rows[1]["positive_count"] == 1
+    assert rows[1]["ndcg@1"] == pytest.approx(1.0)
+    assert rows[1]["average_precision"] == pytest.approx(1.0)
+
+
+def test_evaluate_two_tower_model_collects_ranking_rows_when_requested():
+    model = DummyTwoTowerForEpoch()
+    dataloader = [{
+        "label_matrix": torch.tensor([
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+        ]),
+        "user_id": ["u1", "u2"],
+        "bucket": "2026-05-01T00:00:00Z",
+        "history_mask": torch.tensor([
+            [True, True, False],
+            [True, False, False],
+        ]),
+    }]
+
+    result = _evaluate_two_tower_model(
+        model=model,
+        data_loader=dataloader,
+        device="cpu",
+        embed_dim=0,
+        metrics_top_ks=[1, 2],
+        max_classification_metric_pairs=None,
+        collect_ranking_rows=True,
+    )
+
+    assert len(result["ranking_rows"]) == 2
+    assert result["ranking_rows"][0]["did"] == "u1"
+    assert result["ranking_rows"][0]["average_precision"] == pytest.approx(1.0)
 
 
 def test_run_one_epoch_baseline_metrics_do_not_advance_global_torch_rng():

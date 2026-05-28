@@ -142,6 +142,21 @@ def load_holdout_predictions(
     )
 
 
+def load_holdout_ranking_rows(
+    eval_dir: Optional[Path],
+    holdout_type: str,
+    logger=None,
+) -> Optional[pd.DataFrame]:
+    if eval_dir is None:
+        return None
+    ranking_path = eval_dir / f'holdout_{holdout_type}_ranking_rows.parquet'
+    if not ranking_path.exists():
+        return None
+    if logger:
+        logger.info(f"Loading ranking rows from {ranking_path}")
+    return pd.read_parquet(ranking_path)
+
+
 # ---------------------------------------------------------------------------
 # Shared holdout join (used by both enrichment and user-metadata)
 # ---------------------------------------------------------------------------
@@ -263,6 +278,21 @@ def compute_user_metadata(
     return metadata_df[['did', 'num_embedding_likes', 'num_total_likes']]
 
 
+def compute_user_metadata_from_ranking_rows(ranking_rows_df: pd.DataFrame) -> pd.DataFrame:
+    metadata_df = (
+        ranking_rows_df
+        .groupby('did', as_index=False)
+        .agg(
+            num_embedding_likes=('num_embedding_likes', 'max'),
+            num_total_likes=('num_total_likes', 'max'),
+        )
+    )
+    metadata_df['did'] = metadata_df['did'].astype(str)
+    metadata_df['num_embedding_likes'] = metadata_df['num_embedding_likes'].fillna(0).astype(int)
+    metadata_df['num_total_likes'] = metadata_df['num_total_likes'].fillna(0).astype(int)
+    return metadata_df[['did', 'num_embedding_likes', 'num_total_likes']]
+
+
 # ---------------------------------------------------------------------------
 # Pipeline entry point
 # ---------------------------------------------------------------------------
@@ -287,6 +317,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     # Resolve training output (inputs)
     train_dir = resolve_train_output(context)
     predictions_dir = train_dir / 'predictions'
+    train_eval_dir = train_dir / 'eval'
 
     # Canonical stage output
     out_dir = context.new_stage_dir("05_evaluate", tag=eval_holdout_type)
@@ -297,52 +328,64 @@ def run(context: Context, args) -> Dict[str, Any]:
     logger.info(f"Training output dir: {train_dir}")
     logger.info(f"Holdout type for evaluation: {eval_holdout_type} (split={holdout_split})")
 
-    # Step 1: Load training data from prior stages (target_posts + history for metadata)
-    log_operation_start('Load training data from prior stages', STAGE_LOG_NAME, logger)
-    _, target_posts_df, history_df, _, embed_dim = load_pairwise_training_data(
-        context, logger=logger,
-    )
-    log_prior_stage_inputs(context, logger)
-
-    holdout_target_rows = target_posts_df.filter(pl.col("split") == holdout_split)
-    holdout_users = holdout_target_rows["target_did"].unique().to_list()
-    holdout_users = [str(u) for u in holdout_users]
-
-    if not holdout_users:
-        raise RuntimeError(
-            f"No holdout users found in target_posts (no rows with split='{holdout_split}'). "
-            f"Did the target_posts stage produce a {eval_holdout_type} holdout split? "
-            f"Check --holdout-user-fraction and --holdout-start in your pipeline configuration."
-        )
-    logger.info(f"Holdout users ({eval_holdout_type}): {len(holdout_users)}")
-    logger.info(f"Holdout target rows ({eval_holdout_type}): {len(holdout_target_rows)}")
-
-    # Step 2: Load holdout predictions
-    log_operation_start('Load holdout predictions', STAGE_LOG_NAME, logger)
-    predictions_df = load_holdout_predictions(
-        predictions_dir=predictions_dir if predictions_dir.exists() else None,
+    log_operation_start('Load evaluation artifact', STAGE_LOG_NAME, logger)
+    ranking_rows_df = load_holdout_ranking_rows(
+        eval_dir=train_eval_dir if train_eval_dir.exists() else None,
         holdout_type=eval_holdout_type,
         logger=logger,
     )
+    if ranking_rows_df is not None:
+        predictions_df = pd.DataFrame(columns=['did', 'post_id', 'y_true', 'y_pred_proba'])
+        user_metadata_df = compute_user_metadata_from_ranking_rows(ranking_rows_df)
+        embed_dim = None
+        logger.info(f"Loaded {len(ranking_rows_df)} ranking rows for {ranking_rows_df['did'].nunique()} users")
+    else:
+        # Step 1: Load training data from prior stages (target_posts + history for metadata)
+        log_operation_start('Load training data from prior stages', STAGE_LOG_NAME, logger)
+        _, target_posts_df, history_df, _, embed_dim = load_pairwise_training_data(
+            context, logger=logger,
+        )
+        log_prior_stage_inputs(context, logger)
 
-    if len(predictions_df) == 0:
-        raise RuntimeError("No holdout predictions available")
+        holdout_target_rows = target_posts_df.filter(pl.col("split") == holdout_split)
+        holdout_users = holdout_target_rows["target_did"].unique().to_list()
+        holdout_users = [str(u) for u in holdout_users]
 
-    logger.info(f"Loaded {len(predictions_df)} predictions for {predictions_df['did'].nunique()} users")
+        if not holdout_users:
+            raise RuntimeError(
+                f"No holdout users found in target_posts (no rows with split='{holdout_split}'). "
+                f"Did the target_posts stage produce a {eval_holdout_type} holdout split? "
+                f"Check --holdout-user-fraction and --holdout-start in your pipeline configuration."
+            )
+        logger.info(f"Holdout users ({eval_holdout_type}): {len(holdout_users)}")
+        logger.info(f"Holdout target rows ({eval_holdout_type}): {len(holdout_target_rows)}")
 
-    # Step 2b: Join holdout targets with history (shared by enrichment + metadata)
-    log_operation_start('Join holdout targets with history', STAGE_LOG_NAME, logger)
-    holdout_joined = _join_holdout_with_history(target_posts_df, history_df, holdout_split)
+        # Step 2: Load holdout predictions
+        log_operation_start('Load holdout predictions', STAGE_LOG_NAME, logger)
+        predictions_df = load_holdout_predictions(
+            predictions_dir=predictions_dir if predictions_dir.exists() else None,
+            holdout_type=eval_holdout_type,
+            logger=logger,
+        )
 
-    # Step 2c: Enrich predictions with per-row history length
-    log_operation_start('Enrich predictions with per-row history length', STAGE_LOG_NAME, logger)
-    predictions_df = enrich_predictions_with_history_len(predictions_df, holdout_joined)
-    logger.info(f"Enriched predictions with num_embedding_likes (post-level history length)")
+        if len(predictions_df) == 0:
+            raise RuntimeError("No holdout predictions available")
 
-    # Step 3: Compute user metadata
-    log_operation_start('Compute user metadata', STAGE_LOG_NAME, logger)
-    user_metadata_df = compute_user_metadata(predictions_df, target_posts_df, holdout_joined)
-    logger.info(f"Computed metadata for {len(user_metadata_df)} users")
+        logger.info(f"Loaded {len(predictions_df)} predictions for {predictions_df['did'].nunique()} users")
+
+        # Step 2b: Join holdout targets with history (shared by enrichment + metadata)
+        log_operation_start('Join holdout targets with history', STAGE_LOG_NAME, logger)
+        holdout_joined = _join_holdout_with_history(target_posts_df, history_df, holdout_split)
+
+        # Step 2c: Enrich predictions with per-row history length
+        log_operation_start('Enrich predictions with per-row history length', STAGE_LOG_NAME, logger)
+        predictions_df = enrich_predictions_with_history_len(predictions_df, holdout_joined)
+        logger.info(f"Enriched predictions with num_embedding_likes (post-level history length)")
+
+        # Step 3: Compute user metadata
+        log_operation_start('Compute user metadata', STAGE_LOG_NAME, logger)
+        user_metadata_df = compute_user_metadata(predictions_df, target_posts_df, holdout_joined)
+        logger.info(f"Computed metadata for {len(user_metadata_df)} users")
 
     # Step 4: Create EvalContext
     timestamp = generate_run_timestamp()
@@ -350,6 +393,7 @@ def run(context: Context, args) -> Dict[str, Any]:
     eval_config: Dict[str, Any] = {
         'batch_size': eval_batch_size,
         'embed_dim': embed_dim,
+        'eval_mode': 'ranking_rows' if ranking_rows_df is not None else 'pairwise_predictions',
     }
 
     ctx = EvalContext(
@@ -358,6 +402,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         output_dir=out_dir,
         timestamp=timestamp,
         config=eval_config,
+        ranking_rows_df=ranking_rows_df,
     )
 
     # Step 5: Discover and run evaluation modules
@@ -373,8 +418,10 @@ def run(context: Context, args) -> Dict[str, Any]:
         'runtime_seconds': time.time() - t0,
         'num_holdout_users': ctx.num_holdout_users,
         'num_predictions': ctx.num_predictions,
+        'num_ranking_rows': ctx.num_ranking_rows,
         'train_dir': str(train_dir),
         'embed_dim': embed_dim,
+        'eval_mode': eval_config['eval_mode'],
         'modules': module_results,
     }
 
@@ -388,8 +435,9 @@ def run(context: Context, args) -> Dict[str, Any]:
         f"timestamp: {timestamp}",
         f"num_holdout_users: {ctx.num_holdout_users}",
         f"num_predictions: {ctx.num_predictions}",
+        f"num_ranking_rows: {ctx.num_ranking_rows}",
         f"modules_run: {', '.join(module_results.keys())}",
-        f"inputs: target_posts, user_history, holdout predictions",
+        f"inputs: {'ranking rows' if ranking_rows_df is not None else 'target_posts, user_history, holdout predictions'}",
     ]
     (out_dir / 'stage_info.txt').write_text('\n'.join(info_lines) + '\n')
 

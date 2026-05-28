@@ -48,7 +48,9 @@ class EvalContext:
     
     Attributes:
         predictions_df: DataFrame with columns [did, post_id, y_true, y_pred_proba]
-                       Contains holdout predictions from training stage.
+                       Contains legacy pairwise holdout predictions from training stage.
+        ranking_rows_df: Optional DataFrame with one row per user-hour ranking
+                         evaluation row from bucketed two-tower training.
         user_metadata_df: DataFrame with columns [did, num_embedding_likes, num_total_likes]
                          Contains per-user metadata computed from the bundle.
         output_dir: Base output directory for all evaluation artifacts.
@@ -60,16 +62,28 @@ class EvalContext:
     output_dir: Path
     timestamp: str
     config: Dict[str, Any] = field(default_factory=dict)
+    ranking_rows_df: Optional[pd.DataFrame] = None
+
+    @property
+    def has_ranking_rows(self) -> bool:
+        return self.ranking_rows_df is not None and len(self.ranking_rows_df) > 0
     
     @property
     def num_holdout_users(self) -> int:
         """Get count of holdout users."""
+        if self.has_ranking_rows:
+            return int(self.ranking_rows_df['did'].nunique())
         return int(self.predictions_df['did'].nunique())
     
     @property
     def num_predictions(self) -> int:
         """Get total number of predictions."""
         return len(self.predictions_df)
+
+    @property
+    def num_ranking_rows(self) -> int:
+        """Get total number of matrix ranking rows."""
+        return 0 if self.ranking_rows_df is None else len(self.ranking_rows_df)
 
 
 class EvalModule(ABC):

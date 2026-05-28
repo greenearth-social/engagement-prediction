@@ -751,6 +751,75 @@ def _finalize_rank_metrics(metric_sums: Dict[str, float], user_count: int) -> Di
     }
 
 
+def _ranking_rows_for_batch(
+    batch: Dict[str, Any],
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+    metrics_top_ks: list[int],
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    user_ids = batch["user_id"]
+    bucket = batch["bucket"]
+    history_mask = batch["history_mask"].detach().cpu()
+    labels_cpu = labels.detach().cpu()
+    scores_cpu = scores.detach().cpu()
+
+    for user_idx, user_id in enumerate(user_ids):
+        row_labels = labels_cpu[user_idx].to(dtype=torch.float32)
+        row_scores = scores_cpu[user_idx].to(dtype=torch.float32)
+        ranked_indices = torch.argsort(row_scores, descending=True)
+        ranked_labels = row_labels[ranked_indices]
+        positive_count = int(row_labels.sum().item())
+        candidate_count = int(row_labels.numel())
+
+        row: Dict[str, Any] = {
+            "did": str(user_id),
+            "like_hour_bucket": bucket,
+            "num_embedding_likes": int(history_mask[user_idx].sum().item()),
+            "candidate_count": candidate_count,
+            "positive_count": positive_count,
+        }
+
+        if positive_count > 0:
+            max_k = min(max(metrics_top_ks), candidate_count)
+            discounts = 1.0 / torch.log2(torch.arange(max_k, dtype=torch.float32) + 2.0)
+            cumulative_discounts = discounts.cumsum(dim=0)
+            positive_rank_positions = torch.nonzero(ranked_labels > 0, as_tuple=False).flatten() + 1
+            positive_ranks = positive_rank_positions.to(dtype=torch.float32)
+            row["positive_rank_min"] = float(positive_ranks.min().item())
+            row["positive_rank_mean"] = float(positive_ranks.mean().item())
+            row["positive_rank_max"] = float(positive_ranks.max().item())
+
+            for k in metrics_top_ks:
+                k_eff = min(k, candidate_count)
+                top_labels = ranked_labels[:k_eff]
+                dcg = float((top_labels * discounts[:k_eff]).sum().item())
+                ideal_count = min(positive_count, k_eff)
+                idcg = float(cumulative_discounts[ideal_count - 1].item()) if ideal_count > 0 else 0.0
+                row[f"dcg@{k}"] = dcg
+                row[f"ndcg@{k}"] = dcg / max(idcg, 1.0e-12)
+                row[f"recall@{k}"] = float(top_labels.sum().item()) / positive_count
+
+            y_true = row_labels.numpy()
+            y_score = row_scores.numpy()
+            row["average_precision"] = float(average_precision_score(y_true, y_score))
+            row["auc_roc"] = float(roc_auc_score(y_true, y_score)) if np.unique(y_true).size > 1 else None
+        else:
+            row["positive_rank_min"] = None
+            row["positive_rank_mean"] = None
+            row["positive_rank_max"] = None
+            for k in metrics_top_ks:
+                row[f"dcg@{k}"] = 0.0
+                row[f"ndcg@{k}"] = 0.0
+                row[f"recall@{k}"] = 0.0
+            row["average_precision"] = None
+            row["auc_roc"] = None
+
+        rows.append(row)
+
+    return rows
+
+
 def _run_one_epoch(
     train: bool,
     split_name: str,
@@ -1084,6 +1153,9 @@ def _evaluate_two_tower_model(
     embed_dim: int,
     metrics_top_ks: list[int],
     max_classification_metric_pairs: Optional[int] = DEFAULT_MAX_CLASSIFICATION_METRIC_PAIRS,
+    collect_ranking_rows: bool = False,
+    progress_desc: Optional[str] = None,
+    disable_progress: bool = True,
 ) -> Dict[str, Any]:
     """Evaluate two-tower model with streamed ranking metrics and sampled AUC/AP."""
     model = model.to(device)
@@ -1098,10 +1170,11 @@ def _evaluate_two_tower_model(
     metric_labels: Optional[np.ndarray] = None
     metric_scores: Optional[np.ndarray] = None
     metric_priorities: Optional[np.ndarray] = None
+    ranking_rows: List[Dict[str, Any]] = []
     rng = np.random.default_rng(0)
 
     with torch.inference_mode():
-        for batch in data_loader:
+        for batch in tqdm(data_loader, desc=progress_desc, leave=False, disable=disable_progress):
             loss, scores = model.compute_loss_and_preds(batch, device, embed_dim)
             labels = batch["label_matrix"].to(device, dtype=torch.float32, non_blocking=True)
             ranked_indices = torch.argsort(scores, dim=1, descending=True)
@@ -1113,6 +1186,9 @@ def _evaluate_two_tower_model(
             metric_user_count += batch_metric_user_count
             for key, value in batch_metric_sums.items():
                 metric_sums[key] += value
+
+            if collect_ranking_rows:
+                ranking_rows.extend(_ranking_rows_for_batch(batch, scores, labels, metrics_top_ks))
 
             flat_labels = labels.detach().flatten().cpu().numpy().astype(np.int8, copy=False)
             flat_scores = scores.detach().flatten().cpu().numpy().astype(np.float64, copy=False)
@@ -1162,6 +1238,7 @@ def _evaluate_two_tower_model(
 
     return {
         "metrics": metrics,
+        "ranking_rows": ranking_rows,
     }
 
 
@@ -1216,6 +1293,22 @@ def _stage_info_metric_lines(split_metrics: Dict[str, Dict[str, Any]]) -> List[s
     return lines
 
 
+def _write_ranking_rows(
+    rows: List[Dict[str, Any]],
+    output_path: Path,
+    split_name: str,
+    num_total_likes_by_user: Dict[str, int],
+) -> None:
+    enriched_rows = []
+    for row in rows:
+        enriched = dict(row)
+        user_id = str(enriched["did"])
+        enriched["split"] = split_name
+        enriched["num_total_likes"] = int(num_total_likes_by_user.get(user_id, 0))
+        enriched_rows.append(enriched)
+    pl.DataFrame(enriched_rows).write_parquet(output_path)
+
+
 # =============================================================================
 # Plotting
 # =============================================================================
@@ -1235,7 +1328,8 @@ def run(context: Context, args) -> Dict[str, Any]:
     checkpoints_dir = out_dir / "checkpoints"
     plots_dir = out_dir / "plots"
     logs_dir = out_dir / "logs"
-    for d in (checkpoints_dir, plots_dir, logs_dir):
+    eval_dir = out_dir / "eval"
+    for d in (checkpoints_dir, plots_dir, logs_dir, eval_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     logger = get_stage_logger(STAGE_LOG_NAME, log_file=out_dir / "stage.log")
@@ -1253,6 +1347,15 @@ def run(context: Context, args) -> Dict[str, Any]:
         context, logger=logger,
     )
     log_prior_stage_inputs(context, logger)
+    num_total_likes_by_user = {
+        str(row["did"]): int(row["num_total_likes"])
+        for row in (
+            likes_core_df
+            .group_by("did")
+            .agg(pl.col("subject_uri").n_unique().alias("num_total_likes"))
+            .iter_rows(named=True)
+        )
+    }
 
     # --- hyperparams (extract all args once, use locals everywhere below) ---
     max_history_len = int(args.max_history_len)
@@ -1400,9 +1503,21 @@ def run(context: Context, args) -> Dict[str, Any]:
             logger.info("Skipping two-tower training plots while per-row prediction materialization is disabled")
 
     # Collect split metrics without materializing per-user-candidate predictions
-    train_eval = _evaluate_two_tower_model(trained_model, train_loader, device, embed_dim, metrics_top_ks)
-    val_eval = _evaluate_two_tower_model(trained_model, val_loader, device, embed_dim, metrics_top_ks)
-    val_unseen_eval = _evaluate_two_tower_model(trained_model, val_unseen_loader, device, embed_dim, metrics_top_ks)
+    train_eval = _evaluate_two_tower_model(
+        trained_model, train_loader, device, embed_dim, metrics_top_ks,
+        progress_desc="Evaluate train",
+        disable_progress=disable_progress,
+    )
+    val_eval = _evaluate_two_tower_model(
+        trained_model, val_loader, device, embed_dim, metrics_top_ks,
+        progress_desc="Evaluate validation",
+        disable_progress=disable_progress,
+    )
+    val_unseen_eval = _evaluate_two_tower_model(
+        trained_model, val_unseen_loader, device, embed_dim, metrics_top_ks,
+        progress_desc="Evaluate validation unseen users",
+        disable_progress=disable_progress,
+    )
     logger.info(f"Train metrics: {train_eval['metrics']}")
     logger.info(f"Validation metrics: {val_eval['metrics']}")
     logger.info(f"Validation unseen users metrics: {val_unseen_eval['metrics']}")
@@ -1514,10 +1629,30 @@ def run(context: Context, args) -> Dict[str, Any]:
                 prefetch_factor=prefetch_factor,
                 seed=random_seed,
             )
-            holdout_eval = _evaluate_two_tower_model(trained_model, holdout_loader, device, embed_dim, metrics_top_ks)
+            holdout_eval = _evaluate_two_tower_model(
+                trained_model,
+                holdout_loader,
+                device,
+                embed_dim,
+                metrics_top_ks,
+                collect_ranking_rows=True,
+                progress_desc=f"Evaluate holdout {holdout_type}",
+                disable_progress=disable_progress,
+            )
             split_metrics = holdout_eval["metrics"]
             logger.info(f"Holdout metrics ({holdout_type}): {split_metrics}")
+
             all_holdout_metrics[split_name] = split_metrics
+
+            ranking_rows_path = eval_dir / f"{split_name}_ranking_rows.parquet"
+            _write_ranking_rows(
+                holdout_eval["ranking_rows"],
+                ranking_rows_path,
+                split_name,
+                num_total_likes_by_user,
+            )
+            logger.info(f"Saved holdout ranking rows ({holdout_type}): {ranking_rows_path}")
+
             if holdout_type == eval_holdout_type:
                 holdout_metrics = split_metrics
         except Exception as exc:
