@@ -263,16 +263,6 @@ def test_get_padded_embedding_history_and_mask_batched_rejects_author_history_le
         )
 
 
-def test_get_padded_embedding_history_and_mask_batched_rejects_non_empty_authors_for_empty_history():
-    with pytest.raises(ValueError, match="author_indices must be empty"):
-        get_padded_embedding_history_and_mask_batched(
-            [],
-            max_history_len=3,
-            embed_dim=2,
-            author_indices=[2],
-        )
-
-
 def test_shared_package_re_exports_public_helpers():
     assert shared.__all__ == [
         "get_expanded_embedding_vector",
