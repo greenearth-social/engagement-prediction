@@ -1309,6 +1309,20 @@ def _write_ranking_rows(
     pl.DataFrame(enriched_rows).write_parquet(output_path)
 
 
+def _find_author_idx_artifact_path(context: Context) -> Optional[Path]:
+    get_data_dir = context.get_active_stage_inputs().get("01_get_data")
+    if get_data_dir is None:
+        get_data_dir = context.get_artifact_dir("get_data")
+    if get_data_dir is None:
+        return None
+    candidates = sorted(
+        Path(get_data_dir).glob("author_idx_*.parquet"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
 # =============================================================================
 # Plotting
 # =============================================================================
@@ -1408,6 +1422,15 @@ def run(context: Context, args) -> Dict[str, Any]:
             f"author_embedding_dim={author_embedding_dim}, "
             f"author_table_num_rows={author_table_num_rows}"
         )
+        author_idx_artifact_path = _find_author_idx_artifact_path(context)
+        if author_idx_artifact_path is None:
+            logger.warning("Author embedding table enabled, but no author_idx parquet path was found to log")
+        else:
+            author_idx_artifact_id = context.tracker.log_file_artifact(
+                name="author_idx_mapping",
+                path=author_idx_artifact_path,
+            )
+            logger.info(f"Author index mapping artifact id: {author_idx_artifact_id}")
 
     # Worker settings
     num_workers = int(args.num_dataloader_workers)
