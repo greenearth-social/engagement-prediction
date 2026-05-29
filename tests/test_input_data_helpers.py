@@ -6,11 +6,13 @@ import pytest
 import shared
 
 from shared.input_data_helpers import (
+    AUTHOR_PAD_IDX,
     _decompress_and_unpack_embedding,
     _extract_compressed_embedding_vector_from_struct,
     classify_history_embeddings_shape,
     get_embedding_dim_for_known_model,
     get_expanded_embedding_vector,
+    get_padded_author_indices,
     get_padded_embedding_history_and_mask,
     get_padded_embedding_history_and_mask_batched,
 )
@@ -127,6 +129,14 @@ def test_get_padded_embedding_history_and_mask_raises_on_embed_dim_mismatch():
         get_padded_embedding_history_and_mask([[1.0, 2.0, 3.0]], max_history_len=2, embed_dim=2)
 
 
+def test_get_padded_author_indices_padding_and_truncation():
+    padded = get_padded_author_indices([2, 3], max_history_len=4)
+    assert padded.tolist() == [2, 3, AUTHOR_PAD_IDX, AUTHOR_PAD_IDX]
+
+    truncated = get_padded_author_indices([2, 3, 4], max_history_len=2)
+    assert truncated.tolist() == [2, 3]
+
+
 def test_classify_history_embeddings_shape_covers_public_shapes():
     assert classify_history_embeddings_shape([]) == "single_empty"
     assert classify_history_embeddings_shape([[]]) == "single_empty"
@@ -144,30 +154,35 @@ def test_classify_history_embeddings_shape_rejects_invalid_inputs():
 
 
 def test_get_padded_embedding_history_and_mask_batched_accepts_single_empty_history():
-    padded, mask = get_padded_embedding_history_and_mask_batched(
+    padded, mask, author_indices = get_padded_embedding_history_and_mask_batched(
         [],
         max_history_len=3,
         embed_dim=2,
+        author_indices=[],
     )
     assert padded == [[[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]]
     assert mask == [[False, False, False]]
+    assert author_indices == [[AUTHOR_PAD_IDX, AUTHOR_PAD_IDX, AUTHOR_PAD_IDX]]
 
 
 def test_get_padded_embedding_history_and_mask_batched_accepts_single_history():
-    padded, mask = get_padded_embedding_history_and_mask_batched(
+    padded, mask, author_indices = get_padded_embedding_history_and_mask_batched(
         [[1.0, 2.0], [3.0, 4.0]],
         max_history_len=3,
         embed_dim=2,
+        author_indices=[2, 3],
     )
     assert padded == [[[1.0, 2.0], [3.0, 4.0], [0.0, 0.0]]]
     assert mask == [[True, True, False]]
+    assert author_indices == [[2, 3, AUTHOR_PAD_IDX]]
 
 
 def test_get_padded_embedding_history_and_mask_batched_accepts_batched_histories_and_normalizes_empty_entries():
-    padded, mask = get_padded_embedding_history_and_mask_batched(
+    padded, mask, author_indices = get_padded_embedding_history_and_mask_batched(
         [[], [[1.0, 2.0], [3.0, 4.0]], [[]]],
         max_history_len=3,
         embed_dim=2,
+        author_indices=[[], [2, 3], []],
     )
     assert padded == [
         [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
@@ -179,16 +194,23 @@ def test_get_padded_embedding_history_and_mask_batched_accepts_batched_histories
         [True, True, False],
         [False, False, False],
     ]
+    assert author_indices == [
+        [AUTHOR_PAD_IDX, AUTHOR_PAD_IDX, AUTHOR_PAD_IDX],
+        [2, 3, AUTHOR_PAD_IDX],
+        [AUTHOR_PAD_IDX, AUTHOR_PAD_IDX, AUTHOR_PAD_IDX],
+    ]
 
 
 def test_get_padded_embedding_history_and_mask_batched_accepts_single_nested_empty_history():
-    padded, mask = get_padded_embedding_history_and_mask_batched(
+    padded, mask, author_indices = get_padded_embedding_history_and_mask_batched(
         [[]],
         max_history_len=2,
         embed_dim=2,
+        author_indices=[],
     )
     assert padded == [[[0.0, 0.0], [0.0, 0.0]]]
     assert mask == [[False, False]]
+    assert author_indices == [[AUTHOR_PAD_IDX, AUTHOR_PAD_IDX]]
 
 
 def test_get_padded_embedding_history_and_mask_batched_rejects_non_list_top_level():
@@ -197,6 +219,7 @@ def test_get_padded_embedding_history_and_mask_batched_rejects_non_list_top_leve
             "not-a-list",
             max_history_len=3,
             embed_dim=2,
+            author_indices=[],
         )
 
 
@@ -206,6 +229,7 @@ def test_get_padded_embedding_history_and_mask_batched_rejects_top_level_non_lis
             [1.0, 2.0],
             max_history_len=3,
             embed_dim=2,
+            author_indices=[],
         )
 
 
@@ -215,6 +239,37 @@ def test_get_padded_embedding_history_and_mask_batched_rejects_mixed_batch_shape
             [[], [1.0, 2.0]],
             max_history_len=3,
             embed_dim=2,
+            author_indices=[[], [2]],
+        )
+
+
+def test_get_padded_embedding_history_and_mask_batched_rejects_author_batch_size_mismatch():
+    with pytest.raises(ValueError, match="Batch size of history_embeddings and author_indices must match"):
+        get_padded_embedding_history_and_mask_batched(
+            [[[1.0, 2.0]], [[3.0, 4.0]]],
+            max_history_len=3,
+            embed_dim=2,
+            author_indices=[[2]],
+        )
+
+
+def test_get_padded_embedding_history_and_mask_batched_rejects_author_history_length_mismatch():
+    with pytest.raises(ValueError, match="Length of author_indices must match history length"):
+        get_padded_embedding_history_and_mask_batched(
+            [[1.0, 2.0], [3.0, 4.0]],
+            max_history_len=3,
+            embed_dim=2,
+            author_indices=[2],
+        )
+
+
+def test_get_padded_embedding_history_and_mask_batched_rejects_non_empty_authors_for_empty_history():
+    with pytest.raises(ValueError, match="author_indices must be empty"):
+        get_padded_embedding_history_and_mask_batched(
+            [],
+            max_history_len=3,
+            embed_dim=2,
+            author_indices=[2],
         )
 
 

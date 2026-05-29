@@ -121,11 +121,7 @@ from utils.helpers import (
     load_parquet_from_prior,
     log_operation_start,
 )
-from shared.input_data_helpers import get_padded_embedding_history_and_mask
-
-
-AUTHOR_PAD_IDX = 0
-AUTHOR_UNK_IDX = 1
+from shared.input_data_helpers import get_padded_embedding_history_and_mask, AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
 
 
 def _map_raw_author_idx_to_table_row(

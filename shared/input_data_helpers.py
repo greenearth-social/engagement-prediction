@@ -118,11 +118,15 @@ def get_expanded_embedding_vector(embedding_input: Any, embedding_model: str) ->
 # Input data shape helpers
 # ----------------------------------------
 
+AUTHOR_PAD_IDX = 0
+AUTHOR_UNK_IDX = 1
+
+
 def get_padded_embedding_history_and_mask(
     history_embeddings: Any,
     max_history_len: int, 
     embed_dim: int,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Pad/truncate a variable-length history of embedding vectors and build a mask.
 
@@ -227,35 +231,49 @@ def _normalize_empty_user_history(user_history: list[Any]) -> list[list[float]]:
     return user_history  # type: ignore[return-value]
 
 
-def _normalize_history_embeddings_to_batch(
+def _normalize_history_inputs_to_batch(
     history_embeddings: Any,
-) -> list[list[list[float]]]:
+    shape: HistoryEmbeddingsShape,
+    author_indices: Any,
+) -> tuple[list[list[list[float]]], list[list[int]]]:
     """
     Normalize supported history input shapes into a batched ``[B, T, D]``-style list.
 
     This lets the batching helper accept either a single user's history or a batch
     of histories without duplicating the padding logic.
     """
-    shape = classify_history_embeddings_shape(history_embeddings)
-
     match shape:
         case "single_empty":
-            return [[]]
+            if not isinstance(author_indices, list) or len(author_indices) != 0:
+                raise ValueError("author_indices must be empty when history_embeddings is empty")
+            return [[]], [[]]
         case "single_history":
             # Wrap a single user's history in an outer batch dimension.
-            return [history_embeddings]
+            return [history_embeddings], [author_indices]
         case "batched_history":
             return [
                 _normalize_empty_user_history(user_history)
                 for user_history in history_embeddings
-            ]
+            ], author_indices
+
+
+def get_padded_author_indices(
+    author_indices: Any,
+    max_history_len: int,
+) -> np.ndarray:
+    seq_len = min(len(author_indices), max_history_len)
+    padded = np.full(max_history_len, fill_value=AUTHOR_PAD_IDX, dtype=np.int64)
+    if seq_len > 0:
+        padded[:seq_len] = author_indices[: max_history_len]
+    return padded
 
 
 def get_padded_embedding_history_and_mask_batched(
-    history_embeddings: Any,
+    history_embeddings: list[list[float]] | list[list[list[float]]],
     max_history_len: int, 
     embed_dim: int,
-) -> Tuple[List[List[List[float]]], List[List[float]]]:
+    author_indices: list[int] | list[list[int]],
+) -> tuple[list[list[list[float]]], list[list[bool]], list[list[int]]]:
     """
     Pad and mask one or more users' embedding histories.
 
@@ -263,11 +281,19 @@ def get_padded_embedding_history_and_mask_batched(
     to a batched form, and then applies the single-history padding helper to each
     user independently.
     """
-    batch_history_embeddings = _normalize_history_embeddings_to_batch(history_embeddings)
+    shape = classify_history_embeddings_shape(history_embeddings)
+    batch_history_embeddings, batch_author_indices = _normalize_history_inputs_to_batch(history_embeddings, shape, author_indices)
     batch_padded_history_embeddings = []
     batch_history_mask = []
+    batch_padded_author_indices = []
 
-    for single_history_embeddings in batch_history_embeddings:
+    if len(batch_history_embeddings) != len(batch_author_indices):
+        raise ValueError("Batch size of history_embeddings and author_indices must match")
+    for single_history_embeddings, single_author_indices in zip(batch_history_embeddings, batch_author_indices):
+        if not isinstance(single_author_indices, list):
+            raise ValueError("author_indices must be a list for each history")
+        if len(single_history_embeddings) != len(single_author_indices):
+            raise ValueError("Length of author_indices must match history length for each user")
         padded_history_embeddings, history_mask = get_padded_embedding_history_and_mask(
             history_embeddings=single_history_embeddings,
             max_history_len=max_history_len,
@@ -275,5 +301,11 @@ def get_padded_embedding_history_and_mask_batched(
         )
         batch_padded_history_embeddings.append(padded_history_embeddings.tolist())
         batch_history_mask.append(history_mask.tolist())
+        
+        padded_author_indices = get_padded_author_indices(
+            author_indices=single_author_indices,
+            max_history_len=max_history_len,
+        )
+        batch_padded_author_indices.append(padded_author_indices.tolist())
 
-    return batch_padded_history_embeddings, batch_history_mask
+    return batch_padded_history_embeddings, batch_history_mask, batch_padded_author_indices
