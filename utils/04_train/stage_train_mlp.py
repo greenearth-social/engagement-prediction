@@ -516,7 +516,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     set_random_seeds(random_seed)
 
     log_operation_start("Load training data from prior stages", STAGE_LOG_NAME, logger)
-    embeddings_mmap, likes_core_df, posts_core_df, history_df, _, embed_dim = load_bucketed_training_data(
+    embeddings_mmap, likes_core_df, posts_core_df, history_df, author_idx_mapping_df, embed_dim = load_bucketed_training_data(
         context, logger=logger,
     )
     log_prior_stage_inputs(context, logger)
