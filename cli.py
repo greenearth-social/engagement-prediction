@@ -47,7 +47,7 @@ TRAIN_PLACEHOLDER = 'train_placeholder'
 STAGE_ORDER = ['get_data', 'user_history', TRAIN_PLACEHOLDER, 'evaluate']
 VALID_USER_ENCODERS_BY_MODEL_TYPE: Dict[str, Tuple[str, ...]] = {
     "mlp": ("summarized", "full_transformer", "cross_attention"),
-    "two-tower": ("summarized", "full_transformer", "cross_attention"),
+    "two-tower": ("full_transformer", "cross_attention"),
 }
 
 # Central default map for all run-all parameters
@@ -593,8 +593,6 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     if int(args.min_author_support) < 1:
         raise ValueError("--min-author-support must be >= 1.")
     if use_author_embedding_table:
-        if model_type == "two-tower" and user_encoder == "summarized":
-            raise ValueError("--use-author-embedding-table is not supported with --user-encoder 'summarized'.")
         if int(args.author_embedding_dim) <= 0:
             raise ValueError("--author-embedding-dim must be positive.")
         if not 0.0 <= float(args.author_unknown_dropout_rate) < 1.0:
@@ -776,9 +774,9 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Temperature used to scale cosine-similarity logits in the two-tower model")
     _add_arg_with_default(p_all, "--use-author-embedding-table",
                           action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
-                          help_text="Enable a trainable author embedding table for history posts in the two-tower model")
+                          help_text="Enable a trainable author embedding table for history and candidate posts")
     _add_arg_with_default(p_all, "--author-embedding-dim", type=int, default=argparse.SUPPRESS,
-                          help_text="Embedding dimension for the two-tower history author embedding table")
+                          help_text="Embedding dimension for the trainable author embedding table")
     _add_arg_with_default(p_all, "--min-author-support", type=int, default=argparse.SUPPRESS,
                           help_text="Minimum train-history author occurrence count required for a dedicated embedding row")
     _add_arg_with_default(p_all, "--author-unknown-dropout-rate", type=float, default=argparse.SUPPRESS,
@@ -807,7 +805,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--patience", type=int, default=argparse.SUPPRESS,
                           help_text="Early stopping patience")
     _add_arg_with_default(p_all, "--early-stopping-min-delta", type=float, default=argparse.SUPPRESS,
-                          help_text="Minimum absolute validation AUC improvement required to reset early stopping patience")
+                          help_text="Minimum absolute validation primary-metric improvement required to reset early stopping patience")
     _add_arg_with_default(p_all, "--run-tag", type=str, default=argparse.SUPPRESS,
                           help_text="Tag appended to training output directory name (e.g. mlp_summarized_mean)")
     _add_arg_with_default(p_all, "--no-plots", action="store_true", default=argparse.SUPPRESS,
@@ -834,7 +832,7 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Number of epochs with no improvement before reducing LR")
     # Stage 3 (train) - Training optimization
     _add_arg_with_default(p_all, "--gradient-clip-max-norm", type=float, default=argparse.SUPPRESS,
-                          help_text="Maximum gradient norm for clipping (two-tower only)")
+                          help_text="Maximum gradient norm for clipping")
     # Stage 4 options (subset)
     _add_arg_with_default(p_all, "--eval-batch-size", type=int, default=argparse.SUPPRESS,
                           help_text="Batch size for evaluation")
