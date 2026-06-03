@@ -68,7 +68,12 @@ from utils.helpers import (
     log_operation_start,
     validate_dataframe_schema,
 )
-from shared.input_data_helpers import get_padded_embedding_history_and_mask, AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
+from shared.input_data_helpers import (
+    get_padded_embedding_history_and_mask,
+    get_padded_author_indices,
+    AUTHOR_PAD_IDX,
+    AUTHOR_UNK_IDX,
+)
 
 
 def _author_idx_or_unk(author_idx: Any) -> int:
@@ -995,26 +1000,26 @@ class BucketedEngagementDataset(Dataset):
         self.embed_dim = int(embed_dim)
         self.use_author_embedding_table = bool(use_author_embedding_table)
 
+        likes_columns = ["did", "subject_uri", "split", "like_hour_bucket", "emb_idx"]
+        posts_columns = ["at_uri", "in_random_sample", "negative_hour_bucket", "split_window", "emb_idx"]
+        history_columns = ["did", "like_hour_bucket", "prior_emb_indices"]
+        if self.use_author_embedding_table:
+            likes_columns.append("author_idx")
+            posts_columns.append("author_idx")
+            history_columns.append("prior_author_indices")
+
         validate_dataframe_schema(
             likes_core_df,
-            dict.fromkeys(["did", "subject_uri", "split", "like_hour_bucket", "emb_idx"], None),
+            dict.fromkeys(likes_columns, None),
         )
         validate_dataframe_schema(
             posts_core_df,
-            dict.fromkeys(["at_uri", "in_random_sample", "negative_hour_bucket", "split_window", "emb_idx"], None),
+            dict.fromkeys(posts_columns, None),
         )
         validate_dataframe_schema(
             history_df,
-            dict.fromkeys(["did", "like_hour_bucket", "prior_emb_indices"], None),
+            dict.fromkeys(history_columns, None),
         )
-        if self.use_author_embedding_table:
-            validate_dataframe_schema(likes_core_df, {"author_idx": None})
-            validate_dataframe_schema(posts_core_df, {"author_idx": None})
-            validate_dataframe_schema(history_df, {"prior_author_indices": None})
-
-        history_columns = ["did", "like_hour_bucket", "prior_emb_indices"]
-        if self.use_author_embedding_table:
-            history_columns.append("prior_author_indices")
 
         like_ordered_df = (
             likes_core_df
@@ -1111,10 +1116,7 @@ class BucketedEngagementDataset(Dataset):
         if self.prior_author_indices is None:
             raise ValueError("prior_author_indices must be available when author embeddings are enabled")
         mapped_author_indices = self.prior_author_indices[row_idx]
-        padded = np.full(self.max_history_len, AUTHOR_PAD_IDX, dtype=np.int64)
-        if len(mapped_author_indices) > 0:
-            truncated_len = min(len(mapped_author_indices), self.max_history_len)
-            padded[:truncated_len] = mapped_author_indices[:truncated_len]
+        padded = get_padded_author_indices(mapped_author_indices, self.max_history_len)
         return torch.from_numpy(padded)
 
     def collate_batch(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
