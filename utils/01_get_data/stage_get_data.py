@@ -926,18 +926,6 @@ def _load_posts_core_polars(
     return posts_core_df, stats, embed_dim
 
 
-def _compute_random_sample_threshold(n_rows_total: int, n_sample: int) -> int:
-    if n_rows_total <= 0:
-        return 0
-    max_hash = 2**64 - 1
-    if n_sample >= n_rows_total:
-        return max_hash
-    if n_sample <= 0:
-        return 0
-    # Use integer math to avoid float rounding issues at large ranges.
-    return (n_sample * max_hash) // n_rows_total
-
-
 def _validate_posts_record_created_at_schema(schema: pl.Schema) -> None:
     dtype = schema.get(TIMESTAMP_COL_NAME)
     if dtype not in (pl.String, pl.Utf8):
@@ -1634,7 +1622,6 @@ def _run_greenearth_pipeline(
         likes_core_df=likes_core_df,
         posts_core_df=posts_core_df,
         min_likes_per_user=min_likes_per_user,
-        random_seed=cap_random_seed,
         logger=logger,
     )
     
@@ -1736,7 +1723,6 @@ def _filter_likes_after_post_join(
     likes_core_df: pl.DataFrame,
     posts_core_df: pl.DataFrame,
     min_likes_per_user: int,
-    random_seed: int,
     logger: logging.Logger,
 ) -> Tuple[pl.DataFrame, Dict[str, int]]:
     """Once we've filtered posts, now filter likes to only those that have matching posts in the dataset"""
