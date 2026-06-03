@@ -213,8 +213,9 @@ def validate_dataframe_schema(
     """Validate a DataFrame against an expected schema of column names and dtypes.
 
     Supports pandas DataFrame and polars DataFrame/LazyFrame. expected_schema maps
-    column name -> dtype spec, where dtype spec can be a Python type (e.g., int,
-    float, str), a pandas/numpy dtype, a dtype string, or an iterable of specs.
+    column name -> dtype spec, where dtype spec can be None for a presence-only
+    check, a Python type (e.g., int, float, str), a pandas/numpy dtype, a dtype
+    string, or an iterable of specs.
     """
     import numpy as np
     import pandas as pd
@@ -230,6 +231,8 @@ def validate_dataframe_schema(
         polars_string = {pl.String, pl.Utf8}
 
         def _matches_expected_dtype_polars(dtype: pl.DataType, expected: Any) -> bool:
+            if expected is None:
+                return True
             if isinstance(expected, (list, tuple, set)):
                 return any(_matches_expected_dtype_polars(dtype, e) for e in expected)
 
@@ -320,6 +323,8 @@ def validate_dataframe_schema(
         raise TypeError(f"df must be a pandas DataFrame or polars DataFrame/LazyFrame, got {type(df)!r}")
 
     def _matches_expected_dtype_pandas(series: pd.Series, expected: Any) -> bool:
+        if expected is None:
+            return True
         if isinstance(expected, (list, tuple, set)):
             return any(_matches_expected_dtype_pandas(series, e) for e in expected)
 

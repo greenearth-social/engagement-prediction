@@ -66,6 +66,7 @@ from utils.helpers import (
     get_stage_logger,
     load_parquet_from_prior,
     log_operation_start,
+    validate_dataframe_schema,
 )
 from shared.input_data_helpers import get_padded_embedding_history_and_mask, AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
 
@@ -95,7 +96,10 @@ def get_author_table_num_rows(
     if len(author_idx_mapping_df) == 0:
         return 2
 
-    max_author_idx = int(author_idx_mapping_df["author_idx"].max())
+    max_author_idx_value = author_idx_mapping_df.select(pl.col("author_idx").max()).item()
+    if max_author_idx_value is None:
+        raise ValueError("author_idx column must contain at least one non-null value")
+    max_author_idx = int(max_author_idx_value)
     if max_author_idx < AUTHOR_UNK_IDX:
         raise ValueError("author_idx values must reserve rows 0 and 1 for PAD/UNK")
     return max(max_author_idx + 1, 2)
@@ -943,13 +947,6 @@ def load_bucketed_training_data(
     return embeddings_mmap, likes_core_df, posts_core_df, history_df, author_idx_mapping_df, embed_dim
 
 
-def _require_columns(df: pl.DataFrame, required_columns: set[str], df_name: str) -> None:
-    missing = required_columns.difference(df.columns)
-    if missing:
-        missing_str = ", ".join(sorted(missing))
-        raise ValueError(f"{df_name} is missing required columns: {missing_str}")
-
-
 def _post_split_window_for_like_split(split: str) -> str:
     if split == "val_unseen_users":
         return "val"
@@ -998,25 +995,22 @@ class BucketedEngagementDataset(Dataset):
         self.embed_dim = int(embed_dim)
         self.use_author_embedding_table = bool(use_author_embedding_table)
 
-        _require_columns(
+        validate_dataframe_schema(
             likes_core_df,
-            {"did", "subject_uri", "split", "like_hour_bucket", "emb_idx"},
-            "likes_core_df",
+            dict.fromkeys(["did", "subject_uri", "split", "like_hour_bucket", "emb_idx"], None),
         )
-        _require_columns(
+        validate_dataframe_schema(
             posts_core_df,
-            {"at_uri", "in_random_sample", "negative_hour_bucket", "split_window", "emb_idx"},
-            "posts_core_df",
+            dict.fromkeys(["at_uri", "in_random_sample", "negative_hour_bucket", "split_window", "emb_idx"], None),
         )
-        _require_columns(
+        validate_dataframe_schema(
             history_df,
-            {"did", "like_hour_bucket", "prior_emb_indices"},
-            "history_df",
+            dict.fromkeys(["did", "like_hour_bucket", "prior_emb_indices"], None),
         )
         if self.use_author_embedding_table:
-            _require_columns(likes_core_df, {"author_idx"}, "likes_core_df")
-            _require_columns(posts_core_df, {"author_idx"}, "posts_core_df")
-            _require_columns(history_df, {"prior_author_indices"}, "history_df")
+            validate_dataframe_schema(likes_core_df, {"author_idx": None})
+            validate_dataframe_schema(posts_core_df, {"author_idx": None})
+            validate_dataframe_schema(history_df, {"prior_author_indices": None})
 
         history_columns = ["did", "like_hour_bucket", "prior_emb_indices"]
         if self.use_author_embedding_table:
