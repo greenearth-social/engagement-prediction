@@ -29,6 +29,7 @@ from utils.helpers import (
     log_operation_start,
     log_prior_stage_inputs,
     get_device,
+    plot_training_history,
     clear_cuda_memory,
     set_random_seeds,
 )
@@ -674,7 +675,14 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     clear_cuda_memory()
 
     if generate_plots:
-        logger.info("Skipping MLP training plots while per-row prediction materialization is disabled")
+        hist = training_results["history"]
+        try:
+            val_metric_history = hist.get(f"val_{training_results['primary_metric_name']}", [])
+            best_epoch = val_metric_history.index(max(val_metric_history)) + 1 if val_metric_history else None
+        except Exception as e:
+            logger.warning(f"Could not determine best epoch from training history: {e}")
+            best_epoch = None
+        plot_training_history(hist, plots_dir / f"training_history_{timestamp}.png", best_epoch=best_epoch)
 
     train_eval = evaluate_matrix_model(
         trained_model, train_loader, device, embed_dim, metrics_top_ks,
