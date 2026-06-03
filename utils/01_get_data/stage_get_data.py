@@ -599,7 +599,7 @@ def _load_likes_core_polars(
     min_likes_per_user: int,
     random_seed: int,
     train_start: str,
-    val_start: str,
+    val_start: Optional[str],
     holdout_start: Optional[str],
     holdout_end: Optional[str],
     logger: logging.Logger,
@@ -631,7 +631,7 @@ def _load_likes_core_polars(
     parse_one_ts(holdout_end)
     if train_start_dt is None:
         raise ValueError("Training window start not supplied in input arguments!")
-    if val_start_dt is None:
+    if val_start is None or val_start_dt is None:
         raise ValueError("Validation window start not supplied in input arguments!")
     if val_start_dt <= train_start_dt:
         raise ValueError("Train start date is greater than or equal to val start date!")
@@ -1459,7 +1459,7 @@ def _run_greenearth_pipeline(
             max_liking_users=max_trainval_users,
             max_likes_per_user=max_likes_per_user,
             min_likes_per_user=min_likes_per_user,
-            negative_samples_per_hour=negative_samples_per_hour,
+            negative_posts_sample=negative_samples_per_hour,
             skip_safety_check=(memory_check == "ignore"),
             logger=logger,
         )
@@ -1506,6 +1506,8 @@ def _run_greenearth_pipeline(
     # Load posts metadata (NO embeddings - those are handled at the end)
     log_operation_start('Load posts metadata (no embeddings)', '01_GET_DATA', logger)
     embed_dim_override = get_embedding_dim_for_known_model(embedding_model) if skip_embeddings else None
+    if val_start is None:
+        raise ValueError("val_start must be provided!")
     posts_core_df, posts_stats, embed_dim = _load_posts_core_polars(
         start_str=posts_start,
         end_str=posts_end,
