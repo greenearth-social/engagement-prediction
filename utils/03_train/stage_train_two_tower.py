@@ -589,34 +589,6 @@ class TwoTowerModel(nn.Module):
         return loss, scores
 
 
-def _run_one_epoch(
-    train: bool,
-    split_name: str,
-    model: TwoTowerModel,
-    device: str,
-    dataloader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    disable_progress: bool,
-    embed_dim: int,
-    gradient_clip_max_norm: float,
-    metrics_top_ks: list[int],
-    calc_baseline_metrics: bool,
-):
-    return run_matrix_epoch(
-        train=train,
-        split_name=split_name,
-        model=model,
-        device=device,
-        dataloader=dataloader,
-        optimizer=optimizer,
-        disable_progress=disable_progress,
-        embed_dim=embed_dim,
-        gradient_clip_max_norm=gradient_clip_max_norm,
-        metrics_top_ks=metrics_top_ks,
-        calc_baseline_metrics=calc_baseline_metrics,
-    )
-
-
 # =============================================================================
 # Training Loop
 # =============================================================================
@@ -665,7 +637,7 @@ def train_two_tower_model(
 
     for epoch in tqdm(range(epochs), desc="Training epochs", disable=disable_progress):
         calc_baseline_metrics: bool = epoch == 0
-        train_loss, train_metrics_dict, train_baseline_metrics_dict = _run_one_epoch(
+        train_loss, train_metrics_dict, train_baseline_metrics_dict = run_matrix_epoch(
             train=True,
             split_name="Train",
             model=model,
@@ -679,7 +651,7 @@ def train_two_tower_model(
             calc_baseline_metrics=calc_baseline_metrics,
         )
 
-        val_loss, val_metrics_dict, val_baseline_metrics_dict = _run_one_epoch(
+        val_loss, val_metrics_dict, val_baseline_metrics_dict = run_matrix_epoch(
             train=False,
             split_name="Validation",
             model=model,
@@ -693,7 +665,7 @@ def train_two_tower_model(
             calc_baseline_metrics=calc_baseline_metrics,
         )
 
-        val_unseen_loss, val_unseen_metrics_dict, val_unseen_baseline_metrics_dict = _run_one_epoch(
+        val_unseen_loss, val_unseen_metrics_dict, val_unseen_baseline_metrics_dict = run_matrix_epoch(
             train=False,
             split_name="Validation Unseen Users",
             model=model,

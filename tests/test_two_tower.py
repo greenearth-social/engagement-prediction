@@ -18,7 +18,7 @@ AuthorAwarePostTower = stage_train_two_tower.AuthorAwarePostTower
 _rank_metric_sums_for_batch = matrix_ranking.rank_metric_sums_for_batch
 _calc_baseline_rank_metrics_for_batch = matrix_ranking.calc_baseline_rank_metrics_for_batch
 _finalize_rank_metrics = matrix_ranking.finalize_rank_metrics
-_run_one_epoch = stage_train_two_tower._run_one_epoch
+run_matrix_epoch = matrix_ranking.run_matrix_epoch
 _evaluate_two_tower_model = matrix_ranking.evaluate_matrix_model
 _ranking_rows_for_batch = matrix_ranking.ranking_rows_for_batch
 
@@ -173,7 +173,7 @@ def test_evaluate_two_tower_model_collects_ranking_rows_when_requested():
     assert result["ranking_rows"][0]["average_precision"] == pytest.approx(1.0)
 
 
-def test_run_one_epoch_baseline_metrics_do_not_advance_global_torch_rng():
+def test_run_matrix_epoch_baseline_metrics_do_not_advance_global_torch_rng():
     model = DummyTwoTowerForEpoch()
     dataloader = [{
         "label_matrix": torch.tensor([
@@ -186,7 +186,7 @@ def test_run_one_epoch_baseline_metrics_do_not_advance_global_torch_rng():
     expected_next_random = torch.rand(5)
 
     torch.manual_seed(1234)
-    _run_one_epoch(
+    run_matrix_epoch(
         train=False,
         split_name="Validation",
         model=model,
@@ -204,7 +204,7 @@ def test_run_one_epoch_baseline_metrics_do_not_advance_global_torch_rng():
     assert actual_next_random == pytest.approx(expected_next_random)
 
 
-def test_run_one_epoch_accumulates_baseline_metric_user_count(monkeypatch):
+def test_run_matrix_epoch_accumulates_baseline_metric_user_count(monkeypatch):
     model = DummyTwoTowerForEpoch()
     dataloader = [
         {"label_matrix": torch.ones((2, 3), dtype=torch.float32)},
@@ -226,7 +226,7 @@ def test_run_one_epoch_accumulates_baseline_metric_user_count(monkeypatch):
 
     monkeypatch.setattr(matrix_ranking, "calc_baseline_rank_metrics_for_batch", fake_baseline_metrics)
 
-    _, _, baseline_metrics = _run_one_epoch(
+    _, _, baseline_metrics = run_matrix_epoch(
         train=False,
         split_name="Validation",
         model=model,
