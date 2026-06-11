@@ -1144,14 +1144,36 @@ def run(context: Context, args) -> Dict[str, Any]:
         torchscript_user_name = "engagement_user_tower"
         torchscript_user_path = checkpoints_dir / f"{torchscript_user_name}.pt"
         torch.jit.script(trained_model.user_tower).save(torchscript_user_path)
-        user_model_id = context.tracker.log_artifact(name=f"{torchscript_user_name}", path=torchscript_user_path)
+        user_model_dict = context.tracker.log_artifact(name=f"{torchscript_user_name}", path=torchscript_user_path)
+        user_model_id = ""
+        user_model_uri = ""
+        if user_model_dict:
+            user_model_id = user_model_dict["model_id"]
+            user_model_uri = user_model_dict["uri"]
         logger.info(f"User tower model id: {user_model_id}")
 
         torchscript_post_name = "engagement_post_tower"
         torchscript_post_path = checkpoints_dir / f"{torchscript_post_name}.pt"
         torch.jit.script(trained_model.post_tower).save(torchscript_post_path)
-        post_model_id = context.tracker.log_artifact(name=f"{torchscript_post_name}", path=torchscript_post_path)
+        post_model_dict = context.tracker.log_artifact(name=f"{torchscript_post_name}", path=torchscript_post_path)
+        post_model_id = ""
+        post_model_uri = ""
+        if post_model_dict:
+            post_model_id = post_model_dict["model_id"]
+            post_model_uri = post_model_dict["uri"]
         logger.info(f"Post tower model id: {post_model_id}")
+
+        manifest = {
+            "embedding_space_id": post_model_id,
+            "user_tower_clearml_model_id": user_model_id,
+            "post_tower_clearml_model_id": post_model_id,
+            "user_tower_uri": user_model_uri,
+            "post_tower_uri": post_model_uri,
+            "output_embedding_dim": shared_dim,
+        }
+        manifest_path = checkpoints_dir / "two_tower_serving_manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        context.tracker.log_file_artifact("two_tower_serving_manifest", manifest_path)
 
     # Full per-pair prediction parquet writing is intentionally disabled for now.
     # The bucketed path would produce one row per user-candidate pair, which can

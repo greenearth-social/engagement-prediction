@@ -20,7 +20,7 @@ class ExperimentTracker(Protocol):
     def log_scalar(self, title: str, series: str, value: float, iteration: int) -> None:
         ...
 
-    def log_artifact(self, name: str, path: Path) -> None:
+    def log_artifact(self, name: str, path: Path) -> Optional[dict[str, str]]:
         ...
 
     def log_file_artifact(self, name: str, path: Path) -> Any:
@@ -64,7 +64,7 @@ class NoOpExperimentTracker:
     def log_scalar(self, title: str, series: str, value: float, iteration: int) -> None:
         return None
 
-    def log_artifact(self, name: str, path: Path) -> None:
+    def log_artifact(self, name: str, path: Path) -> Optional[dict[str, str]]:
         return None
 
     def log_file_artifact(self, name: str, path: Path) -> None:
@@ -205,7 +205,7 @@ class ClearMLExperimentTracker:
             iteration=iteration,
         )
 
-    def log_artifact(self, name: str, path: Path) -> Optional[str]:
+    def log_artifact(self, name: str, path: Path) -> Optional[dict[str, str]]:
         from clearml import OutputModel
         p = Path(path)
         if not p.exists():
@@ -219,7 +219,7 @@ class ClearMLExperimentTracker:
             framework='pytorch',
             tags=['candidate'],
         )
-        om.update_weights(str(p), auto_delete_file=False)
+        uri = om.update_weights(str(p), auto_delete_file=False)
 
         # also attach useful metadata
         script = self._task.data.script
@@ -229,7 +229,10 @@ class ClearMLExperimentTracker:
         om.set_metadata("git_branch", getattr(script, "branch", ""))
         om.set_metadata("git_sha", getattr(script, "version_num", ""))
 
-        return om.id
+        return {
+            "model_id": om.id,
+            "uri": uri
+        }
 
     def log_file_artifact(self, name: str, path: Path) -> Any:
         p = Path(path)
