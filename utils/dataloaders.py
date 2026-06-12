@@ -32,6 +32,7 @@ MAIN COMPONENTS
 
 Datasets:
     BucketedEngagementDataset    -- User histories + same-hour candidate posts
+    RankerPairDataset            -- One positive like + one same-hour negative
 
 Hand-Crafted Summarizers (deterministic, no learnable parameters):
     UserSummarizer               -- Abstract base class
@@ -1202,6 +1203,238 @@ class BucketedEngagementDataset(Dataset):
         return output
 
 
+class RankerPairDataset(Dataset):
+    """Positive likes paired with one sampled same-hour negative."""
+
+    def __init__(
+        self,
+        embeddings_mmap: np.ndarray,
+        likes_core_df: pl.DataFrame,
+        posts_core_df: pl.DataFrame,
+        history_df: pl.DataFrame,
+        split: str,
+        max_history_len: int,
+        embed_dim: int,
+        seed: int,
+        use_author_embedding_table: bool = False,
+        logger: Optional[logging.Logger] = None,
+    ):
+        if max_history_len <= 0:
+            raise ValueError("max_history_len must be positive")
+        self.embeddings = embeddings_mmap
+        self.split = str(split)
+        self.max_history_len = int(max_history_len)
+        self.embed_dim = int(embed_dim)
+        self.seed = int(seed)
+        self.use_author_embedding_table = bool(use_author_embedding_table)
+
+        likes_columns = ["did", "subject_uri", "split", "like_hour_bucket", "emb_idx"]
+        posts_columns = ["at_uri", "in_random_sample", "negative_hour_bucket", "split_window", "emb_idx"]
+        history_columns = ["did", "like_hour_bucket", "prior_emb_indices"]
+        if self.use_author_embedding_table:
+            likes_columns.append("author_idx")
+            posts_columns.append("author_idx")
+            history_columns.append("prior_author_indices")
+
+        validate_dataframe_schema(
+            likes_core_df,
+            dict.fromkeys(likes_columns, None),
+        )
+        validate_dataframe_schema(
+            posts_core_df,
+            dict.fromkeys(posts_columns, None),
+        )
+        validate_dataframe_schema(
+            history_df,
+            dict.fromkeys(history_columns, None),
+        )
+
+        like_ordered_df = (
+            likes_core_df
+            .filter(pl.col("split") == self.split)
+            .with_row_index(name="_like_order")
+        )
+        self.user_hour_liked_post_ids: Dict[Tuple[str, Any], set[str]] = {}
+        for row in like_ordered_df.select(["did", "like_hour_bucket", "subject_uri"]).iter_rows(named=True):
+            key = (str(row["did"]), row["like_hour_bucket"])
+            self.user_hour_liked_post_ids.setdefault(key, set()).add(str(row["subject_uri"]))
+
+        post_split_window = _post_split_window_for_like_split(self.split)
+        sampled_posts_df = posts_core_df.filter(
+            (pl.col("split_window") == post_split_window)
+            & pl.col("in_random_sample")
+            & pl.col("negative_hour_bucket").is_not_null()
+        )
+        self.sampled_posts_by_bucket: Dict[Any, List[Dict[str, Any]]] = {}
+        for row in sampled_posts_df.iter_rows(named=True):
+            author_idx = _author_idx_or_unk(row.get("author_idx")) if self.use_author_embedding_table else None
+            self.sampled_posts_by_bucket.setdefault(row["negative_hour_bucket"], []).append({
+                "post_id": str(row["at_uri"]),
+                "emb_idx": int(row["emb_idx"]),
+                "author_idx": author_idx,
+            })
+
+        joined = (
+            like_ordered_df
+            .join(
+                history_df.select(history_columns),
+                on=["did", "like_hour_bucket"],
+                how="left",
+                maintain_order="left",
+            )
+            .sort("_like_order")
+        )
+
+        self.user_ids: List[str] = []
+        self.like_hour_buckets: List[Any] = []
+        self.positive_post_ids: List[str] = []
+        self.positive_post_emb_indices: List[int] = []
+        self.prior_emb_indices: List[np.ndarray] = []
+        self.positive_post_author_indices: Optional[List[int]] = [] if self.use_author_embedding_table else None
+        self.prior_author_indices: Optional[List[np.ndarray]] = [] if self.use_author_embedding_table else None
+
+        dropped_no_negative = 0
+        for row in joined.iter_rows(named=True):
+            user_id = str(row["did"])
+            bucket = row["like_hour_bucket"]
+            if not self._has_usable_negative(user_id, bucket):
+                dropped_no_negative += 1
+                continue
+
+            self.user_ids.append(user_id)
+            self.like_hour_buckets.append(bucket)
+            self.positive_post_ids.append(str(row["subject_uri"]))
+            self.positive_post_emb_indices.append(int(row["emb_idx"]))
+            self.prior_emb_indices.append(_list_to_int_array(row.get("prior_emb_indices")))
+            if self.use_author_embedding_table:
+                if self.positive_post_author_indices is None or self.prior_author_indices is None:
+                    raise ValueError("author index storage must be initialized when author embeddings are enabled")
+                self.positive_post_author_indices.append(_author_idx_or_unk(row.get("author_idx")))
+                self.prior_author_indices.append(_author_idx_list_to_table_rows(row.get("prior_author_indices")))
+
+        if logger:
+            logger.info(
+                f"  RankerPairDataset('{self.split}'): {len(self.user_ids):,} pair rows "
+                f"({dropped_no_negative:,} dropped with no usable same-hour negative)"
+            )
+
+    def __len__(self) -> int:
+        return len(self.user_ids)
+
+    def __getitem__(self, idx: Any) -> Dict[str, Any]:
+        if isinstance(idx, tuple):
+            row_idx, epoch = idx
+        else:
+            row_idx = idx
+            epoch = 0
+        row_idx = int(row_idx)
+        return {
+            "row_idx": row_idx,
+            "epoch": int(epoch),
+            "bucket": self.like_hour_buckets[row_idx],
+            "user_id": self.user_ids[row_idx],
+        }
+
+    def _has_usable_negative(self, user_id: str, bucket: Any) -> bool:
+        liked_post_ids = self.user_hour_liked_post_ids.get((user_id, bucket), set())
+        return any(
+            post["post_id"] not in liked_post_ids
+            for post in self.sampled_posts_by_bucket.get(bucket, [])
+        )
+
+    def _sample_negative_for_row(self, row_idx: int, epoch: int) -> Dict[str, Any]:
+        user_id = self.user_ids[row_idx]
+        bucket = self.like_hour_buckets[row_idx]
+        liked_post_ids = self.user_hour_liked_post_ids.get((user_id, bucket), set())
+        pool = self.sampled_posts_by_bucket.get(bucket, [])
+        if not pool:
+            raise ValueError("RankerPairDataset row has no same-hour negative pool")
+
+        seed = self.seed + (int(epoch) * max(len(self.user_ids), 1)) + int(row_idx)
+        rng = np.random.default_rng(seed)
+        start = int(rng.integers(0, len(pool)))
+        for offset in range(len(pool)):
+            post = pool[(start + offset) % len(pool)]
+            if post["post_id"] not in liked_post_ids:
+                return post
+        raise ValueError("RankerPairDataset row has no usable same-hour negative")
+
+    def _padded_history_for_row(self, row_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        hist_indices = self.prior_emb_indices[row_idx]
+        hist_embeddings = self.embeddings[hist_indices]
+        padded, mask = get_padded_embedding_history_and_mask(hist_embeddings, self.max_history_len, self.embed_dim)
+        return torch.from_numpy(padded), torch.from_numpy(mask)
+
+    def _padded_author_history_for_row(self, row_idx: int) -> torch.Tensor:
+        if self.prior_author_indices is None:
+            raise ValueError("prior_author_indices must be available when author embeddings are enabled")
+        mapped_author_indices = self.prior_author_indices[row_idx]
+        padded = get_padded_author_indices(mapped_author_indices, self.max_history_len)
+        return torch.from_numpy(padded)
+
+    def collate_batch(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not items:
+            raise ValueError("RankerPairDataset.collate_batch received an empty batch")
+
+        history_tensors = []
+        mask_tensors = []
+        candidate_embedding_tensors = []
+        candidate_labels = []
+        candidate_post_ids = []
+        candidate_author_indices = []
+        user_ids = []
+        buckets = []
+
+        for item in items:
+            row_idx = int(item["row_idx"])
+            epoch = int(item.get("epoch", 0))
+            negative_post = self._sample_negative_for_row(row_idx, epoch)
+
+            history, mask = self._padded_history_for_row(row_idx)
+            history_tensors.append(history)
+            mask_tensors.append(mask)
+
+            candidate_emb_indices = np.array([
+                self.positive_post_emb_indices[row_idx],
+                int(negative_post["emb_idx"]),
+            ], dtype=np.int64)
+            candidate_embedding_tensors.append(torch.from_numpy(
+                np.array(self.embeddings[candidate_emb_indices], dtype=np.float32)
+            ))
+            candidate_labels.append([1.0, 0.0])
+            candidate_post_ids.append([
+                self.positive_post_ids[row_idx],
+                negative_post["post_id"],
+            ])
+            user_ids.append(self.user_ids[row_idx])
+            buckets.append(self.like_hour_buckets[row_idx])
+
+            if self.use_author_embedding_table:
+                if self.positive_post_author_indices is None:
+                    raise ValueError("positive_post_author_indices must be available when author embeddings are enabled")
+                candidate_author_indices.append([
+                    self.positive_post_author_indices[row_idx],
+                    int(negative_post.get("author_idx", AUTHOR_UNK_IDX)) 
+                ])
+
+        output: Dict[str, Any] = {
+            "history_embeddings": torch.stack(history_tensors, dim=0),
+            "history_mask": torch.stack(mask_tensors, dim=0),
+            "candidate_post_embeddings": torch.stack(candidate_embedding_tensors, dim=0),
+            "candidate_labels": torch.tensor(candidate_labels, dtype=torch.float32),
+            "user_id": user_ids,
+            "candidate_post_id": candidate_post_ids,
+            "bucket": buckets,
+        }
+        if self.use_author_embedding_table:
+            output["history_author_indices"] = torch.stack(
+                [self._padded_author_history_for_row(int(item["row_idx"])) for item in items],
+                dim=0,
+            )
+            output["candidate_post_author_idx"] = torch.tensor(candidate_author_indices, dtype=torch.long)
+        return output
+
+
 class BucketedBatchSampler(Sampler[List[int]]):
     """Yield user-hour-row batches where each batch belongs to one hour bucket."""
 
@@ -1250,6 +1483,50 @@ class BucketedBatchSampler(Sampler[List[int]]):
             if n_rows % self.batch_size and not self.drop_last:
                 total += 1
         return total
+
+
+class RankerPairBatchSampler(Sampler[List[Tuple[int, int]]]):
+    """Yield mixed-hour ranker pair batches with epoch-aware row indices."""
+
+    def __init__(
+        self,
+        dataset: RankerPairDataset,
+        batch_size: int,
+        shuffle: bool,
+        drop_last: bool,
+        seed: int,
+        resample_each_epoch: bool,
+    ):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.resample_each_epoch = bool(resample_each_epoch)
+        self._epoch = 0
+
+    def __iter__(self) -> Iterator[List[Tuple[int, int]]]:
+        epoch = self._epoch if self.resample_each_epoch else 0
+        rng = np.random.default_rng(self.seed + epoch)
+        if self.resample_each_epoch:
+            self._epoch += 1
+
+        row_indices = list(range(len(self.dataset)))
+        if self.shuffle:
+            rng.shuffle(row_indices)
+        for start in range(0, len(row_indices), self.batch_size):
+            batch = row_indices[start:start + self.batch_size]
+            if len(batch) == self.batch_size or (batch and not self.drop_last):
+                yield [(int(row_idx), int(epoch)) for row_idx in batch]
+
+    def __len__(self) -> int:
+        n_rows = len(self.dataset)
+        full_batches = n_rows // self.batch_size
+        if n_rows % self.batch_size and not self.drop_last:
+            return full_batches + 1
+        return full_batches
 
 
 def create_bucketed_data_loaders(
@@ -1323,6 +1600,88 @@ def create_bucketed_data_loaders(
                 shuffle=False,
                 drop_last=False,
                 seed=seed,
+            ),
+            collate_fn=holdout_dataset.collate_batch,
+            **worker_kw,
+        )
+    return train_loader, val_loader, val_unseen_loader, holdout_loader
+
+
+def create_ranker_pair_data_loaders(
+    train_dataset: RankerPairDataset,
+    val_dataset: RankerPairDataset,
+    val_unseen_dataset: RankerPairDataset,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    persistent_workers: bool,
+    prefetch_factor: int,
+    seed: int,
+    holdout_dataset: Optional[RankerPairDataset] = None,
+):
+    """Create DataLoaders for positive/same-hour-negative ranker pair batches."""
+    from torch.utils.data import DataLoader
+
+    worker_kw: Dict[str, Any] = {
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        worker_kw.update(
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+        )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_sampler=RankerPairBatchSampler(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=True,
+            seed=seed,
+            resample_each_epoch=True,
+        ),
+        collate_fn=train_dataset.collate_batch,
+        **worker_kw,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_sampler=RankerPairBatchSampler(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False,
+            seed=seed,
+            resample_each_epoch=False,
+        ),
+        collate_fn=val_dataset.collate_batch,
+        **worker_kw,
+    )
+    val_unseen_loader = DataLoader(
+        val_unseen_dataset,
+        batch_sampler=RankerPairBatchSampler(
+            val_unseen_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False,
+            seed=seed,
+            resample_each_epoch=False,
+        ),
+        collate_fn=val_unseen_dataset.collate_batch,
+        **worker_kw,
+    )
+    holdout_loader = None
+    if holdout_dataset is not None:
+        holdout_loader = DataLoader(
+            holdout_dataset,
+            batch_sampler=RankerPairBatchSampler(
+                holdout_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                drop_last=False,
+                seed=seed,
+                resample_each_epoch=False,
             ),
             collate_fn=holdout_dataset.collate_batch,
             **worker_kw,
