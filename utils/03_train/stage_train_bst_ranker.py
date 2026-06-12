@@ -116,6 +116,50 @@ class BSTPostAuthorFeatureEncoder(nn.Module):
         return self.fusion_layer(fused_inputs)
 
 
+class LinearPredictionHead(nn.Module):
+    """Linear-layer prediction head for BST candidate-pair encodings."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dims: Sequence[int],
+        dropout_rate: float,
+    ):
+        super().__init__()
+        if input_dim <= 0:
+            raise ValueError("input_dim must be positive")
+        if not 0.0 <= dropout_rate <= 1.0:
+            raise ValueError("dropout_rate must be in [0, 1]")
+
+        hidden_dims = tuple(int(hidden_dim) for hidden_dim in hidden_dims)
+        for hidden_dim in hidden_dims:
+            if hidden_dim <= 0:
+                raise ValueError("hidden_dims must contain only positive values")
+
+        layers: list[nn.Module] = []
+        prev_dim = int(input_dim)
+        for hidden_dim in hidden_dims:
+            layers.extend(
+                [
+                    nn.Linear(prev_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.Dropout(float(dropout_rate)),
+                ]
+            )
+            prev_dim = hidden_dim
+        layers.append(nn.Linear(prev_dim, 1))
+        self.network = nn.Sequential(*layers)
+
+        for module in self.network.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, encoded_pair: torch.Tensor) -> torch.Tensor:
+        return self.network(encoded_pair).squeeze(-1)
+
+
 class BSTRanker(nn.Module):
     """Behavior Sequence Transformer encoder for one user-history/candidate pair."""
 
@@ -133,6 +177,7 @@ class BSTRanker(nn.Module):
         author_unknown_dropout_rate: float,
         norm_first: bool,
         time_delta_bucket_boundaries_hours: Sequence[float],
+        prediction_hidden_dims: Sequence[int],
     ):
         super().__init__()
         if time_embedding_dim <= 0:
@@ -184,8 +229,13 @@ class BSTRanker(nn.Module):
             num_layers=int(num_transformer_layers),
             enable_nested_tensor=False,
         )
+        self.prediction_head = LinearPredictionHead(
+            input_dim=self.transformer_input_dim,
+            hidden_dims=prediction_hidden_dims,
+            dropout_rate=dropout_rate,
+        )
 
-    def forward(
+    def _forward_transformer(
         self,
         history_embeddings: torch.Tensor,
         history_mask: torch.Tensor,
@@ -244,3 +294,47 @@ class BSTRanker(nn.Module):
             src_key_padding_mask=src_key_padding_mask,
         )
         return encoded_sequence[:, -1, :]
+
+    def forward(
+        self,
+        history_embeddings: torch.Tensor,
+        history_mask: torch.Tensor,
+        history_time_deltas_hours: torch.Tensor,
+        candidate_post_embeddings: torch.Tensor,
+        history_author_indices: torch.Tensor,
+        candidate_post_author_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        transformer_output = self._forward_transformer(
+            history_embeddings=history_embeddings,
+            history_mask=history_mask,
+            history_time_deltas_hours=history_time_deltas_hours,
+            candidate_post_embeddings=candidate_post_embeddings,
+            history_author_indices=history_author_indices,
+            candidate_post_author_idx=candidate_post_author_idx,
+        )
+        logits = self.prediction_head(transformer_output)
+        if logits.dim() == 2 and logits.shape == (transformer_output.size(0), 1):
+            logits = logits.squeeze(-1)
+        if logits.shape != (transformer_output.size(0),):
+            raise RuntimeError("prediction_head must return logits with shape [B] or [B, 1]")
+        return logits
+
+    def predict_proba(
+        self,
+        history_embeddings: torch.Tensor,
+        history_mask: torch.Tensor,
+        history_time_deltas_hours: torch.Tensor,
+        candidate_post_embeddings: torch.Tensor,
+        history_author_indices: torch.Tensor,
+        candidate_post_author_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.sigmoid(
+            self.forward(
+                history_embeddings=history_embeddings,
+                history_mask=history_mask,
+                history_time_deltas_hours=history_time_deltas_hours,
+                candidate_post_embeddings=candidate_post_embeddings,
+                history_author_indices=history_author_indices,
+                candidate_post_author_idx=candidate_post_author_idx,
+            )
+        )
