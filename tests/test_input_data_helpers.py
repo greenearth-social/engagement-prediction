@@ -16,6 +16,7 @@ from shared.input_data_helpers import (
     get_padded_author_indices,
     get_padded_embedding_history_and_mask,
     get_padded_embedding_history_and_mask_batched,
+    get_padded_history_time_deltas,
 )
 
 
@@ -136,6 +137,18 @@ def test_get_padded_author_indices_padding_and_truncation():
 
     truncated = get_padded_author_indices([2, 3, 4], max_history_len=2)
     assert truncated.tolist() == [2, 3]
+
+
+def test_get_padded_history_time_deltas_padding_truncation_and_dtype():
+    padded = get_padded_history_time_deltas([1.25, 2.5], max_history_len=4)
+    assert padded.dtype == "float32"
+    assert padded.tolist() == pytest.approx([1.25, 2.5, 0.0, 0.0])
+
+    truncated = get_padded_history_time_deltas([1.0, 2.0, 3.0], max_history_len=2)
+    assert truncated.tolist() == pytest.approx([1.0, 2.0])
+
+    empty = get_padded_history_time_deltas([], max_history_len=3)
+    assert empty.tolist() == pytest.approx([0.0, 0.0, 0.0])
 
 
 def test_classify_history_embeddings_shape_covers_public_shapes():

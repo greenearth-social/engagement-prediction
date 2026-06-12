@@ -35,6 +35,15 @@ def mock_likes_core_df():
         "did": ["u1", "u2", "u1", "u1", "u3", "u4", "u5"],
         "subject_uri": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
         "split": ["train", "train", "train", "train", "train", "val", "val_unseen_users"],
+        "record_created_at": [
+            datetime(2024, 1, 1, 10, 15, tzinfo=timezone.utc),
+            datetime(2024, 1, 1, 10, 30, tzinfo=timezone.utc),
+            datetime(2024, 1, 1, 10, 45, tzinfo=timezone.utc),
+            datetime(2024, 1, 1, 11, 10, tzinfo=timezone.utc),
+            datetime(2024, 1, 1, 12, 5, tzinfo=timezone.utc),
+            datetime(2024, 1, 1, 13, 20, tzinfo=timezone.utc),
+            datetime(2024, 1, 1, 13, 40, tzinfo=timezone.utc),
+        ],
         "like_hour_bucket": [_dt(10), _dt(10), _dt(10), _dt(11), _dt(12), _dt(13), _dt(13)],
         "emb_idx": [0, 1, 2, 3, 4, 5, 6],
         "author_idx": pl.Series([2, 3, 4, None, 2, 2, 4], dtype=pl.UInt32),
@@ -59,6 +68,7 @@ def mock_history_df():
         "did": ["u1", "u2", "u1", "u3", "u4", "u5"],
         "like_hour_bucket": [_dt(10), _dt(10), _dt(11), _dt(12), _dt(13), _dt(13)],
         "prior_emb_indices": [[5, 6, 7], [], [8], [], [9], [10]],
+        "prior_like_age_hours_at_bucket_start": [[1.0, 2.0, 3.0], [], [0.25], [], [4.0], [5.0]],
         "prior_author_indices": [[2, None, 4], [], [3], [], [2], [4]],
     })
 
@@ -268,6 +278,15 @@ def test_ranker_pair_collate_returns_two_candidates_per_positive(ranker_pair_dat
     assert batch["candidate_post_id"][1] == ["p4", "n2"]
     assert batch["history_embeddings"].shape == (2, 3, 4)
     assert batch["history_mask"].tolist() == [[True, True, True], [True, False, False]]
+    np.testing.assert_allclose(
+        batch["history_time_deltas_hours"].numpy(),
+        np.array([
+            [1.25, 2.25, 3.25],
+            [5.0 / 12.0, 0.0, 0.0],
+        ], dtype=np.float32),
+        rtol=0,
+        atol=1e-6,
+    )
     assert batch["candidate_post_embeddings"].shape == (2, 2, 4)
     assert batch["candidate_labels"].tolist() == [[1.0, 0.0], [1.0, 0.0]]
 
@@ -401,6 +420,12 @@ def test_ranker_pair_collate_returns_author_tensors_when_enabled(
 
     assert batch["history_author_indices"].shape == (1, 4)
     assert batch["history_author_indices"][0].tolist() == [2, AUTHOR_UNK_IDX, 4, AUTHOR_PAD_IDX]
+    np.testing.assert_allclose(
+        batch["history_time_deltas_hours"].numpy(),
+        np.array([[1.25, 2.25, 3.25, 0.0]], dtype=np.float32),
+        rtol=0,
+        atol=1e-6,
+    )
     assert batch["candidate_post_author_idx"].tolist() == [[2, AUTHOR_UNK_IDX]]
 
 
@@ -449,4 +474,4 @@ def test_create_ranker_pair_data_loaders_returns_iterable_loaders(
     assert isinstance(val_unseen_loader, DataLoader)
     assert holdout_loader is None
     batch = next(iter(train_loader))
-    assert {"history_embeddings", "history_mask", "candidate_post_embeddings", "candidate_labels"} <= set(batch)
+    assert {"history_embeddings", "history_mask", "history_time_deltas_hours", "candidate_post_embeddings", "candidate_labels"} <= set(batch)

@@ -274,6 +274,17 @@ def get_padded_author_indices(
     return padded
 
 
+def get_padded_history_time_deltas(
+    time_deltas_hours: Any,
+    max_history_len: int,
+) -> np.ndarray:
+    seq_len = min(len(time_deltas_hours), max_history_len)
+    padded = np.zeros(max_history_len, dtype=np.float32)
+    if seq_len > 0:
+        padded[:seq_len] = np.asarray(time_deltas_hours[: max_history_len], dtype=np.float32)
+    return padded
+
+
 def get_padded_embedding_history_and_mask_batched(
     history_embeddings: list[list[float]] | list[list[list[float]]],
     max_history_len: int, 
