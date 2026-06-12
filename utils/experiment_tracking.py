@@ -25,7 +25,7 @@ class ExperimentTracker(Protocol):
     def log_artifact(self, name: str, path: Path) -> dict[str, str]:
         ...
 
-    def log_file_artifact(self, name: str, path: Path) -> Optional[str]:
+    def log_file_artifact(self, name: str, path: Path) -> bool:
         ...
 
     def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
@@ -71,8 +71,8 @@ class NoOpExperimentTracker:
     def log_artifact(self, name: str, path: Path) -> dict[str, str]:
         return {}
 
-    def log_file_artifact(self, name: str, path: Path) -> Optional[str]:
-        return {}
+    def log_file_artifact(self, name: str, path: Path) -> bool:
+        return False
 
     def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
         return None
@@ -240,20 +240,16 @@ class ClearMLExperimentTracker:
             "uri": uri or ""
         }
 
-    def log_file_artifact(self, name: str, path: Path) -> Optional[str]:
+    def log_file_artifact(self, name: str, path: Path) -> bool:
         p = Path(path)
         if not p.exists():
-            return None
+            return False
 
         try:
             uploaded = self._task.upload_artifact(name=name, artifact_object=str(p), wait_on_upload=True)
         except Exception:
-            return None
-        if not uploaded:
-            return None
-
-        artifact = self._task.artifacts.get(name)
-        return getattr(artifact, "uri", "") or ""
+            return False
+        return uploaded
 
     def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
         normalized = normalize_params(params)

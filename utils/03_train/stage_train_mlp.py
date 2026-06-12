@@ -579,11 +579,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         if author_idx_artifact_path is None:
             logger.warning("Author embedding table enabled, but no author_idx parquet path was found to log")
         else:
-            author_idx_uri = context.tracker.log_file_artifact(
+            author_idx_artifact_id = context.tracker.log_file_artifact(
                 name="author_idx_mapping",
                 path=author_idx_artifact_path,
             )
-            logger.info(f"Author index mapping URI: {author_idx_uri}")
+            logger.info(f"Author index mapping artifact id: {author_idx_artifact_id}")
 
     num_workers = int(args.num_dataloader_workers)
     pin_memory = bool(args.dataloader_pin_memory)

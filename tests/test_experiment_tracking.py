@@ -52,5 +52,5 @@ def test_log_file_artifact_uploads_path_to_clearml_task(tmp_path):
 
     result = tracker.log_file_artifact("author_idx_mapping", artifact_path)
 
-    assert result == "gs://bucket/author_idx_mapping.parquet"
+    assert result is True
     assert tracker._task.uploads == [("author_idx_mapping", str(artifact_path), True)]

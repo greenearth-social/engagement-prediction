@@ -936,7 +936,6 @@ def run(context: Context, args) -> Dict[str, Any]:
             "author_idx artifact was not found in 01_get_data output, but --use-author-embedding-table was enabled."
         )
     author_table_num_rows = 0
-    author_idx_uri = ""
     if use_author_embedding_table:
         if author_idx_mapping_df is None:
             raise FileNotFoundError("author_idx_mapping_df is required when use_author_embedding_table is True")
@@ -950,10 +949,11 @@ def run(context: Context, args) -> Dict[str, Any]:
         if author_idx_artifact_path is None:
             logger.warning("Author embedding table enabled, but no author_idx parquet path was found to log")
         else:
-            author_idx_uri = context.tracker.log_file_artifact(
+            author_idx_artifact_id = context.tracker.log_file_artifact(
                 name="author_idx_mapping",
                 path=author_idx_artifact_path,
-            ) or ""
+            )
+            logger.info(f"Author index mapping artifact id: {author_idx_artifact_id}")
 
     # Worker settings
     num_workers = int(args.num_dataloader_workers)
@@ -1161,7 +1161,6 @@ def run(context: Context, args) -> Dict[str, Any]:
             "post_tower_clearml_model_id": post_model_id,
             "user_tower_uri": user_model_metadata["uri"],
             "post_tower_uri": post_model_metadata["uri"],
-            "author_mapping_uri": author_idx_uri,
             "output_embedding_dim": shared_dim,
             "clearml_task_id": context.tracker.id
         }
