@@ -17,13 +17,15 @@ if TYPE_CHECKING:
 
 
 class ExperimentTracker(Protocol):
+    id: str
+
     def log_scalar(self, title: str, series: str, value: float, iteration: int) -> None:
         ...
 
-    def log_artifact(self, name: str, path: Path) -> Optional[dict[str, str]]:
+    def log_artifact(self, name: str, path: Path) -> dict[str, str]:
         ...
 
-    def log_file_artifact(self, name: str, path: Path) -> Any:
+    def log_file_artifact(self, name: str, path: Path) -> Optional[str]:
         ...
 
     def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
@@ -61,14 +63,16 @@ class ExperimentTracker(Protocol):
 
 
 class NoOpExperimentTracker:
+    id: str
+
     def log_scalar(self, title: str, series: str, value: float, iteration: int) -> None:
         return None
 
-    def log_artifact(self, name: str, path: Path) -> Optional[dict[str, str]]:
-        return None
+    def log_artifact(self, name: str, path: Path) -> dict[str, str]:
+        return {}
 
-    def log_file_artifact(self, name: str, path: Path) -> None:
-        return None
+    def log_file_artifact(self, name: str, path: Path) -> Optional[str]:
+        return {}
 
     def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
         return None
@@ -129,6 +133,7 @@ class ClearMLExperimentTracker:
             output_uri=output_uri,
         )
         self._logger = self._task.get_logger()
+        self.id = self._task.id
 
 
     @staticmethod
@@ -205,11 +210,12 @@ class ClearMLExperimentTracker:
             iteration=iteration,
         )
 
-    def log_artifact(self, name: str, path: Path) -> Optional[dict[str, str]]:
+    def log_artifact(self, name: str, path: Path) -> dict[str, str]:
         from clearml import OutputModel
+        empty_metadata = {"model_id": "", "uri": ""}
         p = Path(path)
         if not p.exists():
-            return None
+            return empty_metadata
         
         # create the OutputModel and upload the file as its weights/artifact
         
@@ -234,11 +240,20 @@ class ClearMLExperimentTracker:
             "uri": uri or ""
         }
 
-    def log_file_artifact(self, name: str, path: Path) -> Any:
+    def log_file_artifact(self, name: str, path: Path) -> Optional[str]:
         p = Path(path)
         if not p.exists():
             return None
-        return self._task.upload_artifact(name=name, artifact_object=str(p))
+
+        try:
+            uploaded = self._task.upload_artifact(name=name, artifact_object=str(p), wait_on_upload=True)
+        except Exception:
+            return None
+        if not uploaded:
+            return None
+
+        artifact = self._task.artifacts.get(name)
+        return getattr(artifact, "uri", "") or ""
 
     def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
         normalized = normalize_params(params)
