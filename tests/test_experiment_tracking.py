@@ -1,17 +1,29 @@
 from utils.experiment_tracking import ClearMLExperimentTracker
 
 
+class _FakeArtifact:
+    def __init__(self, key, uri) -> None:
+        self.key = key
+        self.uri = uri
+
+
 class _FakeTask:
     def __init__(self) -> None:
         self.params = None
-        self.artifacts = []
+        self.uploads = []
+        self._artifacts = {}
 
     def set_parameters_as_dict(self, params):
         self.params = params
 
-    def upload_artifact(self, name, artifact_object):
-        self.artifacts.append((name, artifact_object))
-        return "artifact-id"
+    def upload_artifact(self, name, artifact_object, wait_on_upload=False):
+        self.uploads.append((name, artifact_object, wait_on_upload))
+        self._artifacts[name] = _FakeArtifact(name, f"gs://bucket/{name}.parquet")
+        return "artifact-id" if not wait_on_upload else True
+
+    @property
+    def artifacts(self):
+        return self._artifacts
 
 
 def test_log_params_updates_clearml_parameters_with_section_prefix():
@@ -40,5 +52,5 @@ def test_log_file_artifact_uploads_path_to_clearml_task(tmp_path):
 
     result = tracker.log_file_artifact("author_idx_mapping", artifact_path)
 
-    assert result == "artifact-id"
-    assert tracker._task.artifacts == [("author_idx_mapping", str(artifact_path))]
+    assert result is True
+    assert tracker._task.uploads == [("author_idx_mapping", str(artifact_path), True)]

@@ -17,13 +17,15 @@ if TYPE_CHECKING:
 
 
 class ExperimentTracker(Protocol):
+    id: str
+
     def log_scalar(self, title: str, series: str, value: float, iteration: int) -> None:
         ...
 
-    def log_artifact(self, name: str, path: Path) -> None:
+    def log_artifact(self, name: str, path: Path) -> dict[str, str]:
         ...
 
-    def log_file_artifact(self, name: str, path: Path) -> Any:
+    def log_file_artifact(self, name: str, path: Path) -> bool:
         ...
 
     def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
@@ -61,14 +63,16 @@ class ExperimentTracker(Protocol):
 
 
 class NoOpExperimentTracker:
+    id: str
+
     def log_scalar(self, title: str, series: str, value: float, iteration: int) -> None:
         return None
 
-    def log_artifact(self, name: str, path: Path) -> None:
-        return None
+    def log_artifact(self, name: str, path: Path) -> dict[str, str]:
+        return {}
 
-    def log_file_artifact(self, name: str, path: Path) -> None:
-        return None
+    def log_file_artifact(self, name: str, path: Path) -> bool:
+        return False
 
     def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
         return None
@@ -129,6 +133,7 @@ class ClearMLExperimentTracker:
             output_uri=output_uri,
         )
         self._logger = self._task.get_logger()
+        self.id = self._task.id
 
 
     @staticmethod
@@ -205,11 +210,12 @@ class ClearMLExperimentTracker:
             iteration=iteration,
         )
 
-    def log_artifact(self, name: str, path: Path) -> Optional[str]:
+    def log_artifact(self, name: str, path: Path) -> dict[str, str]:
         from clearml import OutputModel
+        empty_metadata = {"model_id": "", "uri": ""}
         p = Path(path)
         if not p.exists():
-            return
+            return empty_metadata
         
         # create the OutputModel and upload the file as its weights/artifact
         
@@ -219,7 +225,7 @@ class ClearMLExperimentTracker:
             framework='pytorch',
             tags=['candidate'],
         )
-        om.update_weights(str(p), auto_delete_file=False)
+        uri = om.update_weights(str(p), auto_delete_file=False)
 
         # also attach useful metadata
         script = self._task.data.script
@@ -229,13 +235,21 @@ class ClearMLExperimentTracker:
         om.set_metadata("git_branch", getattr(script, "branch", ""))
         om.set_metadata("git_sha", getattr(script, "version_num", ""))
 
-        return om.id
+        return {
+            "model_id": om.id,
+            "uri": uri or ""
+        }
 
-    def log_file_artifact(self, name: str, path: Path) -> Any:
+    def log_file_artifact(self, name: str, path: Path) -> bool:
         p = Path(path)
         if not p.exists():
-            return None
-        return self._task.upload_artifact(name=name, artifact_object=str(p))
+            return False
+
+        try:
+            uploaded = self._task.upload_artifact(name=name, artifact_object=str(p), wait_on_upload=True)
+        except Exception:
+            return False
+        return uploaded
 
     def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
         normalized = normalize_params(params)
