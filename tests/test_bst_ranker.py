@@ -9,6 +9,7 @@ import torch.nn as nn
 stage_train_bst_ranker = importlib.import_module("utils.03_train.stage_train_bst_ranker")
 BSTRanker = stage_train_bst_ranker.BSTRanker
 DEFAULT_TIME_DELTA_BUCKET_BOUNDARIES_HOURS = stage_train_bst_ranker.DEFAULT_TIME_DELTA_BUCKET_BOUNDARIES_HOURS
+LinearPredictionHead = stage_train_bst_ranker.LinearPredictionHead
 bucketize_time_deltas_hours = stage_train_bst_ranker.bucketize_time_deltas_hours
 
 
@@ -16,6 +17,7 @@ def _make_model(
     *,
     dropout_rate: float = 0.0,
     num_attention_heads: int = 2,
+    prediction_hidden_dims=(8, 4),
 ) -> BSTRanker:
     torch.manual_seed(123)
     return BSTRanker(
@@ -31,6 +33,7 @@ def _make_model(
         author_unknown_dropout_rate=0.0,
         norm_first=False,
         time_delta_bucket_boundaries_hours=DEFAULT_TIME_DELTA_BUCKET_BOUNDARIES_HOURS,
+        prediction_hidden_dims=prediction_hidden_dims,
     )
 
 
@@ -75,16 +78,41 @@ def _batch() -> dict[str, torch.Tensor]:
     }
 
 
-def test_bst_ranker_forward_shape_and_builtin_transformer_encoder():
+def test_bst_ranker_forward_transformer_shape_and_builtin_transformer_encoder():
     model = _make_model()
     model.eval()
     batch = _batch()
 
-    output = model(**batch)
+    output = model._forward_transformer(**batch)
 
     assert isinstance(model.transformer_encoder, nn.TransformerEncoder)
+    assert isinstance(model.prediction_head, LinearPredictionHead)
     assert output.shape == (2, model.transformer_input_dim)
     assert output.dtype == torch.float32
+
+
+def test_bst_ranker_forward_returns_raw_logits():
+    model = _make_model()
+    model.eval()
+    batch = _batch()
+
+    logits = model(**batch)
+
+    assert logits.shape == (2,)
+    assert logits.dtype == torch.float32
+
+
+def test_bst_ranker_predict_proba_applies_sigmoid_to_logits():
+    model = _make_model()
+    model.eval()
+    batch = _batch()
+
+    logits = model(**batch)
+    probabilities = model.predict_proba(**batch)
+
+    torch.testing.assert_close(probabilities, torch.sigmoid(logits))
+    assert torch.all(probabilities >= 0.0)
+    assert torch.all(probabilities <= 1.0)
 
 
 def test_bst_ranker_rejects_attention_head_mismatch():
@@ -102,6 +130,7 @@ def test_bst_ranker_rejects_attention_head_mismatch():
             author_unknown_dropout_rate=0.0,
             norm_first=False,
             time_delta_bucket_boundaries_hours=DEFAULT_TIME_DELTA_BUCKET_BOUNDARIES_HOURS,
+            prediction_hidden_dims=(7,),
         )
 
 
@@ -157,10 +186,10 @@ def test_bst_ranker_supports_candidate_only_sequence_with_zero_delta_bucket():
     )
 
     assert bucketize_time_deltas_hours(candidate_deltas).tolist() == [[0], [0]]
-    assert output.shape == (2, model.transformer_input_dim)
+    assert output.shape == (2,)
 
 
-def test_bst_ranker_gradients_flow_through_post_time_and_transformer_parameters():
+def test_bst_ranker_gradients_flow_through_post_time_transformer_and_head_parameters():
     model = _make_model()
     batch = _batch()
 
@@ -178,3 +207,35 @@ def test_bst_ranker_gradients_flow_through_post_time_and_transformer_parameters(
         if param.grad is not None
     )
     assert transformer_grad_sum > 0
+    prediction_head_grad_sum = sum(
+        param.grad.abs().sum()
+        for param in model.prediction_head.parameters()
+        if param.grad is not None
+    )
+    assert prediction_head_grad_sum > 0
+
+
+def test_bst_ranker_supports_direct_linear_prediction_head():
+    model = _make_model(prediction_hidden_dims=())
+    model.eval()
+    batch = _batch()
+
+    output = model(**batch)
+
+    linear_layers = [m for m in model.prediction_head.modules() if isinstance(m, nn.Linear)]
+    assert len(linear_layers) == 1
+    assert output.shape == (2,)
+
+
+def test_bst_ranker_rejects_invalid_prediction_hidden_dims():
+    with pytest.raises(ValueError, match="hidden_dims"):
+        _make_model(prediction_hidden_dims=[0])
+
+
+def test_bst_ranker_rejects_invalid_prediction_head_output_shape():
+    model = _make_model()
+    model.prediction_head = nn.Linear(8, 2)
+    batch = _batch()
+
+    with pytest.raises(RuntimeError, match="prediction_head"):
+        model(**batch)
