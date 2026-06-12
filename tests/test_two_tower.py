@@ -23,6 +23,45 @@ _evaluate_two_tower_model = matrix_ranking.evaluate_matrix_model
 _ranking_rows_for_batch = matrix_ranking.ranking_rows_for_batch
 
 
+class _FailingManifestTracker:
+    def __init__(self):
+        self.uploads = []
+
+    def log_file_artifact(self, name, path):
+        self.uploads.append((name, path))
+        raise RuntimeError("upload failed")
+
+
+class _ManifestContext:
+    def __init__(self):
+        self.tracker = _FailingManifestTracker()
+
+
+class _ManifestLogger:
+    def __init__(self):
+        self.exceptions = []
+        self.infos = []
+
+    def exception(self, message):
+        self.exceptions.append(message)
+
+    def info(self, message):
+        self.infos.append(message)
+
+
+def test_log_serving_manifest_artifact_continues_on_upload_failure(tmp_path):
+    manifest_path = tmp_path / "two_tower_serving_manifest.json"
+    manifest_path.write_text("{}\n")
+    context = _ManifestContext()
+    logger = _ManifestLogger()
+
+    stage_train_two_tower._log_serving_manifest_artifact(context, manifest_path, logger)
+
+    assert context.tracker.uploads == [("two_tower_serving_manifest", manifest_path)]
+    assert logger.exceptions == ["Failed to upload two-tower serving manifest; continuing without manifest artifact."]
+    assert logger.infos == []
+
+
 # =============================================================================
 # PostTower Tests
 # =============================================================================

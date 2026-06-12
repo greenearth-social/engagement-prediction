@@ -134,6 +134,15 @@ from utils.matrix_ranking import (
 STAGE_LOG_NAME = "STAGE_03_TRAIN_TWO_TOWER"
 
 
+def _log_serving_manifest_artifact(context: Context, manifest_path: Path, logger: Any) -> None:
+    try:
+        manifest_artifact_id = context.tracker.log_file_artifact("two_tower_serving_manifest", manifest_path)
+    except Exception:
+        logger.exception("Failed to upload two-tower serving manifest; continuing without manifest artifact.")
+        return
+    logger.info(f"Two-tower serving manifest artifact id: {manifest_artifact_id}")
+
+
 # =============================================================================
 # Post Tower
 # =============================================================================
@@ -1148,8 +1157,8 @@ def run(context: Context, args) -> Dict[str, Any]:
         user_model_id = ""
         user_model_uri = ""
         if user_model_dict:
-            user_model_id = user_model_dict["model_id"]
-            user_model_uri = user_model_dict["uri"]
+            user_model_id = user_model_dict.get("model_id") or ""
+            user_model_uri = user_model_dict.get("uri") or ""
         logger.info(f"User tower model id: {user_model_id}")
 
         torchscript_post_name = "engagement_post_tower"
@@ -1159,8 +1168,8 @@ def run(context: Context, args) -> Dict[str, Any]:
         post_model_id = ""
         post_model_uri = ""
         if post_model_dict:
-            post_model_id = post_model_dict["model_id"]
-            post_model_uri = post_model_dict["uri"]
+            post_model_id = post_model_dict.get("model_id") or ""
+            post_model_uri = post_model_dict.get("uri") or ""
         logger.info(f"Post tower model id: {post_model_id}")
 
         manifest = {
@@ -1173,7 +1182,7 @@ def run(context: Context, args) -> Dict[str, Any]:
         }
         manifest_path = checkpoints_dir / "two_tower_serving_manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-        context.tracker.log_file_artifact("two_tower_serving_manifest", manifest_path)
+        _log_serving_manifest_artifact(context, manifest_path, logger)
 
     # Full per-pair prediction parquet writing is intentionally disabled for now.
     # The bucketed path would produce one row per user-candidate pair, which can

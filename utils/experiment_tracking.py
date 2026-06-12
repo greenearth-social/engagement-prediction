@@ -209,7 +209,7 @@ class ClearMLExperimentTracker:
         from clearml import OutputModel
         p = Path(path)
         if not p.exists():
-            return
+            return None
         
         # create the OutputModel and upload the file as its weights/artifact
         
@@ -231,7 +231,7 @@ class ClearMLExperimentTracker:
 
         return {
             "model_id": om.id,
-            "uri": uri
+            "uri": uri or ""
         }
 
     def log_file_artifact(self, name: str, path: Path) -> Any:
