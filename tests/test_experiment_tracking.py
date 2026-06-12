@@ -50,23 +50,7 @@ def test_log_file_artifact_uploads_path_to_clearml_task(tmp_path):
     tracker = ClearMLExperimentTracker.__new__(ClearMLExperimentTracker)
     tracker._task = _FakeTask()
 
-    metadata = tracker.log_file_artifact("author_idx_mapping", artifact_path)
-    artifact_id = metadata["artifact_id"]
+    result = tracker.log_file_artifact("author_idx_mapping", artifact_path)
 
-    # assert artifact_id == "artifact-id"
-    assert tracker._task.uploads == [("author_idx_mapping", str(artifact_path), False)]
-
-
-def test_log_file_artifact_with_metadata_returns_clearml_artifact_uri(tmp_path):
-    artifact_path = tmp_path / "author_idx.parquet"
-    artifact_path.write_bytes(b"parquet")
-    tracker = ClearMLExperimentTracker.__new__(ClearMLExperimentTracker)
-    tracker._task = _FakeTask()
-
-    result = tracker.log_file_artifact_with_metadata("author_idx_mapping", artifact_path)
-
-    assert result == {
-        "artifact_id": "author_idx_mapping",
-        "uri": "gs://bucket/author_idx_mapping.parquet",
-    }
+    assert result == "gs://bucket/author_idx_mapping.parquet"
     assert tracker._task.uploads == [("author_idx_mapping", str(artifact_path), True)]
