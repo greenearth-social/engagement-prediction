@@ -11,7 +11,10 @@ from utils.dataloaders import (
     AUTHOR_UNK_IDX,
     BucketedBatchSampler,
     BucketedEngagementDataset,
+    RankerPairBatchSampler,
+    RankerPairDataset,
     create_bucketed_data_loaders,
+    create_ranker_pair_data_loaders,
     get_author_table_num_rows,
 )
 
@@ -32,6 +35,15 @@ def mock_likes_core_df():
         "did": ["u1", "u2", "u1", "u1", "u3", "u4", "u5"],
         "subject_uri": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
         "split": ["train", "train", "train", "train", "train", "val", "val_unseen_users"],
+        "record_created_at": [
+            datetime(2024, 1, 1, 10, 15, tzinfo=timezone.utc),
+            datetime(2024, 1, 1, 10, 30, tzinfo=timezone.utc),
+            datetime(2024, 1, 1, 10, 45, tzinfo=timezone.utc),
+            datetime(2024, 1, 1, 11, 10, tzinfo=timezone.utc),
+            datetime(2024, 1, 1, 12, 5, tzinfo=timezone.utc),
+            datetime(2024, 1, 1, 13, 20, tzinfo=timezone.utc),
+            datetime(2024, 1, 1, 13, 40, tzinfo=timezone.utc),
+        ],
         "like_hour_bucket": [_dt(10), _dt(10), _dt(10), _dt(11), _dt(12), _dt(13), _dt(13)],
         "emb_idx": [0, 1, 2, 3, 4, 5, 6],
         "author_idx": pl.Series([2, 3, 4, None, 2, 2, 4], dtype=pl.UInt32),
@@ -56,6 +68,7 @@ def mock_history_df():
         "did": ["u1", "u2", "u1", "u3", "u4", "u5"],
         "like_hour_bucket": [_dt(10), _dt(10), _dt(11), _dt(12), _dt(13), _dt(13)],
         "prior_emb_indices": [[5, 6, 7], [], [8], [], [9], [10]],
+        "prior_like_age_hours_at_bucket_start": [[1.0, 2.0, 3.0], [], [0.25], [], [4.0], [5.0]],
         "prior_author_indices": [[2, None, 4], [], [3], [], [2], [4]],
     })
 
@@ -70,6 +83,20 @@ def bucketed_dataset(mock_embeddings_mmap, mock_likes_core_df, mock_posts_core_d
         split="train",
         max_history_len=3,
         embed_dim=4,
+    )
+
+
+@pytest.fixture
+def ranker_pair_dataset(mock_embeddings_mmap, mock_likes_core_df, mock_posts_core_df, mock_history_df):
+    return RankerPairDataset(
+        embeddings_mmap=mock_embeddings_mmap,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
+        history_df=mock_history_df,
+        split="train",
+        max_history_len=3,
+        embed_dim=4,
+        seed=3,
     )
 
 
@@ -233,3 +260,218 @@ def test_create_bucketed_data_loaders_returns_iterable_loaders(
     assert holdout_loader is None
     batch = next(iter(train_loader))
     assert {"history_embeddings", "history_mask", "candidate_post_embeddings", "label_matrix"} <= set(batch)
+
+
+def test_ranker_pair_dataset_keeps_one_row_per_positive_with_same_hour_negatives(ranker_pair_dataset):
+    assert len(ranker_pair_dataset) == 4
+    assert ranker_pair_dataset.user_ids == ["u1", "u2", "u1", "u1"]
+    assert ranker_pair_dataset.positive_post_ids == ["p1", "p2", "p3", "p4"]
+    assert ranker_pair_dataset.like_hour_buckets == [_dt(10), _dt(10), _dt(10), _dt(11)]
+
+
+def test_ranker_pair_collate_returns_two_candidates_per_positive(ranker_pair_dataset):
+    batch = ranker_pair_dataset.collate_batch([ranker_pair_dataset[0], ranker_pair_dataset[3]])
+
+    assert batch["user_id"] == ["u1", "u1"]
+    assert batch["bucket"] == [_dt(10), _dt(11)]
+    assert batch["candidate_post_id"][0][0] == "p1"
+    assert batch["candidate_post_id"][1] == ["p4", "n2"]
+    assert batch["history_embeddings"].shape == (2, 3, 4)
+    assert batch["history_mask"].tolist() == [[True, True, True], [True, False, False]]
+    np.testing.assert_allclose(
+        batch["history_time_deltas_hours"].numpy(),
+        np.array([
+            [1.25, 2.25, 3.25],
+            [5.0 / 12.0, 0.0, 0.0],
+        ], dtype=np.float32),
+        rtol=0,
+        atol=1e-6,
+    )
+    assert batch["candidate_post_embeddings"].shape == (2, 2, 4)
+    assert batch["candidate_labels"].tolist() == [[1.0, 0.0], [1.0, 0.0]]
+
+
+def test_ranker_pair_negatives_match_hour_split_and_exclude_same_hour_user_likes(
+    ranker_pair_dataset,
+    mock_likes_core_df,
+    mock_posts_core_df,
+):
+    batch = ranker_pair_dataset.collate_batch([ranker_pair_dataset[idx] for idx in range(len(ranker_pair_dataset))])
+    posts_by_id = {
+        row["at_uri"]: row
+        for row in mock_posts_core_df.iter_rows(named=True)
+    }
+    liked_by_user_hour = {}
+    for row in mock_likes_core_df.iter_rows(named=True):
+        liked_by_user_hour.setdefault((row["did"], row["like_hour_bucket"]), set()).add(row["subject_uri"])
+
+    for user_id, bucket, candidate_ids in zip(batch["user_id"], batch["bucket"], batch["candidate_post_id"]):
+        negative_id = candidate_ids[1]
+        negative_row = posts_by_id[negative_id]
+        assert negative_row["negative_hour_bucket"] == bucket
+        assert negative_row["split_window"] == "train"
+        assert negative_id not in liked_by_user_hour[(user_id, bucket)]
+
+
+def test_ranker_pair_allows_different_hour_likes_as_negatives(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_history_df,
+):
+    posts_core_df = pl.DataFrame({
+        "at_uri": ["p4", "n2"],
+        "in_random_sample": [True, True],
+        "negative_hour_bucket": [_dt(10), _dt(11)],
+        "split_window": ["train", "train"],
+        "emb_idx": [3, 21],
+        "author_idx": pl.Series([None, 2], dtype=pl.UInt32),
+    })
+    dataset = RankerPairDataset(
+        embeddings_mmap=mock_embeddings_mmap,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=posts_core_df,
+        history_df=mock_history_df,
+        split="train",
+        max_history_len=3,
+        embed_dim=4,
+        seed=0,
+    )
+
+    batch = dataset.collate_batch([dataset[0]])
+
+    assert dataset.user_ids[:3] == ["u1", "u2", "u1"]
+    assert dataset.like_hour_buckets[:3] == [_dt(10), _dt(10), _dt(10)]
+    assert batch["candidate_post_id"][0] == ["p1", "p4"]
+
+
+def test_ranker_pair_sampler_advances_epoch_for_training_resampling(ranker_pair_dataset):
+    sampler = RankerPairBatchSampler(
+        dataset=ranker_pair_dataset,
+        batch_size=2,
+        shuffle=False,
+        drop_last=False,
+        seed=0,
+        resample_each_epoch=True,
+    )
+
+    first_epoch_batches = list(sampler)
+    second_epoch_batches = list(sampler)
+
+    assert first_epoch_batches == [[(0, 0), (1, 0)], [(2, 0), (3, 0)]]
+    assert second_epoch_batches == [[(0, 1), (1, 1)], [(2, 1), (3, 1)]]
+    sampled_negatives = [
+        ranker_pair_dataset.collate_batch([{"row_idx": 1, "epoch": epoch}])["candidate_post_id"][0][1]
+        for epoch in range(8)
+    ]
+    assert len(set(sampled_negatives)) > 1
+    assert sampled_negatives == [
+        ranker_pair_dataset.collate_batch([{"row_idx": 1, "epoch": epoch}])["candidate_post_id"][0][1]
+        for epoch in range(8)
+    ]
+
+
+def test_ranker_pair_validation_loader_keeps_fixed_epoch_negatives(
+    ranker_pair_dataset,
+):
+    _, val_loader, _, _ = create_ranker_pair_data_loaders(
+        train_dataset=ranker_pair_dataset,
+        val_dataset=ranker_pair_dataset,
+        val_unseen_dataset=ranker_pair_dataset,
+        batch_size=len(ranker_pair_dataset),
+        num_workers=0,
+        pin_memory=False,
+        persistent_workers=True,
+        prefetch_factor=2,
+        seed=0,
+    )
+
+    first = next(iter(val_loader))
+    second = next(iter(val_loader))
+
+    assert first["candidate_post_id"] == second["candidate_post_id"]
+
+
+def test_ranker_pair_collate_returns_author_tensors_when_enabled(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_history_df,
+):
+    posts_core_df = pl.DataFrame({
+        "at_uri": ["n_null_author"],
+        "in_random_sample": [True],
+        "negative_hour_bucket": [_dt(10)],
+        "split_window": ["train"],
+        "emb_idx": [20],
+        "author_idx": pl.Series([None], dtype=pl.UInt32),
+    })
+    dataset = RankerPairDataset(
+        embeddings_mmap=mock_embeddings_mmap,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=posts_core_df,
+        history_df=mock_history_df,
+        split="train",
+        max_history_len=4,
+        embed_dim=4,
+        seed=0,
+        use_author_embedding_table=True,
+    )
+
+    batch = dataset.collate_batch([dataset[0]])
+
+    assert batch["history_author_indices"].shape == (1, 4)
+    assert batch["history_author_indices"][0].tolist() == [2, AUTHOR_UNK_IDX, 4, AUTHOR_PAD_IDX]
+    np.testing.assert_allclose(
+        batch["history_time_deltas_hours"].numpy(),
+        np.array([[1.25, 2.25, 3.25, 0.0]], dtype=np.float32),
+        rtol=0,
+        atol=1e-6,
+    )
+    assert batch["candidate_post_author_idx"].tolist() == [[2, AUTHOR_UNK_IDX]]
+
+
+def test_create_ranker_pair_data_loaders_returns_iterable_loaders(
+    ranker_pair_dataset,
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+):
+    val_dataset = RankerPairDataset(
+        embeddings_mmap=mock_embeddings_mmap,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
+        history_df=mock_history_df,
+        split="val",
+        max_history_len=3,
+        embed_dim=4,
+        seed=0,
+    )
+    val_unseen_dataset = RankerPairDataset(
+        embeddings_mmap=mock_embeddings_mmap,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
+        history_df=mock_history_df,
+        split="val_unseen_users",
+        max_history_len=3,
+        embed_dim=4,
+        seed=0,
+    )
+
+    train_loader, val_loader, val_unseen_loader, holdout_loader = create_ranker_pair_data_loaders(
+        train_dataset=ranker_pair_dataset,
+        val_dataset=val_dataset,
+        val_unseen_dataset=val_unseen_dataset,
+        batch_size=2,
+        num_workers=0,
+        pin_memory=False,
+        persistent_workers=True,
+        prefetch_factor=2,
+        seed=0,
+    )
+
+    assert isinstance(train_loader, DataLoader)
+    assert isinstance(val_loader, DataLoader)
+    assert isinstance(val_unseen_loader, DataLoader)
+    assert holdout_loader is None
+    batch = next(iter(train_loader))
+    assert {"history_embeddings", "history_mask", "history_time_deltas_hours", "candidate_post_embeddings", "candidate_labels"} <= set(batch)
