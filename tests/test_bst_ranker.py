@@ -4,13 +4,18 @@ import importlib
 import pytest
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
 
 
 stage_train_bst_ranker = importlib.import_module("utils.03_train.stage_train_bst_ranker")
 BSTRanker = stage_train_bst_ranker.BSTRanker
 DEFAULT_TIME_DELTA_BUCKET_BOUNDARIES_HOURS = stage_train_bst_ranker.DEFAULT_TIME_DELTA_BUCKET_BOUNDARIES_HOURS
 LinearPredictionHead = stage_train_bst_ranker.LinearPredictionHead
+_compute_bst_loss_and_preds = stage_train_bst_ranker._compute_bst_loss_and_preds
+_flatten_ranker_pair_batch = stage_train_bst_ranker._flatten_ranker_pair_batch
 bucketize_time_deltas_hours = stage_train_bst_ranker.bucketize_time_deltas_hours
+run_bst_epoch = stage_train_bst_ranker.run_bst_epoch
+train_bst_ranker_model = stage_train_bst_ranker.train_bst_ranker_model
 
 
 def _make_model(
@@ -76,6 +81,37 @@ def _batch() -> dict[str, torch.Tensor]:
         ),
         "candidate_post_author_idx": torch.tensor([5, 6], dtype=torch.long),
     }
+
+
+def _ranker_pair_batch() -> dict[str, torch.Tensor]:
+    base = _batch()
+    candidate_post_embeddings = torch.stack(
+        [
+            base["candidate_post_embeddings"],
+            torch.flip(base["candidate_post_embeddings"], dims=[0]),
+        ],
+        dim=1,
+    )
+    return {
+        "history_embeddings": base["history_embeddings"],
+        "history_mask": base["history_mask"],
+        "history_time_deltas_hours": base["history_time_deltas_hours"],
+        "candidate_post_embeddings": candidate_post_embeddings,
+        "candidate_labels": torch.tensor([[1.0, 0.0], [1.0, 0.0]], dtype=torch.float32),
+        "history_author_indices": base["history_author_indices"],
+        "candidate_post_author_idx": torch.tensor([[5, 6], [6, 5]], dtype=torch.long),
+    }
+
+
+class _SingleBatchDataset(Dataset):
+    def __init__(self, batch: dict[str, torch.Tensor]) -> None:
+        self.batch = batch
+
+    def __len__(self) -> int:
+        return 1
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        return self.batch
 
 
 def test_bst_ranker_forward_transformer_shape_and_builtin_transformer_encoder():
@@ -239,3 +275,92 @@ def test_bst_ranker_rejects_invalid_prediction_head_output_shape():
 
     with pytest.raises(RuntimeError, match="prediction_head"):
         model(**batch)
+
+
+def test_flatten_ranker_pair_batch_repeats_history_and_flattens_candidates():
+    batch = _ranker_pair_batch()
+
+    flattened = _flatten_ranker_pair_batch(batch, "cpu")
+
+    assert flattened["history_embeddings"].shape == (4, 3, 4)
+    assert flattened["history_mask"].shape == (4, 3)
+    assert flattened["history_time_deltas_hours"].shape == (4, 3)
+    assert flattened["candidate_post_embeddings"].shape == (4, 4)
+    assert flattened["history_author_indices"].shape == (4, 3)
+    assert flattened["candidate_post_author_idx"].tolist() == [5, 6, 6, 5]
+    assert flattened["labels"].tolist() == [1.0, 0.0, 1.0, 0.0]
+    torch.testing.assert_close(flattened["history_embeddings"][0], batch["history_embeddings"][0])
+    torch.testing.assert_close(flattened["history_embeddings"][1], batch["history_embeddings"][0])
+    torch.testing.assert_close(flattened["history_embeddings"][2], batch["history_embeddings"][1])
+    torch.testing.assert_close(flattened["candidate_post_embeddings"][0], batch["candidate_post_embeddings"][0, 0])
+    torch.testing.assert_close(flattened["candidate_post_embeddings"][1], batch["candidate_post_embeddings"][0, 1])
+
+
+def test_compute_bst_loss_and_preds_returns_scalar_loss_logits_and_labels():
+    model = _make_model()
+    batch = _ranker_pair_batch()
+
+    loss, logits, labels = _compute_bst_loss_and_preds(model, batch, "cpu")
+
+    assert loss.shape == ()
+    assert torch.isfinite(loss)
+    assert logits.shape == (4,)
+    assert labels.shape == (4,)
+    assert labels.tolist() == [1.0, 0.0, 1.0, 0.0]
+
+
+def test_run_bst_epoch_computes_auc_roc_and_average_precision():
+    model = _make_model()
+    model.eval()
+    loader = DataLoader(_SingleBatchDataset(_ranker_pair_batch()), batch_size=None, shuffle=False)
+
+    loss, metrics = run_bst_epoch(
+        train=False,
+        split_name="Validation",
+        model=model,
+        device="cpu",
+        dataloader=loader,
+        optimizer=None,
+        disable_progress=True,
+        gradient_clip_max_norm=1.0,
+    )
+
+    assert loss >= 0.0
+    assert metrics["classification_metric_pair_count"] == 4
+    assert metrics["classification_metric_positive_count"] == 2
+    assert metrics["auc_roc"] is not None
+    assert metrics["average_precision"] is not None
+
+
+def test_train_bst_ranker_model_uses_val_unseen_auc_for_primary_metric_and_checkpoint(tmp_path):
+    torch.manual_seed(0)
+    model = _make_model()
+    loader = DataLoader(_SingleBatchDataset(_ranker_pair_batch()), batch_size=None, shuffle=False)
+
+    results = train_bst_ranker_model(
+        model=model,
+        train_loader=loader,
+        val_loader=loader,
+        val_unseen_loader=loader,
+        device="cpu",
+        epochs=2,
+        learning_rate=1e-3,
+        weight_decay=0.0,
+        patience=10,
+        early_stopping_min_delta=0.0,
+        checkpoints_dir=tmp_path,
+        disable_progress=True,
+        lr_scheduler_factor=0.5,
+        lr_scheduler_patience=2,
+        gradient_clip_max_norm=1.0,
+    )
+
+    assert results["primary_metric_name"] == "val_unseen_auc_roc"
+    assert len(results["history"]["train_auc_roc"]) == 2
+    assert len(results["history"]["val_auc_roc"]) == 2
+    assert len(results["history"]["val_unseen_auc_roc"]) == 2
+    assert len(results["history"]["train_average_precision"]) == 2
+    assert len(results["history"]["val_average_precision"]) == 2
+    assert len(results["history"]["val_unseen_average_precision"]) == 2
+    assert results["best_val_metric"] == max(results["history"]["val_unseen_auc_roc"])
+    assert (tmp_path / "bst_ranker_best.pth").exists()
