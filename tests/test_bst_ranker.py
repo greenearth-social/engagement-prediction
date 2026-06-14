@@ -9,13 +9,14 @@ from torch.utils.data import DataLoader, Dataset
 
 stage_train_bst_ranker = importlib.import_module("utils.03_train.stage_train_bst_ranker")
 BSTRanker = stage_train_bst_ranker.BSTRanker
-DEFAULT_TIME_DELTA_BUCKET_BOUNDARIES_HOURS = stage_train_bst_ranker.DEFAULT_TIME_DELTA_BUCKET_BOUNDARIES_HOURS
 LinearPredictionHead = stage_train_bst_ranker.LinearPredictionHead
 _compute_bst_loss_and_preds = stage_train_bst_ranker._compute_bst_loss_and_preds
 _flatten_ranker_pair_batch = stage_train_bst_ranker._flatten_ranker_pair_batch
 bucketize_time_deltas_hours = stage_train_bst_ranker.bucketize_time_deltas_hours
 run_bst_epoch = stage_train_bst_ranker.run_bst_epoch
 train_bst_ranker_model = stage_train_bst_ranker.train_bst_ranker_model
+
+DEFAULT_TIME_DELTA_BUCKET_BOUNDARIES_HOURS = [1.0, 3.0, 6.0, 12.0, 24.0, 72.0, 168.0, 720.0, 2160.0]
 
 
 def _make_model(
@@ -173,7 +174,7 @@ def test_bst_ranker_rejects_attention_head_mismatch():
 def test_bucketize_time_deltas_hours_reserves_zero_and_clips_tail():
     deltas = torch.tensor([-2.0, 0.0, 0.5, 1.0, 1.1, 3.0, 2160.0, 2161.0])
 
-    bucket_ids = bucketize_time_deltas_hours(deltas)
+    bucket_ids = bucketize_time_deltas_hours(deltas, DEFAULT_TIME_DELTA_BUCKET_BOUNDARIES_HOURS)
 
     assert bucket_ids.dtype == torch.long
     assert bucket_ids.tolist() == [0, 0, 1, 1, 2, 2, 9, 10]
@@ -221,7 +222,7 @@ def test_bst_ranker_supports_candidate_only_sequence_with_zero_delta_bucket():
         candidate_post_author_idx=torch.tensor([5, 6], dtype=torch.long),
     )
 
-    assert bucketize_time_deltas_hours(candidate_deltas).tolist() == [[0], [0]]
+    assert bucketize_time_deltas_hours(candidate_deltas, DEFAULT_TIME_DELTA_BUCKET_BOUNDARIES_HOURS).tolist() == [[0], [0]]
     assert output.shape == (2,)
 
 

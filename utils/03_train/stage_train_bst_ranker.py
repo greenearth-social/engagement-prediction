@@ -39,7 +39,6 @@ from utils.matrix_ranking import stage_info_metric_lines
 from utils.pipeline.core import Context
 
 
-DEFAULT_TIME_DELTA_BUCKET_BOUNDARIES_HOURS = (1.0, 3.0, 6.0, 12.0, 24.0, 72.0, 168.0, 720.0, 2160.0)
 STAGE_LOG_NAME = "STAGE_03_TRAIN_BST_RANKER"
 
 
@@ -59,7 +58,7 @@ def _validate_time_delta_bucket_boundaries(boundaries_hours: Sequence[float]) ->
 
 def bucketize_time_deltas_hours(
     time_deltas_hours: torch.Tensor,
-    boundaries_hours: Sequence[float] = DEFAULT_TIME_DELTA_BUCKET_BOUNDARIES_HOURS,
+    boundaries_hours: Sequence[float],
 ) -> torch.Tensor:
     """Map raw hour deltas to embedding-table bucket IDs."""
     boundaries = _validate_time_delta_bucket_boundaries(boundaries_hours)
@@ -711,10 +710,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     dropout_rate = float(args.bst_dropout_rate)
     norm_first = bool(args.bst_norm_first)
     time_delta_bucket_boundaries_hours = tuple(float(v) for v in args.bst_time_delta_bucket_boundaries_hours)
+    if args.bst_prediction_hidden_dims is None:
+        raise ValueError("bst_prediction_hidden_dims is required for BST ranker training")
     prediction_hidden_dims = tuple(int(v) for v in args.bst_prediction_hidden_dims)
-    use_author_embedding_table = bool(args.bst_use_author_embedding_table)
-    author_embedding_dim = int(args.bst_author_embedding_dim)
-    author_unknown_dropout_rate = float(args.bst_author_unknown_dropout_rate)
+    use_author_embedding_table = bool(args.use_author_embedding_table)
+    author_embedding_dim = int(args.author_embedding_dim)
+    author_unknown_dropout_rate = float(args.author_unknown_dropout_rate)
     batch_size = int(args.batch_size)
     learning_rate = float(args.learning_rate)
     weight_decay = float(args.bst_weight_decay)
@@ -729,10 +730,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     gradient_clip_max_norm = float(args.gradient_clip_max_norm)
 
     if not use_author_embedding_table:
-        raise ValueError("BST ranker v1 requires bst_use_author_embedding_table=True")
+        raise ValueError("BST ranker v1 requires use_author_embedding_table=True")
     if author_idx_mapping_df is None:
         raise FileNotFoundError(
-            "author_idx artifact was not found in 01_get_data output, but bst_use_author_embedding_table was enabled."
+            "author_idx artifact was not found in 01_get_data output, but use_author_embedding_table was enabled."
         )
     author_table_num_rows = get_author_table_num_rows(author_idx_mapping_df)
     logger.info(
@@ -893,7 +894,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     logger.info(f"Validation unseen users metrics: {val_unseen_metrics}")
 
     config = {
-        "model_type": "bst_ranker",
+        "model_type": "bst-ranker",
         "post_embedding_dim": embed_dim,
         "model_dim": model_dim,
         "time_embedding_dim": time_embedding_dim,

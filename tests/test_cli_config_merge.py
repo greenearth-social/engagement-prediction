@@ -160,6 +160,128 @@ def test_mlp_allows_author_embedding_table():
     assert merged.model_type == "mlp"
 
 
+def test_bst_ranker_model_type_maps_train_alias():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "bst-ranker",
+        "--start-from", "train",
+        "--stop-after", "train",
+        "--use-author-embedding-table",
+        "--bst-prediction-hidden-dims", "144", "72",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    train_key = cli._get_train_key(merged.model_type)
+    stage_order = cli._get_stage_order_for_model_type(train_key)
+    start_idx, stop_idx, includes_train = cli._get_stage_folder_and_start_stop_indices(
+        stage_order,
+        merged.start_from,
+        merged.stop_after,
+        train_key,
+    )
+
+    assert train_key == "train_bst_ranker"
+    assert stage_order[start_idx] == "train_bst_ranker"
+    assert stage_order[stop_idx] == "train_bst_ranker"
+    assert includes_train is True
+    assert merged.bst_num_transformer_layers == 1
+
+
+def test_bst_ranker_explicit_train_stage_names_parse():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "bst-ranker",
+        "--start-from", "train_bst_ranker",
+        "--stop-after", "train_bst_ranker",
+        "--use-author-embedding-table",
+        "--bst-prediction-hidden-dims", "144", "72",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.start_from == "train_bst_ranker"
+    assert merged.stop_after == "train_bst_ranker"
+
+
+def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
+    config_path = Path(tmp_path) / "bst.yml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            model_type: bst-ranker
+            use_author_embedding_table: true
+            bst_model_dim: 96
+            bst_time_embedding_dim: 32
+            bst_num_attention_heads: 8
+            bst_num_transformer_layers: 1
+            bst_transformer_ff_dim: 384
+            bst_dropout_rate: 0.2
+            bst_norm_first: true
+            bst_time_delta_bucket_boundaries_hours: [1, 2, 4]
+            bst_prediction_hidden_dims: [128, 64]
+            bst_weight_decay: 0.02
+            """
+        ).strip()
+        + "\n"
+    )
+
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--config", str(config_path)])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.model_type == "bst-ranker"
+    assert merged.bst_model_dim == 96
+    assert merged.bst_time_embedding_dim == 32
+    assert merged.bst_num_attention_heads == 8
+    assert merged.bst_prediction_hidden_dims == [128, 64]
+    cli._validate_bst_config(merged)
+
+
+def test_bst_ranker_requires_author_embedding_table():
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--model-type", "bst-ranker", "--bst-prediction-hidden-dims", "144", "72"])
+    merged = cli._merge_args_with_config(raw)
+
+    with pytest.raises(ValueError, match="use-author-embedding-table"):
+        cli._validate_bst_config(merged)
+
+
+def test_bst_ranker_requires_prediction_hidden_dims():
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--model-type", "bst-ranker", "--use-author-embedding-table"])
+    merged = cli._merge_args_with_config(raw)
+    merged.bst_prediction_hidden_dims = None
+
+    with pytest.raises(ValueError, match="bst-prediction-hidden-dims"):
+        cli._validate_bst_config(merged)
+
+
+def test_bst_ranker_accepts_explicit_empty_prediction_hidden_dims():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "bst-ranker",
+        "--use-author-embedding-table",
+        "--bst-prediction-hidden-dims",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.bst_prediction_hidden_dims == []
+    cli._validate_bst_config(merged)
+
+
+def test_bst_ranker_validates_transformer_head_divisibility():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "bst-ranker",
+        "--use-author-embedding-table",
+        "--bst-time-embedding-dim", "15",
+        "--bst-prediction-hidden-dims", "144", "72",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    with pytest.raises(ValueError, match="divisible"):
+        cli._validate_bst_config(merged)
+
+
 def test_min_author_support_must_be_positive_even_without_author_table(tmp_path):
     parser = cli.build_parser()
     raw = parser.parse_args(["--min-author-support", "0", "--stop-after", "get_data"])
