@@ -1298,10 +1298,10 @@ class RankerPairDataset(Dataset):
         self.positive_like_timestamps: List[Any] = []
         self.positive_post_ids: List[str] = []
         self.positive_post_emb_indices: List[int] = []
-        self.prior_emb_indices: List[np.ndarray] = []
-        self.prior_like_age_hours_at_bucket_start: List[np.ndarray] = []
+        self.prior_emb_indices: List[Any] = []
+        self.prior_like_age_hours_at_bucket_start: List[Any] = []
         self.positive_post_author_indices: Optional[List[int]] = [] if self.use_author_embedding_table else None
-        self.prior_author_indices: Optional[List[np.ndarray]] = [] if self.use_author_embedding_table else None
+        self.prior_author_indices: Optional[List[Any]] = [] if self.use_author_embedding_table else None
 
         dropped_no_negative = 0
         for row in joined.iter_rows(named=True):
@@ -1316,13 +1316,13 @@ class RankerPairDataset(Dataset):
             self.positive_like_timestamps.append(row[TIMESTAMP_COL_NAME])
             self.positive_post_ids.append(str(row["subject_uri"]))
             self.positive_post_emb_indices.append(int(row["emb_idx"]))
-            self.prior_emb_indices.append(_list_to_int_array(row.get("prior_emb_indices")))
-            self.prior_like_age_hours_at_bucket_start.append(_list_to_float_array(row.get("prior_like_age_hours_at_bucket_start")))
+            self.prior_emb_indices.append(row.get("prior_emb_indices"))
+            self.prior_like_age_hours_at_bucket_start.append(row.get("prior_like_age_hours_at_bucket_start"))
             if self.use_author_embedding_table:
                 if self.positive_post_author_indices is None or self.prior_author_indices is None:
                     raise ValueError("author index storage must be initialized when author embeddings are enabled")
                 self.positive_post_author_indices.append(_author_idx_or_unk(row.get("author_idx")))
-                self.prior_author_indices.append(_author_idx_list_to_table_rows(row.get("prior_author_indices")))
+                self.prior_author_indices.append(row.get("prior_author_indices"))
 
         if logger:
             logger.info(
@@ -1343,8 +1343,6 @@ class RankerPairDataset(Dataset):
         return {
             "row_idx": row_idx,
             "epoch": int(epoch),
-            "bucket": self.like_hour_buckets[row_idx],
-            "user_id": self.user_ids[row_idx],
         }
 
     def _has_usable_negative(self, user_id: str, bucket: Any) -> bool:
@@ -1372,7 +1370,7 @@ class RankerPairDataset(Dataset):
         raise ValueError("RankerPairDataset row has no usable same-hour negative")
 
     def _padded_history_for_row(self, row_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        hist_indices = self.prior_emb_indices[row_idx]
+        hist_indices = _list_to_int_array(self.prior_emb_indices[row_idx])
         hist_embeddings = self.embeddings[hist_indices]
         padded, mask = get_padded_embedding_history_and_mask(hist_embeddings, self.max_history_len, self.embed_dim)
         return torch.from_numpy(padded), torch.from_numpy(mask)
@@ -1380,7 +1378,7 @@ class RankerPairDataset(Dataset):
     def _padded_author_history_for_row(self, row_idx: int) -> torch.Tensor:
         if self.prior_author_indices is None:
             raise ValueError("prior_author_indices must be available when author embeddings are enabled")
-        mapped_author_indices = self.prior_author_indices[row_idx]
+        mapped_author_indices = _author_idx_list_to_table_rows(self.prior_author_indices[row_idx])
         padded = get_padded_author_indices(mapped_author_indices, self.max_history_len)
         return torch.from_numpy(padded)
 
@@ -1388,7 +1386,7 @@ class RankerPairDataset(Dataset):
         positive_offset_hours = (
             self.positive_like_timestamps[row_idx] - self.like_hour_buckets[row_idx]
         ).total_seconds() / 3600.0
-        deltas = self.prior_like_age_hours_at_bucket_start[row_idx] + np.float32(positive_offset_hours)
+        deltas = _list_to_float_array(self.prior_like_age_hours_at_bucket_start[row_idx]) + np.float32(positive_offset_hours)
         padded = get_padded_history_time_deltas(deltas, self.max_history_len)
         return torch.from_numpy(padded)
 
@@ -1401,10 +1399,7 @@ class RankerPairDataset(Dataset):
         time_delta_tensors = []
         candidate_embedding_tensors = []
         candidate_labels = []
-        candidate_post_ids = []
         candidate_author_indices = []
-        user_ids = []
-        buckets = []
 
         for item in items:
             row_idx = int(item["row_idx"])
@@ -1424,12 +1419,6 @@ class RankerPairDataset(Dataset):
                 np.array(self.embeddings[candidate_emb_indices], dtype=np.float32)
             ))
             candidate_labels.append([1.0, 0.0])
-            candidate_post_ids.append([
-                self.positive_post_ids[row_idx],
-                negative_post["post_id"],
-            ])
-            user_ids.append(self.user_ids[row_idx])
-            buckets.append(self.like_hour_buckets[row_idx])
 
             if self.use_author_embedding_table:
                 if self.positive_post_author_indices is None:
@@ -1445,9 +1434,6 @@ class RankerPairDataset(Dataset):
             "history_time_deltas_hours": torch.stack(time_delta_tensors, dim=0),
             "candidate_post_embeddings": torch.stack(candidate_embedding_tensors, dim=0),
             "candidate_labels": torch.tensor(candidate_labels, dtype=torch.float32),
-            "user_id": user_ids,
-            "candidate_post_id": candidate_post_ids,
-            "bucket": buckets,
         }
         if self.use_author_embedding_table:
             output["history_author_indices"] = torch.stack(

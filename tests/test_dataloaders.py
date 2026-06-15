@@ -272,10 +272,9 @@ def test_ranker_pair_dataset_keeps_one_row_per_positive_with_same_hour_negatives
 def test_ranker_pair_collate_returns_two_candidates_per_positive(ranker_pair_dataset):
     batch = ranker_pair_dataset.collate_batch([ranker_pair_dataset[0], ranker_pair_dataset[3]])
 
-    assert batch["user_id"] == ["u1", "u1"]
-    assert batch["bucket"] == [_dt(10), _dt(11)]
-    assert batch["candidate_post_id"][0][0] == "p1"
-    assert batch["candidate_post_id"][1] == ["p4", "n2"]
+    assert "user_id" not in batch
+    assert "bucket" not in batch
+    assert "candidate_post_id" not in batch
     assert batch["history_embeddings"].shape == (2, 3, 4)
     assert batch["history_mask"].tolist() == [[True, True, True], [True, False, False]]
     np.testing.assert_allclose(
@@ -288,6 +287,8 @@ def test_ranker_pair_collate_returns_two_candidates_per_positive(ranker_pair_dat
         atol=1e-6,
     )
     assert batch["candidate_post_embeddings"].shape == (2, 2, 4)
+    np.testing.assert_allclose(batch["candidate_post_embeddings"][0, 0].numpy(), ranker_pair_dataset.embeddings[0])
+    np.testing.assert_allclose(batch["candidate_post_embeddings"][1, 0].numpy(), ranker_pair_dataset.embeddings[3])
     assert batch["candidate_labels"].tolist() == [[1.0, 0.0], [1.0, 0.0]]
 
 
@@ -296,7 +297,6 @@ def test_ranker_pair_negatives_match_hour_split_and_exclude_same_hour_user_likes
     mock_likes_core_df,
     mock_posts_core_df,
 ):
-    batch = ranker_pair_dataset.collate_batch([ranker_pair_dataset[idx] for idx in range(len(ranker_pair_dataset))])
     posts_by_id = {
         row["at_uri"]: row
         for row in mock_posts_core_df.iter_rows(named=True)
@@ -305,8 +305,10 @@ def test_ranker_pair_negatives_match_hour_split_and_exclude_same_hour_user_likes
     for row in mock_likes_core_df.iter_rows(named=True):
         liked_by_user_hour.setdefault((row["did"], row["like_hour_bucket"]), set()).add(row["subject_uri"])
 
-    for user_id, bucket, candidate_ids in zip(batch["user_id"], batch["bucket"], batch["candidate_post_id"]):
-        negative_id = candidate_ids[1]
+    for row_idx in range(len(ranker_pair_dataset)):
+        user_id = ranker_pair_dataset.user_ids[row_idx]
+        bucket = ranker_pair_dataset.like_hour_buckets[row_idx]
+        negative_id = ranker_pair_dataset._sample_negative_for_row(row_idx, epoch=0)["post_id"]
         negative_row = posts_by_id[negative_id]
         assert negative_row["negative_hour_bucket"] == bucket
         assert negative_row["split_window"] == "train"
@@ -341,7 +343,8 @@ def test_ranker_pair_allows_different_hour_likes_as_negatives(
 
     assert dataset.user_ids[:3] == ["u1", "u2", "u1"]
     assert dataset.like_hour_buckets[:3] == [_dt(10), _dt(10), _dt(10)]
-    assert batch["candidate_post_id"][0] == ["p1", "p4"]
+    assert "candidate_post_id" not in batch
+    assert dataset._sample_negative_for_row(0, epoch=0)["post_id"] == "p4"
 
 
 def test_ranker_pair_sampler_advances_epoch_for_training_resampling(ranker_pair_dataset):
@@ -360,12 +363,12 @@ def test_ranker_pair_sampler_advances_epoch_for_training_resampling(ranker_pair_
     assert first_epoch_batches == [[(0, 0), (1, 0)], [(2, 0), (3, 0)]]
     assert second_epoch_batches == [[(0, 1), (1, 1)], [(2, 1), (3, 1)]]
     sampled_negatives = [
-        ranker_pair_dataset.collate_batch([{"row_idx": 1, "epoch": epoch}])["candidate_post_id"][0][1]
+        ranker_pair_dataset._sample_negative_for_row(1, epoch=epoch)["post_id"]
         for epoch in range(8)
     ]
     assert len(set(sampled_negatives)) > 1
     assert sampled_negatives == [
-        ranker_pair_dataset.collate_batch([{"row_idx": 1, "epoch": epoch}])["candidate_post_id"][0][1]
+        ranker_pair_dataset._sample_negative_for_row(1, epoch=epoch)["post_id"]
         for epoch in range(8)
     ]
 
@@ -388,7 +391,10 @@ def test_ranker_pair_validation_loader_keeps_fixed_epoch_negatives(
     first = next(iter(val_loader))
     second = next(iter(val_loader))
 
-    assert first["candidate_post_id"] == second["candidate_post_id"]
+    np.testing.assert_allclose(
+        first["candidate_post_embeddings"].numpy(),
+        second["candidate_post_embeddings"].numpy(),
+    )
 
 
 def test_ranker_pair_collate_returns_author_tensors_when_enabled(
