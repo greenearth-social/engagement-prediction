@@ -111,7 +111,7 @@ DEFAULTS: Dict[str, Any] = {
     "bst_dropout_rate": 0.1,
     "bst_norm_first": False,
     "bst_time_delta_bucket_boundaries_hours": [1.0, 3.0, 6.0, 12.0, 24.0, 72.0, 168.0, 720.0, 2160.0],
-    "bst_prediction_hidden_dims": [64, 32],
+    "bst_prediction_hidden_dims": [64, 32, 16],
     "bst_weight_decay": 0.01,
     "hidden_dims": [64, 32, 16],
     "dropout_rate_mlp": 0.5,
