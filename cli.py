@@ -113,6 +113,7 @@ DEFAULTS: Dict[str, Any] = {
     "bst_time_delta_bucket_boundaries_hours": [1.0, 3.0, 6.0, 12.0, 24.0, 72.0, 168.0, 720.0, 2160.0],
     "bst_prediction_hidden_dims": [64, 32, 16],
     "bst_weight_decay": 0.01,
+    "bst_use_auc_as_primary": False,
     "hidden_dims": [64, 32, 16],
     "dropout_rate_mlp": 0.5,
     "dropout_rate_two_tower": 0.1,
@@ -847,6 +848,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Required BST ranker prediction-head hidden dimensions. Use no values for a direct linear head")
     _add_arg_with_default(p_all, "--bst-weight-decay", type=float, default=argparse.SUPPRESS,
                           help_text="Weight decay for BST ranker model")
+    _add_arg_with_default(p_all, "--bst-use-auc-as-primary", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
+                          help_text="Use validation unseen AUC-ROC as the BST primary metric instead of validation unseen loss")
     # Stage 3 options (shared)
     _add_arg_with_default(p_all, "--epochs", type=int, default=argparse.SUPPRESS,
                           help_text="Training epochs")

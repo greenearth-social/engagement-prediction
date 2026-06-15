@@ -219,6 +219,7 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
             bst_time_delta_bucket_boundaries_hours: [1, 2, 4]
             bst_prediction_hidden_dims: [128, 64]
             bst_weight_decay: 0.02
+            bst_use_auc_as_primary: true
             """
         ).strip()
         + "\n"
@@ -233,7 +234,24 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
     assert merged.bst_time_embedding_dim == 32
     assert merged.bst_num_attention_heads == 8
     assert merged.bst_prediction_hidden_dims == [128, 64]
+    assert merged.bst_use_auc_as_primary is True
     cli._validate_bst_config(merged)
+
+
+def test_bst_ranker_auc_primary_flag_defaults_to_false():
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--model-type", "bst-ranker"])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.bst_use_auc_as_primary is False
+
+
+def test_bst_ranker_auc_primary_flag_can_be_enabled():
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--model-type", "bst-ranker", "--bst-use-auc-as-primary"])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.bst_use_auc_as_primary is True
 
 
 def test_bst_ranker_requires_author_embedding_table():

@@ -21,6 +21,7 @@ from tqdm import tqdm
 from shared.input_data_helpers import AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
 from utils.dataloaders import (
     RankerPairDataset,
+    build_ranker_pair_negative_pools_by_split_window,
     create_ranker_pair_data_loaders,
     get_author_table_num_rows,
     load_bucketed_training_data,
@@ -447,6 +448,7 @@ def run_bst_epoch(
     optimizer: Optional[torch.optim.Optimizer],
     disable_progress: bool,
     gradient_clip_max_norm: float,
+    compute_classification_metrics: bool = True,
 ) -> Tuple[float, Dict[str, Any]]:
     if train:
         if optimizer is None:
@@ -457,6 +459,8 @@ def run_bst_epoch(
 
     loss_sum = torch.zeros((), device=device)
     batches = 0
+    pair_count = 0
+    positive_count = 0
     label_chunks: List[torch.Tensor] = []
     logit_chunks: List[torch.Tensor] = []
 
@@ -474,20 +478,29 @@ def run_bst_epoch(
 
             loss_sum += loss.detach()
             batches += 1
-            label_chunks.append(labels.detach().cpu())
-            logit_chunks.append(logits.detach().cpu())
+            if compute_classification_metrics:
+                label_chunks.append(labels.detach().cpu())
+                logit_chunks.append(logits.detach().cpu())
+            else:
+                pair_count += int(labels.numel())
+                positive_count += int(labels.detach().sum().item())
 
     loss = (loss_sum / max(batches, 1)).item()
-    if label_chunks:
+    if compute_classification_metrics and label_chunks:
         all_labels = torch.cat(label_chunks)
         all_logits = torch.cat(logit_chunks)
         metrics = _classification_metrics_from_logits(all_labels, all_logits)
-    else:
+    elif compute_classification_metrics:
         metrics = {
             "classification_metric_pair_count": 0,
             "classification_metric_positive_count": 0,
             "auc_roc": None,
             "average_precision": None,
+        }
+    else:
+        metrics = {
+            "classification_metric_pair_count": pair_count,
+            "classification_metric_positive_count": positive_count,
         }
     metrics["loss"] = loss
     return loss, metrics
@@ -541,28 +554,33 @@ def train_bst_ranker_model(
     lr_scheduler_factor: float,
     lr_scheduler_patience: int,
     gradient_clip_max_norm: float,
+    bst_use_auc_as_primary: bool = False,
     experiment_tracker: Optional[Any] = None,
 ) -> Dict[str, Any]:
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    scheduler_mode = "max" if bst_use_auc_as_primary else "min"
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=lr_scheduler_factor, patience=lr_scheduler_patience
+        optimizer, mode=scheduler_mode, factor=lr_scheduler_factor, patience=lr_scheduler_patience
     )
 
-    primary_metric_name = "val_unseen_auc_roc"
+    primary_metric_name = "val_unseen_auc_roc" if bst_use_auc_as_primary else "val_unseen_loss"
     history: Dict[str, List[float]] = {
         "train_loss": [],
         "val_loss": [],
         "val_unseen_loss": [],
-        "train_auc_roc": [],
-        "val_auc_roc": [],
-        "val_unseen_auc_roc": [],
-        "train_average_precision": [],
-        "val_average_precision": [],
-        "val_unseen_average_precision": [],
     }
-    best_val_metric = float("-inf")
-    best_reset_val_metric = float("-inf")
+    if bst_use_auc_as_primary:
+        history.update({
+            "train_auc_roc": [],
+            "val_auc_roc": [],
+            "val_unseen_auc_roc": [],
+            "train_average_precision": [],
+            "val_average_precision": [],
+            "val_unseen_average_precision": [],
+        })
+    best_val_metric = float("-inf") if bst_use_auc_as_primary else float("inf")
+    best_reset_val_metric = float("-inf") if bst_use_auc_as_primary else float("inf")
     best_val_loss = float("inf")
     patience_counter = 0
     best_state_dict = None
@@ -577,6 +595,7 @@ def train_bst_ranker_model(
             optimizer=optimizer,
             disable_progress=disable_progress,
             gradient_clip_max_norm=gradient_clip_max_norm,
+            compute_classification_metrics=bst_use_auc_as_primary,
         )
         val_loss, val_metrics = run_bst_epoch(
             train=False,
@@ -587,6 +606,7 @@ def train_bst_ranker_model(
             optimizer=None,
             disable_progress=disable_progress,
             gradient_clip_max_norm=gradient_clip_max_norm,
+            compute_classification_metrics=bst_use_auc_as_primary,
         )
         val_unseen_loss, val_unseen_metrics = run_bst_epoch(
             train=False,
@@ -597,24 +617,25 @@ def train_bst_ranker_model(
             optimizer=None,
             disable_progress=disable_progress,
             gradient_clip_max_norm=gradient_clip_max_norm,
+            compute_classification_metrics=bst_use_auc_as_primary,
         )
-
-        train_auc = train_metrics.get("auc_roc")
-        val_auc = val_metrics.get("auc_roc")
-        val_unseen_auc = val_unseen_metrics.get("auc_roc")
-        train_ap = train_metrics.get("average_precision")
-        val_ap = val_metrics.get("average_precision")
-        val_unseen_ap = val_unseen_metrics.get("average_precision")
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["val_unseen_loss"].append(val_unseen_loss)
-        history["train_auc_roc"].append(float(train_auc) if train_auc is not None else float("nan"))
-        history["val_auc_roc"].append(float(val_auc) if val_auc is not None else float("nan"))
-        history["val_unseen_auc_roc"].append(float(val_unseen_auc) if val_unseen_auc is not None else float("nan"))
-        history["train_average_precision"].append(float(train_ap) if train_ap is not None else float("nan"))
-        history["val_average_precision"].append(float(val_ap) if val_ap is not None else float("nan"))
-        history["val_unseen_average_precision"].append(float(val_unseen_ap) if val_unseen_ap is not None else float("nan"))
+        if bst_use_auc_as_primary:
+            train_auc = train_metrics.get("auc_roc")
+            val_auc = val_metrics.get("auc_roc")
+            val_unseen_auc = val_unseen_metrics.get("auc_roc")
+            train_ap = train_metrics.get("average_precision")
+            val_ap = val_metrics.get("average_precision")
+            val_unseen_ap = val_unseen_metrics.get("average_precision")
+            history["train_auc_roc"].append(float(train_auc) if train_auc is not None else float("nan"))
+            history["val_auc_roc"].append(float(val_auc) if val_auc is not None else float("nan"))
+            history["val_unseen_auc_roc"].append(float(val_unseen_auc) if val_unseen_auc is not None else float("nan"))
+            history["train_average_precision"].append(float(train_ap) if train_ap is not None else float("nan"))
+            history["val_average_precision"].append(float(val_ap) if val_ap is not None else float("nan"))
+            history["val_unseen_average_precision"].append(float(val_unseen_ap) if val_unseen_ap is not None else float("nan"))
 
         _log_bst_epoch_metrics(
             experiment_tracker,
@@ -627,11 +648,27 @@ def train_bst_ranker_model(
             val_unseen_metrics,
         )
 
-        scheduler_metric = float(val_unseen_auc) if val_unseen_auc is not None else float("-inf")
-        scheduler.step(scheduler_metric)
+        if bst_use_auc_as_primary:
+            val_unseen_auc = val_unseen_metrics.get("auc_roc")
+            primary_metric = float(val_unseen_auc) if val_unseen_auc is not None else None
+        else:
+            primary_metric = float(val_unseen_loss)
 
-        if val_unseen_auc is not None and float(val_unseen_auc) > best_val_metric:
-            best_val_metric = float(val_unseen_auc)
+        if primary_metric is not None:
+            scheduler.step(primary_metric)
+        else:
+            scheduler.step(float("-inf") if bst_use_auc_as_primary else float("inf"))
+
+        better_than_best = (
+            primary_metric is not None
+            and (
+                primary_metric > best_val_metric
+                if bst_use_auc_as_primary
+                else primary_metric < best_val_metric
+            )
+        )
+        if better_than_best and primary_metric is not None:
+            best_val_metric = primary_metric
             best_val_loss = val_unseen_loss
             best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
@@ -642,19 +679,28 @@ def train_bst_ranker_model(
                         "model_state_dict": best_state_dict,
                         "val_unseen_loss": val_unseen_loss,
                         "primary_metric_name": primary_metric_name,
-                        "val_unseen_primary_metric": float(val_unseen_auc),
+                        "val_unseen_primary_metric": primary_metric,
                         "history": history,
                     },
                     checkpoints_dir / "bst_ranker_best.pth",
                 )
 
         significant_improvement = (
-            val_unseen_auc is not None
-            and float(val_unseen_auc) > best_reset_val_metric
-            and (float(val_unseen_auc) - best_reset_val_metric) >= early_stopping_min_delta
+            primary_metric is not None
+            and (
+                (
+                    primary_metric > best_reset_val_metric
+                    and (primary_metric - best_reset_val_metric) >= early_stopping_min_delta
+                )
+                if bst_use_auc_as_primary
+                else (
+                    primary_metric < best_reset_val_metric
+                    and (best_reset_val_metric - primary_metric) >= early_stopping_min_delta
+                )
+            )
         )
-        if val_unseen_auc is not None and significant_improvement:
-            best_reset_val_metric = float(val_unseen_auc)
+        if primary_metric is not None and significant_improvement:
+            best_reset_val_metric = primary_metric
             patience_counter = 0
         else:
             patience_counter += 1
@@ -728,6 +774,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     lr_scheduler_factor = float(args.lr_scheduler_factor)
     lr_scheduler_patience = int(args.lr_scheduler_patience)
     gradient_clip_max_norm = float(args.gradient_clip_max_norm)
+    bst_use_auc_as_primary = bool(args.bst_use_auc_as_primary)
 
     if not use_author_embedding_table:
         raise ValueError("BST ranker v1 requires use_author_embedding_table=True")
@@ -756,6 +803,14 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     persistent_workers = bool(args.dataloader_persistent_workers)
     prefetch_factor = int(args.dataloader_prefetch_factor)
 
+    log_operation_start("Build shared ranker negative pools", STAGE_LOG_NAME, logger)
+    negative_pools_by_split_window = build_ranker_pair_negative_pools_by_split_window(
+        posts_core_df,
+        use_author_embedding_table=use_author_embedding_table,
+    )
+    train_negative_pool = negative_pools_by_split_window.get("train", {})
+    val_negative_pool = negative_pools_by_split_window.get("val", {})
+
     log_operation_start("Create ranker pair datasets", STAGE_LOG_NAME, logger)
     train_dataset = RankerPairDataset(
         embeddings_mmap=embeddings_mmap,
@@ -767,6 +822,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         embed_dim=embed_dim,
         seed=random_seed,
         use_author_embedding_table=use_author_embedding_table,
+        sampled_posts_by_bucket=train_negative_pool,
         logger=logger,
     )
     val_dataset = RankerPairDataset(
@@ -779,6 +835,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         embed_dim=embed_dim,
         seed=random_seed,
         use_author_embedding_table=use_author_embedding_table,
+        sampled_posts_by_bucket=val_negative_pool,
         logger=logger,
     )
     val_unseen_dataset = RankerPairDataset(
@@ -791,6 +848,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         embed_dim=embed_dim,
         seed=random_seed,
         use_author_embedding_table=use_author_embedding_table,
+        sampled_posts_by_bucket=val_negative_pool,
         logger=logger,
     )
     train_loader, val_loader, val_unseen_loader, _ = create_ranker_pair_data_loaders(
@@ -839,6 +897,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         lr_scheduler_factor=lr_scheduler_factor,
         lr_scheduler_patience=lr_scheduler_patience,
         gradient_clip_max_norm=gradient_clip_max_norm,
+        bst_use_auc_as_primary=bst_use_auc_as_primary,
         experiment_tracker=context.tracker,
     )
     trained_model: BSTRanker = training_results["model"]
@@ -847,13 +906,17 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     if generate_plots:
         hist = training_results["history"]
         try:
-            val_unseen_metric_history = hist.get("val_unseen_auc_roc", [])
+            primary_metric_name = training_results["primary_metric_name"]
+            val_unseen_metric_history = hist.get(primary_metric_name, [])
             valid_metrics = [
                 (idx + 1, float(value))
                 for idx, value in enumerate(val_unseen_metric_history)
                 if float(value) == float(value)
             ]
-            best_epoch = max(valid_metrics, key=lambda item: item[1])[0] if valid_metrics else None
+            if primary_metric_name.endswith("_loss"):
+                best_epoch = min(valid_metrics, key=lambda item: item[1])[0] if valid_metrics else None
+            else:
+                best_epoch = max(valid_metrics, key=lambda item: item[1])[0] if valid_metrics else None
         except Exception as exc:
             logger.warning(f"Could not determine best epoch from BST training history: {exc}")
             best_epoch = None
@@ -868,6 +931,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         optimizer=None,
         disable_progress=disable_progress,
         gradient_clip_max_norm=gradient_clip_max_norm,
+        compute_classification_metrics=bst_use_auc_as_primary,
     )
     val_loss, val_metrics = run_bst_epoch(
         train=False,
@@ -878,6 +942,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         optimizer=None,
         disable_progress=disable_progress,
         gradient_clip_max_norm=gradient_clip_max_norm,
+        compute_classification_metrics=bst_use_auc_as_primary,
     )
     val_unseen_loss, val_unseen_metrics = run_bst_epoch(
         train=False,
@@ -888,6 +953,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         optimizer=None,
         disable_progress=disable_progress,
         gradient_clip_max_norm=gradient_clip_max_norm,
+        compute_classification_metrics=bst_use_auc_as_primary,
     )
     logger.info(f"Train metrics: {train_metrics}")
     logger.info(f"Validation metrics: {val_metrics}")
@@ -912,6 +978,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "author_table_num_rows": author_table_num_rows,
         "author_pad_idx": AUTHOR_PAD_IDX,
         "author_unk_idx": AUTHOR_UNK_IDX,
+        "bst_use_auc_as_primary": bst_use_auc_as_primary,
     }
 
     model_path = None

@@ -986,6 +986,62 @@ def _author_idx_list_to_table_rows(
     ], dtype=np.uint32)
 
 
+def _ranker_pair_posts_columns(use_author_embedding_table: bool) -> List[str]:
+    posts_columns = ["at_uri", "in_random_sample", "negative_hour_bucket", "split_window", "emb_idx"]
+    if use_author_embedding_table:
+        posts_columns.append("author_idx")
+    return posts_columns
+
+
+def build_ranker_pair_negative_pool(
+    posts_core_df: pl.DataFrame,
+    split_window: str,
+    use_author_embedding_table: bool = False,
+) -> Dict[Any, List[Dict[str, Any]]]:
+    validate_dataframe_schema(
+        posts_core_df,
+        dict.fromkeys(_ranker_pair_posts_columns(use_author_embedding_table), None),
+    )
+    sampled_posts_df = posts_core_df.filter(
+        (pl.col("split_window") == split_window)
+        & pl.col("in_random_sample")
+        & pl.col("negative_hour_bucket").is_not_null()
+    )
+    sampled_posts_by_bucket: Dict[Any, List[Dict[str, Any]]] = {}
+    for row in sampled_posts_df.iter_rows(named=True):
+        author_idx = _author_idx_or_unk(row.get("author_idx")) if use_author_embedding_table else None
+        sampled_posts_by_bucket.setdefault(row["negative_hour_bucket"], []).append({
+            "post_id": str(row["at_uri"]),
+            "emb_idx": int(row["emb_idx"]),
+            "author_idx": author_idx,
+        })
+    return sampled_posts_by_bucket
+
+
+def build_ranker_pair_negative_pools_by_split_window(
+    posts_core_df: pl.DataFrame,
+    use_author_embedding_table: bool = False,
+) -> Dict[str, Dict[Any, List[Dict[str, Any]]]]:
+    validate_dataframe_schema(
+        posts_core_df,
+        dict.fromkeys(_ranker_pair_posts_columns(use_author_embedding_table), None),
+    )
+    sampled_posts_df = posts_core_df.filter(
+        pl.col("in_random_sample")
+        & pl.col("negative_hour_bucket").is_not_null()
+    )
+    sampled_posts_by_split_window: Dict[str, Dict[Any, List[Dict[str, Any]]]] = {}
+    for row in sampled_posts_df.iter_rows(named=True):
+        author_idx = _author_idx_or_unk(row.get("author_idx")) if use_author_embedding_table else None
+        split_window = str(row["split_window"])
+        sampled_posts_by_split_window.setdefault(split_window, {}).setdefault(row["negative_hour_bucket"], []).append({
+            "post_id": str(row["at_uri"]),
+            "emb_idx": int(row["emb_idx"]),
+            "author_idx": author_idx,
+        })
+    return sampled_posts_by_split_window
+
+
 class BucketedEngagementDataset(Dataset):
     """User-hour positives grouped by hour bucket with same-hour candidate posts."""
 
@@ -1225,6 +1281,7 @@ class RankerPairDataset(Dataset):
         embed_dim: int,
         seed: int,
         use_author_embedding_table: bool = False,
+        sampled_posts_by_bucket: Optional[Dict[Any, List[Dict[str, Any]]]] = None,
         logger: Optional[logging.Logger] = None,
     ):
         if max_history_len <= 0:
@@ -1237,11 +1294,10 @@ class RankerPairDataset(Dataset):
         self.use_author_embedding_table = bool(use_author_embedding_table)
 
         likes_columns = ["did", "subject_uri", "split", "like_hour_bucket", TIMESTAMP_COL_NAME, "emb_idx"]
-        posts_columns = ["at_uri", "in_random_sample", "negative_hour_bucket", "split_window", "emb_idx"]
+        posts_columns = _ranker_pair_posts_columns(self.use_author_embedding_table)
         history_columns = ["did", "like_hour_bucket", "prior_emb_indices", "prior_like_age_hours_at_bucket_start"]
         if self.use_author_embedding_table:
             likes_columns.append("author_idx")
-            posts_columns.append("author_idx")
             history_columns.append("prior_author_indices")
 
         validate_dataframe_schema(
@@ -1267,20 +1323,14 @@ class RankerPairDataset(Dataset):
             key = (str(row["did"]), row["like_hour_bucket"])
             self.user_hour_liked_post_ids.setdefault(key, set()).add(str(row["subject_uri"]))
 
-        post_split_window = _post_split_window_for_like_split(self.split)
-        sampled_posts_df = posts_core_df.filter(
-            (pl.col("split_window") == post_split_window)
-            & pl.col("in_random_sample")
-            & pl.col("negative_hour_bucket").is_not_null()
-        )
-        self.sampled_posts_by_bucket: Dict[Any, List[Dict[str, Any]]] = {}
-        for row in sampled_posts_df.iter_rows(named=True):
-            author_idx = _author_idx_or_unk(row.get("author_idx")) if self.use_author_embedding_table else None
-            self.sampled_posts_by_bucket.setdefault(row["negative_hour_bucket"], []).append({
-                "post_id": str(row["at_uri"]),
-                "emb_idx": int(row["emb_idx"]),
-                "author_idx": author_idx,
-            })
+        if sampled_posts_by_bucket is None:
+            post_split_window = _post_split_window_for_like_split(self.split)
+            sampled_posts_by_bucket = build_ranker_pair_negative_pool(
+                posts_core_df,
+                post_split_window,
+                use_author_embedding_table=self.use_author_embedding_table,
+            )
+        self.sampled_posts_by_bucket = sampled_posts_by_bucket
 
         joined = (
             like_ordered_df

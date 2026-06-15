@@ -13,6 +13,7 @@ from utils.dataloaders import (
     BucketedEngagementDataset,
     RankerPairBatchSampler,
     RankerPairDataset,
+    build_ranker_pair_negative_pools_by_split_window,
     create_bucketed_data_loaders,
     create_ranker_pair_data_loaders,
     get_author_table_num_rows,
@@ -395,6 +396,42 @@ def test_ranker_pair_validation_loader_keeps_fixed_epoch_negatives(
         first["candidate_post_embeddings"].numpy(),
         second["candidate_post_embeddings"].numpy(),
     )
+
+
+def test_ranker_pair_datasets_can_share_negative_pools(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+):
+    negative_pools_by_split_window = build_ranker_pair_negative_pools_by_split_window(mock_posts_core_df)
+    val_negative_pool = negative_pools_by_split_window["val"]
+    val_dataset = RankerPairDataset(
+        embeddings_mmap=mock_embeddings_mmap,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
+        history_df=mock_history_df,
+        split="val",
+        max_history_len=3,
+        embed_dim=4,
+        seed=0,
+        sampled_posts_by_bucket=val_negative_pool,
+    )
+    val_unseen_dataset = RankerPairDataset(
+        embeddings_mmap=mock_embeddings_mmap,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
+        history_df=mock_history_df,
+        split="val_unseen_users",
+        max_history_len=3,
+        embed_dim=4,
+        seed=0,
+        sampled_posts_by_bucket=val_negative_pool,
+    )
+
+    assert val_dataset.sampled_posts_by_bucket is val_unseen_dataset.sampled_posts_by_bucket
+    assert val_dataset._sample_negative_for_row(0, epoch=0)["post_id"] == "n_val"
+    assert val_unseen_dataset._sample_negative_for_row(0, epoch=0)["post_id"] == "n_val"
 
 
 def test_ranker_pair_collate_returns_author_tensors_when_enabled(

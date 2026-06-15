@@ -333,6 +333,72 @@ def test_run_bst_epoch_computes_auc_roc_and_average_precision():
     assert metrics["average_precision"] is not None
 
 
+def test_run_bst_epoch_skips_auc_roc_and_average_precision_when_disabled(monkeypatch):
+    model = _make_model()
+    model.eval()
+    loader = DataLoader(_SingleBatchDataset(_ranker_pair_batch()), batch_size=None, shuffle=False)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("classification metrics should not be computed")
+
+    monkeypatch.setattr(stage_train_bst_ranker, "_classification_metrics_from_logits", fail_if_called)
+
+    loss, metrics = run_bst_epoch(
+        train=False,
+        split_name="Validation",
+        model=model,
+        device="cpu",
+        dataloader=loader,
+        optimizer=None,
+        disable_progress=True,
+        gradient_clip_max_norm=1.0,
+        compute_classification_metrics=False,
+    )
+
+    assert loss >= 0.0
+    assert metrics["classification_metric_pair_count"] == 4
+    assert metrics["classification_metric_positive_count"] == 2
+    assert "auc_roc" not in metrics
+    assert "average_precision" not in metrics
+
+
+def test_train_bst_ranker_model_uses_val_unseen_loss_by_default(tmp_path):
+    torch.manual_seed(0)
+    model = _make_model()
+    loader = DataLoader(_SingleBatchDataset(_ranker_pair_batch()), batch_size=None, shuffle=False)
+
+    results = train_bst_ranker_model(
+        model=model,
+        train_loader=loader,
+        val_loader=loader,
+        val_unseen_loader=loader,
+        device="cpu",
+        epochs=2,
+        learning_rate=1e-3,
+        weight_decay=0.0,
+        patience=10,
+        early_stopping_min_delta=0.0,
+        checkpoints_dir=tmp_path,
+        disable_progress=True,
+        lr_scheduler_factor=0.5,
+        lr_scheduler_patience=2,
+        gradient_clip_max_norm=1.0,
+    )
+
+    assert results["primary_metric_name"] == "val_unseen_loss"
+    assert len(results["history"]["train_loss"]) == 2
+    assert len(results["history"]["val_loss"]) == 2
+    assert len(results["history"]["val_unseen_loss"]) == 2
+    assert "train_auc_roc" not in results["history"]
+    assert "val_auc_roc" not in results["history"]
+    assert "val_unseen_auc_roc" not in results["history"]
+    assert "train_average_precision" not in results["history"]
+    assert "val_average_precision" not in results["history"]
+    assert "val_unseen_average_precision" not in results["history"]
+    assert results["best_val_metric"] == min(results["history"]["val_unseen_loss"])
+    assert (tmp_path / "bst_ranker_best.pth").exists()
+
+
 def test_train_bst_ranker_model_uses_val_unseen_auc_for_primary_metric_and_checkpoint(tmp_path):
     torch.manual_seed(0)
     model = _make_model()
@@ -354,6 +420,7 @@ def test_train_bst_ranker_model_uses_val_unseen_auc_for_primary_metric_and_check
         lr_scheduler_factor=0.5,
         lr_scheduler_patience=2,
         gradient_clip_max_norm=1.0,
+        bst_use_auc_as_primary=True,
     )
 
     assert results["primary_metric_name"] == "val_unseen_auc_roc"
