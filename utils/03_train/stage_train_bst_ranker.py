@@ -851,6 +851,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         sampled_posts_by_bucket=val_negative_pool,
         logger=logger,
     )
+    del likes_core_df, posts_core_df, history_df, author_idx_mapping_df
     train_loader, val_loader, val_unseen_loader, _ = create_ranker_pair_data_loaders(
         train_dataset=train_dataset,
         val_dataset=val_dataset,
