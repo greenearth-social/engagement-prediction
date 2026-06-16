@@ -1068,6 +1068,14 @@ class BucketedEngagementDataset(Dataset):
         likes_columns = ["did", "subject_uri", "split", "like_hour_bucket", "emb_idx"]
         posts_columns = ["at_uri", "in_random_sample", "negative_hour_bucket", "split_window", "emb_idx"]
         history_columns = ["did", "like_hour_bucket", "prior_emb_indices"]
+        self.has_history_time_deltas = "prior_like_age_hours_at_bucket_start" in history_df.columns
+        if self.has_history_time_deltas:
+            history_columns.append("prior_like_age_hours_at_bucket_start")
+        elif logger:
+            logger.warning(
+                "BucketedEngagementDataset history input is missing "
+                "prior_like_age_hours_at_bucket_start; emitting zero history_time_deltas_hours"
+            )
         if self.use_author_embedding_table:
             likes_columns.append("author_idx")
             posts_columns.append("author_idx")
@@ -1129,6 +1137,16 @@ class BucketedEngagementDataset(Dataset):
             _list_to_int_array(value)
             for value in joined["prior_emb_indices"].to_list()
         ]
+        if self.has_history_time_deltas:
+            self.prior_like_age_hours_at_bucket_start = [
+                _list_to_float_array(value)
+                for value in joined["prior_like_age_hours_at_bucket_start"].to_list()
+            ]
+        else:
+            self.prior_like_age_hours_at_bucket_start = [
+                np.array([], dtype=np.float32)
+                for _ in self.prior_emb_indices
+            ]
 
         self.liked_post_author_indices: Optional[List[np.ndarray]] = None
         self.prior_author_indices: Optional[List[np.ndarray]] = None
@@ -1184,6 +1202,11 @@ class BucketedEngagementDataset(Dataset):
         padded = get_padded_author_indices(mapped_author_indices, self.max_history_len)
         return torch.from_numpy(padded)
 
+    def _padded_time_deltas_for_row(self, row_idx: int) -> torch.Tensor:
+        deltas = self.prior_like_age_hours_at_bucket_start[row_idx]
+        padded = get_padded_history_time_deltas(deltas, self.max_history_len)
+        return torch.from_numpy(padded)
+
     def collate_batch(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not items:
             raise ValueError("BucketedEngagementDataset.collate_batch received an empty batch")
@@ -1201,10 +1224,12 @@ class BucketedEngagementDataset(Dataset):
 
         history_tensors = []
         mask_tensors = []
+        time_delta_tensors = []
         for row_idx in row_indices:
             history, mask = self._padded_history_for_row(row_idx)
             history_tensors.append(history)
             mask_tensors.append(mask)
+            time_delta_tensors.append(self._padded_time_deltas_for_row(row_idx))
 
         candidate_post_ids: List[str] = []
         candidate_emb_indices: List[int] = []
@@ -1252,6 +1277,7 @@ class BucketedEngagementDataset(Dataset):
         output: Dict[str, Any] = {
             "history_embeddings": torch.stack(history_tensors, dim=0),
             "history_mask": torch.stack(mask_tensors, dim=0),
+            "history_time_deltas_hours": torch.stack(time_delta_tensors, dim=0),
             "candidate_post_embeddings": candidate_post_embeddings,
             "label_matrix": label_matrix,
             "user_id": user_ids,

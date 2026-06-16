@@ -158,6 +158,15 @@ def test_bucketed_collate_builds_candidates_and_same_hour_labels(bucketed_datase
     assert batch["candidate_post_id"] == ["p1", "p3", "p2", "n1", "p4"]
     assert batch["history_embeddings"].shape == (2, 3, 4)
     assert batch["history_mask"].tolist() == [[True, True, True], [False, False, False]]
+    np.testing.assert_allclose(
+        batch["history_time_deltas_hours"].numpy(),
+        np.array([
+            [1.0, 2.0, 3.0],
+            [0.0, 0.0, 0.0],
+        ], dtype=np.float32),
+        rtol=0,
+        atol=1e-6,
+    )
     assert batch["candidate_post_embeddings"].shape == (5, 4)
 
     labels_by_user = {
@@ -260,7 +269,7 @@ def test_create_bucketed_data_loaders_returns_iterable_loaders(
     assert isinstance(val_unseen_loader, DataLoader)
     assert holdout_loader is None
     batch = next(iter(train_loader))
-    assert {"history_embeddings", "history_mask", "candidate_post_embeddings", "label_matrix"} <= set(batch)
+    assert {"history_embeddings", "history_mask", "history_time_deltas_hours", "candidate_post_embeddings", "label_matrix"} <= set(batch)
 
 
 def test_ranker_pair_dataset_keeps_one_row_per_positive_with_same_hour_negatives(ranker_pair_dataset):
