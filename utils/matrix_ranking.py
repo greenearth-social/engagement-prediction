@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import math
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 import numpy as np
 import polars as pl
@@ -16,6 +17,34 @@ from tqdm import tqdm
 
 DEFAULT_MAX_CLASSIFICATION_METRIC_PAIRS = 2_000_000
 FINAL_CLASSIFICATION_METRICS = ("auc_roc", "average_precision")
+
+
+@dataclass
+class MatrixBatchScores:
+    scores: torch.Tensor
+    loss: Optional[torch.Tensor] = None
+
+
+class MatrixRankingScorer(Protocol):
+    def prepare_for_eval(self, device: str) -> None:
+        ...
+
+    def score_batch(self, batch: Dict[str, Any], device: str) -> MatrixBatchScores:
+        ...
+
+
+class TorchMatrixModelScorer:
+    def __init__(self, model: torch.nn.Module, embed_dim: int):
+        self.model = model
+        self.embed_dim = int(embed_dim)
+
+    def prepare_for_eval(self, device: str) -> None:
+        self.model = self.model.to(device)
+        self.model.eval()
+
+    def score_batch(self, batch: Dict[str, Any], device: str) -> MatrixBatchScores:
+        loss, scores = self.model.compute_loss_and_preds(batch, device, self.embed_dim)
+        return MatrixBatchScores(scores=scores, loss=loss)
 
 
 def empty_rank_metric_sums(metrics_top_ks: list[int]) -> Dict[str, float]:
@@ -255,23 +284,21 @@ def run_matrix_epoch(
     return loss, metrics_dict, baseline_metrics_dict
 
 
-def evaluate_matrix_model(
-    model: torch.nn.Module,
+def evaluate_matrix_scorer(
+    scorer: MatrixRankingScorer,
     data_loader: DataLoader,
     device: str,
-    embed_dim: int,
     metrics_top_ks: list[int],
     max_classification_metric_pairs: Optional[int] = DEFAULT_MAX_CLASSIFICATION_METRIC_PAIRS,
     collect_ranking_rows: bool = False,
     progress_desc: Optional[str] = None,
     disable_progress: bool = True,
 ) -> Dict[str, Any]:
-    """Evaluate a matrix-ranking model with streamed rank metrics and sampled AUC/AP."""
-    model = model.to(device)
-    model.eval()
+    """Evaluate a matrix-ranking scorer with streamed rank metrics and sampled AUC/AP."""
+    scorer.prepare_for_eval(device)
 
     loss_sum = torch.zeros((), device=device)
-    batches = 0
+    loss_batches = 0
     metric_sums = empty_rank_metric_sums(metrics_top_ks)
     metric_user_count = 0
     classification_pair_count = 0
@@ -284,14 +311,19 @@ def evaluate_matrix_model(
 
     with torch.inference_mode():
         for batch in tqdm(data_loader, desc=progress_desc, leave=False, disable=disable_progress):
-            loss, scores = model.compute_loss_and_preds(batch, device, embed_dim)
+            batch_scores = scorer.score_batch(batch, device)
+            scores = batch_scores.scores.to(device)
             labels = batch["label_matrix"].to(device, dtype=torch.float32, non_blocking=True)
+            if scores.shape != labels.shape:
+                raise RuntimeError("Expected scores and label_matrix to have matching [num_users, num_candidates] shapes")
+
             ranked_indices = torch.argsort(scores, dim=1, descending=True)
             ranked_labels = torch.gather(labels, dim=1, index=ranked_indices)
             batch_metric_sums, batch_metric_user_count = rank_metric_sums_for_batch(ranked_labels, metrics_top_ks)
 
-            loss_sum += loss.detach()
-            batches += 1
+            if batch_scores.loss is not None:
+                loss_sum += batch_scores.loss.detach().to(device)
+                loss_batches += 1
             metric_user_count += batch_metric_user_count
             for key, value in batch_metric_sums.items():
                 metric_sums[key] += value
@@ -328,7 +360,7 @@ def evaluate_matrix_model(
                         metric_priorities = metric_priorities[keep_idx]
 
     metrics: Dict[str, Any] = finalize_rank_metrics(metric_sums, metric_user_count)
-    metrics["loss"] = (loss_sum / max(batches, 1)).item()
+    metrics["loss"] = (loss_sum / loss_batches).item() if loss_batches > 0 else None
     metrics["rank_metric_user_count"] = metric_user_count
     metrics["classification_metric_pair_count"] = classification_pair_count
     metrics["classification_metric_positive_count"] = classification_positive_count
@@ -350,6 +382,30 @@ def evaluate_matrix_model(
         "metrics": metrics,
         "ranking_rows": ranking_rows,
     }
+
+
+def evaluate_matrix_model(
+    model: torch.nn.Module,
+    data_loader: DataLoader,
+    device: str,
+    embed_dim: int,
+    metrics_top_ks: list[int],
+    max_classification_metric_pairs: Optional[int] = DEFAULT_MAX_CLASSIFICATION_METRIC_PAIRS,
+    collect_ranking_rows: bool = False,
+    progress_desc: Optional[str] = None,
+    disable_progress: bool = True,
+) -> Dict[str, Any]:
+    """Evaluate a matrix-ranking model with streamed rank metrics and sampled AUC/AP."""
+    return evaluate_matrix_scorer(
+        TorchMatrixModelScorer(model, embed_dim),
+        data_loader,
+        device,
+        metrics_top_ks,
+        max_classification_metric_pairs=max_classification_metric_pairs,
+        collect_ranking_rows=collect_ranking_rows,
+        progress_desc=progress_desc,
+        disable_progress=disable_progress,
+    )
 
 
 def optional_float_metric(value: Any) -> Optional[float]:
