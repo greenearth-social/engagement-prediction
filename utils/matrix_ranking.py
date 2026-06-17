@@ -16,7 +16,10 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 DEFAULT_MAX_CLASSIFICATION_METRIC_PAIRS = 2_000_000
-FINAL_CLASSIFICATION_METRICS = ("auc_roc", "average_precision")
+FINAL_CLASSIFICATION_METRICS = ("auc_roc", "classification_average_precision")
+CLASSIFICATION_METRIC_ALIASES = {
+    "classification_average_precision": ("classification_average_precision", "average_precision"),
+}
 
 
 @dataclass
@@ -51,6 +54,7 @@ def empty_rank_metric_sums(metrics_top_ks: list[int]) -> Dict[str, float]:
     metric_sums = {f"dcg@{k}": 0.0 for k in metrics_top_ks}
     metric_sums.update({f"ndcg@{k}": 0.0 for k in metrics_top_ks})
     metric_sums.update({f"recall@{k}": 0.0 for k in metrics_top_ks})
+    metric_sums["mean_average_precision"] = 0.0
     return metric_sums
 
 
@@ -79,6 +83,16 @@ def calc_baseline_rank_metrics_for_batch(
         )
         cumulative_discounts = discounts.cumsum(dim=0)
         relevant_probability = total_relevant / float(num_candidates)
+        positions = torch.arange(1, num_candidates + 1, device=labels.device, dtype=torch.float32)
+        if num_candidates == 1:
+            expected_average_precision = torch.ones_like(total_relevant)
+        else:
+            harmonic_sum = (1.0 / positions).sum()
+            tail_sum = ((positions - 1.0) / positions).sum()
+            expected_average_precision = (
+                harmonic_sum + tail_sum * ((total_relevant - 1.0) / float(num_candidates - 1))
+            ) / float(num_candidates)
+        metric_sums["mean_average_precision"] = float(expected_average_precision.sum().item())
 
         for k in metrics_top_ks:
             k_eff = min(k, num_candidates)
@@ -114,6 +128,16 @@ def rank_metric_sums_for_batch(
 
         ranked_labels = ranked_labels[eligible]
         total_relevant = total_relevant[eligible]
+        positions = torch.arange(
+            1,
+            ranked_labels.size(1) + 1,
+            device=ranked_labels.device,
+            dtype=torch.float32,
+        )
+        cumulative_relevant = ranked_labels.cumsum(dim=1)
+        precision_at_rank = cumulative_relevant / positions
+        average_precision = (precision_at_rank * ranked_labels).sum(dim=1) / total_relevant
+        metric_sums["mean_average_precision"] = float(average_precision.sum().item())
 
         max_k = min(max(metrics_top_ks), ranked_labels.size(1))
         discounts = 1.0 / torch.log2(
@@ -374,9 +398,9 @@ def evaluate_matrix_scorer(
     else:
         metrics["auc_roc"] = None
     if metric_labels is not None and int(metric_labels.sum()) > 0 and metric_scores is not None:
-        metrics["average_precision"] = float(average_precision_score(metric_labels, metric_scores))
+        metrics["classification_average_precision"] = float(average_precision_score(metric_labels, metric_scores))
     else:
-        metrics["average_precision"] = None
+        metrics["classification_average_precision"] = None
 
     return {
         "metrics": metrics,
@@ -417,6 +441,14 @@ def optional_float_metric(value: Any) -> Optional[float]:
     return metric_value
 
 
+def optional_metric_value(metrics: Dict[str, Any], metric_name: str) -> Optional[float]:
+    for key in CLASSIFICATION_METRIC_ALIASES.get(metric_name, (metric_name,)):
+        metric_value = optional_float_metric(metrics.get(key))
+        if metric_value is not None:
+            return metric_value
+    return None
+
+
 def split_metric_label(split_name: str) -> str:
     return split_name.replace("_", " ").title()
 
@@ -424,7 +456,7 @@ def split_metric_label(split_name: str) -> str:
 def clearml_metric_label(metric_name: str) -> str:
     return {
         "auc_roc": "AUC-ROC",
-        "average_precision": "Average Precision",
+        "classification_average_precision": "Classification Average Precision",
     }.get(metric_name, metric_name.replace("_", " ").title())
 
 
@@ -437,7 +469,7 @@ def log_final_classification_metrics(
         return
     for split_name, metrics in split_metrics.items():
         for metric_name in FINAL_CLASSIFICATION_METRICS:
-            metric_value = optional_float_metric(metrics.get(metric_name))
+            metric_value = optional_metric_value(metrics, metric_name)
             if metric_value is None:
                 continue
             metric_label = clearml_metric_label(metric_name)
@@ -453,7 +485,7 @@ def stage_info_metric_lines(split_metrics: Dict[str, Dict[str, Any]]) -> List[st
     lines = []
     for split_name, metrics in split_metrics.items():
         for metric_name in FINAL_CLASSIFICATION_METRICS:
-            metric_value = optional_float_metric(metrics.get(metric_name))
+            metric_value = optional_metric_value(metrics, metric_name)
             if metric_value is not None:
                 lines.append(f"{split_name}_{metric_name}: {metric_value:.4f}")
     return lines

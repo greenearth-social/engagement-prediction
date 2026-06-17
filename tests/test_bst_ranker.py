@@ -23,6 +23,8 @@ def _make_model(
     *,
     dropout_rate: float = 0.0,
     num_attention_heads: int = 2,
+    num_transformer_layers: int = 1,
+    norm_first: bool = False,
     prediction_hidden_dims=(8, 4),
 ) -> BSTRanker:
     torch.manual_seed(123)
@@ -33,11 +35,11 @@ def _make_model(
         model_dim=5,
         time_embedding_dim=3,
         num_attention_heads=num_attention_heads,
-        num_transformer_layers=1,
+        num_transformer_layers=num_transformer_layers,
         transformer_ff_dim=16,
         dropout_rate=dropout_rate,
         author_unknown_dropout_rate=0.0,
-        norm_first=False,
+        norm_first=norm_first,
         time_delta_bucket_boundaries_hours=DEFAULT_TIME_DELTA_BUCKET_BOUNDARIES_HOURS,
         prediction_hidden_dims=prediction_hidden_dims,
     )
@@ -82,6 +84,19 @@ def _batch() -> dict[str, torch.Tensor]:
         ),
         "candidate_post_author_idx": torch.tensor([5, 6], dtype=torch.long),
     }
+
+
+def _expected_matrix_scores(model: BSTRanker, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    num_users = batch["history_embeddings"].shape[0]
+    num_candidates = batch["candidate_post_embeddings"].shape[0]
+    return model(
+        history_embeddings=batch["history_embeddings"].repeat_interleave(num_candidates, dim=0),
+        history_mask=batch["history_mask"].repeat_interleave(num_candidates, dim=0),
+        history_time_deltas_hours=batch["history_time_deltas_hours"].repeat_interleave(num_candidates, dim=0),
+        candidate_post_embeddings=batch["candidate_post_embeddings"].repeat(num_users, 1),
+        history_author_indices=batch["history_author_indices"].repeat_interleave(num_candidates, dim=0),
+        candidate_post_author_idx=batch["candidate_post_author_idx"].repeat(num_users),
+    ).reshape(num_users, num_candidates)
 
 
 def _ranker_pair_batch() -> dict[str, torch.Tensor]:
@@ -137,6 +152,37 @@ def test_bst_ranker_forward_returns_raw_logits():
 
     assert logits.shape == (2,)
     assert logits.dtype == torch.float32
+
+
+@pytest.mark.parametrize("norm_first", [False, True])
+def test_bst_ranker_score_candidate_matrix_one_layer_matches_repeated_path(norm_first):
+    model = _make_model(norm_first=norm_first)
+    model.eval()
+    batch = _batch()
+
+    with torch.inference_mode():
+        expected = _expected_matrix_scores(model, batch)
+        scores = model.score_candidate_matrix_one_layer(**batch)
+
+    assert scores.shape == (2, 2)
+    torch.testing.assert_close(scores, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_bst_ranker_score_candidate_matrix_one_layer_requires_eval_mode():
+    model = _make_model()
+    batch = _batch()
+
+    with pytest.raises(RuntimeError, match="eval mode"):
+        model.score_candidate_matrix_one_layer(**batch)
+
+
+def test_bst_ranker_score_candidate_matrix_one_layer_rejects_multi_layer_model():
+    model = _make_model(num_transformer_layers=2)
+    model.eval()
+    batch = _batch()
+
+    with pytest.raises(RuntimeError, match="exactly one transformer layer"):
+        model.score_candidate_matrix_one_layer(**batch)
 
 
 def test_bst_ranker_predict_proba_applies_sigmoid_to_logits():
@@ -197,6 +243,27 @@ def test_bst_ranker_masks_padded_history_positions():
     changed_batch["history_author_indices"][1, 1:] = torch.tensor([3, 4])
 
     changed_output = model(**changed_batch)
+
+    torch.testing.assert_close(changed_output, output, atol=1e-6, rtol=1e-6)
+
+
+def test_bst_ranker_score_candidate_matrix_one_layer_masks_padded_history_positions():
+    model = _make_model()
+    model.eval()
+    batch = _batch()
+
+    output = model.score_candidate_matrix_one_layer(**batch)
+    changed_batch = {key: value.clone() for key, value in batch.items()}
+    changed_batch["history_embeddings"][0, 2] = torch.tensor([1000.0, 1000.0, 1000.0, 1000.0])
+    changed_batch["history_embeddings"][1, 1:] = torch.tensor(
+        [[2000.0, 2000.0, 2000.0, 2000.0], [3000.0, 3000.0, 3000.0, 3000.0]]
+    )
+    changed_batch["history_time_deltas_hours"][0, 2] = 100000.0
+    changed_batch["history_time_deltas_hours"][1, 1:] = torch.tensor([200000.0, 300000.0])
+    changed_batch["history_author_indices"][0, 2] = 2
+    changed_batch["history_author_indices"][1, 1:] = torch.tensor([3, 4])
+
+    changed_output = model.score_candidate_matrix_one_layer(**changed_batch)
 
     torch.testing.assert_close(changed_output, output, atol=1e-6, rtol=1e-6)
 
@@ -310,7 +377,7 @@ def test_compute_bst_loss_and_preds_returns_scalar_loss_logits_and_labels():
     assert labels.tolist() == [1.0, 0.0, 1.0, 0.0]
 
 
-def test_run_bst_epoch_computes_auc_roc_and_average_precision():
+def test_run_bst_epoch_computes_auc_roc_and_classification_average_precision():
     model = _make_model()
     model.eval()
     loader = DataLoader(_SingleBatchDataset(_ranker_pair_batch()), batch_size=None, shuffle=False)
@@ -330,10 +397,10 @@ def test_run_bst_epoch_computes_auc_roc_and_average_precision():
     assert metrics["classification_metric_pair_count"] == 4
     assert metrics["classification_metric_positive_count"] == 2
     assert metrics["auc_roc"] is not None
-    assert metrics["average_precision"] is not None
+    assert metrics["classification_average_precision"] is not None
 
 
-def test_run_bst_epoch_skips_auc_roc_and_average_precision_when_disabled(monkeypatch):
+def test_run_bst_epoch_skips_auc_roc_and_classification_average_precision_when_disabled(monkeypatch):
     model = _make_model()
     model.eval()
     loader = DataLoader(_SingleBatchDataset(_ranker_pair_batch()), batch_size=None, shuffle=False)
@@ -359,7 +426,7 @@ def test_run_bst_epoch_skips_auc_roc_and_average_precision_when_disabled(monkeyp
     assert metrics["classification_metric_pair_count"] == 4
     assert metrics["classification_metric_positive_count"] == 2
     assert "auc_roc" not in metrics
-    assert "average_precision" not in metrics
+    assert "classification_average_precision" not in metrics
 
 
 def test_train_bst_ranker_model_uses_val_unseen_loss_by_default(tmp_path):
@@ -392,9 +459,9 @@ def test_train_bst_ranker_model_uses_val_unseen_loss_by_default(tmp_path):
     assert "train_auc_roc" not in results["history"]
     assert "val_auc_roc" not in results["history"]
     assert "val_unseen_auc_roc" not in results["history"]
-    assert "train_average_precision" not in results["history"]
-    assert "val_average_precision" not in results["history"]
-    assert "val_unseen_average_precision" not in results["history"]
+    assert "train_classification_average_precision" not in results["history"]
+    assert "val_classification_average_precision" not in results["history"]
+    assert "val_unseen_classification_average_precision" not in results["history"]
     assert results["best_val_metric"] == min(results["history"]["val_unseen_loss"])
     assert (tmp_path / "bst_ranker_best.pth").exists()
 
@@ -427,8 +494,8 @@ def test_train_bst_ranker_model_uses_val_unseen_auc_for_primary_metric_and_check
     assert len(results["history"]["train_auc_roc"]) == 2
     assert len(results["history"]["val_auc_roc"]) == 2
     assert len(results["history"]["val_unseen_auc_roc"]) == 2
-    assert len(results["history"]["train_average_precision"]) == 2
-    assert len(results["history"]["val_average_precision"]) == 2
-    assert len(results["history"]["val_unseen_average_precision"]) == 2
+    assert len(results["history"]["train_classification_average_precision"]) == 2
+    assert len(results["history"]["val_classification_average_precision"]) == 2
+    assert len(results["history"]["val_unseen_classification_average_precision"]) == 2
     assert results["best_val_metric"] == max(results["history"]["val_unseen_auc_roc"])
     assert (tmp_path / "bst_ranker_best.pth").exists()

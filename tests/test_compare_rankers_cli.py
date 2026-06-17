@@ -1,4 +1,5 @@
 import json
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -6,6 +7,7 @@ import pytest
 import torch
 
 import cli
+import compare
 
 
 def _make_stage_output(
@@ -23,6 +25,21 @@ def _make_stage_output(
         "inputs": inputs or {},
     }) + "\n")
     return out_dir
+
+
+def _compare_checkpoint_config(max_history_len=7, use_author_embedding_table=True):
+    return {
+        "model_type": "two_tower",
+        "max_history_len": max_history_len,
+        "use_author_embedding_table": use_author_embedding_table,
+        "author_embedding_dim": 2,
+        "author_table_num_rows": 8,
+        "author_unknown_dropout_rate": 0.0,
+    }
+
+
+def _write_compare_checkpoint(path: Path, config: dict) -> None:
+    torch.save({"model_state_dict": {}, "config": config}, path)
 
 
 def test_compare_rankers_parser_accepts_repeated_models():
@@ -61,18 +78,96 @@ def test_implicit_run_all_parser_still_defaults_to_run_all():
 )
 def test_parse_compare_model_spec_rejects_invalid_specs(raw_spec):
     with pytest.raises(ValueError):
-        cli._parse_compare_model_spec(raw_spec)
+        compare._parse_compare_model_spec(raw_spec)
 
 
 def test_compare_model_spec_preserves_absolute_checkpoint_path(tmp_path):
     checkpoint_path = tmp_path / "two_tower.pth"
     checkpoint_path.write_bytes(b"checkpoint")
 
-    spec = cli._parse_compare_model_spec(f"tt:two-tower:{checkpoint_path}")
-    resolved = cli._resolve_compare_checkpoint_path(spec["checkpoint_path"])
+    spec = compare._parse_compare_model_spec(f"tt:two-tower:{checkpoint_path}")
+    resolved = compare._resolve_compare_checkpoint_path(spec["checkpoint_path"])
 
     assert spec["checkpoint_path"] == str(checkpoint_path)
     assert resolved == checkpoint_path.resolve()
+
+
+def test_compare_max_history_len_comes_from_model_configs():
+    specs = [
+        {"name": "tt", "checkpoint_path": "/tmp/two_tower.pth"},
+        {"name": "bst", "checkpoint_path": "/tmp/bst.pth"},
+    ]
+    configs = {
+        "tt": _compare_checkpoint_config(max_history_len=11),
+        "bst": _compare_checkpoint_config(max_history_len=11),
+    }
+
+    resolved = compare._resolve_compare_max_history_len(
+        argparse.Namespace(),
+        model_specs=specs,
+        model_configs=configs,
+    )
+
+    assert resolved == 11
+
+
+def test_compare_max_history_len_fails_when_missing_without_cli_override():
+    specs = [{"name": "tt", "checkpoint_path": "/tmp/two_tower.pth"}]
+    configs = {"tt": {"use_author_embedding_table": True}}
+
+    with pytest.raises(ValueError, match="max_history_len"):
+        compare._resolve_compare_max_history_len(
+            argparse.Namespace(),
+            model_specs=specs,
+            model_configs=configs,
+        )
+
+
+def test_compare_max_history_len_fails_when_model_configs_disagree():
+    specs = [
+        {"name": "tt", "checkpoint_path": "/tmp/two_tower.pth"},
+        {"name": "bst", "checkpoint_path": "/tmp/bst.pth"},
+    ]
+    configs = {
+        "tt": _compare_checkpoint_config(max_history_len=7),
+        "bst": _compare_checkpoint_config(max_history_len=9),
+    }
+
+    with pytest.raises(ValueError, match="matching max_history_len"):
+        compare._resolve_compare_max_history_len(
+            argparse.Namespace(),
+            model_specs=specs,
+            model_configs=configs,
+        )
+
+
+def test_compare_max_history_len_cli_override_allows_config_disagreement():
+    specs = [
+        {"name": "tt", "checkpoint_path": "/tmp/two_tower.pth"},
+        {"name": "bst", "checkpoint_path": "/tmp/bst.pth"},
+    ]
+    configs = {
+        "tt": _compare_checkpoint_config(max_history_len=7),
+        "bst": _compare_checkpoint_config(max_history_len=9),
+    }
+
+    resolved = compare._resolve_compare_max_history_len(
+        argparse.Namespace(max_history_len=12),
+        model_specs=specs,
+        model_configs=configs,
+    )
+
+    assert resolved == 12
+
+
+def test_compare_rankers_requires_author_embedding_config():
+    spec = {"name": "tt", "checkpoint_path": "/tmp/two_tower.pth"}
+
+    with pytest.raises(ValueError, match="use_author_embedding_table=True"):
+        compare._validate_compare_author_config(
+            spec,
+            _compare_checkpoint_config(use_author_embedding_table=False),
+        )
 
 
 def test_compare_rankers_rejects_config(tmp_path):
@@ -99,8 +194,8 @@ def test_compare_rankers_evaluates_models_and_writes_metrics(tmp_path, monkeypat
     )
     two_tower_checkpoint = tmp_path / "two_tower.pth"
     bst_checkpoint = tmp_path / "bst.pth"
-    two_tower_checkpoint.write_bytes(b"checkpoint")
-    bst_checkpoint.write_bytes(b"checkpoint")
+    _write_compare_checkpoint(two_tower_checkpoint, _compare_checkpoint_config(max_history_len=7))
+    _write_compare_checkpoint(bst_checkpoint, _compare_checkpoint_config(max_history_len=7))
 
     import utils.dataloaders as dataloaders
     import utils.matrix_ranking as matrix_ranking
@@ -211,8 +306,8 @@ def test_compare_rankers_evaluates_models_and_writes_metrics(tmp_path, monkeypat
     assert cli.cmd_compare_rankers(raw) == 0
 
     assert created_datasets == [
-        {"split": "val", "use_author_embedding_table": True, "max_history_len": cli.DEFAULTS["max_history_len"], "embed_dim": 2},
-        {"split": "empty", "use_author_embedding_table": True, "max_history_len": cli.DEFAULTS["max_history_len"], "embed_dim": 2},
+        {"split": "val", "use_author_embedding_table": True, "max_history_len": 7, "embed_dim": 2},
+        {"split": "empty", "use_author_embedding_table": True, "max_history_len": 7, "embed_dim": 2},
     ]
     assert len(eval_calls) == 2
     assert all(call["device"] == "cpu" for call in eval_calls)
@@ -225,6 +320,7 @@ def test_compare_rankers_evaluates_models_and_writes_metrics(tmp_path, monkeypat
     out_dir = compare_dirs[0]
     metrics_summary = json.loads((out_dir / "metrics.json").read_text())
     assert metrics_summary["skipped_splits"] == ["empty"]
+    assert metrics_summary["max_history_len"] == 7
     assert set(metrics_summary["metrics"].keys()) == {"tt", "bst"}
     assert set(metrics_summary["metrics"]["tt"].keys()) == {"val"}
     assert (out_dir / "metrics.csv").read_text().startswith("model_name,model_type,checkpoint_path,split,metric,value\n")

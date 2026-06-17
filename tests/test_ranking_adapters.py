@@ -176,7 +176,7 @@ def test_bst_pth_adapter_requires_bucketed_bst_fields(tmp_path):
     model = _make_bst_model(config)
     checkpoint_path = tmp_path / "bst_ranker.pth"
     torch.save({"model_state_dict": model.state_dict(), "config": config}, checkpoint_path)
-    adapter = BstPthAdapter(checkpoint_path)
+    adapter = BstPthAdapter(checkpoint_path, candidate_chunk_size=2)
 
     with pytest.raises(RuntimeError, match="history_time_deltas_hours"):
         adapter.score_batch({

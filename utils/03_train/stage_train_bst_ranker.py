@@ -323,6 +323,171 @@ class BSTRanker(nn.Module):
         )
         return encoded_sequence[:, -1, :]
 
+    def _validate_one_layer_matrix_scorer(self) -> nn.TransformerEncoderLayer:
+        if self.training:
+            raise RuntimeError("score_candidate_matrix_one_layer requires the model to be in eval mode")
+        layers = getattr(self.transformer_encoder, "layers", None)
+        if layers is None or len(layers) != 1:
+            raise RuntimeError("score_candidate_matrix_one_layer requires exactly one transformer layer")
+        layer = layers[0]
+        if not isinstance(layer, nn.TransformerEncoderLayer):
+            raise RuntimeError("score_candidate_matrix_one_layer requires a standard TransformerEncoderLayer")
+        self_attn = layer.self_attn
+        if (
+            not isinstance(self_attn, nn.MultiheadAttention)
+            or not self_attn.batch_first
+            or not getattr(self_attn, "_qkv_same_embed_dim", False)
+            or self_attn.in_proj_weight is None
+            or self_attn.in_proj_bias is None
+            or self_attn.out_proj is None
+        ):
+            raise RuntimeError("score_candidate_matrix_one_layer requires packed batch-first self-attention projections")
+        if self_attn.embed_dim != self.transformer_input_dim:
+            raise RuntimeError("score_candidate_matrix_one_layer found a transformer dimension mismatch")
+        return layer
+
+    def _candidate_token_self_attention(
+        self,
+        layer: nn.TransformerEncoderLayer,
+        history_input: torch.Tensor,
+        history_mask: torch.Tensor,
+        candidate_input: torch.Tensor,
+    ) -> torch.Tensor:
+        self_attn = layer.self_attn
+        num_users, max_history_len, embed_dim = history_input.shape
+        num_candidates = int(candidate_input.size(0))
+        num_heads = int(self_attn.num_heads)
+        head_dim = embed_dim // num_heads
+        scale = float(head_dim) ** -0.5
+
+        q_weight, k_weight, v_weight = self_attn.in_proj_weight.chunk(3, dim=0)
+        q_bias, k_bias, v_bias = self_attn.in_proj_bias.chunk(3, dim=0)
+        query = F.linear(candidate_input, q_weight, q_bias).view(num_candidates, num_heads, head_dim)
+        history_key = F.linear(history_input, k_weight, k_bias).view(num_users, max_history_len, num_heads, head_dim)
+        history_value = F.linear(history_input, v_weight, v_bias).view(num_users, max_history_len, num_heads, head_dim)
+        candidate_key = F.linear(candidate_input, k_weight, k_bias).view(num_candidates, num_heads, head_dim)
+        candidate_value = F.linear(candidate_input, v_weight, v_bias).view(num_candidates, num_heads, head_dim)
+
+        history_scores = torch.einsum("cnd,uhnd->unch", query, history_key) * scale
+        history_scores = history_scores.masked_fill(~history_mask[:, None, None, :], float("-inf"))
+        candidate_scores = (query * candidate_key).sum(dim=-1).transpose(0, 1) * scale
+        candidate_scores = candidate_scores.unsqueeze(0).unsqueeze(-1).expand(num_users, -1, -1, -1)
+        attention_scores = torch.cat([history_scores, candidate_scores], dim=-1)
+        attention_weights = torch.softmax(attention_scores, dim=-1)
+
+        if max_history_len == 0:
+            history_context = torch.zeros(
+                (num_users, num_candidates, num_heads, head_dim),
+                device=history_input.device,
+                dtype=history_input.dtype,
+            )
+        else:
+            history_context = torch.einsum(
+                "unch,uhnd->ucnd",
+                attention_weights[..., :max_history_len],
+                history_value,
+            )
+        candidate_context = (
+            attention_weights[..., max_history_len].permute(0, 2, 1).unsqueeze(-1)
+            * candidate_value.unsqueeze(0)
+        )
+        attention_output = (history_context + candidate_context).reshape(num_users, num_candidates, embed_dim)
+        return self_attn.out_proj(attention_output)
+
+    def _candidate_token_feed_forward(
+        self,
+        layer: nn.TransformerEncoderLayer,
+        candidate_state: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden = layer.linear1(candidate_state)
+        hidden = layer.activation(hidden)
+        hidden = layer.dropout(hidden)
+        hidden = layer.linear2(hidden)
+        return layer.dropout2(hidden)
+
+    def score_candidate_matrix_one_layer(
+        self,
+        history_embeddings: torch.Tensor,
+        history_mask: torch.Tensor,
+        history_time_deltas_hours: torch.Tensor,
+        candidate_post_embeddings: torch.Tensor,
+        history_author_indices: torch.Tensor,
+        candidate_post_author_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        layer = self._validate_one_layer_matrix_scorer()
+        if history_embeddings.dim() != 3:
+            raise ValueError("history_embeddings must have shape [U, H, D]")
+        if candidate_post_embeddings.dim() != 2:
+            raise ValueError("candidate_post_embeddings must have shape [C, D]")
+        num_users, max_history_len, embed_dim = history_embeddings.shape
+        num_candidates = int(candidate_post_embeddings.size(0))
+        if embed_dim != self.post_embedding_dim:
+            raise ValueError(
+                f"history_embeddings last dimension ({embed_dim}) must match post_embedding_dim ({self.post_embedding_dim})"
+            )
+        if candidate_post_embeddings.shape != (num_candidates, self.post_embedding_dim):
+            raise ValueError("candidate_post_embeddings must have shape [C, post_embedding_dim]")
+        if history_mask.shape != (num_users, max_history_len):
+            raise ValueError("history_mask must have shape [U, H]")
+        if history_time_deltas_hours.shape != (num_users, max_history_len):
+            raise ValueError("history_time_deltas_hours must have shape [U, H]")
+        if history_author_indices.shape != (num_users, max_history_len):
+            raise ValueError("history_author_indices must have shape [U, H]")
+        if candidate_post_author_idx.shape != (num_candidates,):
+            raise ValueError("candidate_post_author_idx must have shape [C]")
+
+        device = history_embeddings.device
+        history_mask = history_mask.to(device=device, dtype=torch.bool)
+        history_time_deltas_hours = history_time_deltas_hours.to(device=device)
+        candidate_post_embeddings = candidate_post_embeddings.to(device=device)
+        history_author_indices = history_author_indices.to(device=device, dtype=torch.long)
+        candidate_post_author_idx = candidate_post_author_idx.to(device=device, dtype=torch.long)
+
+        history_post_vectors = self.post_feature_encoder(history_embeddings, history_author_indices)
+        candidate_post_vectors = self.post_feature_encoder(
+            candidate_post_embeddings,
+            candidate_post_author_idx,
+        )
+        history_time_bucket_ids = bucketize_time_deltas_hours(
+            history_time_deltas_hours,
+            self.time_delta_bucket_boundaries_hours,
+        )
+        history_time_embeddings = self.time_delta_embedding(history_time_bucket_ids)
+        candidate_time_bucket_ids = torch.zeros((num_candidates,), device=device, dtype=torch.long)
+        candidate_time_embeddings = self.time_delta_embedding(candidate_time_bucket_ids)
+        history_input = torch.cat([history_post_vectors, history_time_embeddings], dim=-1)
+        candidate_input = torch.cat([candidate_post_vectors, candidate_time_embeddings], dim=-1)
+
+        if layer.norm_first:
+            attention_output = layer.dropout1(
+                self._candidate_token_self_attention(
+                    layer,
+                    layer.norm1(history_input),
+                    history_mask,
+                    layer.norm1(candidate_input),
+                )
+            )
+            candidate_state = candidate_input.unsqueeze(0) + attention_output
+            candidate_state = candidate_state + self._candidate_token_feed_forward(
+                layer,
+                layer.norm2(candidate_state),
+            )
+        else:
+            attention_output = layer.dropout1(
+                self._candidate_token_self_attention(layer, history_input, history_mask, candidate_input)
+            )
+            candidate_state = layer.norm1(candidate_input.unsqueeze(0) + attention_output)
+            candidate_state = layer.norm2(
+                candidate_state + self._candidate_token_feed_forward(layer, candidate_state)
+            )
+
+        logits = self.prediction_head(candidate_state.reshape(num_users * num_candidates, self.transformer_input_dim))
+        if logits.dim() == 2 and logits.shape == (num_users * num_candidates, 1):
+            logits = logits.squeeze(-1)
+        if logits.shape != (num_users * num_candidates,):
+            raise RuntimeError("prediction_head must return logits with shape [U*C] or [U*C, 1]")
+        return logits.reshape(num_users, num_candidates)
+
     def forward(
         self,
         history_embeddings: torch.Tensor,
@@ -432,9 +597,9 @@ def _classification_metrics_from_logits(labels: torch.Tensor, logits: torch.Tens
     else:
         metrics["auc_roc"] = None
     if positive_count > 0:
-        metrics["average_precision"] = float(average_precision_score(labels_np, logits_np))
+        metrics["classification_average_precision"] = float(average_precision_score(labels_np, logits_np))
     else:
-        metrics["average_precision"] = None
+        metrics["classification_average_precision"] = None
     return metrics
 
 
@@ -495,7 +660,7 @@ def run_bst_epoch(
             "classification_metric_pair_count": 0,
             "classification_metric_positive_count": 0,
             "auc_roc": None,
-            "average_precision": None,
+            "classification_average_precision": None,
         }
     else:
         metrics = {
@@ -521,7 +686,10 @@ def _log_bst_epoch_metrics(
     experiment_tracker.log_scalar("Training Loss History", "Train Loss", float(train_loss), iteration)
     experiment_tracker.log_scalar("Training Loss History", "Validation Loss", float(val_loss), iteration)
     experiment_tracker.log_scalar("Training Loss History", "Validation Unseen Users Loss", float(val_unseen_loss), iteration)
-    for metric_name, metric_label in (("auc_roc", "AUC-ROC"), ("average_precision", "Average Precision")):
+    for metric_name, metric_label in (
+        ("auc_roc", "AUC-ROC"),
+        ("classification_average_precision", "Classification Average Precision"),
+    ):
         for split_label, metrics in (
             ("Train", train_metrics),
             ("Validation", val_metrics),
@@ -575,9 +743,9 @@ def train_bst_ranker_model(
             "train_auc_roc": [],
             "val_auc_roc": [],
             "val_unseen_auc_roc": [],
-            "train_average_precision": [],
-            "val_average_precision": [],
-            "val_unseen_average_precision": [],
+            "train_classification_average_precision": [],
+            "val_classification_average_precision": [],
+            "val_unseen_classification_average_precision": [],
         })
     best_val_metric = float("-inf") if bst_use_auc_as_primary else float("inf")
     best_reset_val_metric = float("-inf") if bst_use_auc_as_primary else float("inf")
@@ -627,15 +795,15 @@ def train_bst_ranker_model(
             train_auc = train_metrics.get("auc_roc")
             val_auc = val_metrics.get("auc_roc")
             val_unseen_auc = val_unseen_metrics.get("auc_roc")
-            train_ap = train_metrics.get("average_precision")
-            val_ap = val_metrics.get("average_precision")
-            val_unseen_ap = val_unseen_metrics.get("average_precision")
+            train_ap = train_metrics.get("classification_average_precision")
+            val_ap = val_metrics.get("classification_average_precision")
+            val_unseen_ap = val_unseen_metrics.get("classification_average_precision")
             history["train_auc_roc"].append(float(train_auc) if train_auc is not None else float("nan"))
             history["val_auc_roc"].append(float(val_auc) if val_auc is not None else float("nan"))
             history["val_unseen_auc_roc"].append(float(val_unseen_auc) if val_unseen_auc is not None else float("nan"))
-            history["train_average_precision"].append(float(train_ap) if train_ap is not None else float("nan"))
-            history["val_average_precision"].append(float(val_ap) if val_ap is not None else float("nan"))
-            history["val_unseen_average_precision"].append(float(val_unseen_ap) if val_unseen_ap is not None else float("nan"))
+            history["train_classification_average_precision"].append(float(train_ap) if train_ap is not None else float("nan"))
+            history["val_classification_average_precision"].append(float(val_ap) if val_ap is not None else float("nan"))
+            history["val_unseen_classification_average_precision"].append(float(val_unseen_ap) if val_unseen_ap is not None else float("nan"))
 
         _log_bst_epoch_metrics(
             experiment_tracker,

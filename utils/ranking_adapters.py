@@ -41,6 +41,12 @@ def _load_checkpoint_config(checkpoint: Dict[str, Any], checkpoint_path: Path) -
     )
 
 
+def load_checkpoint_config(checkpoint_path: str | Path) -> Dict[str, Any]:
+    checkpoint_path = Path(checkpoint_path)
+    checkpoint = _load_checkpoint(checkpoint_path)
+    return _load_checkpoint_config(checkpoint, checkpoint_path)
+
+
 def _require_config(config: Dict[str, Any], key: str) -> Any:
     if key not in config:
         raise ValueError(f"Model config is missing required key: {key}")
@@ -50,8 +56,9 @@ def _require_config(config: Dict[str, Any], key: str) -> Any:
 class TwoTowerPthAdapter:
     """Matrix-ranking scorer for saved TwoTowerModel .pth checkpoints."""
 
-    def __init__(self, checkpoint_path: str | Path):
+    def __init__(self, checkpoint_path: str | Path, config_overrides: Optional[Dict[str, Any]] = None):
         self.checkpoint_path = Path(checkpoint_path)
+        self.config_overrides = dict(config_overrides or {})
         self.model: Optional[torch.nn.Module] = None
         self.config: Optional[Dict[str, Any]] = None
 
@@ -59,6 +66,7 @@ class TwoTowerPthAdapter:
         if self.model is None:
             checkpoint = _load_checkpoint(self.checkpoint_path)
             config = _load_checkpoint_config(checkpoint, self.checkpoint_path)
+            config = {**config, **self.config_overrides}
             if config.get("model_type") not in ("two_tower", "two-tower"):
                 raise ValueError(f"Expected two-tower checkpoint, got model_type={config.get('model_type')!r}")
 
@@ -128,11 +136,17 @@ class TwoTowerPthAdapter:
 class BstPthAdapter:
     """Matrix-ranking scorer for saved BSTRanker .pth checkpoints."""
 
-    def __init__(self, checkpoint_path: str | Path, candidate_chunk_size: int):
+    def __init__(
+        self,
+        checkpoint_path: str | Path,
+        candidate_chunk_size: int,
+        config_overrides: Optional[Dict[str, Any]] = None,
+    ):
         if candidate_chunk_size <= 0:
             raise ValueError("candidate_chunk_size must be positive")
         self.checkpoint_path = Path(checkpoint_path)
         self.candidate_chunk_size = int(candidate_chunk_size)
+        self.config_overrides = dict(config_overrides or {})
         self.model: Optional[torch.nn.Module] = None
         self.config: Optional[Dict[str, Any]] = None
 
@@ -140,6 +154,7 @@ class BstPthAdapter:
         if self.model is None:
             checkpoint = _load_checkpoint(self.checkpoint_path)
             config = _load_checkpoint_config(checkpoint, self.checkpoint_path)
+            config = {**config, **self.config_overrides}
             if config.get("model_type") != "bst-ranker":
                 raise ValueError(f"Expected bst-ranker checkpoint, got model_type={config.get('model_type')!r}")
             if not bool(config.get("use_author_embedding_table", False)):
@@ -195,22 +210,20 @@ class BstPthAdapter:
         history_author_indices = batch["history_author_indices"].to(device, dtype=torch.long, non_blocking=True)
         candidate_post_author_idx = batch["candidate_post_author_idx"].to(device, dtype=torch.long, non_blocking=True)
 
-        num_users = int(history_embeddings.size(0))
         num_candidates = int(candidate_post_embeddings.size(0))
         score_chunks = []
         for start in range(0, num_candidates, self.candidate_chunk_size):
             end = min(start + self.candidate_chunk_size, num_candidates)
-            chunk_size = end - start
             candidate_embeddings_chunk = candidate_post_embeddings[start:end]
             candidate_author_chunk = candidate_post_author_idx[start:end]
-            logits = self.model(
-                history_embeddings=history_embeddings.repeat_interleave(chunk_size, dim=0),
-                history_mask=history_mask.repeat_interleave(chunk_size, dim=0),
-                history_time_deltas_hours=history_time_deltas_hours.repeat_interleave(chunk_size, dim=0),
-                candidate_post_embeddings=candidate_embeddings_chunk.repeat(num_users, 1),
-                history_author_indices=history_author_indices.repeat_interleave(chunk_size, dim=0),
-                candidate_post_author_idx=candidate_author_chunk.repeat(num_users),
+            logits = self.model.score_candidate_matrix_one_layer(
+                history_embeddings=history_embeddings,
+                history_mask=history_mask,
+                history_time_deltas_hours=history_time_deltas_hours,
+                candidate_post_embeddings=candidate_embeddings_chunk,
+                history_author_indices=history_author_indices,
+                candidate_post_author_idx=candidate_author_chunk,
             )
-            score_chunks.append(logits.reshape(num_users, chunk_size))
+            score_chunks.append(logits)
 
         return MatrixBatchScores(scores=torch.cat(score_chunks, dim=1))
