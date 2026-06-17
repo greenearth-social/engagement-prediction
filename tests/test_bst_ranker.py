@@ -32,6 +32,8 @@ def _make_model(
         post_embedding_dim=4,
         author_table_num_rows=8,
         author_embedding_dim=3,
+        content_projection_dim=6,
+        author_projection_dim=4,
         model_dim=5,
         time_embedding_dim=3,
         num_attention_heads=num_attention_heads,
@@ -204,6 +206,8 @@ def test_bst_ranker_rejects_attention_head_mismatch():
             post_embedding_dim=4,
             author_table_num_rows=8,
             author_embedding_dim=3,
+            content_projection_dim=6,
+            author_projection_dim=4,
             model_dim=5,
             time_embedding_dim=2,
             num_attention_heads=4,
@@ -301,6 +305,10 @@ def test_bst_ranker_gradients_flow_through_post_time_transformer_and_head_parame
     loss = output.square().sum()
     loss.backward()
 
+    assert model.post_feature_encoder.content_projection.weight.grad is not None
+    assert model.post_feature_encoder.content_projection.weight.grad.abs().sum() > 0
+    assert model.post_feature_encoder.author_projection.weight.grad is not None
+    assert model.post_feature_encoder.author_projection.weight.grad.abs().sum() > 0
     assert model.post_feature_encoder.fusion_layer.weight.grad is not None
     assert model.post_feature_encoder.fusion_layer.weight.grad.abs().sum() > 0
     assert model.time_delta_embedding.weight.grad is not None

@@ -165,6 +165,8 @@ class BstPthAdapter:
                 post_embedding_dim=int(_require_config(config, "post_embedding_dim")),
                 author_table_num_rows=int(_require_config(config, "author_table_num_rows")),
                 author_embedding_dim=int(_require_config(config, "author_embedding_dim")),
+                content_projection_dim=int(_require_config(config, "content_projection_dim")),
+                author_projection_dim=int(_require_config(config, "author_projection_dim")),
                 model_dim=int(_require_config(config, "model_dim")),
                 time_embedding_dim=int(_require_config(config, "time_embedding_dim")),
                 num_attention_heads=int(_require_config(config, "num_attention_heads")),

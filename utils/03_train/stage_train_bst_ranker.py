@@ -81,6 +81,8 @@ class BSTPostAuthorFeatureEncoder(nn.Module):
         post_embedding_dim: int,
         author_table_num_rows: int,
         author_embedding_dim: int,
+        content_projection_dim: int,
+        author_projection_dim: int,
         model_dim: int,
         author_unknown_dropout_rate: float,
     ):
@@ -91,12 +93,18 @@ class BSTPostAuthorFeatureEncoder(nn.Module):
             raise ValueError("author_table_num_rows must be at least 2")
         if author_embedding_dim <= 0:
             raise ValueError("author_embedding_dim must be positive")
+        if content_projection_dim <= 0:
+            raise ValueError("content_projection_dim must be positive")
+        if author_projection_dim <= 0:
+            raise ValueError("author_projection_dim must be positive")
         if model_dim <= 0:
             raise ValueError("model_dim must be positive")
         if not 0.0 <= author_unknown_dropout_rate <= 1.0:
             raise ValueError("author_unknown_dropout_rate must be in [0, 1]")
 
         self.post_embedding_dim = int(post_embedding_dim)
+        self.content_projection_dim = int(content_projection_dim)
+        self.author_projection_dim = int(author_projection_dim)
         self.model_dim = int(model_dim)
         self.author_unknown_dropout_rate = float(author_unknown_dropout_rate)
         self.author_embedding = nn.Embedding(
@@ -108,13 +116,25 @@ class BSTPostAuthorFeatureEncoder(nn.Module):
         with torch.no_grad():
             self.author_embedding.weight[AUTHOR_PAD_IDX].zero_()
 
+        self.content_projection = nn.Linear(
+            int(post_embedding_dim),
+            self.content_projection_dim,
+        )
+        self.author_projection = nn.Linear(
+            int(author_embedding_dim),
+            self.author_projection_dim,
+        )
+        self.projection_activation = nn.GELU()
+        self.content_projection_norm = nn.LayerNorm(self.content_projection_dim)
+        self.author_projection_norm = nn.LayerNorm(self.author_projection_dim)
         self.fusion_layer = nn.Linear(
-            int(post_embedding_dim) + int(author_embedding_dim),
+            self.content_projection_dim + self.author_projection_dim,
             int(model_dim),
         )
-        nn.init.xavier_uniform_(self.fusion_layer.weight)
-        if self.fusion_layer.bias is not None:
-            nn.init.zeros_(self.fusion_layer.bias)
+        for layer in (self.content_projection, self.author_projection, self.fusion_layer):
+            nn.init.xavier_uniform_(layer.weight)
+            if layer.bias is not None:
+                nn.init.zeros_(layer.bias)
 
     def forward(
         self,
@@ -140,7 +160,13 @@ class BSTPostAuthorFeatureEncoder(nn.Module):
                 )
 
         author_embeddings = self.author_embedding(author_indices)
-        fused_inputs = torch.cat([post_embeddings, author_embeddings], dim=-1)
+        content_features = self.content_projection_norm(
+            self.projection_activation(self.content_projection(post_embeddings))
+        )
+        author_features = self.author_projection_norm(
+            self.projection_activation(self.author_projection(author_embeddings))
+        )
+        fused_inputs = torch.cat([content_features, author_features], dim=-1)
         return self.fusion_layer(fused_inputs)
 
 
@@ -196,6 +222,8 @@ class BSTRanker(nn.Module):
         post_embedding_dim: int,
         author_table_num_rows: int,
         author_embedding_dim: int,
+        content_projection_dim: int,
+        author_projection_dim: int,
         model_dim: int,
         time_embedding_dim: int,
         num_attention_heads: int,
@@ -220,6 +248,8 @@ class BSTRanker(nn.Module):
             raise ValueError("dropout_rate must be in [0, 1]")
 
         self.post_embedding_dim = int(post_embedding_dim)
+        self.content_projection_dim = int(content_projection_dim)
+        self.author_projection_dim = int(author_projection_dim)
         self.model_dim = int(model_dim)
         self.time_embedding_dim = int(time_embedding_dim)
         self.time_delta_bucket_boundaries_hours = _validate_time_delta_bucket_boundaries(
@@ -234,6 +264,8 @@ class BSTRanker(nn.Module):
             post_embedding_dim=post_embedding_dim,
             author_table_num_rows=author_table_num_rows,
             author_embedding_dim=author_embedding_dim,
+            content_projection_dim=content_projection_dim,
+            author_projection_dim=author_projection_dim,
             model_dim=model_dim,
             author_unknown_dropout_rate=author_unknown_dropout_rate,
         )
@@ -917,6 +949,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     max_history_len = int(args.max_history_len)
     model_dim = int(args.bst_model_dim)
+    content_projection_dim = int(args.bst_content_projection_dim)
+    author_projection_dim = int(args.bst_author_projection_dim)
     time_embedding_dim = int(args.bst_time_embedding_dim)
     num_attention_heads = int(args.bst_num_attention_heads)
     num_transformer_layers = int(args.bst_num_transformer_layers)
@@ -976,6 +1010,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "model_type": "bst-ranker",
         "post_embedding_dim": embed_dim,
         "model_dim": model_dim,
+        "content_projection_dim": content_projection_dim,
+        "author_projection_dim": author_projection_dim,
         "time_embedding_dim": time_embedding_dim,
         "num_attention_heads": num_attention_heads,
         "num_transformer_layers": num_transformer_layers,
@@ -1084,6 +1120,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         post_embedding_dim=embed_dim,
         author_table_num_rows=author_table_num_rows,
         author_embedding_dim=author_embedding_dim,
+        content_projection_dim=content_projection_dim,
+        author_projection_dim=author_projection_dim,
         model_dim=model_dim,
         time_embedding_dim=time_embedding_dim,
         num_attention_heads=num_attention_heads,

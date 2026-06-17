@@ -107,6 +107,8 @@ DEFAULTS: Dict[str, Any] = {
     "weight_decay_mlp": 0.1,
     "weight_decay_two_tower": 0.01,
     "bst_model_dim": 128,
+    "bst_content_projection_dim": 128,
+    "bst_author_projection_dim": 32,
     "bst_time_embedding_dim": 16,
     "bst_num_attention_heads": 4,
     "bst_num_transformer_layers": 1,
@@ -544,10 +546,16 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
         raise ValueError("--bst-prediction-hidden-dims values must be positive integers.")
 
     model_dim = int(args.bst_model_dim)
+    content_projection_dim = int(args.bst_content_projection_dim)
+    author_projection_dim = int(args.bst_author_projection_dim)
     time_embedding_dim = int(args.bst_time_embedding_dim)
     num_attention_heads = int(args.bst_num_attention_heads)
     if model_dim <= 0:
         raise ValueError("--bst-model-dim must be positive.")
+    if content_projection_dim <= 0:
+        raise ValueError("--bst-content-projection-dim must be positive.")
+    if author_projection_dim <= 0:
+        raise ValueError("--bst-author-projection-dim must be positive.")
     if time_embedding_dim <= 0:
         raise ValueError("--bst-time-embedding-dim must be positive.")
     if num_attention_heads <= 0:
@@ -858,6 +866,10 @@ def build_parser() -> argparse.ArgumentParser:
     # BST ranker specific options
     _add_arg_with_default(p_all, "--bst-model-dim", type=int, default=argparse.SUPPRESS,
                           help_text="BST ranker fused post/author model dimension")
+    _add_arg_with_default(p_all, "--bst-content-projection-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="BST ranker content branch projection dimension")
+    _add_arg_with_default(p_all, "--bst-author-projection-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="BST ranker author branch projection dimension")
     _add_arg_with_default(p_all, "--bst-time-embedding-dim", type=int, default=argparse.SUPPRESS,
                           help_text="BST ranker time-delta embedding dimension")
     _add_arg_with_default(p_all, "--bst-num-attention-heads", type=int, default=argparse.SUPPRESS,

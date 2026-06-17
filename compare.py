@@ -82,6 +82,13 @@ def _validate_compare_author_config(model_spec: Dict[str, str], config: Dict[str
     _require_compare_model_config(model_spec, config, "author_unknown_dropout_rate")
 
 
+def _validate_compare_bst_config(model_spec: Dict[str, str], config: Dict[str, Any]) -> None:
+    if model_spec["model_type"] != "bst-ranker":
+        return
+    _require_compare_model_config(model_spec, config, "content_projection_dim")
+    _require_compare_model_config(model_spec, config, "author_projection_dim")
+
+
 def _resolve_compare_max_history_len(
     args: argparse.Namespace,
     *,
@@ -215,6 +222,7 @@ def cmd_compare_rankers(
         spec["checkpoint_path"] = str(_resolve_compare_checkpoint_path(spec["checkpoint_path"]))
         config = load_checkpoint_config(spec["checkpoint_path"])
         _validate_compare_author_config(spec, config)
+        _validate_compare_bst_config(spec, config)
         model_configs[spec["name"]] = config
         parsed_specs.append(spec)
 

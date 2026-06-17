@@ -33,6 +33,8 @@ def _compare_checkpoint_config(max_history_len=7, use_author_embedding_table=Tru
         "max_history_len": max_history_len,
         "use_author_embedding_table": use_author_embedding_table,
         "author_embedding_dim": 2,
+        "content_projection_dim": 4,
+        "author_projection_dim": 2,
         "author_table_num_rows": 8,
         "author_unknown_dropout_rate": 0.0,
     }
@@ -168,6 +170,15 @@ def test_compare_rankers_requires_author_embedding_config():
             spec,
             _compare_checkpoint_config(use_author_embedding_table=False),
         )
+
+
+def test_compare_rankers_requires_bst_projection_config():
+    spec = {"name": "bst", "model_type": "bst-ranker", "checkpoint_path": "/tmp/bst.pth"}
+    config = _compare_checkpoint_config()
+    del config["content_projection_dim"]
+
+    with pytest.raises(ValueError, match="content_projection_dim"):
+        compare._validate_compare_bst_config(spec, config)
 
 
 def test_compare_rankers_rejects_config(tmp_path):

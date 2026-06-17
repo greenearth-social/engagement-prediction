@@ -210,6 +210,8 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
             model_type: bst-ranker
             use_author_embedding_table: true
             bst_model_dim: 96
+            bst_content_projection_dim: 80
+            bst_author_projection_dim: 24
             bst_time_embedding_dim: 32
             bst_num_attention_heads: 8
             bst_num_transformer_layers: 1
@@ -231,6 +233,8 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
 
     assert merged.model_type == "bst-ranker"
     assert merged.bst_model_dim == 96
+    assert merged.bst_content_projection_dim == 80
+    assert merged.bst_author_projection_dim == 24
     assert merged.bst_time_embedding_dim == 32
     assert merged.bst_num_attention_heads == 8
     assert merged.bst_prediction_hidden_dims == [128, 64]
@@ -284,6 +288,27 @@ def test_bst_ranker_accepts_explicit_empty_prediction_hidden_dims():
 
     assert merged.bst_prediction_hidden_dims == []
     cli._validate_bst_config(merged)
+
+
+@pytest.mark.parametrize(
+    ("arg_name", "error_match"),
+    [
+        ("bst_content_projection_dim", "bst-content-projection-dim"),
+        ("bst_author_projection_dim", "bst-author-projection-dim"),
+    ],
+)
+def test_bst_ranker_validates_projection_dims(arg_name, error_match):
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "bst-ranker",
+        "--use-author-embedding-table",
+        "--bst-prediction-hidden-dims", "144", "72",
+    ])
+    merged = cli._merge_args_with_config(raw)
+    setattr(merged, arg_name, 0)
+
+    with pytest.raises(ValueError, match=error_match):
+        cli._validate_bst_config(merged)
 
 
 def test_bst_ranker_validates_transformer_head_divisibility():
