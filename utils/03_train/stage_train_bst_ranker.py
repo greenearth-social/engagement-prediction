@@ -775,6 +775,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     lr_scheduler_patience = int(args.lr_scheduler_patience)
     gradient_clip_max_norm = float(args.gradient_clip_max_norm)
     bst_use_auc_as_primary = bool(args.bst_use_auc_as_primary)
+    primary_metric_name = "val_unseen_auc_roc" if bst_use_auc_as_primary else "val_unseen_loss"
 
     if not use_author_embedding_table:
         raise ValueError("BST ranker v1 requires use_author_embedding_table=True")
@@ -802,6 +803,52 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     pin_memory = bool(args.dataloader_pin_memory)
     persistent_workers = bool(args.dataloader_persistent_workers)
     prefetch_factor = int(args.dataloader_prefetch_factor)
+
+    config = {
+        "model_type": "bst-ranker",
+        "post_embedding_dim": embed_dim,
+        "model_dim": model_dim,
+        "time_embedding_dim": time_embedding_dim,
+        "num_attention_heads": num_attention_heads,
+        "num_transformer_layers": num_transformer_layers,
+        "transformer_ff_dim": transformer_ff_dim,
+        "dropout_rate": dropout_rate,
+        "norm_first": norm_first,
+        "time_delta_bucket_boundaries_hours": list(time_delta_bucket_boundaries_hours),
+        "prediction_hidden_dims": list(prediction_hidden_dims),
+        "max_history_len": max_history_len,
+        "use_author_embedding_table": use_author_embedding_table,
+        "author_embedding_dim": author_embedding_dim,
+        "author_unknown_dropout_rate": author_unknown_dropout_rate,
+        "author_table_num_rows": author_table_num_rows,
+        "author_pad_idx": AUTHOR_PAD_IDX,
+        "author_unk_idx": AUTHOR_UNK_IDX,
+        "bst_use_auc_as_primary": bst_use_auc_as_primary,
+    }
+    training_config = {
+        **config,
+        "batch_size": batch_size,
+        "learning_rate": learning_rate,
+        "weight_decay": weight_decay,
+        "epochs": epochs,
+        "patience": patience,
+        "early_stopping_min_delta": early_stopping_min_delta,
+        "random_seed": random_seed,
+        "lr_scheduler_factor": lr_scheduler_factor,
+        "lr_scheduler_patience": lr_scheduler_patience,
+        "gradient_clip_max_norm": gradient_clip_max_norm,
+        "primary_metric_name": primary_metric_name,
+        "num_dataloader_workers": num_workers,
+        "dataloader_pin_memory": pin_memory,
+        "dataloader_persistent_workers": persistent_workers,
+        "dataloader_prefetch_factor": prefetch_factor,
+        "save_model": save_model,
+        "generate_plots": generate_plots,
+    }
+    training_config_path = out_dir / "training_config.json"
+    with open(training_config_path, "w") as f:
+        json.dump(training_config, f, indent=2)
+    logger.info(f"Training config written to: {training_config_path}")
 
     log_operation_start("Build shared ranker negative pools", STAGE_LOG_NAME, logger)
     negative_pools_by_split_window = build_ranker_pair_negative_pools_by_split_window(
@@ -960,28 +1007,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     logger.info(f"Validation metrics: {val_metrics}")
     logger.info(f"Validation unseen users metrics: {val_unseen_metrics}")
 
-    config = {
-        "model_type": "bst-ranker",
-        "post_embedding_dim": embed_dim,
-        "model_dim": model_dim,
-        "time_embedding_dim": time_embedding_dim,
-        "num_attention_heads": num_attention_heads,
-        "num_transformer_layers": num_transformer_layers,
-        "transformer_ff_dim": transformer_ff_dim,
-        "dropout_rate": dropout_rate,
-        "norm_first": norm_first,
-        "time_delta_bucket_boundaries_hours": list(time_delta_bucket_boundaries_hours),
-        "prediction_hidden_dims": list(prediction_hidden_dims),
-        "max_history_len": max_history_len,
-        "use_author_embedding_table": use_author_embedding_table,
-        "author_embedding_dim": author_embedding_dim,
-        "author_unknown_dropout_rate": author_unknown_dropout_rate,
-        "author_table_num_rows": author_table_num_rows,
-        "author_pad_idx": AUTHOR_PAD_IDX,
-        "author_unk_idx": AUTHOR_UNK_IDX,
-        "bst_use_auc_as_primary": bst_use_auc_as_primary,
-    }
-
     model_path = None
     if save_model:
         log_operation_start("Save BST ranker checkpoint", STAGE_LOG_NAME, logger)
@@ -1004,15 +1029,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "val": val_metrics,
         "val_unseen_users": val_unseen_metrics,
     }
-    training_config = {
-        **config,
-        "batch_size": batch_size,
-        "learning_rate": learning_rate,
-        "weight_decay": weight_decay,
-        "epochs": epochs,
-        "patience": patience,
-        "early_stopping_min_delta": early_stopping_min_delta,
-        "random_seed": random_seed,
+    runtime = time.time() - t0
+    training_results_path = out_dir / "training_results.json"
+    end_of_training_values = {
+        "runtime_seconds": runtime,
+        "model_path": str(model_path) if model_path else None,
         "train_samples": len(train_dataset),
         "val_samples": len(val_dataset),
         "val_unseen_samples": len(val_unseen_dataset),
@@ -1024,11 +1045,13 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "val_unseen_metrics": val_unseen_metrics,
         "primary_metric_name": training_results["primary_metric_name"],
         "best_val_metric": training_results["best_val_metric"],
+        "best_val_loss": training_results["best_val_loss"],
+        "training_history": training_results["history"],
     }
-    with open(out_dir / "training_config.json", "w") as f:
-        json.dump(training_config, f, indent=2)
+    with open(training_results_path, "w") as f:
+        json.dump(end_of_training_values, f, indent=2)
+    logger.info(f"Training results written to: {training_results_path}")
 
-    runtime = time.time() - t0
     info_lines = [
         "stage: train_bst_ranker",
         f"timestamp: {timestamp}",
@@ -1049,6 +1072,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "output_dir": out_dir,
         "artifacts": {
             "model_path": str(model_path) if model_path else None,
-            "training_config": str(out_dir / "training_config.json"),
+            "training_config": str(training_config_path),
+            "training_results": str(training_results_path),
         },
     }

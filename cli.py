@@ -14,9 +14,11 @@ Usage examples:
 """
 
 import argparse
+import csv
 import os
 import sys
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
@@ -26,6 +28,7 @@ import copy
 from utils.pipeline import registry as reg
 from utils.pipeline.dependencies import (
     pin_lineage_aligned_inputs,
+    resolve_stage_dependencies_for_run,
     validate_explicit_prior_pin_consistency,
 )
 from utils.experiment_tracking import build_experiment_tracker
@@ -35,6 +38,7 @@ from utils.pipeline.core import (
     LINEAGE_FILENAME,
     new_pipeline_run_dir,
     ensure_pipeline_run_dir,
+    new_stage_artifact_dir,
     update_latest_symlink,
 )
 
@@ -49,6 +53,8 @@ VALID_USER_ENCODERS_BY_MODEL_TYPE: Dict[str, Tuple[str, ...]] = {
     "mlp": ("summarized", "full_transformer", "cross_attention"),
     "two-tower": ("full_transformer", "cross_attention"),
 }
+DEFAULT_COMPARE_SPLITS = ["val", "val_unseen_users", "holdout_unseen_users", "holdout_seen_users"]
+VALID_COMPARE_MODEL_TYPES = {"two-tower", "bst-ranker"}
 
 # Central default map for all run-all parameters
 DEFAULTS: Dict[str, Any] = {
@@ -355,6 +361,297 @@ def _resolve_prior_spec(
         f"Expected an existing path (absolute or relative to {Path(output_root).resolve()}) "
         f"or a stage_run_id under {Path(artifacts_dir).resolve() / stage_folder}."
     )
+
+
+def _parse_compare_model_spec(raw: str) -> Dict[str, str]:
+    parts = str(raw).split(":", 2)
+    if len(parts) != 3:
+        raise ValueError("Model spec must have format name:type:path")
+    name, model_type, checkpoint_path = (part.strip() for part in parts)
+    if not name:
+        raise ValueError("Model spec name must not be empty")
+    if model_type not in VALID_COMPARE_MODEL_TYPES:
+        valid = ", ".join(sorted(VALID_COMPARE_MODEL_TYPES))
+        raise ValueError(f"Model spec type must be one of: {valid}")
+    if not checkpoint_path:
+        raise ValueError("Model spec checkpoint path must not be empty")
+    return {
+        "name": name,
+        "model_type": model_type,
+        "checkpoint_path": checkpoint_path,
+    }
+
+
+def _resolve_compare_checkpoint_path(path_str: str) -> Path:
+    path = Path(path_str).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    path = path.resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Compare-rankers checkpoint not found: {path}")
+    return path
+
+
+def _compare_arg(args: argparse.Namespace, key: str, default: Any) -> Any:
+    return getattr(args, key, default)
+
+
+def _metric_value_for_csv(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _write_compare_metrics_csv(
+    path: Path,
+    *,
+    model_specs: List[Dict[str, str]],
+    metrics_by_model: Dict[str, Dict[str, Dict[str, Any]]],
+) -> None:
+    specs_by_name = {spec["name"]: spec for spec in model_specs}
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["model_name", "model_type", "checkpoint_path", "split", "metric", "value"],
+        )
+        writer.writeheader()
+        for model_name, split_metrics in metrics_by_model.items():
+            spec = specs_by_name[model_name]
+            for split_name, metrics in split_metrics.items():
+                for metric_name, metric_value in sorted(metrics.items()):
+                    writer.writerow({
+                        "model_name": model_name,
+                        "model_type": spec["model_type"],
+                        "checkpoint_path": spec["checkpoint_path"],
+                        "split": split_name,
+                        "metric": metric_name,
+                        "value": _metric_value_for_csv(metric_value),
+                    })
+
+
+def _make_compare_adapter(model_spec: Dict[str, str], *, bst_candidate_chunk_size: int):
+    from utils.ranking_adapters import BstPthAdapter, TwoTowerPthAdapter
+
+    if model_spec["model_type"] == "two-tower":
+        return TwoTowerPthAdapter(model_spec["checkpoint_path"])
+    if model_spec["model_type"] == "bst-ranker":
+        return BstPthAdapter(model_spec["checkpoint_path"], candidate_chunk_size=bst_candidate_chunk_size)
+    raise ValueError(f"Unsupported model type: {model_spec['model_type']}")
+
+
+def cmd_compare_rankers(args: argparse.Namespace) -> int:
+    """Compare saved ranker checkpoints on shared bucketed candidate sets."""
+    if getattr(args, "config", None):
+        raise SystemExit("--config is not supported for compare-rankers")
+    raw_model_specs = list(_compare_arg(args, "model", []) or [])
+    if not raw_model_specs:
+        raise SystemExit("compare-rankers requires at least one --model name:type:path")
+
+    run_timestamp = generate_run_timestamp()
+    if not hasattr(args, "output_dir"):
+        setattr(args, "output_dir", None)
+    output_root = _resolve_run_dir(args, run_timestamp=run_timestamp)
+    artifacts_dir = (output_root / "artifacts").resolve()
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = new_stage_artifact_dir(artifacts_dir, "compare_rankers", tag="rankers")
+
+    from utils.helpers import get_stage_logger, log_operation_start
+
+    logger = get_stage_logger(f"COMPARE_RANKERS", log_file=out_dir / "stage.log")
+    log_operation_start("Compare rankers", "COMPARE_RANKERS", logger)
+    t0 = time.time()
+
+    parsed_specs: List[Dict[str, str]] = []
+    seen_names = set()
+    for raw in raw_model_specs:
+        spec = _parse_compare_model_spec(raw)
+        if spec["name"] in seen_names:
+            raise ValueError(f"Duplicate compare-rankers model name: {spec['name']}")
+        seen_names.add(spec["name"])
+        spec["checkpoint_path"] = str(_resolve_compare_checkpoint_path(spec["checkpoint_path"]))
+        parsed_specs.append(spec)
+
+    requested_splits = list(_compare_arg(args, "splits", DEFAULT_COMPARE_SPLITS))
+    metrics_top_ks = list(_compare_arg(args, "metrics_top_ks", DEFAULTS["metrics_top_ks"]))
+    batch_size = int(_compare_arg(args, "batch_size", DEFAULTS["batch_size"]))
+    random_seed = int(_compare_arg(args, "random_seed", DEFAULTS["random_seed"]))
+    num_workers = int(_compare_arg(args, "num_dataloader_workers", DEFAULTS["num_dataloader_workers"]))
+    pin_memory = bool(_compare_arg(args, "dataloader_pin_memory", DEFAULTS["dataloader_pin_memory"]))
+    persistent_workers = bool(_compare_arg(args, "dataloader_persistent_workers", DEFAULTS["dataloader_persistent_workers"]))
+    prefetch_factor = int(_compare_arg(args, "dataloader_prefetch_factor", DEFAULTS["dataloader_prefetch_factor"]))
+    bst_candidate_chunk_size = int(_compare_arg(args, "bst_candidate_chunk_size", 1024))
+    disable_progress = bool(_compare_arg(args, "disable_progress", DEFAULTS["disable_progress"]))
+
+    print(f"Batch Size: {batch_size}")
+    print(f"Candidate Chunk Size: {bst_candidate_chunk_size}")
+    print(f"Num workers: {num_workers}")
+    print(f"Pin memory: {pin_memory}")
+    print(f"Prefetch Factor: {prefetch_factor}")
+    print(f"Persistent Workers: {persistent_workers}")
+
+    import torch
+    from torch.utils.data import DataLoader
+    from utils.dataloaders import (
+        BucketedBatchSampler,
+        BucketedEngagementDataset,
+        load_bucketed_training_data,
+    )
+    from utils.matrix_ranking import evaluate_matrix_scorer
+
+    device_arg = _compare_arg(args, "device", DEFAULTS["device"])
+    device = str(device_arg) if device_arg else ("cuda" if torch.cuda.is_available() else "cpu")
+
+    run_dir = out_dir / "run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ctx = Context(
+        run_dir=run_dir,
+        artifacts_dir=artifacts_dir,
+        runs_dir=(output_root / "runs").resolve(),
+        pipeline_run_id=out_dir.name,
+        run_timestamp=run_timestamp,
+        use_latest=True,
+    )
+
+    prior_01_get_data = _resolve_prior_spec(
+        _compare_arg(args, "prior_01_get_data", None),
+        output_root=output_root,
+        artifacts_dir=artifacts_dir,
+        stage_folder="01_get_data",
+    )
+    prior_02_user_history = _resolve_prior_spec(
+        _compare_arg(args, "prior_02_user_history", None),
+        output_root=output_root,
+        artifacts_dir=artifacts_dir,
+        stage_folder="02_user_history",
+    )
+    if prior_01_get_data is not None:
+        ctx.prior_outputs["01_get_data"] = prior_01_get_data
+    if prior_02_user_history is not None:
+        ctx.prior_outputs["02_user_history"] = prior_02_user_history
+    validate_explicit_prior_pin_consistency(ctx)
+    resolved_priors = resolve_stage_dependencies_for_run(
+        ctx=ctx,
+        consumer_stage_folder="03_train",
+    )
+    ctx.prior_outputs.update(resolved_priors)
+
+    embeddings_mmap, likes_core_df, posts_core_df, history_df, _author_idx_mapping_df, embed_dim = load_bucketed_training_data(
+        ctx,
+        logger=logger,
+    )
+
+    worker_kw: Dict[str, Any] = {
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        worker_kw.update(
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+        )
+
+    split_loaders: Dict[str, DataLoader] = {}
+    split_row_counts: Dict[str, int] = {}
+    skipped_splits: List[str] = []
+    for split_name in requested_splits:
+        dataset = BucketedEngagementDataset(
+            embeddings_mmap=embeddings_mmap,
+            likes_core_df=likes_core_df,
+            posts_core_df=posts_core_df,
+            history_df=history_df,
+            split=split_name,
+            max_history_len=int(_compare_arg(args, "max_history_len", DEFAULTS["max_history_len"])),
+            embed_dim=embed_dim,
+            use_author_embedding_table=True,
+            logger=logger,
+        )
+        split_row_counts[split_name] = len(dataset)
+        if len(dataset) == 0:
+            skipped_splits.append(split_name)
+            logger.warning(f"No rows for split '{split_name}', skipping.")
+            continue
+        split_loaders[split_name] = DataLoader(
+            dataset,
+            batch_sampler=BucketedBatchSampler(
+                dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                drop_last=False,
+                seed=random_seed,
+            ),
+            collate_fn=dataset.collate_batch,
+            **worker_kw,
+        )
+
+    metrics_by_model: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for model_spec in parsed_specs:
+        model_name = model_spec["name"]
+        logger.info(
+            f"Evaluating model '{model_name}' ({model_spec['model_type']}): {model_spec['checkpoint_path']}"
+        )
+        adapter = _make_compare_adapter(
+            model_spec,
+            bst_candidate_chunk_size=bst_candidate_chunk_size,
+        )
+        metrics_by_model[model_name] = {}
+        for split_name, loader in split_loaders.items():
+            result = evaluate_matrix_scorer(
+                adapter,
+                loader,
+                device,
+                metrics_top_ks,
+                collect_ranking_rows=False,
+                progress_desc=f"{model_name} {split_name}",
+                disable_progress=disable_progress,
+            )
+            metrics = result["metrics"]
+            metrics_by_model[model_name][split_name] = metrics
+            logger.info(f"Metrics for {model_name}/{split_name}:\n{json.dumps(metrics, indent=2)}")
+        del adapter
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+    summary = {
+        "timestamp": run_timestamp,
+        "runtime_seconds": time.time() - t0,
+        "device": device,
+        "splits": requested_splits,
+        "skipped_splits": skipped_splits,
+        "split_row_counts": split_row_counts,
+        "metrics_top_ks": metrics_top_ks,
+        "batch_size": batch_size,
+        "bst_candidate_chunk_size": bst_candidate_chunk_size,
+        "model_specs": parsed_specs,
+        "metrics": metrics_by_model,
+        "prior_inputs": {k: str(v) for k, v in ctx.get_active_stage_inputs().items()},
+    }
+
+    (out_dir / "metrics.json").write_text(json.dumps(summary, indent=2, default=str, sort_keys=True) + "\n")
+    (out_dir / "model_specs.json").write_text(json.dumps(parsed_specs, indent=2, sort_keys=True) + "\n")
+    _write_compare_metrics_csv(
+        out_dir / "metrics.csv",
+        model_specs=parsed_specs,
+        metrics_by_model=metrics_by_model,
+    )
+
+    info_lines = [
+        "stage: compare_rankers",
+        f"timestamp: {run_timestamp}",
+        f"runtime_seconds: {time.time() - t0:.2f}",
+        f"device: {device}",
+        f"models: {', '.join(spec['name'] for spec in parsed_specs)}",
+        f"splits: {', '.join(requested_splits)}",
+        f"skipped_splits: {', '.join(skipped_splits) if skipped_splits else 'none'}",
+        f"metrics_top_ks: {', '.join(str(k) for k in metrics_top_ks)}",
+        f"batch_size: {batch_size}",
+    ]
+    for folder, path in sorted(ctx.get_active_stage_inputs().items()):
+        info_lines.append(f"prior_input_{folder}: {path}")
+    (out_dir / "stage_info.txt").write_text("\n".join(info_lines) + "\n")
+
+    logger.info(f"Compare-rankers complete. Output: {out_dir}")
+    print(f"✅ compare-rankers completed successfully: {out_dir}")
+    return 0
 
 
 def cmd_run_all(args: argparse.Namespace) -> int:
@@ -719,13 +1016,31 @@ def build_parser() -> argparse.ArgumentParser:
         "command",
         nargs="?",
         default="run-all",
-        choices=["run-all"],
+        choices=["run-all", "compare-rankers"],
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--config",
         type=str,
         help="YAML/JSON config file with run-all parameters (CLI flags override config)",
+    )
+    parser.add_argument(
+        "--model",
+        action="append",
+        default=argparse.SUPPRESS,
+        help="compare-rankers model spec in name:type:path format; repeat for multiple models",
+    )
+    parser.add_argument(
+        "--splits",
+        nargs="+",
+        default=argparse.SUPPRESS,
+        help=f"compare-rankers splits to evaluate (default: {' '.join(DEFAULT_COMPARE_SPLITS)})",
+    )
+    parser.add_argument(
+        "--bst-candidate-chunk-size",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="compare-rankers BST candidate chunk size (default: 2048)",
     )
     # run-all (modular 4-stage end-to-end)
     p_all = parser
@@ -951,6 +1266,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     raw_args = parser.parse_args()
+    if raw_args.command == "compare-rankers":
+        return cmd_compare_rankers(raw_args)
     merged_args = _merge_args_with_config(raw_args)
     return merged_args.func(merged_args)
 

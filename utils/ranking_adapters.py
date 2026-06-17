@@ -92,7 +92,9 @@ class TwoTowerPthAdapter:
             model.load_state_dict(checkpoint["model_state_dict"])
             self.model = model
             self.config = config
-
+        
+        if self.model is None:
+            raise ValueError("Problem loading Two Tower model!")
         self.model = self.model.to(device)
         self.model.eval()
 
@@ -126,7 +128,7 @@ class TwoTowerPthAdapter:
 class BstPthAdapter:
     """Matrix-ranking scorer for saved BSTRanker .pth checkpoints."""
 
-    def __init__(self, checkpoint_path: str | Path, candidate_chunk_size: int = 2048):
+    def __init__(self, checkpoint_path: str | Path, candidate_chunk_size: int):
         if candidate_chunk_size <= 0:
             raise ValueError("candidate_chunk_size must be positive")
         self.checkpoint_path = Path(checkpoint_path)
@@ -162,7 +164,9 @@ class BstPthAdapter:
             model.load_state_dict(checkpoint["model_state_dict"])
             self.model = model
             self.config = config
-
+        
+        if self.model is None:
+            raise ValueError("Problem loading BST model!")
         self.model = self.model.to(device)
         self.model.eval()
 
