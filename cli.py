@@ -119,6 +119,10 @@ DEFAULTS: Dict[str, Any] = {
     "bst_prediction_hidden_dims": [64, 32, 16],
     "bst_weight_decay": 0.01,
     "bst_use_auc_as_primary": False,
+    "bst_training_mode": "listwise",
+    "bst_candidate_sample_size": 64,
+    "bst_batch_size": 128,
+    "bst_max_train_batches_per_epoch": None,
     "hidden_dims": [64, 32, 16],
     "dropout_rate_mlp": 0.5,
     "dropout_rate_two_tower": 0.1,
@@ -550,6 +554,10 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
     author_projection_dim = int(args.bst_author_projection_dim)
     time_embedding_dim = int(args.bst_time_embedding_dim)
     num_attention_heads = int(args.bst_num_attention_heads)
+    num_transformer_layers = int(args.bst_num_transformer_layers)
+    bst_candidate_sample_size = int(args.bst_candidate_sample_size)
+    bst_batch_size = int(args.bst_batch_size)
+    bst_max_train_batches_per_epoch = args.bst_max_train_batches_per_epoch
     if model_dim <= 0:
         raise ValueError("--bst-model-dim must be positive.")
     if content_projection_dim <= 0:
@@ -562,6 +570,16 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
         raise ValueError("--bst-num-attention-heads must be positive.")
     if (model_dim + time_embedding_dim) % num_attention_heads != 0:
         raise ValueError("--bst-model-dim + --bst-time-embedding-dim must be divisible by --bst-num-attention-heads.")
+    if args.bst_training_mode not in ("listwise", "pairwise"):
+        raise ValueError("--bst-training-mode must be listwise or pairwise.")
+    if args.bst_training_mode == "listwise" and num_transformer_layers != 1:
+        raise ValueError("--bst-training-mode=listwise requires --bst-num-transformer-layers=1.")
+    if bst_candidate_sample_size <= 0:
+        raise ValueError("--bst-candidate-sample-size must be positive.")
+    if bst_batch_size <= 0:
+        raise ValueError("--bst-batch-size must be positive.")
+    if bst_max_train_batches_per_epoch is not None and int(bst_max_train_batches_per_epoch) <= 0:
+        raise ValueError("--bst-max-train-batches-per-epoch must be positive when provided.")
 
 
 def _get_stage_order_for_model_type(train_key: str) -> List[str]:
@@ -891,6 +909,14 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Weight decay for BST ranker model")
     _add_arg_with_default(p_all, "--bst-use-auc-as-primary", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help_text="Use validation unseen AUC-ROC as the BST primary metric instead of validation unseen loss")
+    _add_arg_with_default(p_all, "--bst-training-mode", type=str, choices=["listwise", "pairwise"], default=argparse.SUPPRESS,
+                          help_text="BST training objective/data shape: listwise matrix ranking or pairwise binary classification")
+    _add_arg_with_default(p_all, "--bst-candidate-sample-size", type=int, default=argparse.SUPPRESS,
+                          help_text="Candidate cap for BST listwise training batches")
+    _add_arg_with_default(p_all, "--bst-batch-size", type=int, default=argparse.SUPPRESS,
+                          help_text="Batch size for BST ranker training")
+    _add_arg_with_default(p_all, "--bst-max-train-batches-per-epoch", type=int, default=argparse.SUPPRESS,
+                          help_text="Optional cap on BST train batches per epoch for fast experiments")
     # Stage 3 options (shared)
     _add_arg_with_default(p_all, "--epochs", type=int, default=argparse.SUPPRESS,
                           help_text="Training epochs")

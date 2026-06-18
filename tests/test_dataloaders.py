@@ -186,6 +186,116 @@ def test_bucketed_collate_dedupes_candidates(bucketed_dataset):
     assert batch["label_matrix"][0].tolist() == [1.0, 1.0, 0.0, 0.0, 0.0]
 
 
+def test_bucketed_collate_candidate_cap_keeps_all_positives(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+):
+    dataset = BucketedEngagementDataset(
+        embeddings_mmap=mock_embeddings_mmap,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
+        history_df=mock_history_df,
+        split="train",
+        max_history_len=3,
+        embed_dim=4,
+        candidate_sample_size=4,
+        seed=0,
+    )
+
+    batch = dataset.collate_batch([dataset[0], dataset[1]])
+
+    assert len(batch["candidate_post_id"]) == 4
+    assert {"p1", "p2", "p3"} <= set(batch["candidate_post_id"])
+    positive_indices = {
+        post_id: idx
+        for idx, post_id in enumerate(batch["candidate_post_id"])
+        if post_id in {"p1", "p2", "p3"}
+    }
+    assert batch["label_matrix"][0, positive_indices["p1"]].item() == 1.0
+    assert batch["label_matrix"][0, positive_indices["p3"]].item() == 1.0
+    assert batch["label_matrix"][1, positive_indices["p2"]].item() == 1.0
+
+
+def test_bucketed_collate_candidate_cap_allows_positive_overflow(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+):
+    dataset = BucketedEngagementDataset(
+        embeddings_mmap=mock_embeddings_mmap,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
+        history_df=mock_history_df,
+        split="train",
+        max_history_len=3,
+        embed_dim=4,
+        candidate_sample_size=2,
+        seed=0,
+    )
+
+    batch = dataset.collate_batch([dataset[0], dataset[1]])
+
+    assert batch["candidate_post_id"] == ["p1", "p3", "p2"]
+    assert batch["label_matrix"].shape == (2, 3)
+
+
+def test_bucketed_candidate_sampling_changes_by_epoch(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+):
+    dataset = BucketedEngagementDataset(
+        embeddings_mmap=mock_embeddings_mmap,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
+        history_df=mock_history_df,
+        split="train",
+        max_history_len=3,
+        embed_dim=4,
+        candidate_sample_size=4,
+        seed=0,
+    )
+
+    sampled_candidates = [
+        tuple(dataset.collate_batch([dataset[(0, epoch)], dataset[(1, epoch)]])["candidate_post_id"])
+        for epoch in range(8)
+    ]
+
+    assert len(set(sampled_candidates)) > 1
+    assert sampled_candidates == [
+        tuple(dataset.collate_batch([dataset[(0, epoch)], dataset[(1, epoch)]])["candidate_post_id"])
+        for epoch in range(8)
+    ]
+
+
+def test_bucketed_validation_candidate_sampling_is_deterministic(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+):
+    dataset = BucketedEngagementDataset(
+        embeddings_mmap=mock_embeddings_mmap,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
+        history_df=mock_history_df,
+        split="train",
+        max_history_len=3,
+        embed_dim=4,
+        candidate_sample_size=4,
+        seed=0,
+    )
+
+    first = dataset.collate_batch([dataset[0], dataset[1]])
+    second = dataset.collate_batch([dataset[0], dataset[1]])
+
+    assert first["candidate_post_id"] == second["candidate_post_id"]
+
+
 def test_bucketed_collate_handles_empty_sampled_negative_bucket(bucketed_dataset):
     batch = bucketed_dataset.collate_batch([bucketed_dataset[3]])
 

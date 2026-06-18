@@ -222,6 +222,10 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
             bst_prediction_hidden_dims: [128, 64]
             bst_weight_decay: 0.02
             bst_use_auc_as_primary: true
+            bst_training_mode: listwise
+            bst_candidate_sample_size: 32
+            bst_batch_size: 16
+            bst_max_train_batches_per_epoch: 5
             """
         ).strip()
         + "\n"
@@ -239,6 +243,25 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
     assert merged.bst_num_attention_heads == 8
     assert merged.bst_prediction_hidden_dims == [128, 64]
     assert merged.bst_use_auc_as_primary is True
+    assert merged.bst_training_mode == "listwise"
+    assert merged.bst_candidate_sample_size == 32
+    assert merged.bst_batch_size == 16
+    assert merged.bst_max_train_batches_per_epoch == 5
+    cli._validate_bst_config(merged)
+
+
+def test_bst_ranker_listwise_training_defaults():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "bst-ranker",
+        "--use-author-embedding-table",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.bst_training_mode == "listwise"
+    assert merged.bst_candidate_sample_size == 64
+    assert merged.bst_batch_size == 128
+    assert merged.bst_max_train_batches_per_epoch is None
     cli._validate_bst_config(merged)
 
 
@@ -256,6 +279,53 @@ def test_bst_ranker_auc_primary_flag_can_be_enabled():
     merged = cli._merge_args_with_config(raw)
 
     assert merged.bst_use_auc_as_primary is True
+
+
+def test_bst_ranker_listwise_requires_one_transformer_layer():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "bst-ranker",
+        "--use-author-embedding-table",
+        "--bst-num-transformer-layers", "2",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    with pytest.raises(ValueError, match="requires --bst-num-transformer-layers=1"):
+        cli._validate_bst_config(merged)
+
+
+def test_bst_ranker_pairwise_allows_multiple_transformer_layers():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "bst-ranker",
+        "--use-author-embedding-table",
+        "--bst-training-mode", "pairwise",
+        "--bst-num-transformer-layers", "2",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    cli._validate_bst_config(merged)
+
+
+@pytest.mark.parametrize(
+    ("flag", "message"),
+    [
+        ("--bst-candidate-sample-size", "bst-candidate-sample-size"),
+        ("--bst-batch-size", "bst-batch-size"),
+        ("--bst-max-train-batches-per-epoch", "bst-max-train-batches-per-epoch"),
+    ],
+)
+def test_bst_ranker_rejects_non_positive_listwise_training_controls(flag, message):
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "bst-ranker",
+        "--use-author-embedding-table",
+        flag, "0",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    with pytest.raises(ValueError, match=message):
+        cli._validate_bst_config(merged)
 
 
 def test_bst_ranker_requires_author_embedding_table():

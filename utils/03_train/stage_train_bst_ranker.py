@@ -20,8 +20,10 @@ from tqdm import tqdm
 
 from shared.input_data_helpers import AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
 from utils.dataloaders import (
+    BucketedEngagementDataset,
     RankerPairDataset,
     build_ranker_pair_negative_pools_by_split_window,
+    create_bucketed_data_loaders,
     create_ranker_pair_data_loaders,
     get_author_table_num_rows,
     load_bucketed_training_data,
@@ -36,7 +38,13 @@ from utils.helpers import (
     plot_training_history,
     set_random_seeds,
 )
-from utils.matrix_ranking import stage_info_metric_lines
+from utils.matrix_ranking import (
+    MatrixBatchScores,
+    empty_rank_metric_sums,
+    evaluate_matrix_scorer,
+    rank_metric_sums_for_batch,
+    stage_info_metric_lines,
+)
 from utils.pipeline.core import Context
 
 
@@ -356,8 +364,6 @@ class BSTRanker(nn.Module):
         return encoded_sequence[:, -1, :]
 
     def _validate_one_layer_matrix_scorer(self) -> nn.TransformerEncoderLayer:
-        if self.training:
-            raise RuntimeError("score_candidate_matrix_one_layer requires the model to be in eval mode")
         layers = getattr(self.transformer_encoder, "layers", None)
         if layers is None or len(layers) != 1:
             raise RuntimeError("score_candidate_matrix_one_layer requires exactly one transformer layer")
@@ -406,6 +412,7 @@ class BSTRanker(nn.Module):
         candidate_scores = candidate_scores.unsqueeze(0).unsqueeze(-1).expand(num_users, -1, -1, -1)
         attention_scores = torch.cat([history_scores, candidate_scores], dim=-1)
         attention_weights = torch.softmax(attention_scores, dim=-1)
+        attention_weights = F.dropout(attention_weights, p=float(self_attn.dropout), training=self.training)
 
         if max_history_len == 0:
             history_context = torch.zeros(
@@ -616,6 +623,40 @@ def _compute_bst_loss_and_preds(
     return loss, logits, labels
 
 
+def _compute_bst_listwise_loss_and_preds(
+    model: BSTRanker,
+    batch: Dict[str, Any],
+    device: str,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    history_embeddings = batch["history_embeddings"].to(device, non_blocking=True)
+    history_mask = batch["history_mask"].to(device, non_blocking=True)
+    history_time_deltas_hours = batch["history_time_deltas_hours"].to(device, non_blocking=True)
+    candidate_post_embeddings = batch["candidate_post_embeddings"].to(device, non_blocking=True)
+    labels = batch["label_matrix"].to(device, dtype=torch.float32, non_blocking=True)
+    if "history_author_indices" not in batch or "candidate_post_author_idx" not in batch:
+        raise RuntimeError("BST listwise batches must include author index tensors")
+    history_author_indices = batch["history_author_indices"].to(device, dtype=torch.long, non_blocking=True)
+    candidate_post_author_idx = batch["candidate_post_author_idx"].to(device, dtype=torch.long, non_blocking=True)
+
+    scores = model.score_candidate_matrix_one_layer(
+        history_embeddings=history_embeddings,
+        history_mask=history_mask,
+        history_time_deltas_hours=history_time_deltas_hours,
+        candidate_post_embeddings=candidate_post_embeddings,
+        history_author_indices=history_author_indices,
+        candidate_post_author_idx=candidate_post_author_idx,
+    )
+    if scores.shape != labels.shape:
+        raise RuntimeError("Expected BST scores and label_matrix to have matching [num_users, num_candidates] shapes")
+    positive_counts = labels.sum(dim=1, keepdim=True)
+    if torch.any(positive_counts <= 0):
+        raise RuntimeError("Each user row in label_matrix must contain at least one positive candidate")
+
+    targets = labels / positive_counts
+    loss_per_user = -(targets * F.log_softmax(scores, dim=1)).sum(dim=1)
+    return loss_per_user.mean(), scores, labels
+
+
 def _classification_metrics_from_logits(labels: torch.Tensor, logits: torch.Tensor) -> Dict[str, Any]:
     labels_np = labels.detach().cpu().numpy()
     logits_np = logits.detach().cpu().numpy()
@@ -703,6 +744,82 @@ def run_bst_epoch(
     return loss, metrics
 
 
+def run_bst_listwise_epoch(
+    *,
+    train: bool,
+    split_name: str,
+    model: BSTRanker,
+    device: str,
+    dataloader: DataLoader,
+    optimizer: Optional[torch.optim.Optimizer],
+    disable_progress: bool,
+    gradient_clip_max_norm: float,
+    metrics_top_ks: List[int],
+    max_batches: Optional[int] = None,
+) -> Tuple[float, Dict[str, Any]]:
+    if train:
+        if optimizer is None:
+            raise ValueError("optimizer is required when train=True")
+        model.train()
+    else:
+        model.eval()
+
+    loss_sum = torch.zeros((), device=device)
+    batches = 0
+    metric_sums = empty_rank_metric_sums(metrics_top_ks)
+    metric_user_count = 0
+
+    with nullcontext() if train else torch.inference_mode():
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc=split_name, leave=False, disable=disable_progress)):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+            if train and optimizer is not None:
+                optimizer.zero_grad()
+
+            loss, scores, labels = _compute_bst_listwise_loss_and_preds(model, batch, device)
+            ranked_indices = torch.argsort(scores.detach(), dim=1, descending=True)
+            ranked_labels = torch.gather(labels, dim=1, index=ranked_indices)
+            batch_metric_sums, batch_metric_user_count = rank_metric_sums_for_batch(
+                ranked_labels,
+                metrics_top_ks,
+            )
+
+            if train and optimizer is not None:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_max_norm)
+                optimizer.step()
+
+            loss_sum += loss.detach()
+            batches += 1
+            metric_user_count += batch_metric_user_count
+            for key, value in batch_metric_sums.items():
+                metric_sums[key] += value
+
+    loss = (loss_sum / max(batches, 1)).item()
+    metrics: Dict[str, Any] = {
+        key: value / metric_user_count if metric_user_count > 0 else 0.0
+        for key, value in metric_sums.items()
+    }
+    metrics["loss"] = loss
+    metrics["rank_metric_user_count"] = metric_user_count
+    return loss, metrics
+
+
+class BSTRankerMatrixScorer:
+    """Matrix-ranking scorer for an in-memory BST model."""
+
+    def __init__(self, model: BSTRanker):
+        self.model = model
+
+    def prepare_for_eval(self, device: str) -> None:
+        self.model = self.model.to(device)
+        self.model.eval()
+
+    def score_batch(self, batch: Dict[str, Any], device: str) -> MatrixBatchScores:
+        loss, scores, _ = _compute_bst_listwise_loss_and_preds(self.model, batch, device)
+        return MatrixBatchScores(scores=scores, loss=loss)
+
+
 def _log_bst_epoch_metrics(
     experiment_tracker: Optional[Any],
     iteration: int,
@@ -738,6 +855,59 @@ def _log_bst_epoch_metrics(
             )
 
 
+def _listwise_history_metric_names(metrics_top_ks: List[int]) -> List[str]:
+    names: List[str] = []
+    for k in metrics_top_ks:
+        names.extend([f"ndcg@{k}", f"recall@{k}"])
+    names.append("mean_average_precision")
+    return names
+
+
+def _append_split_metrics_to_history(
+    history: Dict[str, List[float]],
+    split_name: str,
+    metrics: Dict[str, Any],
+    metric_names: List[str],
+) -> None:
+    for metric_name in metric_names:
+        key = f"{split_name}_{metric_name}"
+        metric_value = metrics.get(metric_name)
+        history.setdefault(key, []).append(float(metric_value) if metric_value is not None else float("nan"))
+
+
+def _log_bst_listwise_epoch_metrics(
+    experiment_tracker: Optional[Any],
+    iteration: int,
+    train_metrics: Dict[str, Any],
+    val_metrics: Dict[str, Any],
+    val_unseen_metrics: Dict[str, Any],
+    metrics_top_ks: List[int],
+    primary_metric_name: str,
+) -> None:
+    if experiment_tracker is None:
+        return
+    primary_metric_key = primary_metric_name.replace("val_unseen_", "", 1)
+    primary_metric_value = val_unseen_metrics.get(primary_metric_key)
+    if primary_metric_value is not None:
+        experiment_tracker.log_scalar(
+            f"Primary Ranking Metric ({primary_metric_key})",
+            f"Validation Unseen Users {primary_metric_key}",
+            float(primary_metric_value),
+            iteration,
+        )
+    for k in metrics_top_ks:
+        for metric_name, metric_label in ((f"ndcg@{k}", f"NDCG@{k}"), (f"recall@{k}", f"Recall@{k}")):
+            for split_label, metrics in (
+                ("Train", train_metrics),
+                ("Validation", val_metrics),
+                ("Validation Unseen Users", val_unseen_metrics),
+            ):
+                metric_value = metrics.get(metric_name)
+                if metric_value is None:
+                    continue
+                experiment_tracker.log_scalar(metric_label, f"{split_label} {metric_label}", float(metric_value), iteration)
+
+
 def train_bst_ranker_model(
     model: BSTRanker,
     train_loader: DataLoader,
@@ -755,22 +925,42 @@ def train_bst_ranker_model(
     lr_scheduler_patience: int,
     gradient_clip_max_norm: float,
     bst_use_auc_as_primary: bool = False,
+    bst_training_mode: str = "listwise",
+    metrics_top_ks: Optional[List[int]] = None,
+    bst_max_train_batches_per_epoch: Optional[int] = None,
     experiment_tracker: Optional[Any] = None,
 ) -> Dict[str, Any]:
+    if bst_training_mode not in ("listwise", "pairwise"):
+        raise ValueError("bst_training_mode must be 'listwise' or 'pairwise'")
+    metrics_top_ks = list(metrics_top_ks or [30])
+    if not metrics_top_ks:
+        raise ValueError("metrics_top_ks must contain at least one value")
+    if bst_max_train_batches_per_epoch is not None and bst_max_train_batches_per_epoch <= 0:
+        raise ValueError("bst_max_train_batches_per_epoch must be positive when provided")
+
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler_mode = "max" if bst_use_auc_as_primary else "min"
+    listwise_mode = bst_training_mode == "listwise"
+    scheduler_mode = "max" if listwise_mode or bst_use_auc_as_primary else "min"
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode=scheduler_mode, factor=lr_scheduler_factor, patience=lr_scheduler_patience
     )
 
-    primary_metric_name = "val_unseen_auc_roc" if bst_use_auc_as_primary else "val_unseen_loss"
+    if listwise_mode:
+        primary_metric_name = f"val_unseen_ndcg@{metrics_top_ks[0]}"
+    else:
+        primary_metric_name = "val_unseen_auc_roc" if bst_use_auc_as_primary else "val_unseen_loss"
     history: Dict[str, List[float]] = {
         "train_loss": [],
         "val_loss": [],
         "val_unseen_loss": [],
     }
-    if bst_use_auc_as_primary:
+    listwise_metric_names = _listwise_history_metric_names(metrics_top_ks)
+    if listwise_mode:
+        for split_name in ("train", "val", "val_unseen"):
+            for metric_name in listwise_metric_names:
+                history[f"{split_name}_{metric_name}"] = []
+    elif bst_use_auc_as_primary:
         history.update({
             "train_auc_roc": [],
             "val_auc_roc": [],
@@ -779,51 +969,91 @@ def train_bst_ranker_model(
             "val_classification_average_precision": [],
             "val_unseen_classification_average_precision": [],
         })
-    best_val_metric = float("-inf") if bst_use_auc_as_primary else float("inf")
-    best_reset_val_metric = float("-inf") if bst_use_auc_as_primary else float("inf")
+    best_val_metric = float("-inf") if scheduler_mode == "max" else float("inf")
+    best_reset_val_metric = float("-inf") if scheduler_mode == "max" else float("inf")
     best_val_loss = float("inf")
     patience_counter = 0
     best_state_dict = None
 
     for epoch in tqdm(range(epochs), desc="Training epochs", disable=disable_progress):
-        train_loss, train_metrics = run_bst_epoch(
-            train=True,
-            split_name="Train",
-            model=model,
-            device=device,
-            dataloader=train_loader,
-            optimizer=optimizer,
-            disable_progress=disable_progress,
-            gradient_clip_max_norm=gradient_clip_max_norm,
-            compute_classification_metrics=bst_use_auc_as_primary,
-        )
-        val_loss, val_metrics = run_bst_epoch(
-            train=False,
-            split_name="Validation",
-            model=model,
-            device=device,
-            dataloader=val_loader,
-            optimizer=None,
-            disable_progress=disable_progress,
-            gradient_clip_max_norm=gradient_clip_max_norm,
-            compute_classification_metrics=bst_use_auc_as_primary,
-        )
-        val_unseen_loss, val_unseen_metrics = run_bst_epoch(
-            train=False,
-            split_name="Validation Unseen Users",
-            model=model,
-            device=device,
-            dataloader=val_unseen_loader,
-            optimizer=None,
-            disable_progress=disable_progress,
-            gradient_clip_max_norm=gradient_clip_max_norm,
-            compute_classification_metrics=bst_use_auc_as_primary,
-        )
+        if listwise_mode:
+            train_loss, train_metrics = run_bst_listwise_epoch(
+                train=True,
+                split_name="Train",
+                model=model,
+                device=device,
+                dataloader=train_loader,
+                optimizer=optimizer,
+                disable_progress=disable_progress,
+                gradient_clip_max_norm=gradient_clip_max_norm,
+                metrics_top_ks=metrics_top_ks,
+                max_batches=bst_max_train_batches_per_epoch,
+            )
+            val_loss, val_metrics = run_bst_listwise_epoch(
+                train=False,
+                split_name="Validation",
+                model=model,
+                device=device,
+                dataloader=val_loader,
+                optimizer=None,
+                disable_progress=disable_progress,
+                gradient_clip_max_norm=gradient_clip_max_norm,
+                metrics_top_ks=metrics_top_ks,
+            )
+            val_unseen_loss, val_unseen_metrics = run_bst_listwise_epoch(
+                train=False,
+                split_name="Validation Unseen Users",
+                model=model,
+                device=device,
+                dataloader=val_unseen_loader,
+                optimizer=None,
+                disable_progress=disable_progress,
+                gradient_clip_max_norm=gradient_clip_max_norm,
+                metrics_top_ks=metrics_top_ks,
+            )
+        else:
+            train_loss, train_metrics = run_bst_epoch(
+                train=True,
+                split_name="Train",
+                model=model,
+                device=device,
+                dataloader=train_loader,
+                optimizer=optimizer,
+                disable_progress=disable_progress,
+                gradient_clip_max_norm=gradient_clip_max_norm,
+                compute_classification_metrics=bst_use_auc_as_primary,
+            )
+            val_loss, val_metrics = run_bst_epoch(
+                train=False,
+                split_name="Validation",
+                model=model,
+                device=device,
+                dataloader=val_loader,
+                optimizer=None,
+                disable_progress=disable_progress,
+                gradient_clip_max_norm=gradient_clip_max_norm,
+                compute_classification_metrics=bst_use_auc_as_primary,
+            )
+            val_unseen_loss, val_unseen_metrics = run_bst_epoch(
+                train=False,
+                split_name="Validation Unseen Users",
+                model=model,
+                device=device,
+                dataloader=val_unseen_loader,
+                optimizer=None,
+                disable_progress=disable_progress,
+                gradient_clip_max_norm=gradient_clip_max_norm,
+                compute_classification_metrics=bst_use_auc_as_primary,
+            )
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["val_unseen_loss"].append(val_unseen_loss)
-        if bst_use_auc_as_primary:
+        if listwise_mode:
+            _append_split_metrics_to_history(history, "train", train_metrics, listwise_metric_names)
+            _append_split_metrics_to_history(history, "val", val_metrics, listwise_metric_names)
+            _append_split_metrics_to_history(history, "val_unseen", val_unseen_metrics, listwise_metric_names)
+        elif bst_use_auc_as_primary:
             train_auc = train_metrics.get("auc_roc")
             val_auc = val_metrics.get("auc_roc")
             val_unseen_auc = val_unseen_metrics.get("auc_roc")
@@ -847,8 +1077,22 @@ def train_bst_ranker_model(
             val_metrics,
             val_unseen_metrics,
         )
+        if listwise_mode:
+            _log_bst_listwise_epoch_metrics(
+                experiment_tracker,
+                epoch + 1,
+                train_metrics,
+                val_metrics,
+                val_unseen_metrics,
+                metrics_top_ks,
+                primary_metric_name,
+            )
 
-        if bst_use_auc_as_primary:
+        if listwise_mode:
+            primary_metric_key = primary_metric_name.replace("val_unseen_", "", 1)
+            primary_metric_value = val_unseen_metrics.get(primary_metric_key)
+            primary_metric = float(primary_metric_value) if primary_metric_value is not None else None
+        elif bst_use_auc_as_primary:
             val_unseen_auc = val_unseen_metrics.get("auc_roc")
             primary_metric = float(val_unseen_auc) if val_unseen_auc is not None else None
         else:
@@ -857,13 +1101,13 @@ def train_bst_ranker_model(
         if primary_metric is not None:
             scheduler.step(primary_metric)
         else:
-            scheduler.step(float("-inf") if bst_use_auc_as_primary else float("inf"))
+            scheduler.step(float("-inf") if scheduler_mode == "max" else float("inf"))
 
         better_than_best = (
             primary_metric is not None
             and (
                 primary_metric > best_val_metric
-                if bst_use_auc_as_primary
+                if scheduler_mode == "max"
                 else primary_metric < best_val_metric
             )
         )
@@ -892,7 +1136,7 @@ def train_bst_ranker_model(
                     primary_metric > best_reset_val_metric
                     and (primary_metric - best_reset_val_metric) >= early_stopping_min_delta
                 )
-                if bst_use_auc_as_primary
+                if scheduler_mode == "max"
                 else (
                     primary_metric < best_reset_val_metric
                     and (best_reset_val_metric - primary_metric) >= early_stopping_min_delta
@@ -964,7 +1208,15 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     use_author_embedding_table = bool(args.use_author_embedding_table)
     author_embedding_dim = int(args.author_embedding_dim)
     author_unknown_dropout_rate = float(args.author_unknown_dropout_rate)
-    batch_size = int(args.batch_size)
+    bst_training_mode = str(args.bst_training_mode)
+    batch_size = int(args.bst_batch_size)
+    bst_candidate_sample_size = int(args.bst_candidate_sample_size)
+    bst_max_train_batches_per_epoch = getattr(args, "bst_max_train_batches_per_epoch", None)
+    if bst_max_train_batches_per_epoch is not None:
+        bst_max_train_batches_per_epoch = int(bst_max_train_batches_per_epoch)
+    metrics_top_ks = list(args.metrics_top_ks)
+    if not metrics_top_ks:
+        raise ValueError("metrics_top_ks must contain at least one value")
     learning_rate = float(args.learning_rate)
     weight_decay = float(args.bst_weight_decay)
     epochs = int(args.epochs)
@@ -977,7 +1229,14 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     lr_scheduler_patience = int(args.lr_scheduler_patience)
     gradient_clip_max_norm = float(args.gradient_clip_max_norm)
     bst_use_auc_as_primary = bool(args.bst_use_auc_as_primary)
-    primary_metric_name = "val_unseen_auc_roc" if bst_use_auc_as_primary else "val_unseen_loss"
+    primary_metric_name = (
+        f"val_unseen_ndcg@{metrics_top_ks[0]}"
+        if bst_training_mode == "listwise"
+        else ("val_unseen_auc_roc" if bst_use_auc_as_primary else "val_unseen_loss")
+    )
+
+    if bst_training_mode == "listwise" and num_transformer_layers != 1:
+        raise ValueError("BST listwise training requires bst_num_transformer_layers=1")
 
     if not use_author_embedding_table:
         raise ValueError("BST ranker v1 requires use_author_embedding_table=True")
@@ -1028,10 +1287,14 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "author_pad_idx": AUTHOR_PAD_IDX,
         "author_unk_idx": AUTHOR_UNK_IDX,
         "bst_use_auc_as_primary": bst_use_auc_as_primary,
+        "bst_training_mode": bst_training_mode,
+        "bst_candidate_sample_size": bst_candidate_sample_size,
     }
     training_config = {
         **config,
         "batch_size": batch_size,
+        "bst_batch_size": batch_size,
+        "bst_max_train_batches_per_epoch": bst_max_train_batches_per_epoch,
         "learning_rate": learning_rate,
         "weight_decay": weight_decay,
         "epochs": epochs,
@@ -1042,6 +1305,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "lr_scheduler_patience": lr_scheduler_patience,
         "gradient_clip_max_norm": gradient_clip_max_norm,
         "primary_metric_name": primary_metric_name,
+        "metrics_top_ks": metrics_top_ks,
         "num_dataloader_workers": num_workers,
         "dataloader_pin_memory": pin_memory,
         "dataloader_persistent_workers": persistent_workers,
@@ -1054,66 +1318,120 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         json.dump(training_config, f, indent=2)
     logger.info(f"Training config written to: {training_config_path}")
 
-    log_operation_start("Build shared ranker negative pools", STAGE_LOG_NAME, logger)
-    negative_pools_by_split_window = build_ranker_pair_negative_pools_by_split_window(
-        posts_core_df,
-        use_author_embedding_table=use_author_embedding_table,
-    )
-    train_negative_pool = negative_pools_by_split_window.get("train", {})
-    val_negative_pool = negative_pools_by_split_window.get("val", {})
+    if bst_training_mode == "listwise":
+        log_operation_start("Create capped bucketed BST datasets", STAGE_LOG_NAME, logger)
+        train_dataset = BucketedEngagementDataset(
+            embeddings_mmap=embeddings_mmap,
+            likes_core_df=likes_core_df,
+            posts_core_df=posts_core_df,
+            history_df=history_df,
+            split="train",
+            max_history_len=max_history_len,
+            embed_dim=embed_dim,
+            use_author_embedding_table=use_author_embedding_table,
+            candidate_sample_size=bst_candidate_sample_size,
+            seed=random_seed,
+            logger=logger,
+        )
+        val_dataset = BucketedEngagementDataset(
+            embeddings_mmap=embeddings_mmap,
+            likes_core_df=likes_core_df,
+            posts_core_df=posts_core_df,
+            history_df=history_df,
+            split="val",
+            max_history_len=max_history_len,
+            embed_dim=embed_dim,
+            use_author_embedding_table=use_author_embedding_table,
+            candidate_sample_size=bst_candidate_sample_size,
+            seed=random_seed,
+            logger=logger,
+        )
+        val_unseen_dataset = BucketedEngagementDataset(
+            embeddings_mmap=embeddings_mmap,
+            likes_core_df=likes_core_df,
+            posts_core_df=posts_core_df,
+            history_df=history_df,
+            split="val_unseen_users",
+            max_history_len=max_history_len,
+            embed_dim=embed_dim,
+            use_author_embedding_table=use_author_embedding_table,
+            candidate_sample_size=bst_candidate_sample_size,
+            seed=random_seed,
+            logger=logger,
+        )
+        train_loader, val_loader, val_unseen_loader, _ = create_bucketed_data_loaders(
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            val_unseen_dataset=val_unseen_dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+            seed=random_seed,
+            train_resample_candidates_each_epoch=True,
+        )
+    else:
+        log_operation_start("Build shared ranker negative pools", STAGE_LOG_NAME, logger)
+        negative_pools_by_split_window = build_ranker_pair_negative_pools_by_split_window(
+            posts_core_df,
+            use_author_embedding_table=use_author_embedding_table,
+        )
+        train_negative_pool = negative_pools_by_split_window.get("train", {})
+        val_negative_pool = negative_pools_by_split_window.get("val", {})
 
-    log_operation_start("Create ranker pair datasets", STAGE_LOG_NAME, logger)
-    train_dataset = RankerPairDataset(
-        embeddings_mmap=embeddings_mmap,
-        likes_core_df=likes_core_df,
-        posts_core_df=posts_core_df,
-        history_df=history_df,
-        split="train",
-        max_history_len=max_history_len,
-        embed_dim=embed_dim,
-        seed=random_seed,
-        use_author_embedding_table=use_author_embedding_table,
-        sampled_posts_by_bucket=train_negative_pool,
-        logger=logger,
-    )
-    val_dataset = RankerPairDataset(
-        embeddings_mmap=embeddings_mmap,
-        likes_core_df=likes_core_df,
-        posts_core_df=posts_core_df,
-        history_df=history_df,
-        split="val",
-        max_history_len=max_history_len,
-        embed_dim=embed_dim,
-        seed=random_seed,
-        use_author_embedding_table=use_author_embedding_table,
-        sampled_posts_by_bucket=val_negative_pool,
-        logger=logger,
-    )
-    val_unseen_dataset = RankerPairDataset(
-        embeddings_mmap=embeddings_mmap,
-        likes_core_df=likes_core_df,
-        posts_core_df=posts_core_df,
-        history_df=history_df,
-        split="val_unseen_users",
-        max_history_len=max_history_len,
-        embed_dim=embed_dim,
-        seed=random_seed,
-        use_author_embedding_table=use_author_embedding_table,
-        sampled_posts_by_bucket=val_negative_pool,
-        logger=logger,
-    )
+        log_operation_start("Create ranker pair datasets", STAGE_LOG_NAME, logger)
+        train_dataset = RankerPairDataset(
+            embeddings_mmap=embeddings_mmap,
+            likes_core_df=likes_core_df,
+            posts_core_df=posts_core_df,
+            history_df=history_df,
+            split="train",
+            max_history_len=max_history_len,
+            embed_dim=embed_dim,
+            seed=random_seed,
+            use_author_embedding_table=use_author_embedding_table,
+            sampled_posts_by_bucket=train_negative_pool,
+            logger=logger,
+        )
+        val_dataset = RankerPairDataset(
+            embeddings_mmap=embeddings_mmap,
+            likes_core_df=likes_core_df,
+            posts_core_df=posts_core_df,
+            history_df=history_df,
+            split="val",
+            max_history_len=max_history_len,
+            embed_dim=embed_dim,
+            seed=random_seed,
+            use_author_embedding_table=use_author_embedding_table,
+            sampled_posts_by_bucket=val_negative_pool,
+            logger=logger,
+        )
+        val_unseen_dataset = RankerPairDataset(
+            embeddings_mmap=embeddings_mmap,
+            likes_core_df=likes_core_df,
+            posts_core_df=posts_core_df,
+            history_df=history_df,
+            split="val_unseen_users",
+            max_history_len=max_history_len,
+            embed_dim=embed_dim,
+            seed=random_seed,
+            use_author_embedding_table=use_author_embedding_table,
+            sampled_posts_by_bucket=val_negative_pool,
+            logger=logger,
+        )
+        train_loader, val_loader, val_unseen_loader, _ = create_ranker_pair_data_loaders(
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            val_unseen_dataset=val_unseen_dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+            seed=random_seed,
+        )
     del likes_core_df, posts_core_df, history_df, author_idx_mapping_df
-    train_loader, val_loader, val_unseen_loader, _ = create_ranker_pair_data_loaders(
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        val_unseen_dataset=val_unseen_dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor,
-        seed=random_seed,
-    )
 
     log_operation_start("Create BST ranker model", STAGE_LOG_NAME, logger)
     model = BSTRanker(
@@ -1134,7 +1452,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         prediction_hidden_dims=prediction_hidden_dims,
     )
 
-    log_operation_start(f"Train BST ranker (epochs={epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)
+    log_operation_start(f"Train BST ranker (mode={bst_training_mode}, epochs={epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)
     training_results = train_bst_ranker_model(
         model=model,
         train_loader=train_loader,
@@ -1152,6 +1470,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         lr_scheduler_patience=lr_scheduler_patience,
         gradient_clip_max_norm=gradient_clip_max_norm,
         bst_use_auc_as_primary=bst_use_auc_as_primary,
+        bst_training_mode=bst_training_mode,
+        metrics_top_ks=metrics_top_ks,
+        bst_max_train_batches_per_epoch=bst_max_train_batches_per_epoch,
         experiment_tracker=context.tracker,
     )
     trained_model: BSTRanker = training_results["model"]
@@ -1176,39 +1497,73 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             best_epoch = None
         plot_training_history(hist, plots_dir / f"training_history_{timestamp}.png", best_epoch=best_epoch)
 
-    train_loss, train_metrics = run_bst_epoch(
-        train=False,
-        split_name="Evaluate train",
-        model=trained_model,
-        device=device,
-        dataloader=train_loader,
-        optimizer=None,
-        disable_progress=disable_progress,
-        gradient_clip_max_norm=gradient_clip_max_norm,
-        compute_classification_metrics=bst_use_auc_as_primary,
-    )
-    val_loss, val_metrics = run_bst_epoch(
-        train=False,
-        split_name="Evaluate validation",
-        model=trained_model,
-        device=device,
-        dataloader=val_loader,
-        optimizer=None,
-        disable_progress=disable_progress,
-        gradient_clip_max_norm=gradient_clip_max_norm,
-        compute_classification_metrics=bst_use_auc_as_primary,
-    )
-    val_unseen_loss, val_unseen_metrics = run_bst_epoch(
-        train=False,
-        split_name="Evaluate validation unseen users",
-        model=trained_model,
-        device=device,
-        dataloader=val_unseen_loader,
-        optimizer=None,
-        disable_progress=disable_progress,
-        gradient_clip_max_norm=gradient_clip_max_norm,
-        compute_classification_metrics=bst_use_auc_as_primary,
-    )
+    if bst_training_mode == "listwise":
+        bst_matrix_scorer = BSTRankerMatrixScorer(trained_model)
+        train_eval = evaluate_matrix_scorer(
+            bst_matrix_scorer,
+            train_loader,
+            device=device,
+            metrics_top_ks=metrics_top_ks,
+            progress_desc="Evaluate train",
+            disable_progress=disable_progress,
+            max_batches=bst_max_train_batches_per_epoch,
+        )
+        val_eval = evaluate_matrix_scorer(
+            bst_matrix_scorer,
+            val_loader,
+            device=device,
+            metrics_top_ks=metrics_top_ks,
+            progress_desc="Evaluate validation",
+            disable_progress=disable_progress,
+        )
+        val_unseen_eval = evaluate_matrix_scorer(
+            bst_matrix_scorer,
+            val_unseen_loader,
+            device=device,
+            metrics_top_ks=metrics_top_ks,
+            progress_desc="Evaluate validation unseen users",
+            disable_progress=disable_progress,
+        )
+        train_metrics = train_eval["metrics"]
+        val_metrics = val_eval["metrics"]
+        val_unseen_metrics = val_unseen_eval["metrics"]
+        train_loss = float(train_metrics["loss"]) if train_metrics.get("loss") is not None else 0.0
+        val_loss = float(val_metrics["loss"]) if val_metrics.get("loss") is not None else 0.0
+        val_unseen_loss = float(val_unseen_metrics["loss"]) if val_unseen_metrics.get("loss") is not None else 0.0
+    else:
+        train_loss, train_metrics = run_bst_epoch(
+            train=False,
+            split_name="Evaluate train",
+            model=trained_model,
+            device=device,
+            dataloader=train_loader,
+            optimizer=None,
+            disable_progress=disable_progress,
+            gradient_clip_max_norm=gradient_clip_max_norm,
+            compute_classification_metrics=bst_use_auc_as_primary,
+        )
+        val_loss, val_metrics = run_bst_epoch(
+            train=False,
+            split_name="Evaluate validation",
+            model=trained_model,
+            device=device,
+            dataloader=val_loader,
+            optimizer=None,
+            disable_progress=disable_progress,
+            gradient_clip_max_norm=gradient_clip_max_norm,
+            compute_classification_metrics=bst_use_auc_as_primary,
+        )
+        val_unseen_loss, val_unseen_metrics = run_bst_epoch(
+            train=False,
+            split_name="Evaluate validation unseen users",
+            model=trained_model,
+            device=device,
+            dataloader=val_unseen_loader,
+            optimizer=None,
+            disable_progress=disable_progress,
+            gradient_clip_max_norm=gradient_clip_max_norm,
+            compute_classification_metrics=bst_use_auc_as_primary,
+        )
     logger.info(f"Train metrics: {train_metrics}")
     logger.info(f"Validation metrics: {val_metrics}")
     logger.info(f"Validation unseen users metrics: {val_unseen_metrics}")
@@ -1262,7 +1617,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "stage: train_bst_ranker",
         f"timestamp: {timestamp}",
         f"runtime_seconds: {runtime:.2f}",
-        f"settings: batch_size={batch_size}, lr={learning_rate}, epochs={epochs}, max_history_len={max_history_len}, early_stopping_min_delta={early_stopping_min_delta}",
+        f"settings: mode={bst_training_mode}, batch_size={batch_size}, candidate_sample_size={bst_candidate_sample_size}, lr={learning_rate}, epochs={epochs}, max_history_len={max_history_len}, early_stopping_min_delta={early_stopping_min_delta}",
         f"train_samples: {len(train_dataset)}",
         f"val_samples: {len(val_dataset)}",
         f"val_unseen_samples: {len(val_unseen_dataset)}",

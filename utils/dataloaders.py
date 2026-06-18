@@ -1055,15 +1055,21 @@ class BucketedEngagementDataset(Dataset):
         max_history_len: int,
         embed_dim: int,
         use_author_embedding_table: bool = False,
+        candidate_sample_size: Optional[int] = None,
+        seed: int = 0,
         logger: Optional[logging.Logger] = None,
     ):
         if max_history_len <= 0:
             raise ValueError("max_history_len must be positive")
+        if candidate_sample_size is not None and candidate_sample_size <= 0:
+            raise ValueError("candidate_sample_size must be positive when provided")
         self.embeddings = embeddings_mmap
         self.split = str(split)
         self.max_history_len = int(max_history_len)
         self.embed_dim = int(embed_dim)
         self.use_author_embedding_table = bool(use_author_embedding_table)
+        self.candidate_sample_size = int(candidate_sample_size) if candidate_sample_size is not None else None
+        self.seed = int(seed)
 
         likes_columns = ["did", "subject_uri", "split", "like_hour_bucket", "emb_idx"]
         posts_columns = ["at_uri", "in_random_sample", "negative_hour_bucket", "split_window", "emb_idx"]
@@ -1182,11 +1188,18 @@ class BucketedEngagementDataset(Dataset):
     def __len__(self) -> int:
         return len(self.user_ids)
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
+    def __getitem__(self, idx: Any) -> Dict[str, Any]:
+        if isinstance(idx, tuple):
+            row_idx, epoch = idx
+        else:
+            row_idx = idx
+            epoch = 0
+        row_idx = int(row_idx)
         return {
-            "row_idx": int(idx),
-            "bucket": self.like_hour_buckets[idx],
-            "user_id": self.user_ids[idx],
+            "row_idx": row_idx,
+            "bucket": self.like_hour_buckets[row_idx],
+            "user_id": self.user_ids[row_idx],
+            "epoch": int(epoch),
         }
 
     def _padded_history_for_row(self, row_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1207,11 +1220,41 @@ class BucketedEngagementDataset(Dataset):
         padded = get_padded_history_time_deltas(deltas, self.max_history_len)
         return torch.from_numpy(padded)
 
+    def _sample_candidate_posts_for_batch(
+        self,
+        row_indices: List[int],
+        bucket: Any,
+        epoch: int,
+        candidate_to_idx: Dict[str, int],
+    ) -> List[Dict[str, Any]]:
+        sampled_posts = [
+            post
+            for post in self.sampled_posts_by_bucket.get(bucket, [])
+            if post["post_id"] not in candidate_to_idx
+        ]
+        if self.candidate_sample_size is None:
+            return sampled_posts
+        remaining_slots = self.candidate_sample_size - len(candidate_to_idx)
+        if remaining_slots <= 0:
+            return []
+        if len(sampled_posts) <= remaining_slots:
+            return sampled_posts
+
+        sorted_row_indices = sorted(int(row_idx) for row_idx in row_indices)
+        row_seed = sum((pos + 1) * (row_idx + 1) for pos, row_idx in enumerate(sorted_row_indices))
+        rng = np.random.default_rng(self.seed + int(epoch) * max(len(self.user_ids), 1) + row_seed)
+        selected_indices = sorted(rng.choice(len(sampled_posts), size=remaining_slots, replace=False).tolist())
+        return [sampled_posts[idx] for idx in selected_indices]
+
     def collate_batch(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not items:
             raise ValueError("BucketedEngagementDataset.collate_batch received an empty batch")
 
         row_indices = [int(item["row_idx"]) for item in items]
+        epochs = {int(item.get("epoch", 0)) for item in items}
+        if len(epochs) != 1:
+            raise ValueError("Bucketed batches must contain rows from exactly one sampling epoch")
+        epoch = next(iter(epochs))
         bucket = self.like_hour_buckets[row_indices[0]]
         if any(self.like_hour_buckets[row_idx] != bucket for row_idx in row_indices):
             raise ValueError("Bucketed batches must contain rows from exactly one hour bucket")
@@ -1260,7 +1303,7 @@ class BucketedEngagementDataset(Dataset):
             ):
                 add_candidate(post_id, int(emb_idx), int(author_idx) if author_idx is not None else None)
 
-        for post in self.sampled_posts_by_bucket.get(bucket, []):
+        for post in self._sample_candidate_posts_for_batch(row_indices, bucket, epoch, candidate_to_idx):
             add_candidate(post["post_id"], int(post["emb_idx"]), post.get("author_idx"))
 
         candidate_post_embeddings = torch.from_numpy(
@@ -1530,6 +1573,7 @@ class BucketedBatchSampler(Sampler[List[int]]):
         shuffle: bool,
         drop_last: bool,
         seed: int,
+        resample_candidates_each_epoch: bool = False,
     ):
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -1538,10 +1582,12 @@ class BucketedBatchSampler(Sampler[List[int]]):
         self.shuffle = bool(shuffle)
         self.drop_last = bool(drop_last)
         self.seed = int(seed)
+        self.resample_candidates_each_epoch = bool(resample_candidates_each_epoch)
         self._epoch = 0
 
-    def __iter__(self) -> Iterator[List[int]]:
-        rng = np.random.default_rng(self.seed + self._epoch)
+    def __iter__(self) -> Iterator[List[Any]]:
+        epoch = self._epoch
+        rng = np.random.default_rng(self.seed + epoch)
         self._epoch += 1
         batches: List[List[int]] = []
         buckets = list(self.dataset.row_indices_by_bucket.keys())
@@ -1557,7 +1603,11 @@ class BucketedBatchSampler(Sampler[List[int]]):
                     batches.append(batch)
         if self.shuffle:
             rng.shuffle(batches)
-        yield from batches
+        for batch in batches:
+            if self.resample_candidates_each_epoch:
+                yield [(int(row_idx), int(epoch)) for row_idx in batch]
+            else:
+                yield batch
 
     def __len__(self) -> int:
         total = 0
@@ -1625,6 +1675,7 @@ def create_bucketed_data_loaders(
     prefetch_factor: int,
     seed: int,
     holdout_dataset: Optional[BucketedEngagementDataset] = None,
+    train_resample_candidates_each_epoch: bool = False,
 ):
     """Create DataLoaders for bucketed two-tower batches."""
     from torch.utils.data import DataLoader
@@ -1647,6 +1698,7 @@ def create_bucketed_data_loaders(
             shuffle=True,
             drop_last=True,
             seed=seed,
+            resample_candidates_each_epoch=train_resample_candidates_each_epoch,
         ),
         collate_fn=train_dataset.collate_batch,
         **worker_kw,

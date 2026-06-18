@@ -317,6 +317,7 @@ def evaluate_matrix_scorer(
     collect_ranking_rows: bool = False,
     progress_desc: Optional[str] = None,
     disable_progress: bool = True,
+    max_batches: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Evaluate a matrix-ranking scorer with streamed rank metrics and sampled AUC/AP."""
     scorer.prepare_for_eval(device)
@@ -334,7 +335,9 @@ def evaluate_matrix_scorer(
     rng = np.random.default_rng(0)
 
     with torch.inference_mode():
-        for batch in tqdm(data_loader, desc=progress_desc, leave=False, disable=disable_progress):
+        for batch_idx, batch in enumerate(tqdm(data_loader, desc=progress_desc, leave=False, disable=disable_progress)):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
             batch_scores = scorer.score_batch(batch, device)
             scores = batch_scores.scores.to(device)
             labels = batch["label_matrix"].to(device, dtype=torch.float32, non_blocking=True)
@@ -418,6 +421,7 @@ def evaluate_matrix_model(
     collect_ranking_rows: bool = False,
     progress_desc: Optional[str] = None,
     disable_progress: bool = True,
+    max_batches: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Evaluate a matrix-ranking model with streamed rank metrics and sampled AUC/AP."""
     return evaluate_matrix_scorer(
@@ -429,6 +433,7 @@ def evaluate_matrix_model(
         collect_ranking_rows=collect_ranking_rows,
         progress_desc=progress_desc,
         disable_progress=disable_progress,
+        max_batches=max_batches,
     )
 
 
