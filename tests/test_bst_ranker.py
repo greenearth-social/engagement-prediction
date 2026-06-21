@@ -13,7 +13,6 @@ LinearPredictionHead = stage_train_bst_ranker.LinearPredictionHead
 _compute_bst_loss_and_preds = stage_train_bst_ranker._compute_bst_loss_and_preds
 _compute_bst_listwise_loss_and_preds = stage_train_bst_ranker._compute_bst_listwise_loss_and_preds
 _flatten_ranker_pair_batch = stage_train_bst_ranker._flatten_ranker_pair_batch
-bucketize_time_deltas_hours = stage_train_bst_ranker.bucketize_time_deltas_hours
 run_bst_epoch = stage_train_bst_ranker.run_bst_epoch
 run_bst_listwise_epoch = stage_train_bst_ranker.run_bst_listwise_epoch
 train_bst_ranker_model = stage_train_bst_ranker.train_bst_ranker_model
@@ -241,10 +240,11 @@ def test_bst_ranker_rejects_attention_head_mismatch():
         )
 
 
-def test_bucketize_time_deltas_hours_reserves_zero_and_clips_tail():
+def test_bst_ranker_bucketizes_time_deltas_reserving_zero_and_clipping_tail():
+    model = _make_model()
     deltas = torch.tensor([-2.0, 0.0, 0.5, 1.0, 1.1, 3.0, 2160.0, 2161.0])
 
-    bucket_ids = bucketize_time_deltas_hours(deltas, DEFAULT_TIME_DELTA_BUCKET_BOUNDARIES_HOURS)
+    bucket_ids = model._bucketize_time_deltas_hours(deltas)
 
     assert bucket_ids.dtype == torch.long
     assert bucket_ids.tolist() == [0, 0, 1, 1, 2, 2, 9, 10]
@@ -313,7 +313,7 @@ def test_bst_ranker_supports_candidate_only_sequence_with_zero_delta_bucket():
         candidate_post_author_idx=torch.tensor([5, 6], dtype=torch.long),
     )
 
-    assert bucketize_time_deltas_hours(candidate_deltas, DEFAULT_TIME_DELTA_BUCKET_BOUNDARIES_HOURS).tolist() == [[0], [0]]
+    assert model._bucketize_time_deltas_hours(candidate_deltas).tolist() == [[0], [0]]
     assert output.shape == (2,)
 
 
@@ -357,6 +357,26 @@ def test_bst_ranker_supports_direct_linear_prediction_head():
     linear_layers = [m for m in model.prediction_head.modules() if isinstance(m, nn.Linear)]
     assert len(linear_layers) == 1
     assert output.shape == (2,)
+
+
+def test_bst_ranker_torchscript_forward_matches_eager():
+    model = _make_model().eval()
+    batch = _batch()
+
+    with torch.no_grad():
+        eager_output = model(**batch)
+        scripted_model = torch.jit.script(model)
+        scripted_output = scripted_model(
+            batch["history_embeddings"],
+            batch["history_mask"],
+            batch["history_time_deltas_hours"],
+            batch["candidate_post_embeddings"],
+            batch["history_author_indices"],
+            batch["candidate_post_author_idx"],
+        )
+
+    assert scripted_output.shape == eager_output.shape
+    assert torch.allclose(scripted_output, eager_output, atol=1e-5)
 
 
 def test_bst_ranker_rejects_invalid_prediction_hidden_dims():

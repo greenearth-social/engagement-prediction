@@ -74,7 +74,6 @@ from shared.input_data_helpers import (
     get_padded_embedding_history_and_mask,
     get_padded_author_indices,
     get_padded_history_time_deltas,
-    AUTHOR_PAD_IDX,
     AUTHOR_UNK_IDX,
 )
 

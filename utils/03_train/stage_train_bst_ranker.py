@@ -66,22 +66,6 @@ def _validate_time_delta_bucket_boundaries(boundaries_hours: Sequence[float]) ->
     return boundaries
 
 
-def bucketize_time_deltas_hours(
-    time_deltas_hours: torch.Tensor,
-    boundaries_hours: Sequence[float],
-) -> torch.Tensor:
-    """Map raw hour deltas to embedding-table bucket IDs."""
-    boundaries = _validate_time_delta_bucket_boundaries(boundaries_hours)
-    deltas = time_deltas_hours
-    if not torch.is_floating_point(deltas):
-        deltas = deltas.to(dtype=torch.float32)
-    deltas = torch.clamp(deltas, min=0.0)
-    boundary_tensor = torch.tensor(boundaries, device=deltas.device, dtype=deltas.dtype)
-    positive_bucket_ids = torch.bucketize(deltas, boundary_tensor, right=False) + 1
-    zero_bucket_ids = torch.zeros_like(positive_bucket_ids)
-    return torch.where(deltas <= 0.0, zero_bucket_ids, positive_bucket_ids).to(dtype=torch.long)
-
-
 class BSTRanker(nn.Module):
     """Behavior Sequence Transformer encoder for one user-history/candidate pair."""
 
@@ -123,6 +107,11 @@ class BSTRanker(nn.Module):
         self.time_delta_bucket_boundaries_hours = _validate_time_delta_bucket_boundaries(
             time_delta_bucket_boundaries_hours
         )
+        self.register_buffer(
+            "_time_delta_bucket_boundaries_tensor",
+            torch.tensor(self.time_delta_bucket_boundaries_hours, dtype=torch.float32),
+            persistent=False,
+        )
         self.num_time_delta_buckets = len(self.time_delta_bucket_boundaries_hours) + 2
         self.transformer_input_dim = self.model_dim + self.time_embedding_dim
         if self.transformer_input_dim % int(num_attention_heads) != 0:
@@ -162,6 +151,19 @@ class BSTRanker(nn.Module):
             hidden_dims=prediction_hidden_dims,
             dropout_rate=dropout_rate,
         )
+
+    def _bucketize_time_deltas_hours(self, time_deltas_hours: torch.Tensor) -> torch.Tensor:
+        deltas = time_deltas_hours
+        if not torch.is_floating_point(deltas):
+            deltas = deltas.to(dtype=torch.float32)
+        deltas = torch.clamp(deltas, min=0.0)
+        boundary_tensor = self._time_delta_bucket_boundaries_tensor.to(
+            device=deltas.device,
+            dtype=deltas.dtype,
+        )
+        positive_bucket_ids = torch.bucketize(deltas, boundary_tensor, right=False) + 1
+        zero_bucket_ids = torch.zeros_like(positive_bucket_ids)
+        return torch.where(deltas <= 0.0, zero_bucket_ids, positive_bucket_ids).to(dtype=torch.long)
 
     def _forward_transformer(
         self,
@@ -208,10 +210,7 @@ class BSTRanker(nn.Module):
 
         candidate_time_delta = torch.zeros((batch_size, 1), device=device, dtype=history_time_deltas_hours.dtype)
         sequence_time_deltas = torch.cat([history_time_deltas_hours, candidate_time_delta], dim=1)
-        time_bucket_ids = bucketize_time_deltas_hours(
-            sequence_time_deltas,
-            self.time_delta_bucket_boundaries_hours,
-        )
+        time_bucket_ids = self._bucketize_time_deltas_hours(sequence_time_deltas)
         time_embeddings = self.time_delta_embedding(time_bucket_ids)
         transformer_input = torch.cat([post_sequence, time_embeddings], dim=-1)
 
@@ -347,10 +346,7 @@ class BSTRanker(nn.Module):
             candidate_post_embeddings,
             candidate_post_author_idx,
         )
-        history_time_bucket_ids = bucketize_time_deltas_hours(
-            history_time_deltas_hours,
-            self.time_delta_bucket_boundaries_hours,
-        )
+        history_time_bucket_ids = self._bucketize_time_deltas_hours(history_time_deltas_hours)
         history_time_embeddings = self.time_delta_embedding(history_time_bucket_ids)
         candidate_time_bucket_ids = torch.zeros((num_candidates,), device=device, dtype=torch.long)
         candidate_time_embeddings = self.time_delta_embedding(candidate_time_bucket_ids)
@@ -587,16 +583,16 @@ def run_bst_epoch(
     if compute_classification_metrics and label_chunks:
         all_labels = torch.cat(label_chunks)
         all_logits = torch.cat(logit_chunks)
-        metrics = _classification_metrics_from_logits(all_labels, all_logits)
+        metrics: dict[str, Any] = _classification_metrics_from_logits(all_labels, all_logits)
     elif compute_classification_metrics:
-        metrics = {
+        metrics: dict[str, Any] = {
             "classification_metric_pair_count": 0,
             "classification_metric_positive_count": 0,
             "auc_roc": None,
             "classification_average_precision": None,
         }
     else:
-        metrics = {
+        metrics: dict[str, Any] = {
             "classification_metric_pair_count": pair_count,
             "classification_metric_positive_count": positive_count,
         }
@@ -1443,6 +1439,29 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             model_path,
         )
         logger.info(f"Model saved to: {model_path}")
+
+        trained_model = trained_model.cpu().eval()
+        torchscript_name = "ranker"
+        torchscript_path = checkpoints_dir / f"{torchscript_name}.pt"
+        torch.jit.script(trained_model).save(torchscript_path)
+        ranker_model_metadata = context.tracker.log_artifact(name=torchscript_name, path=torchscript_path)
+        ranker_model_id = ranker_model_metadata.get("model_id", "")
+        ranker_uri = ranker_model_metadata.get("uri", "")
+        logger.info(f"Ranker model id: {ranker_model_id}")
+        logger.info(f"Ranker model URI: {ranker_uri}")
+
+        manifest = {
+            "ranker_clearml_model_id": ranker_model_id,
+            "ranker_uri": ranker_uri,
+            "clearml_task_id": getattr(context.tracker, "id", ""),
+        }
+        manifest_path = checkpoints_dir / "ranker_serving_manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        try:
+            manifest_uri = context.tracker.log_file_artifact("ranker_serving_manifest", manifest_path)
+            logger.info(f"Ranker serving manifest artifact id: {manifest_uri}")
+        except Exception:
+            logger.exception("Failed to upload ranker serving manifest; continuing without manifest artifact.")
 
     final_split_metrics: Dict[str, Dict[str, Any]] = {
         "train": train_metrics,

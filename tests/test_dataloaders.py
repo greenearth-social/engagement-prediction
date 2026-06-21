@@ -6,9 +6,8 @@ import polars as pl
 import pytest
 from torch.utils.data import DataLoader
 
+from shared.input_data_helpers import AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
 from utils.dataloaders import (
-    AUTHOR_PAD_IDX,
-    AUTHOR_UNK_IDX,
     BucketedBatchSampler,
     BucketedEngagementDataset,
     RankerPairBatchSampler,

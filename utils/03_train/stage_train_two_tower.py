@@ -113,8 +113,6 @@ from utils.helpers import (
     find_author_idx_artifact_path,
 )
 from utils.dataloaders import (
-    AUTHOR_PAD_IDX,
-    AUTHOR_UNK_IDX,
     BucketedEngagementDataset,
     create_bucketed_data_loaders,
     get_author_table_num_rows,
@@ -131,6 +129,7 @@ from utils.matrix_ranking import (
     stage_info_metric_lines,
     write_ranking_rows,
 )
+from shared.input_data_helpers import AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
 
 STAGE_LOG_NAME = "STAGE_03_TRAIN_TWO_TOWER"
 

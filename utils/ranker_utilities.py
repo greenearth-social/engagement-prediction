@@ -44,6 +44,7 @@ class BSTPostAuthorFeatureEncoder(nn.Module):
         self.author_projection_dim = int(author_projection_dim)
         self.model_dim = int(model_dim)
         self.author_unknown_dropout_rate = float(author_unknown_dropout_rate)
+        self.author_unk_idx = int(AUTHOR_UNK_IDX)
         self.author_embedding = nn.Embedding(
             num_embeddings=int(author_table_num_rows),
             embedding_dim=int(author_embedding_dim),
@@ -87,12 +88,12 @@ class BSTPostAuthorFeatureEncoder(nn.Module):
 
         author_indices = author_indices.to(device=post_embeddings.device, dtype=torch.long)
         if self.training and self.author_unknown_dropout_rate > 0.0:
-            eligible = author_indices > AUTHOR_UNK_IDX
+            eligible = author_indices > self.author_unk_idx
             if torch.any(eligible):
                 dropout_mask = torch.rand(author_indices.shape, device=author_indices.device) < self.author_unknown_dropout_rate
                 author_indices = torch.where(
                     eligible & dropout_mask,
-                    torch.full_like(author_indices, AUTHOR_UNK_IDX),
+                    torch.full_like(author_indices, self.author_unk_idx),
                     author_indices,
                 )
 
