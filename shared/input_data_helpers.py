@@ -284,6 +284,17 @@ def get_padded_author_indices(
     return padded
 
 
+def get_padded_history_time_deltas(
+    time_deltas_hours: Any,
+    max_history_len: int,
+) -> np.ndarray:
+    seq_len = min(len(time_deltas_hours), max_history_len)
+    padded = np.zeros(max_history_len, dtype=np.float32)
+    if seq_len > 0:
+        padded[:seq_len] = np.asarray(time_deltas_hours[: max_history_len], dtype=np.float32)
+    return padded
+
+
 def get_padded_embedding_history_and_mask_batched(
     history_embeddings: list[list[float]] | list[list[list[float]]],
     max_history_len: int, 
@@ -305,6 +316,7 @@ def get_padded_embedding_history_and_mask_batched(
     batch_padded_history_embeddings = []
     batch_history_mask = []
     batch_padded_author_indices = []
+    batch_padded_time_deltas_hours = []
 
     if len(batch_history_embeddings) != len(batch_author_indices):
         raise ValueError("Batch size of history_embeddings and author_indices must match")
@@ -329,10 +341,10 @@ def get_padded_embedding_history_and_mask_batched(
         )
         batch_padded_author_indices.append(padded_author_indices.tolist())
 
-        padded_time_deltas_hours = get_padded_author_indices(
+        padded_time_deltas_hours = get_padded_history_time_deltas(
             time_deltas_hours=td,
             max_history_len=max_history_len,
         )
-        batch_padded_author_indices.append(padded_author_indices.tolist())
+        batch_padded_time_deltas_hours.append(padded_time_deltas_hours.tolist())
 
-    return batch_padded_history_embeddings, batch_history_mask, batch_padded_author_indices
+    return batch_padded_history_embeddings, batch_history_mask, batch_padded_author_indices, batch_padded_time_deltas_hours
