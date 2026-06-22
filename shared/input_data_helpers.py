@@ -327,6 +327,8 @@ def get_padded_embedding_history_and_mask_batched(
             raise ValueError("author_indices must be a list for each history")
         if len(he) != len(ai):
             raise ValueError("Length of author_indices must match history length for each user")
+        if len(he) != len(td):
+            raise ValueError("Length of time_deltas_hours must match history length for each user")
         padded_history_embeddings, history_mask = get_padded_embedding_history_and_mask(
             history_embeddings=he,
             max_history_len=max_history_len,
