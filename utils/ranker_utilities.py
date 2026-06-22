@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Sequence
+from typing import List, Sequence
 
 import torch
 import torch.nn as nn
@@ -114,7 +114,7 @@ class LinearPredictionHead(nn.Module):
     def __init__(
         self,
         input_dim: int,
-        hidden_dims: Sequence[int],
+        hidden_dims: List[int],
         dropout_rate: float,
     ):
         super().__init__()

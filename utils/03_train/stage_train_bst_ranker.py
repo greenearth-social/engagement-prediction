@@ -85,8 +85,8 @@ class BSTRanker(nn.Module):
         dropout_rate: float,
         author_unknown_dropout_rate: float,
         norm_first: bool,
-        time_delta_bucket_boundaries_hours: Sequence[float],
-        prediction_hidden_dims: Sequence[int],
+        time_delta_bucket_boundaries_hours: List[float],
+        prediction_hidden_dims: List[int],
     ):
         super().__init__()
         if time_embedding_dim <= 0:
@@ -1058,10 +1058,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     transformer_ff_dim = int(args.bst_transformer_ff_dim)
     dropout_rate = float(args.bst_dropout_rate)
     norm_first = bool(args.bst_norm_first)
-    time_delta_bucket_boundaries_hours = tuple(float(v) for v in args.bst_time_delta_bucket_boundaries_hours)
+    time_delta_bucket_boundaries_hours = [float(v) for v in args.bst_time_delta_bucket_boundaries_hours]
     if args.prediction_hidden_dims is None:
         raise ValueError("prediction_hidden_dims is required for BST ranker training")
-    prediction_hidden_dims = tuple(int(v) for v in args.prediction_hidden_dims)
+    prediction_hidden_dims = [int(v) for v in args.prediction_hidden_dims]
     use_author_embedding_table = bool(args.use_author_embedding_table)
     author_embedding_dim = int(args.author_embedding_dim)
     author_unknown_dropout_rate = float(args.author_unknown_dropout_rate)
