@@ -300,7 +300,7 @@ def get_padded_embedding_history_and_mask_batched(
     max_history_len: int, 
     embed_dim: int,
     author_indices: list[int] | list[list[int]] | None,
-    time_deltas_hours: list[float] | list[list[float]] | None,
+    time_deltas_hours: list[float] | list[list[float]] | None = None,
 ) -> tuple[list[list[list[float]]], list[list[bool]], list[list[int]], list[list[float]] | None]:
     """
     Pad and mask one or more users' embedding histories.
