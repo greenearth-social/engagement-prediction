@@ -301,7 +301,7 @@ def get_padded_embedding_history_and_mask_batched(
     embed_dim: int,
     author_indices: list[int] | list[list[int]] | None,
     time_deltas_hours: list[float] | list[list[float]] | None = None,
-) -> tuple[list[list[list[float]]], list[list[bool]], list[list[int]], list[list[float]] | None]:
+) -> tuple[list[list[list[float]]], list[list[bool]], list[list[int]], list[list[float]]]:
     """
     Pad and mask one or more users' embedding histories.
 
@@ -320,7 +320,7 @@ def get_padded_embedding_history_and_mask_batched(
 
     if len(batch_history_embeddings) != len(batch_author_indices):
         raise ValueError("Batch size of history_embeddings and author_indices must match")
-    if batch_time_deltas_hours and len(batch_history_embeddings) != len(batch_time_deltas_hours):
+    if len(batch_history_embeddings) != len(batch_time_deltas_hours):
         raise ValueError("Batch size of history_embeddings and time_deltas_hours must match")
     for he, ai, td in zip(batch_history_embeddings, batch_author_indices, batch_time_deltas_hours):
         if not isinstance(ai, list):
