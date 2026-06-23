@@ -232,10 +232,11 @@ def _normalize_empty_user_history(user_history: list[Any]) -> list[list[float]]:
 
 
 def _normalize_history_inputs_to_batch(
-    history_embeddings: list[list[float]] | list[list[list[float]]],
+    history_embeddings: Any,
     shape: HistoryEmbeddingsShape,
-    author_indices: list[int] | list[list[int]] | None,
-) -> tuple[list[list[list[float]]], list[list[int]]]:
+    author_indices: Any,
+    time_deltas_hours: Any,
+) -> tuple[list[list[list[float]]], list[list[int]], list[list[float]]]:
     """
     Normalize supported history input shapes into a batched ``[B, T, D]``-style list.
 
@@ -244,23 +245,32 @@ def _normalize_history_inputs_to_batch(
     """
     match shape:
         case "single_empty":
-            return [[]], [[]]
+            return [[]], [[]], [[]]
         case "single_history":
             # Wrap a single user's history in an outer batch dimension.
             if author_indices is None:
                 author_indices = [AUTHOR_UNK_IDX] * len(history_embeddings)
-            return [history_embeddings], [author_indices] # type: ignore
+            if time_deltas_hours is None:
+                time_deltas_hours = [0.0] * len(history_embeddings)
+            return [history_embeddings], [author_indices], [time_deltas_hours]
         case "batched_history":
             batch_history_embeddings = [
                 _normalize_empty_user_history(user_history)
                 for user_history in history_embeddings
             ]
+            author_indices_result = author_indices
             if author_indices is None:
-                return batch_history_embeddings, [
+                author_indices_result = [
                     [AUTHOR_UNK_IDX] * len(user_history)
                     for user_history in batch_history_embeddings
                 ]
-            return batch_history_embeddings, author_indices # type: ignore
+            time_deltas_hours_result = time_deltas_hours
+            if time_deltas_hours is None:
+                time_deltas_hours_result = [
+                    [0.0] * len(user_history)
+                    for user_history in batch_history_embeddings
+                ]
+            return batch_history_embeddings, author_indices_result, time_deltas_hours_result
 
 
 def get_padded_author_indices(
@@ -274,12 +284,24 @@ def get_padded_author_indices(
     return padded
 
 
+def get_padded_history_time_deltas(
+    time_deltas_hours: Any,
+    max_history_len: int,
+) -> np.ndarray:
+    seq_len = min(len(time_deltas_hours), max_history_len)
+    padded = np.zeros(max_history_len, dtype=np.float32)
+    if seq_len > 0:
+        padded[:seq_len] = np.asarray(time_deltas_hours[: max_history_len], dtype=np.float32)
+    return padded
+
+
 def get_padded_embedding_history_and_mask_batched(
     history_embeddings: list[list[float]] | list[list[list[float]]],
     max_history_len: int, 
     embed_dim: int,
     author_indices: list[int] | list[list[int]] | None,
-) -> tuple[list[list[list[float]]], list[list[bool]], list[list[int]]]:
+    time_deltas_hours: list[float] | list[list[float]] | None = None,
+) -> tuple[list[list[list[float]]], list[list[bool]], list[list[int]], list[list[float]]]:
     """
     Pad and mask one or more users' embedding histories.
 
@@ -288,20 +310,27 @@ def get_padded_embedding_history_and_mask_batched(
     user independently.
     """
     shape = classify_history_embeddings_shape(history_embeddings)
-    batch_history_embeddings, batch_author_indices = _normalize_history_inputs_to_batch(history_embeddings, shape, author_indices)
+    batch_history_embeddings, batch_author_indices, batch_time_deltas_hours = _normalize_history_inputs_to_batch(
+        history_embeddings, shape, author_indices, time_deltas_hours
+    )
     batch_padded_history_embeddings = []
     batch_history_mask = []
     batch_padded_author_indices = []
+    batch_padded_time_deltas_hours = []
 
     if len(batch_history_embeddings) != len(batch_author_indices):
         raise ValueError("Batch size of history_embeddings and author_indices must match")
-    for single_history_embeddings, single_author_indices in zip(batch_history_embeddings, batch_author_indices):
-        if not isinstance(single_author_indices, list):
+    if len(batch_history_embeddings) != len(batch_time_deltas_hours):
+        raise ValueError("Batch size of history_embeddings and time_deltas_hours must match")
+    for he, ai, td in zip(batch_history_embeddings, batch_author_indices, batch_time_deltas_hours):
+        if not isinstance(ai, list):
             raise ValueError("author_indices must be a list for each history")
-        if len(single_history_embeddings) != len(single_author_indices):
+        if len(he) != len(ai):
             raise ValueError("Length of author_indices must match history length for each user")
+        if len(he) != len(td):
+            raise ValueError("Length of time_deltas_hours must match history length for each user")
         padded_history_embeddings, history_mask = get_padded_embedding_history_and_mask(
-            history_embeddings=single_history_embeddings,
+            history_embeddings=he,
             max_history_len=max_history_len,
             embed_dim=embed_dim,
         )
@@ -309,9 +338,15 @@ def get_padded_embedding_history_and_mask_batched(
         batch_history_mask.append(history_mask.tolist())
         
         padded_author_indices = get_padded_author_indices(
-            author_indices=single_author_indices,
+            author_indices=ai,
             max_history_len=max_history_len,
         )
         batch_padded_author_indices.append(padded_author_indices.tolist())
 
-    return batch_padded_history_embeddings, batch_history_mask, batch_padded_author_indices
+        padded_time_deltas_hours = get_padded_history_time_deltas(
+            time_deltas_hours=td,
+            max_history_len=max_history_len,
+        )
+        batch_padded_time_deltas_hours.append(padded_time_deltas_hours.tolist())
+
+    return batch_padded_history_embeddings, batch_history_mask, batch_padded_author_indices, batch_padded_time_deltas_hours
