@@ -96,6 +96,18 @@ def _make_bst_model(config):
     )
 
 
+def _bst_bucketed_batch():
+    return {
+        "history_embeddings": torch.randn(2, 3, 4),
+        "history_mask": torch.tensor([[True, True, False], [True, False, False]]),
+        "history_time_deltas_hours": torch.tensor([[0.5, 2.0, 0.0], [4.0, 0.0, 0.0]]),
+        "candidate_post_embeddings": torch.randn(3, 4),
+        "history_author_indices": torch.tensor([[2, 3, 0], [4, 0, 0]]),
+        "candidate_post_author_idx": torch.tensor([2, 3, 5]),
+        "label_matrix": torch.tensor([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]]),
+    }
+
+
 def test_two_tower_pth_adapter_scores_bucketed_batch(tmp_path):
     torch.manual_seed(11)
     config = _two_tower_config()
@@ -123,6 +135,31 @@ def test_two_tower_pth_adapter_scores_bucketed_batch(tmp_path):
     torch.testing.assert_close(scores, expected)
 
 
+def test_two_tower_pth_adapter_requires_author_tensors_for_author_checkpoint(tmp_path):
+    torch.manual_seed(15)
+    config = _two_tower_config()
+    config.update({
+        "use_author_embedding_table": True,
+        "author_embedding_dim": 2,
+        "author_unknown_dropout_rate": 0.0,
+        "author_table_num_rows": 6,
+    })
+    model = _make_two_tower_model(config)
+    checkpoint_path = tmp_path / "two_tower_author.pth"
+    torch.save({"model_state_dict": model.state_dict(), "config": config}, checkpoint_path)
+    batch = {
+        "history_embeddings": torch.randn(2, 3, 4),
+        "history_mask": torch.tensor([[True, True, False], [True, False, False]]),
+        "candidate_post_embeddings": torch.randn(3, 4),
+        "label_matrix": torch.tensor([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]]),
+    }
+
+    adapter = TwoTowerPthAdapter(checkpoint_path)
+
+    with pytest.raises(RuntimeError, match="requires author tensors"):
+        adapter.score_batch(batch, "cpu")
+
+
 def test_two_tower_pth_adapter_loads_config_from_stage_training_config(tmp_path):
     torch.manual_seed(12)
     config = _two_tower_config()
@@ -146,15 +183,7 @@ def test_bst_pth_adapter_scores_bucketed_batch_in_candidate_chunks(tmp_path):
     model.eval()
     checkpoint_path = tmp_path / "bst_ranker.pth"
     torch.save({"model_state_dict": model.state_dict(), "config": config}, checkpoint_path)
-    batch = {
-        "history_embeddings": torch.randn(2, 3, 4),
-        "history_mask": torch.tensor([[True, True, False], [True, False, False]]),
-        "history_time_deltas_hours": torch.tensor([[0.5, 2.0, 0.0], [4.0, 0.0, 0.0]]),
-        "candidate_post_embeddings": torch.randn(3, 4),
-        "history_author_indices": torch.tensor([[2, 3, 0], [4, 0, 0]]),
-        "candidate_post_author_idx": torch.tensor([2, 3, 5]),
-        "label_matrix": torch.tensor([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]]),
-    }
+    batch = _bst_bucketed_batch()
 
     adapter = BstPthAdapter(checkpoint_path, candidate_chunk_size=2)
     adapter.prepare_for_eval("cpu")
@@ -174,6 +203,25 @@ def test_bst_pth_adapter_scores_bucketed_batch_in_candidate_chunks(tmp_path):
     torch.testing.assert_close(scores, expected)
 
 
+def test_bst_pth_adapter_rejects_non_positive_candidate_chunk_size(tmp_path):
+    with pytest.raises(ValueError, match="candidate_chunk_size"):
+        BstPthAdapter(tmp_path / "bst_ranker.pth", candidate_chunk_size=0)
+
+
+def test_bst_pth_adapter_documents_one_layer_matrix_scorer_constraint(tmp_path):
+    torch.manual_seed(16)
+    config = _bst_config()
+    config["num_transformer_layers"] = 2
+    model = _make_bst_model(config)
+    checkpoint_path = tmp_path / "bst_ranker_multi_layer.pth"
+    torch.save({"model_state_dict": model.state_dict(), "config": config}, checkpoint_path)
+
+    adapter = BstPthAdapter(checkpoint_path, candidate_chunk_size=2)
+
+    with pytest.raises(RuntimeError, match="exactly one transformer layer"):
+        adapter.score_batch(_bst_bucketed_batch(), "cpu")
+
+
 def test_bst_pth_adapter_requires_bucketed_bst_fields(tmp_path):
     torch.manual_seed(14)
     config = _bst_config()
@@ -190,4 +238,3 @@ def test_bst_pth_adapter_requires_bucketed_bst_fields(tmp_path):
             "history_author_indices": torch.ones((1, 3), dtype=torch.long),
             "candidate_post_author_idx": torch.ones(2, dtype=torch.long),
         }, "cpu")
-
