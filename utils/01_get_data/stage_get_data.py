@@ -757,7 +757,7 @@ def _load_likes_core_polars(
     
     # ===== Apply per-user random cap (NOT recency-based) =====
     if max_likes_per_user > 0 and n_after_user_sample > 0:
-        likes_lf = _apply_per_user_recency_cap(likes_lf, max_likes_per_user)
+        likes_lf = _apply_per_user_random_cap(likes_lf, max_likes_per_user, random_seed)
     
     likes_df = (
         likes_lf

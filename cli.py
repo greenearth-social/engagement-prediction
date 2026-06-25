@@ -122,11 +122,6 @@ DEFAULTS: Dict[str, Any] = {
     "bst_use_auc_as_primary": False,
     "bst_training_mode": "listwise",
     "bst_max_train_batches_per_epoch": None,
-    "din_model_dim": 128,
-    "din_attention_hidden_dims": [64, 32],
-    "din_dropout_rate": 0.1,
-    "din_weight_decay": 0.01,
-    "din_max_train_batches_per_epoch": None,
     "hidden_dims": [64, 32, 16],
     "dropout_rate_mlp": 0.5,
     "dropout_rate_two_tower": 0.1,
@@ -534,8 +529,6 @@ def _get_train_key(model_type: str) -> str:
         return 'train_two_tower'
     elif model_type == 'bst-ranker':
         return 'train_bst_ranker'
-    elif model_type == 'din-ranker':
-        return 'train_din_ranker'
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -586,48 +579,6 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
         raise ValueError("--batch-size must be positive.")
     if bst_max_train_batches_per_epoch is not None and int(bst_max_train_batches_per_epoch) <= 0:
         raise ValueError("--bst-max-train-batches-per-epoch must be positive when provided.")
-
-
-def _validate_din_config(args: argparse.Namespace) -> None:
-    if not bool(args.use_author_embedding_table):
-        raise ValueError("--use-author-embedding-table is required when --model-type is 'din-ranker'.")
-    for attr_name, flag_name in (
-        ("din_attention_hidden_dims", "--din-attention-hidden-dims"),
-        ("prediction_hidden_dims", "--prediction-hidden-dims"),
-    ):
-        hidden_dims = getattr(args, attr_name)
-        if hidden_dims is None:
-            raise ValueError(f"{flag_name} is required when --model-type is 'din-ranker'.")
-        if isinstance(hidden_dims, (str, bytes)):
-            raise ValueError(f"{flag_name} must be a list of integers.")
-        try:
-            parsed_hidden_dims = tuple(int(v) for v in hidden_dims)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"{flag_name} must be a list of integers.") from exc
-        if any(dim <= 0 for dim in parsed_hidden_dims):
-            raise ValueError(f"{flag_name} values must be positive integers.")
-
-    model_dim = int(args.din_model_dim)
-    content_projection_dim = int(args.content_projection_dim)
-    author_projection_dim = int(args.author_projection_dim)
-    candidate_sample_size = int(args.candidate_sample_size)
-    batch_size = int(args.batch_size)
-    din_max_train_batches_per_epoch = args.din_max_train_batches_per_epoch
-    dropout_rate = float(args.din_dropout_rate)
-    if model_dim <= 0:
-        raise ValueError("--din-model-dim must be positive.")
-    if content_projection_dim <= 0:
-        raise ValueError("--content-projection-dim must be positive.")
-    if author_projection_dim <= 0:
-        raise ValueError("--author-projection-dim must be positive.")
-    if not 0.0 <= dropout_rate <= 1.0:
-        raise ValueError("--din-dropout-rate must be in [0, 1].")
-    if candidate_sample_size <= 0:
-        raise ValueError("--candidate-sample-size must be positive.")
-    if batch_size <= 0:
-        raise ValueError("--batch-size must be positive.")
-    if din_max_train_batches_per_epoch is not None and int(din_max_train_batches_per_epoch) <= 0:
-        raise ValueError("--din-max-train-batches-per-epoch must be positive when provided.")
 
 
 def _get_stage_order_for_model_type(train_key: str) -> List[str]:
@@ -726,8 +677,6 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
             raise ValueError("--author-unknown-dropout-rate must be in [0, 1).")
     if model_type == "bst-ranker":
         _validate_bst_config(args)
-    if model_type == "din-ranker":
-        _validate_din_config(args)
 
     # Override train stage key if --model-type is specified
     train_key = _get_train_key(model_type)
@@ -783,7 +732,6 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
                 'train_mlp': "Stage 3: Train model (MLP)…",
                 'train_two_tower': "Stage 3: Train model (Two-Tower)…",
                 'train_bst_ranker': "Stage 3: Train model (BST Ranker)…",
-                'train_din_ranker': "Stage 3: Train model (DIN Ranker)…",
                 'evaluate': "Stage 4: Evaluate model…",
             }
             label = label_map.get(key, f"Stage {idx+1}: {key}…")
@@ -896,8 +844,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="EMA smoothing factor (0,1]. Higher = more weight on recent likes. Only used when --user-summarization=ema")
     _add_arg_with_default(p_all, "--user-encoder", type=str, choices=["summarized", "full_transformer", "cross_attention"],
                           default=argparse.SUPPRESS, help_text="User encoder type (summarized, full_transformer, or cross_attention).")
-    _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower", "bst-ranker", "din-ranker"],
-                          default=argparse.SUPPRESS, help_text="Model architecture: mlp, two-tower, bst-ranker, or din-ranker")
+    _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower", "bst-ranker"],
+                          default=argparse.SUPPRESS, help_text="Model architecture: mlp, two-tower, or bst-ranker")
     # Two-tower specific options
     _add_arg_with_default(p_all, "--shared-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower shared embedding dimension")
@@ -967,17 +915,6 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="BST training objective/data shape: listwise matrix ranking or pairwise binary classification")
     _add_arg_with_default(p_all, "--bst-max-train-batches-per-epoch", type=int, default=argparse.SUPPRESS,
                           help_text="Optional cap on BST train batches per epoch for fast experiments")
-    # DIN ranker specific options
-    _add_arg_with_default(p_all, "--din-model-dim", type=int, default=argparse.SUPPRESS,
-                          help_text="DIN ranker fused post/author model dimension")
-    _add_arg_with_default(p_all, "--din-attention-hidden-dims", type=int, nargs="*", default=argparse.SUPPRESS,
-                          help_text="DIN ranker attention-unit hidden dimensions. Use no values for a direct linear attention unit")
-    _add_arg_with_default(p_all, "--din-dropout-rate", type=float, default=argparse.SUPPRESS,
-                          help_text="DIN ranker dropout rate")
-    _add_arg_with_default(p_all, "--din-weight-decay", type=float, default=argparse.SUPPRESS,
-                          help_text="Weight decay for DIN ranker model")
-    _add_arg_with_default(p_all, "--din-max-train-batches-per-epoch", type=int, default=argparse.SUPPRESS,
-                          help_text="Optional cap on DIN train batches per epoch for fast experiments")
     # Stage 3 options (shared)
     _add_arg_with_default(p_all, "--epochs", type=int, default=argparse.SUPPRESS,
                           help_text="Training epochs")
@@ -1043,10 +980,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="(Deprecated) Always enabled during sequential run-all")
     # Selective reruns and prior pinning
     _add_arg_with_default(p_all, "--start-from", type=str,
-                          choices=["get_data", "user_history", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "train_din_ranker", "evaluate"],
+                          choices=["get_data", "user_history", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Begin execution at this stage")
     _add_arg_with_default(p_all, "--stop-after", type=str,
-                          choices=["get_data", "user_history", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "train_din_ranker", "evaluate"],
+                          choices=["get_data", "user_history", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Stop after this stage completes")
     _add_arg_with_default(p_all, "--pick-prior", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help_text="If multiple prior outputs exist, prompt to pick (foreground only)")
