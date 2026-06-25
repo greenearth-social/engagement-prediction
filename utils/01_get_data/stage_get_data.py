@@ -1034,35 +1034,23 @@ def _get_negative_sample_posts(
             how="inner",
         ) # at_uri, record_created_at, did, record_text, negative_hour_bucket, count
         .with_columns(
-            (
-                (pl.col("count") ** negative_sampling_alpha) /
-                (pl.col("count") ** negative_sampling_alpha).sum().over("negative_hour_bucket")
-            ).alias("_negative_sample_weight")
-        ) # at_uri, record_created_at, did, record_text, negative_hour_bucket, count, _negative_sample_weight
+            (pl.col("count") ** negative_sampling_alpha).alias("_weight"),
+            (pl.col("at_uri").hash(seed=random_seed).cast(pl.Float64) / float(2**64 - 1)).alias("_rand_val"),
+        ) # at_uri, record_created_at, did, record_text, negative_hour_bucket, count, _weight, _rand_val
         .with_columns(
-            pl.col("_negative_sample_weight").cum_sum().over("negative_hour_bucket").alias("_cum_sample_weight")
-        ) # at_uri, record_created_at, did, record_text, negative_hour_bucket, count, _negative_sample_weight, _cum_sample_weight
-        .sort(["negative_hour_bucket", "_cum_sample_weight"])
+            (-pl.col("_rand_val").log() / pl.col("_weight")).alias("_sample_score"),
+        ) # at_uri, record_created_at, did, record_text, negative_hour_bucket, count, _weight, _rand_val, _sample_score
+        .with_columns(
+            pl.col("_sample_score").rank("ordinal").over("negative_hour_bucket").alias("_sample_rank")
+        ) # at_uri, record_created_at, did, record_text, negative_hour_bucket, count, _weight, _rand_val, _sample_score, _sample_rank
+        .filter(
+            pl.col("_sample_rank") <= negative_samples_per_hour
+        )
         .collect(engine="streaming")
     )
-
-    hour_buckets = posts_with_weights_df["negative_hour_bucket"].unique().to_list()
-    rng = np.random.default_rng(random_seed)
-    rand_df = pl.DataFrame({
-        "negative_hour_bucket": [hb for hb in hour_buckets for _ in range(negative_samples_per_hour)],
-        "_rand_val": rng.random(len(hour_buckets) * negative_samples_per_hour),
-    }).sort(["negative_hour_bucket", "_rand_val"])
-
     return (
-        rand_df
-        .join_asof(
-            posts_with_weights_df,
-            left_on="_rand_val",
-            right_on="_cum_sample_weight",
-            by="negative_hour_bucket",
-            strategy="forward",
-        ) # negative_hour_bucket, _rand_val, at_uri, record_created_at, did, record_text, count, _negative_sample_weight, _cum_sample_weight
-        .drop(["_rand_val", "count", "_negative_sample_weight", "_cum_sample_weight"])
+        posts_with_weights_df
+        .drop(["count", "_weight", "_rand_val", "_sample_score", "_sample_rank"])
         .with_columns(
             pl.lit(False).alias("is_liked"),
             pl.lit(True).alias("in_random_sample"),
