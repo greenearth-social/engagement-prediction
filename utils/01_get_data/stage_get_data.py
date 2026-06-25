@@ -1018,7 +1018,7 @@ def _get_negative_sample_posts(
     cols_metadata: List[str],
     negative_samples_per_hour: int,
     random_seed: int,
-    negative_sampling_alpha: float = 0.5,
+    negative_sampling_alpha: float,
 ) -> pl.DataFrame:
     posts_with_weights_df = (
         posts_lf
