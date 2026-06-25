@@ -283,7 +283,7 @@ Current compare-rankers assumptions:
 - Model specs use `name:type:path`.
 - Supported types are `two-tower` and `bst-ranker`.
 - Compared checkpoints must use author embeddings.
-- Compared checkpoints should use the same `max_history_len`.
+- If compared checkpoints use different `max_history_len` values, pass `--max-history-len` to choose the evaluation history length.
 - BST checkpoints are scored with the optimized one-layer matrix scorer, so compare-rankers is intended for one-layer/listwise BST checkpoints.
 
 ## Selective Reruns And Prior Pins

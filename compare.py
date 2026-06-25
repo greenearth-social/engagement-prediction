@@ -236,12 +236,11 @@ def cmd_compare_rankers(
     prefetch_factor = int(getattr(args, "dataloader_prefetch_factor", DEFAULT_COMPARE_DATALOADER_PREFETCH_FACTOR))
     bst_candidate_chunk_size = int(getattr(args, "bst_candidate_chunk_size", DEFAULT_COMPARE_BST_CANDIDATE_CHUNK_SIZE))
     disable_progress = bool(getattr(args, "disable_progress", DEFAULT_COMPARE_DISABLE_PROGRESS))
-    max_history_len = _resolve_compare_max_history_len(
+    eval_max_history_len = _resolve_compare_max_history_len(
         args,
         model_specs=parsed_specs,
         model_configs=model_configs,
     )
-    adapter_config_overrides = {"max_history_len": max_history_len} if hasattr(args, "max_history_len") else None
 
     print(f"Batch Size: {batch_size}")
     print(f"Candidate Chunk Size: {bst_candidate_chunk_size}")
@@ -321,7 +320,7 @@ def cmd_compare_rankers(
             posts_core_df=posts_core_df,
             history_df=history_df,
             split=split_name,
-            max_history_len=max_history_len,
+            max_history_len=eval_max_history_len,
             embed_dim=embed_dim,
             use_author_embedding_table=True,
             logger=logger,
@@ -353,7 +352,7 @@ def cmd_compare_rankers(
         adapter = _make_compare_adapter(
             model_spec,
             bst_candidate_chunk_size=bst_candidate_chunk_size,
-            config_overrides=adapter_config_overrides,
+            config_overrides=None,
         )
         metrics_by_model[model_name] = {}
         for split_name, loader in split_loaders.items():
@@ -383,7 +382,7 @@ def cmd_compare_rankers(
         "metrics_top_ks": metrics_top_ks,
         "batch_size": batch_size,
         "bst_candidate_chunk_size": bst_candidate_chunk_size,
-        "max_history_len": max_history_len,
+        "max_history_len": eval_max_history_len,
         "model_specs": parsed_specs,
         "metrics": metrics_by_model,
         "prior_inputs": {k: str(v) for k, v in ctx.get_active_stage_inputs().items()},
@@ -407,7 +406,7 @@ def cmd_compare_rankers(
         f"skipped_splits: {', '.join(skipped_splits) if skipped_splits else 'none'}",
         f"metrics_top_ks: {', '.join(str(k) for k in metrics_top_ks)}",
         f"batch_size: {batch_size}",
-        f"max_history_len: {max_history_len}",
+        f"max_history_len: {eval_max_history_len}",
     ]
     for folder, path in sorted(ctx.get_active_stage_inputs().items()):
         info_lines.append(f"prior_input_{folder}: {path}")

@@ -209,7 +209,7 @@ def test_compare_rankers_evaluates_models_and_writes_metrics(tmp_path, monkeypat
     two_tower_checkpoint = tmp_path / "two_tower.pth"
     bst_checkpoint = tmp_path / "bst.pth"
     _write_compare_checkpoint(two_tower_checkpoint, _compare_checkpoint_config(max_history_len=7))
-    _write_compare_checkpoint(bst_checkpoint, _compare_checkpoint_config(max_history_len=7))
+    _write_compare_checkpoint(bst_checkpoint, _compare_checkpoint_config(max_history_len=9))
 
     import utils.dataloaders as dataloaders
     import utils.matrix_ranking as matrix_ranking
@@ -312,6 +312,7 @@ def test_compare_rankers_evaluates_models_and_writes_metrics(tmp_path, monkeypat
         "--splits", "val", "empty",
         "--metrics-top-ks", "30",
         "--batch-size", "2",
+        "--max-history-len", "5",
         "--num-dataloader-workers", "0",
         "--device", "cpu",
         "--bst-candidate-chunk-size", "17",
@@ -320,8 +321,8 @@ def test_compare_rankers_evaluates_models_and_writes_metrics(tmp_path, monkeypat
     assert cli.cmd_compare_rankers(raw) == 0
 
     assert created_datasets == [
-        {"split": "val", "use_author_embedding_table": True, "max_history_len": 7, "embed_dim": 2},
-        {"split": "empty", "use_author_embedding_table": True, "max_history_len": 7, "embed_dim": 2},
+        {"split": "val", "use_author_embedding_table": True, "max_history_len": 5, "embed_dim": 2},
+        {"split": "empty", "use_author_embedding_table": True, "max_history_len": 5, "embed_dim": 2},
     ]
     assert len(eval_calls) == 2
     assert all(call["device"] == "cpu" for call in eval_calls)
@@ -334,7 +335,7 @@ def test_compare_rankers_evaluates_models_and_writes_metrics(tmp_path, monkeypat
     out_dir = compare_dirs[0]
     metrics_summary = json.loads((out_dir / "metrics.json").read_text())
     assert metrics_summary["skipped_splits"] == ["empty"]
-    assert metrics_summary["max_history_len"] == 7
+    assert metrics_summary["max_history_len"] == 5
     assert set(metrics_summary["metrics"].keys()) == {"tt", "bst"}
     assert set(metrics_summary["metrics"]["tt"].keys()) == {"val"}
     assert (out_dir / "metrics.csv").read_text().startswith("model_name,model_type,checkpoint_path,split,metric,value\n")
