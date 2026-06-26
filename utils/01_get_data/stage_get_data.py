@@ -127,6 +127,7 @@ import re
 from google.cloud import storage
 import numpy as np
 from tqdm import tqdm
+import gc
 
 from utils.pipeline.core import (
     Context,
@@ -1601,6 +1602,9 @@ def _run_greenearth_pipeline(
         initial_negative_sampling_pct=initial_negative_sampling_pct,
         logger=logger,
     )
+    del like_counts_df
+    gc.collect()
+
     all_stats['likes'] = likes_stats
     n_users_final = likes_core_df['did'].n_unique()
     all_stats['likes']['n_users_final'] = n_users_final
