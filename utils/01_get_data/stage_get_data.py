@@ -883,6 +883,7 @@ def _load_posts_core_polars(
     cols_metadata = ["at_uri", TIMESTAMP_COL_NAME, "did", "record_text"]
 
     # get posts: sampled via hash, or in liked_post_uris:
+    logger.info(f"Finding popular posts to sample as negatives...")
     negative_posts_df = _get_negative_sample_posts(
         posts_lf,
         like_counts_df,
@@ -891,7 +892,10 @@ def _load_posts_core_polars(
         random_seed,
         negative_sampling_alpha,
     )
+    logger.info(f"Done finding popular posts to sample as negatives.")
+    logger.info(f"Getting post info for liked posts...")
     liked_posts_df = _get_liked_posts_metadata_df(posts_lf, liked_post_uris_df, cols_metadata)
+    logger.info(f"Done getting post info for liked posts.")
     posts_core_df = _combine_posts_dfs(negative_posts_df, liked_posts_df, cols_metadata)
 
     # get embedding dim (we need this for later memmap writing, but don't expand here)
