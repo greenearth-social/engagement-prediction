@@ -55,17 +55,22 @@ def _write_posts_parquet(tmp_path, rows):
     return path
 
 
-def _prior_likes_for_posts(rows, count=100, popularity_hour_bucket="2024-01-02T00:00:00"):
+def _prior_likes_for_posts(rows, count=100, popularity_hour_bucket="2024-01-02T00:00:00", is_negative_candidate_seed=True):
     if callable(popularity_hour_bucket):
         buckets = [popularity_hour_bucket(row) for row in rows]
     elif isinstance(popularity_hour_bucket, dict):
         buckets = [popularity_hour_bucket[row["at_uri"]] for row in rows]
     else:
         buckets = [popularity_hour_bucket for _ in rows]
+    if isinstance(is_negative_candidate_seed, dict):
+        negative_candidate_seeds = [is_negative_candidate_seed[row["at_uri"]] for row in rows]
+    else:
+        negative_candidate_seeds = [is_negative_candidate_seed for _ in rows]
     return pl.DataFrame({
         "subject_uri": [row["at_uri"] for row in rows],
         "popularity_hour_bucket": buckets,
         "prior_cumulative_likes": [count for _ in rows],
+        "is_negative_candidate_seed": negative_candidate_seeds,
     }).with_columns(
         pl.col("popularity_hour_bucket").str.to_datetime(time_zone="UTC"),
         pl.col("prior_cumulative_likes").cast(pl.UInt64),
@@ -321,6 +326,7 @@ def test_prior_cumulative_likes_excludes_same_hour_and_forces_liked_uris(stage_g
     )
 
     assert set(prior_likes_df["subject_uri"].to_list()) == {"post:forced"}
+    assert prior_likes_df["is_negative_candidate_seed"].to_list() == [False, False]
 
     likes_df = pl.DataFrame({
         "did": ["target_same", "target_next", "target_later"],
@@ -350,6 +356,24 @@ def test_prior_cumulative_likes_excludes_same_hour_and_forces_liked_uris(stage_g
         "target_next": 2,
         "target_later": 3,
     }
+    assert "is_negative_candidate_seed" not in enriched_likes_df.columns
+
+    forced_post_lf = pl.DataFrame([{
+        "at_uri": "post:forced",
+        "did": "author_forced",
+        "record_created_at": "2024-01-01T12:00:00",
+        "record_text": "forced",
+    }]).lazy()
+    forced_negative_df = stage_get_data_module._get_negative_sample_posts(
+        posts_lf=forced_post_lf,
+        prior_likes_df=prior_likes_df,
+        cols_metadata=["at_uri", "record_created_at", "did", "record_text"],
+        negative_samples_per_hour=10,
+        random_seed=123,
+        negative_sampling_alpha=0.5,
+        min_likes_per_negative_post=1,
+    )
+    assert forced_negative_df.height == 0
 
 
 def test_load_posts_random_sample_all_metadata_only(tmp_path, stage_get_data_module):
@@ -419,6 +443,7 @@ def test_negative_sampling_filters_and_weights_by_prior_counts(tmp_path, stage_g
         "subject_uri": ["post:low", "post:mid", "post:popular"],
         "popularity_hour_bucket": ["2024-01-02T05:00:00", "2024-01-02T05:00:00", "2024-01-02T05:00:00"],
         "prior_cumulative_likes": [4, 6, 1_000_000],
+        "is_negative_candidate_seed": [True, True, True],
     }).with_columns(
         pl.col("popularity_hour_bucket").str.to_datetime(time_zone="UTC"),
         pl.col("prior_cumulative_likes").cast(pl.UInt64),
