@@ -624,25 +624,32 @@ def _build_prior_cumulative_likes_df(
         raw_likes_lf
         .select(["subject_uri", TIMESTAMP_COL_NAME])
         .join(liked_uri_marker_lf, on="subject_uri", how="left")
-        .filter(
+        .with_columns(
             ((pl.col("subject_uri").hash(seed=random_seed).cast(pl.Float64) / float(2**64 - 1)) < initial_negative_sampling_pct)
+            .alias("is_negative_candidate_seed")
+        )
+        .filter(
+            pl.col("is_negative_candidate_seed")
             | pl.col("_force_include").fill_null(False)
         )
         .with_columns(
             _hour_bucket_key_expr(TIMESTAMP_COL_NAME).str.to_datetime(time_zone="UTC").alias("_like_hour_bucket")
-        ) # subject_uri, record_created_at, _force_include, _like_hour_bucket
+        ) # subject_uri, record_created_at, _force_include, is_negative_candidate_seed, _like_hour_bucket
         .group_by(["subject_uri", "_like_hour_bucket"])
-        .len()
-        .rename({"len": "likes_this_hour"}) # subject_uri, _like_hour_bucket, likes_this_hour
+        .agg(
+            pl.len().alias("likes_this_hour"),
+            pl.col("is_negative_candidate_seed").any(),
+        ) # subject_uri, _like_hour_bucket, likes_this_hour, is_negative_candidate_seed
         .sort(["subject_uri", "_like_hour_bucket"])
         .with_columns(
             pl.col("likes_this_hour").cum_sum().over("subject_uri").alias("prior_cumulative_likes")
-        ) # subject_uri, _like_hour_bucket, likes_this_hour, prior_cumulative_likes
+        ) # subject_uri, _like_hour_bucket, likes_this_hour, is_negative_candidate_seed, prior_cumulative_likes
         .select(
             "subject_uri",
             (pl.col("_like_hour_bucket") + pl.duration(hours=1)).alias("popularity_hour_bucket"),
             pl.col("prior_cumulative_likes").cast(pl.UInt64),
-        ) # subject_uri, popularity_hour_bucket, prior_cumulative_likes
+            "is_negative_candidate_seed",
+        ) # subject_uri, popularity_hour_bucket, prior_cumulative_likes, is_negative_candidate_seed
         .collect(engine="streaming")
     )
 
@@ -651,15 +658,13 @@ def _add_prior_cumulative_likes_to_likes(
     likes_df: pl.DataFrame,
     prior_likes_df: pl.DataFrame,
 ) -> pl.DataFrame:
-    if prior_likes_df.height == 0:
-        return likes_df.with_columns(
-            pl.lit(0, dtype=pl.UInt64).alias("prior_cumulative_likes")
-        )
     return (
         likes_df # did, subject_uri, record_created_at, split, like_hour_bucket
         .sort(["like_hour_bucket", "subject_uri"])
         .join_asof(
-            prior_likes_df.sort(["popularity_hour_bucket", "subject_uri"]),
+            prior_likes_df
+            .select(["subject_uri", "popularity_hour_bucket", "prior_cumulative_likes"])
+            .sort(["popularity_hour_bucket", "subject_uri"]),
             left_on="like_hour_bucket",
             right_on="popularity_hour_bucket",
             by="subject_uri",
@@ -1072,6 +1077,7 @@ def _get_negative_sample_posts(
     metadata_lf = posts_lf.select(cols_metadata)
     prior_candidates_lf = (
         prior_likes_df
+        .filter(pl.col("is_negative_candidate_seed"))
         .rename({
             "subject_uri": "at_uri",
             "popularity_hour_bucket": "negative_hour_bucket",
@@ -1780,11 +1786,11 @@ def _run_greenearth_pipeline(
 
         # Add emb_idx column from uri_to_idx mapping
         # Convert to DataFrame for joining
-        uri_idx_df = pl.DataFrame({
+        valid_uri_idx_df = pl.DataFrame({
             "at_uri": list(uri_to_idx.keys()),
             "emb_idx": list(uri_to_idx.values()),
         })
-        posts_core_df = posts_core_df.join(uri_idx_df, on="at_uri", how="left")
+        posts_core_df = posts_core_df.join(valid_uri_idx_df, on="at_uri", how="left")
 
         # Verify no nulls in emb_idx
         n_null_post_idx = posts_core_df.filter(pl.col("emb_idx").is_null()).height
