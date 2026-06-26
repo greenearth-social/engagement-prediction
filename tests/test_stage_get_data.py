@@ -465,6 +465,48 @@ def test_negative_sampling_filters_and_weights_by_prior_counts(tmp_path, stage_g
     assert posts_df["record_created_at"].to_list() == ["2024-01-01T12:00:00"]
 
 
+def test_negative_sampling_hashes_post_and_hour(tmp_path, stage_get_data_module):
+    embedding_model = "test-model"
+    posts_rows = [
+        {"at_uri": "post:a", "did": "author_a", "record_created_at": "2024-01-01T12:00:00", "record_text": "a", "embeddings": [{"key": embedding_model, "value": _encode_embedding([0.1, 0.2, 0.3])}]},
+        {"at_uri": "post:b", "did": "author_b", "record_created_at": "2024-01-01T12:00:00", "record_text": "b", "embeddings": [{"key": embedding_model, "value": _encode_embedding([0.1, 0.2, 0.3])}]},
+    ]
+    posts_path = _write_posts_parquet(tmp_path, posts_rows)
+    prior_likes_df = pl.DataFrame({
+        "subject_uri": ["post:a", "post:b", "post:a", "post:b"],
+        "popularity_hour_bucket": [
+            "2024-01-02T05:00:00",
+            "2024-01-02T05:00:00",
+            "2024-01-02T06:00:00",
+            "2024-01-02T06:00:00",
+        ],
+        "prior_cumulative_likes": [10, 10, 10, 10],
+        "is_negative_candidate_seed": [True, True, True, True],
+    }).with_columns(
+        pl.col("popularity_hour_bucket").str.to_datetime(time_zone="UTC"),
+        pl.col("prior_cumulative_likes").cast(pl.UInt64),
+    )
+
+    posts_df = stage_get_data_module._get_negative_sample_posts(
+        posts_lf=pl.scan_parquet(str(posts_path)),
+        prior_likes_df=prior_likes_df,
+        cols_metadata=["at_uri", "record_created_at", "did", "record_text"],
+        negative_samples_per_hour=1,
+        random_seed=3,
+        negative_sampling_alpha=0.0,
+        min_likes_per_negative_post=1,
+    )
+
+    sampled_by_bucket = {
+        row["negative_hour_bucket"].isoformat(): row["at_uri"]
+        for row in posts_df.select(["negative_hour_bucket", "at_uri"]).iter_rows(named=True)
+    }
+    assert sampled_by_bucket == {
+        "2024-01-02T05:00:00+00:00": "post:b",
+        "2024-01-02T06:00:00+00:00": "post:a",
+    }
+
+
 def test_load_posts_liked_always_included_with_null_negative_bucket(tmp_path, stage_get_data_module):
     """Test that liked posts are always included even with zero random sample."""
     embedding_model = "test-model"
@@ -745,6 +787,7 @@ def test_write_embeddings_memmap(tmp_path, stage_get_data_module):
     
     # Load and verify contents using the uri_to_idx mapping
     mmap = np.load(embeddings_path, mmap_mode="r")
+    assert mmap.shape == (3, embed_dim)
     
     # post:1 has embedding [0.1, 0.2, 0.3]
     assert np.allclose(mmap[uri_to_idx["post:1"]], [0.1, 0.2, 0.3], atol=1e-5)
@@ -754,6 +797,7 @@ def test_write_embeddings_memmap(tmp_path, stage_get_data_module):
     assert np.allclose(mmap[uri_to_idx["post:5"]], [1.3, 1.4, 1.5], atol=1e-5)
     
     del mmap  # Close memmap
+    assert not embeddings_path.with_suffix(".tmp.npy").exists()
 
 
 def test_write_embeddings_memmap_handles_missing_embeddings(tmp_path, stage_get_data_module):
@@ -807,12 +851,77 @@ def test_write_embeddings_memmap_handles_missing_embeddings(tmp_path, stage_get_
     
     # Memmap should have exactly 2 rows (no gaps)
     mmap = np.load(embeddings_path, mmap_mode="r")
+    assert mmap.shape == (2, embed_dim)
     
     # Verify embeddings are correct using uri_to_idx
     assert np.allclose(mmap[uri_to_idx["post:1"]], [0.1, 0.2, 0.3], atol=1e-5)
     assert np.allclose(mmap[uri_to_idx["post:3"]], [0.7, 0.8, 0.9], atol=1e-5)
     
     del mmap
+    assert not embeddings_path.with_suffix(".tmp.npy").exists()
+
+
+def test_write_embeddings_memmap_skips_duplicate_uris_and_cleans_temp_file(tmp_path, stage_get_data_module):
+    embedding_model = "test-model"
+    posts_rows = [
+        {"at_uri": "post:1", "record_created_at": "2024-01-01T10:00:00", "did": "user:a",
+         "record_text": "text1", "embeddings": [{"key": embedding_model, "value": _encode_embedding([0.1, 0.2, 0.3])}]},
+        {"at_uri": "post:1", "record_created_at": "2024-01-01T10:05:00", "did": "user:a",
+         "record_text": "text1 duplicate", "embeddings": [{"key": embedding_model, "value": _encode_embedding([9.0, 9.0, 9.0])}]},
+    ]
+    posts_path = _write_posts_parquet(tmp_path, posts_rows)
+    posts_core_df = pl.DataFrame({"at_uri": ["post:1"]})
+    embeddings_path = tmp_path / "embeddings.npy"
+    logger = logging.getLogger("test_stage_get_data.duplicate_emb")
+    embed_dim = 3
+
+    uri_to_idx, stats = stage_get_data_module._write_embeddings_memmap(
+        posts_paths=[str(posts_path)],
+        posts_start="2024-01-01T00:00:00",
+        posts_end="2024-01-02T00:00:00",
+        posts_core_df=posts_core_df,
+        embeddings_path=embeddings_path,
+        embed_dim=embed_dim,
+        embedding_model=embedding_model,
+        logger=logger,
+    )
+
+    assert uri_to_idx == {"post:1": 0}
+    assert stats["n_embeddings_valid"] == 1
+    assert stats["n_embeddings_duplicate_uri"] == 1
+    assert not embeddings_path.with_suffix(".tmp.npy").exists()
+
+    mmap = np.load(embeddings_path, mmap_mode="r")
+    assert mmap.shape == (1, embed_dim)
+    assert np.allclose(mmap[0], [0.1, 0.2, 0.3], atol=1e-5)
+    del mmap
+
+
+def test_write_embeddings_memmap_cleans_temp_file_when_no_valid_embeddings(tmp_path, stage_get_data_module):
+    embedding_model = "test-model"
+    posts_rows = [
+        {"at_uri": "post:1", "record_created_at": "2024-01-01T10:00:00", "did": "user:a",
+         "record_text": "text1", "embeddings": None},
+    ]
+    posts_path = _write_posts_parquet(tmp_path, posts_rows)
+    posts_core_df = pl.DataFrame({"at_uri": ["post:1"]})
+    embeddings_path = tmp_path / "embeddings.npy"
+    logger = logging.getLogger("test_stage_get_data.no_valid_emb")
+
+    with pytest.raises(ValueError, match="No valid embeddings"):
+        stage_get_data_module._write_embeddings_memmap(
+            posts_paths=[str(posts_path)],
+            posts_start="2024-01-01T00:00:00",
+            posts_end="2024-01-02T00:00:00",
+            posts_core_df=posts_core_df,
+            embeddings_path=embeddings_path,
+            embed_dim=3,
+            embedding_model=embedding_model,
+            logger=logger,
+        )
+
+    assert not embeddings_path.exists()
+    assert not embeddings_path.with_suffix(".tmp.npy").exists()
 
 
 def test_get_embeddings_list_col_extracts_and_decodes(stage_get_data_module):

@@ -1095,7 +1095,12 @@ def _get_negative_sample_posts(
         )
         .with_columns(
             (pl.col("prior_cumulative_likes") ** negative_sampling_alpha).alias("_weight"),
-            (pl.col("at_uri").hash(seed=random_seed).cast(pl.Float64) / float(2**64 - 1)).alias("_rand_val"),
+            (
+                pl.concat_str([
+                    pl.col("at_uri"),
+                    pl.col("negative_hour_bucket").cast(pl.Utf8),
+                ]).hash(seed=random_seed).cast(pl.Float64) / float(2**64 - 1)
+            ).alias("_rand_val"),
         ) # at_uri, record_created_at, did, record_text, negative_hour_bucket, prior_cumulative_likes, _weight, _rand_val
         .with_columns(
             (-pl.col("_rand_val").log() / pl.col("_weight")).alias("_sample_score"),
@@ -1415,7 +1420,7 @@ def _write_embeddings_memmap(
         - stats: Dict with write statistics (n_written, n_skipped, etc.)
     """
     n_posts_candidate = len(posts_core_df)
-    logger.info(f"Validating embeddings for {n_posts_candidate:,} candidate posts...")
+    logger.info(f"Writing embeddings for {n_posts_candidate:,} candidate posts...")
     
     # Build set of candidate URIs (posts we want embeddings for)
     candidate_uris = set(posts_core_df["at_uri"].to_list())
@@ -1441,72 +1446,62 @@ def _write_embeddings_memmap(
                 yield row["at_uri"], row["_emb_vec"]
         row_pbar.close()
     
-    # First pass: count valid embeddings to pre-allocate memmap with exact size
+    # Write embeddings once to an oversized local memmap, then compact locally to exact shape.
     n_null = 0
     n_wrong_dim = 0
     n_duplicate_uri = 0
     n_valid = 0
+    uri_to_idx: Dict[str, int] = {}
     seen_valid_uris: set[str] = set()
-    
-    t0_validate = time.monotonic()
-    for uri, emb_vec in _iter_candidate_embeddings(desc="Pass 1/2: validating"):
+    tmp_embeddings_path = embeddings_path.with_suffix(".tmp.npy")
+    if tmp_embeddings_path.exists():
+        tmp_embeddings_path.unlink()
+    tmp_mmap = np.lib.format.open_memmap(
+        tmp_embeddings_path,
+        mode="w+",
+        dtype=np.float32,
+        shape=(n_candidates_unique, embed_dim),
+    )
+    logger.info(f"Pre-allocated temporary memmap: shape={tmp_mmap.shape}, dtype={tmp_mmap.dtype}")
+
+    t0_write = time.monotonic()
+    for uri, emb_vec in _iter_candidate_embeddings(desc="Scanning and writing embeddings"):
         if emb_vec is None:
             n_null += 1
             continue
-        
         if len(emb_vec) != embed_dim:
             n_wrong_dim += 1
             continue
-        
         if uri in seen_valid_uris:
             n_duplicate_uri += 1
             continue
-        
         seen_valid_uris.add(uri)
+
+        tmp_mmap[n_valid] = np.array(emb_vec, dtype=np.float32)
+        uri_to_idx[uri] = n_valid
         n_valid += 1
+    t_write = time.monotonic() - t0_write
     n_skipped = n_null + n_wrong_dim + n_duplicate_uri
-    t_validate = time.monotonic() - t0_validate
-    logger.info(f"Validation pass completed in {t_validate:.1f}s")
-    
+    logger.info(f"Embedding scan/write completed in {t_write:.1f}s")
     logger.info(
         f"Validated embeddings: {n_valid:,} valid, {n_skipped:,} skipped "
         f"(null={n_null:,}, wrong_dim={n_wrong_dim:,}, duplicate_uri={n_duplicate_uri:,})"
     )
-    
+
     if n_valid == 0:
+        del tmp_mmap
+        tmp_embeddings_path.unlink(missing_ok=True)
         raise ValueError("No valid embeddings found - cannot create memmap")
-    
-    # Pre-allocate memmap with exact size (no gaps)
+
     mmap = np.lib.format.open_memmap(embeddings_path, mode="w+", dtype=np.float32, shape=(n_valid, embed_dim))
-    logger.info(f"Pre-allocated memmap: shape={mmap.shape}, dtype={mmap.dtype}")
-    
-    # Write embeddings sequentially and build uri_to_idx mapping
-    uri_to_idx: Dict[str, int] = {}
-    idx = 0
-    seen_valid_uris = set()
-    t0_write = time.monotonic()
-    for uri, emb_vec in _iter_candidate_embeddings(desc="Pass 2/2: writing"):
-        if emb_vec is None:
-            continue
-        if len(emb_vec) != embed_dim:
-            continue
-        if uri in seen_valid_uris:
-            continue
-        seen_valid_uris.add(uri)
-        
-        mmap[idx] = np.array(emb_vec, dtype=np.float32)
-        uri_to_idx[uri] = idx
-        idx += 1
-    t_write = time.monotonic() - t0_write
-    logger.info(f"Write pass completed in {t_write:.1f}s — wrote {idx:,} embeddings")
-    
-    if idx != n_valid:
-        logger.warning(f"Expected to write {n_valid:,} embeddings, but wrote {idx:,}")
-    
-    # Flush to disk
+    mmap[:] = tmp_mmap[:n_valid]
+    tmp_mmap.flush()
     mmap.flush()
-    del mmap  # Close the memmap
-    
+    del tmp_mmap
+    del mmap
+    tmp_embeddings_path.unlink(missing_ok=True)
+    logger.info(f"Compacted embeddings memmap to exact shape=({n_valid:,}, {embed_dim})")
+
     # Log summary
     file_size_mb = embeddings_path.stat().st_size / (1024 * 1024)
     logger.info(f"✓ Wrote {n_valid:,} embeddings to memmap ({file_size_mb:.1f} MB)")
