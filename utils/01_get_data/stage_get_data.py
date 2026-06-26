@@ -610,15 +610,18 @@ def _apply_per_user_recency_cap(
 def _get_post_like_counts(
     raw_likes_lf: pl.LazyFrame,
     min_likes_per_negative_post: int,
+    random_seed: int,
+    initial_negative_sampling_pct: float,
 ) -> pl.DataFrame:
     return (
         raw_likes_lf
-        .select(
-            pl
-            .col("subject_uri")
-            .value_counts(sort=True)
+        .select("subject_uri")
+        .filter(
+            (pl.col("subject_uri").hash(seed=random_seed).cast(pl.Float64) / float(2**64 - 1)) < initial_negative_sampling_pct
         )
-        .unnest("subject_uri")
+        .group_by("subject_uri")
+        .len()
+        .rename({"len": "count"})
         .filter(pl.col("count") >= min_likes_per_negative_post)
         .collect(engine="streaming")
     )
@@ -639,6 +642,7 @@ def _load_likes_core_polars(
     holdout_start: Optional[str],
     holdout_end: Optional[str],
     min_likes_per_negative_post: int,
+    initial_negative_sampling_pct: float,
     logger: logging.Logger,
 ) -> Tuple[pl.DataFrame, Dict[str, Any], pl.DataFrame]:
     """
@@ -804,7 +808,9 @@ def _load_likes_core_polars(
 
     ### Get global posts with a minimum number of likes and a weight based on like count,
     ### for sampling negatives in the next step
-    like_counts_df = _get_post_like_counts(base_lf, min_likes_per_negative_post)
+    logger.info(f"Finding popular posts to sample as negatives...")
+    like_counts_df = _get_post_like_counts(base_lf, min_likes_per_negative_post, random_seed, initial_negative_sampling_pct)
+    logger.info(f"Done finding popular posts to sample as negatives.")
     stats['min_likes_per_negative_post'] = min_likes_per_negative_post
     stats['n_negative_candidate_posts_by_like_count'] = like_counts_df.height
     
@@ -1133,11 +1139,14 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     min_author_support = int(args.min_author_support)
     negative_samples_per_hour = int(args.negative_samples_per_hour)
     negative_sampling_alpha = float(args.negative_sampling_alpha)
-    min_likes_per_negative_post = int(args.min_likes_per_negative_post)
     if negative_sampling_alpha < 0:
         raise ValueError("negative_sampling_alpha must be non-negative")
+    min_likes_per_negative_post = int(args.min_likes_per_negative_post)
     if min_likes_per_negative_post < 0:
         raise ValueError("min_likes_per_negative_post must be non-negative")
+    initial_negative_sampling_pct = float(args.initial_negative_sampling_pct)
+    if initial_negative_sampling_pct < 0 or initial_negative_sampling_pct > 1:
+        raise ValueError("initial_negative_sampling_pct must be between 0 and 1")
     cap_random_seed = int(args.cap_random_seed)
     train_start = _get_train_start(args.train_start, posts_start, likes_start)
     val_start = args.val_start
@@ -1181,6 +1190,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         negative_samples_per_hour=negative_samples_per_hour,
         negative_sampling_alpha=negative_sampling_alpha,
         min_likes_per_negative_post=min_likes_per_negative_post,
+        initial_negative_sampling_pct=initial_negative_sampling_pct,
         cap_random_seed=cap_random_seed,
         train_start=train_start,
         val_start=val_start,
@@ -1484,6 +1494,7 @@ def _run_greenearth_pipeline(
     negative_samples_per_hour: int,
     negative_sampling_alpha: float,
     min_likes_per_negative_post: int,
+    initial_negative_sampling_pct: float,
     cap_random_seed: int,
     train_start: str,
     val_start: Optional[str],
@@ -1587,6 +1598,7 @@ def _run_greenearth_pipeline(
         holdout_start=holdout_start,
         holdout_end=holdout_end,
         min_likes_per_negative_post=min_likes_per_negative_post,
+        initial_negative_sampling_pct=initial_negative_sampling_pct,
         logger=logger,
     )
     all_stats['likes'] = likes_stats
