@@ -54,7 +54,7 @@ Tests live under `tests/` and use the `test_*.py` naming convention.
 - `utils/03_train/stage_train_two_tower.py`: Stage 3 two-tower matrix ranker.
 - `utils/03_train/stage_train_bst_ranker.py`: Stage 3 BST heavy ranker.
 - `utils/04_evaluate/stage_evaluate.py`: Stage 4 holdout evaluation from compact ranking-row artifacts.
-- `utils/dataloaders.py`: bucketed listwise datasets, pairwise ranker datasets, samplers, and shared user encoders.
+- `utils/dataloaders.py`: bucketed listwise datasets, samplers, and shared user encoders.
 - `utils/matrix_ranking.py`: shared matrix ranking metrics, final metric logging, and ranking-row writers.
 - `utils/ranking_adapters.py`: `.pth` checkpoint adapters for compare-rankers.
 - `utils/pipeline/{core.py,dependencies.py,registry.py}`: artifact directories, lineage, dependency resolution, and stage registry.
@@ -113,7 +113,7 @@ Important Stage 1 behavior:
 - `max_likes_per_user` applies a deterministic random per-user cap.
 - `max_trainval_users` samples users eligible for train/validation/seen-holdout rows.
 - `max_unseen_eval_users` samples users used only for unseen validation and holdout.
-- `negative_samples_per_hour` controls the same-hour post pool used for listwise and pairwise ranker training.
+- `negative_samples_per_hour` controls the same-hour post pool used for matrix ranker training.
 - `min_author_support` controls which authors get dedicated author embedding rows when author features are enabled.
 
 Primary artifacts include `likes_core_*.parquet`, `posts_core_*.parquet`, `embeddings_*.npy`, and, when available, `author_idx_*.parquet`.
@@ -203,10 +203,7 @@ python cli.py --model-type bst-ranker \
   --stop-after train
 ```
 
-BST supports two training modes:
-
-- `listwise`: matrix ranking over capped same-hour candidate sets. This mode requires `bst_num_transformer_layers: 1` because it uses the optimized one-layer matrix scorer.
-- `pairwise`: one positive plus one same-hour sampled negative per row. This mode can use multiple transformer layers.
+BST training uses matrix ranking over capped same-hour candidate sets. It requires `bst_num_transformer_layers: 1` because it uses the optimized one-layer matrix scorer.
 
 Useful options:
 
@@ -220,8 +217,6 @@ Useful options:
 - `--bst-transformer-ff-dim`
 - `--bst-dropout-rate`
 - `--bst-time-delta-bucket-boundaries-hours`
-- `--bst-training-mode listwise|pairwise`
-- `--bst-use-auc-as-primary`
 - `--bst-max-train-batches-per-epoch`
 
 Current branch note: BST training writes train/validation metrics and checkpoints, but Stage 4 evaluation expects holdout ranking-row artifacts. Until BST holdout ranking rows are wired in, use `--stop-after train` for BST runs and compare checkpoints with `compare-rankers`.
@@ -284,7 +279,7 @@ Current compare-rankers assumptions:
 - Supported types are `two-tower` and `bst-ranker`.
 - Compared checkpoints must use author embeddings.
 - If compared checkpoints use different `max_history_len` values, pass `--max-history-len` to choose the evaluation history length.
-- BST checkpoints are scored with the optimized one-layer matrix scorer, so compare-rankers is intended for one-layer/listwise BST checkpoints.
+- BST checkpoints are scored with the optimized one-layer matrix scorer.
 
 ## Selective Reruns And Prior Pins
 

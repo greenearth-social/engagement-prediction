@@ -119,8 +119,6 @@ DEFAULTS: Dict[str, Any] = {
     "bst_norm_first": False,
     "bst_time_delta_bucket_boundaries_hours": [1.0, 3.0, 6.0, 12.0, 24.0, 72.0, 168.0, 720.0, 2160.0],
     "bst_weight_decay": 0.01,
-    "bst_use_auc_as_primary": False,
-    "bst_training_mode": "listwise",
     "bst_max_train_batches_per_epoch": None,
     "hidden_dims": [64, 32, 16],
     "dropout_rate_mlp": 0.5,
@@ -569,10 +567,8 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
         raise ValueError("--bst-num-attention-heads must be positive.")
     if (model_dim + time_embedding_dim) % num_attention_heads != 0:
         raise ValueError("--bst-model-dim + --bst-time-embedding-dim must be divisible by --bst-num-attention-heads.")
-    if args.bst_training_mode not in ("listwise", "pairwise"):
-        raise ValueError("--bst-training-mode must be listwise or pairwise.")
-    if args.bst_training_mode == "listwise" and num_transformer_layers != 1:
-        raise ValueError("--bst-training-mode=listwise requires --bst-num-transformer-layers=1.")
+    if num_transformer_layers != 1:
+        raise ValueError("BST ranker requires --bst-num-transformer-layers=1.")
     if candidate_sample_size <= 0:
         raise ValueError("--candidate-sample-size must be positive.")
     if batch_size <= 0:
@@ -909,10 +905,6 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="BST ranker time-delta bucket boundaries in hours")
     _add_arg_with_default(p_all, "--bst-weight-decay", type=float, default=argparse.SUPPRESS,
                           help_text="Weight decay for BST ranker model")
-    _add_arg_with_default(p_all, "--bst-use-auc-as-primary", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
-                          help_text="Use validation unseen AUC-ROC as the BST primary metric instead of validation unseen loss")
-    _add_arg_with_default(p_all, "--bst-training-mode", type=str, choices=["listwise", "pairwise"], default=argparse.SUPPRESS,
-                          help_text="BST training objective/data shape: listwise matrix ranking or pairwise binary classification")
     _add_arg_with_default(p_all, "--bst-max-train-batches-per-epoch", type=int, default=argparse.SUPPRESS,
                           help_text="Optional cap on BST train batches per epoch for fast experiments")
     # Stage 3 options (shared)

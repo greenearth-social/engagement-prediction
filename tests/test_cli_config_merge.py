@@ -221,8 +221,6 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
             bst_time_delta_bucket_boundaries_hours: [1, 2, 4]
             prediction_hidden_dims: [128, 64]
             bst_weight_decay: 0.02
-            bst_use_auc_as_primary: true
-            bst_training_mode: listwise
             candidate_sample_size: 32
             batch_size: 16
             bst_max_train_batches_per_epoch: 5
@@ -242,15 +240,13 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
     assert merged.bst_time_embedding_dim == 32
     assert merged.bst_num_attention_heads == 8
     assert merged.prediction_hidden_dims == [128, 64]
-    assert merged.bst_use_auc_as_primary is True
-    assert merged.bst_training_mode == "listwise"
     assert merged.candidate_sample_size == 32
     assert merged.batch_size == 16
     assert merged.bst_max_train_batches_per_epoch == 5
     cli._validate_bst_config(merged)
 
 
-def test_bst_ranker_listwise_training_defaults():
+def test_bst_ranker_training_defaults():
     parser = cli.build_parser()
     raw = parser.parse_args([
         "--model-type", "bst-ranker",
@@ -258,30 +254,13 @@ def test_bst_ranker_listwise_training_defaults():
     ])
     merged = cli._merge_args_with_config(raw)
 
-    assert merged.bst_training_mode == "listwise"
     assert merged.candidate_sample_size == 64
     assert merged.batch_size == cli.DEFAULTS["batch_size"]
     assert merged.bst_max_train_batches_per_epoch is None
     cli._validate_bst_config(merged)
 
 
-def test_bst_ranker_auc_primary_flag_defaults_to_false():
-    parser = cli.build_parser()
-    raw = parser.parse_args(["--model-type", "bst-ranker"])
-    merged = cli._merge_args_with_config(raw)
-
-    assert merged.bst_use_auc_as_primary is False
-
-
-def test_bst_ranker_auc_primary_flag_can_be_enabled():
-    parser = cli.build_parser()
-    raw = parser.parse_args(["--model-type", "bst-ranker", "--bst-use-auc-as-primary"])
-    merged = cli._merge_args_with_config(raw)
-
-    assert merged.bst_use_auc_as_primary is True
-
-
-def test_bst_ranker_listwise_requires_one_transformer_layer():
+def test_bst_ranker_requires_one_transformer_layer():
     parser = cli.build_parser()
     raw = parser.parse_args([
         "--model-type", "bst-ranker",
@@ -292,19 +271,6 @@ def test_bst_ranker_listwise_requires_one_transformer_layer():
 
     with pytest.raises(ValueError, match="requires --bst-num-transformer-layers=1"):
         cli._validate_bst_config(merged)
-
-
-def test_bst_ranker_pairwise_allows_multiple_transformer_layers():
-    parser = cli.build_parser()
-    raw = parser.parse_args([
-        "--model-type", "bst-ranker",
-        "--use-author-embedding-table",
-        "--bst-training-mode", "pairwise",
-        "--bst-num-transformer-layers", "2",
-    ])
-    merged = cli._merge_args_with_config(raw)
-
-    cli._validate_bst_config(merged)
 
 
 @pytest.mark.parametrize(

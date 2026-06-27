@@ -10,10 +10,7 @@ from torch.utils.data import DataLoader, Dataset
 stage_train_bst_ranker = importlib.import_module("utils.03_train.stage_train_bst_ranker")
 BSTRanker = stage_train_bst_ranker.BSTRanker
 LinearPredictionHead = stage_train_bst_ranker.LinearPredictionHead
-_compute_bst_loss_and_preds = stage_train_bst_ranker._compute_bst_loss_and_preds
 _compute_bst_listwise_loss_and_preds = stage_train_bst_ranker._compute_bst_listwise_loss_and_preds
-_flatten_ranker_pair_batch = stage_train_bst_ranker._flatten_ranker_pair_batch
-run_bst_epoch = stage_train_bst_ranker.run_bst_epoch
 run_bst_listwise_epoch = stage_train_bst_ranker.run_bst_listwise_epoch
 train_bst_ranker_model = stage_train_bst_ranker.train_bst_ranker_model
 
@@ -102,26 +99,6 @@ def _expected_matrix_scores(model: BSTRanker, batch: dict[str, torch.Tensor]) ->
     ).reshape(num_users, num_candidates)
 
 
-def _ranker_pair_batch() -> dict[str, torch.Tensor]:
-    base = _batch()
-    candidate_post_embeddings = torch.stack(
-        [
-            base["candidate_post_embeddings"],
-            torch.flip(base["candidate_post_embeddings"], dims=[0]),
-        ],
-        dim=1,
-    )
-    return {
-        "history_embeddings": base["history_embeddings"],
-        "history_mask": base["history_mask"],
-        "history_time_deltas_hours": base["history_time_deltas_hours"],
-        "candidate_post_embeddings": candidate_post_embeddings,
-        "candidate_labels": torch.tensor([[1.0, 0.0], [1.0, 0.0]], dtype=torch.float32),
-        "history_author_indices": base["history_author_indices"],
-        "candidate_post_author_idx": torch.tensor([[5, 6], [6, 5]], dtype=torch.long),
-    }
-
-
 def _listwise_batch() -> dict[str, torch.Tensor]:
     batch = _batch()
     return {
@@ -204,19 +181,6 @@ def test_bst_ranker_score_candidate_matrix_one_layer_rejects_multi_layer_model()
 
     with pytest.raises(RuntimeError, match="exactly one transformer layer"):
         model.score_candidate_matrix_one_layer(**batch)
-
-
-def test_bst_ranker_predict_proba_applies_sigmoid_to_logits():
-    model = _make_model()
-    model.eval()
-    batch = _batch()
-
-    logits = model(**batch)
-    probabilities = model.predict_proba(**batch)
-
-    torch.testing.assert_close(probabilities, torch.sigmoid(logits))
-    assert torch.all(probabilities >= 0.0)
-    assert torch.all(probabilities <= 1.0)
 
 
 def test_bst_ranker_rejects_attention_head_mismatch():
@@ -413,38 +377,6 @@ def test_bst_ranker_rejects_invalid_prediction_head_output_shape():
         model(**batch)
 
 
-def test_flatten_ranker_pair_batch_repeats_history_and_flattens_candidates():
-    batch = _ranker_pair_batch()
-
-    flattened = _flatten_ranker_pair_batch(batch, "cpu")
-
-    assert flattened["history_embeddings"].shape == (4, 3, 4)
-    assert flattened["history_mask"].shape == (4, 3)
-    assert flattened["history_time_deltas_hours"].shape == (4, 3)
-    assert flattened["candidate_post_embeddings"].shape == (4, 4)
-    assert flattened["history_author_indices"].shape == (4, 3)
-    assert flattened["candidate_post_author_idx"].tolist() == [5, 6, 6, 5]
-    assert flattened["labels"].tolist() == [1.0, 0.0, 1.0, 0.0]
-    torch.testing.assert_close(flattened["history_embeddings"][0], batch["history_embeddings"][0])
-    torch.testing.assert_close(flattened["history_embeddings"][1], batch["history_embeddings"][0])
-    torch.testing.assert_close(flattened["history_embeddings"][2], batch["history_embeddings"][1])
-    torch.testing.assert_close(flattened["candidate_post_embeddings"][0], batch["candidate_post_embeddings"][0, 0])
-    torch.testing.assert_close(flattened["candidate_post_embeddings"][1], batch["candidate_post_embeddings"][0, 1])
-
-
-def test_compute_bst_loss_and_preds_returns_scalar_loss_logits_and_labels():
-    model = _make_model()
-    batch = _ranker_pair_batch()
-
-    loss, logits, labels = _compute_bst_loss_and_preds(model, batch, "cpu")
-
-    assert loss.shape == ()
-    assert torch.isfinite(loss)
-    assert logits.shape == (4,)
-    assert labels.shape == (4,)
-    assert labels.tolist() == [1.0, 0.0, 1.0, 0.0]
-
-
 def test_compute_bst_listwise_loss_and_preds_returns_finite_multi_positive_loss_and_gradients():
     model = _make_model()
     batch = _listwise_batch()
@@ -464,30 +396,7 @@ def test_compute_bst_listwise_loss_and_preds_returns_finite_multi_positive_loss_
     assert grad_sum > 0
 
 
-def test_run_bst_epoch_computes_auc_roc_and_classification_average_precision():
-    model = _make_model()
-    model.eval()
-    loader = DataLoader(_SingleBatchDataset(_ranker_pair_batch()), batch_size=None, shuffle=False)
-
-    loss, metrics = run_bst_epoch(
-        train=False,
-        split_name="Validation",
-        model=model,
-        device="cpu",
-        dataloader=loader,
-        optimizer=None,
-        disable_progress=True,
-        gradient_clip_max_norm=1.0,
-    )
-
-    assert loss >= 0.0
-    assert metrics["classification_metric_pair_count"] == 4
-    assert metrics["classification_metric_positive_count"] == 2
-    assert metrics["auc_roc"] is not None
-    assert metrics["classification_average_precision"] is not None
-
-
-def test_run_bst_listwise_epoch_computes_rank_metrics_without_classification_accumulation():
+def test_run_bst_listwise_epoch_computes_rank_metrics():
     model = _make_model()
     model.eval()
     loader = DataLoader(_SingleBatchDataset(_listwise_batch()), batch_size=None, shuffle=False)
@@ -510,112 +419,6 @@ def test_run_bst_listwise_epoch_computes_rank_metrics_without_classification_acc
     for metric_name in ("ndcg@1", "recall@1", "ndcg@2", "recall@2", "mean_average_precision"):
         assert metric_name in metrics
         assert 0.0 <= metrics[metric_name] <= 1.0
-    assert "classification_metric_pair_count" not in metrics
-    assert "auc_roc" not in metrics
-    assert "classification_average_precision" not in metrics
-
-
-def test_run_bst_epoch_skips_auc_roc_and_classification_average_precision_when_disabled(monkeypatch):
-    model = _make_model()
-    model.eval()
-    loader = DataLoader(_SingleBatchDataset(_ranker_pair_batch()), batch_size=None, shuffle=False)
-
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("classification metrics should not be computed")
-
-    monkeypatch.setattr(stage_train_bst_ranker, "_classification_metrics_from_logits", fail_if_called)
-
-    loss, metrics = run_bst_epoch(
-        train=False,
-        split_name="Validation",
-        model=model,
-        device="cpu",
-        dataloader=loader,
-        optimizer=None,
-        disable_progress=True,
-        gradient_clip_max_norm=1.0,
-        compute_classification_metrics=False,
-    )
-
-    assert loss >= 0.0
-    assert metrics["classification_metric_pair_count"] == 4
-    assert metrics["classification_metric_positive_count"] == 2
-    assert "auc_roc" not in metrics
-    assert "classification_average_precision" not in metrics
-
-
-def test_train_bst_ranker_model_uses_val_unseen_loss_by_default(tmp_path):
-    torch.manual_seed(0)
-    model = _make_model()
-    loader = DataLoader(_SingleBatchDataset(_ranker_pair_batch()), batch_size=None, shuffle=False)
-
-    results = train_bst_ranker_model(
-        model=model,
-        train_loader=loader,
-        val_loader=loader,
-        val_unseen_loader=loader,
-        device="cpu",
-        epochs=2,
-        learning_rate=1e-3,
-        weight_decay=0.0,
-        patience=10,
-        early_stopping_min_delta=0.0,
-        checkpoints_dir=tmp_path,
-        disable_progress=True,
-        lr_scheduler_factor=0.5,
-        lr_scheduler_patience=2,
-        gradient_clip_max_norm=1.0,
-        bst_training_mode="pairwise",
-    )
-
-    assert results["primary_metric_name"] == "val_unseen_loss"
-    assert len(results["history"]["train_loss"]) == 2
-    assert len(results["history"]["val_loss"]) == 2
-    assert len(results["history"]["val_unseen_loss"]) == 2
-    assert "train_auc_roc" not in results["history"]
-    assert "val_auc_roc" not in results["history"]
-    assert "val_unseen_auc_roc" not in results["history"]
-    assert "train_classification_average_precision" not in results["history"]
-    assert "val_classification_average_precision" not in results["history"]
-    assert "val_unseen_classification_average_precision" not in results["history"]
-    assert results["best_val_metric"] == min(results["history"]["val_unseen_loss"])
-    assert (tmp_path / "bst_ranker_best.pth").exists()
-
-
-def test_train_bst_ranker_model_uses_val_unseen_auc_for_primary_metric_and_checkpoint(tmp_path):
-    torch.manual_seed(0)
-    model = _make_model()
-    loader = DataLoader(_SingleBatchDataset(_ranker_pair_batch()), batch_size=None, shuffle=False)
-
-    results = train_bst_ranker_model(
-        model=model,
-        train_loader=loader,
-        val_loader=loader,
-        val_unseen_loader=loader,
-        device="cpu",
-        epochs=2,
-        learning_rate=1e-3,
-        weight_decay=0.0,
-        patience=10,
-        early_stopping_min_delta=0.0,
-        checkpoints_dir=tmp_path,
-        disable_progress=True,
-        lr_scheduler_factor=0.5,
-        lr_scheduler_patience=2,
-        gradient_clip_max_norm=1.0,
-        bst_use_auc_as_primary=True,
-        bst_training_mode="pairwise",
-    )
-
-    assert results["primary_metric_name"] == "val_unseen_auc_roc"
-    assert len(results["history"]["train_auc_roc"]) == 2
-    assert len(results["history"]["val_auc_roc"]) == 2
-    assert len(results["history"]["val_unseen_auc_roc"]) == 2
-    assert len(results["history"]["train_classification_average_precision"]) == 2
-    assert len(results["history"]["val_classification_average_precision"]) == 2
-    assert len(results["history"]["val_unseen_classification_average_precision"]) == 2
-    assert results["best_val_metric"] == max(results["history"]["val_unseen_auc_roc"])
-    assert (tmp_path / "bst_ranker_best.pth").exists()
 
 
 def test_train_bst_ranker_model_uses_val_unseen_ndcg_for_listwise_primary_metric_and_checkpoint(
@@ -643,10 +446,6 @@ def test_train_bst_ranker_model_uses_val_unseen_ndcg_for_listwise_primary_metric
             "ndcg@1": ndcg,
             "recall@1": ndcg,
             "mean_average_precision": ndcg,
-            "classification_metric_pair_count": 4,
-            "classification_metric_positive_count": 2,
-            "auc_roc": 0.5,
-            "classification_average_precision": 0.5,
             "rank_metric_user_count": 2,
         }
 
@@ -668,17 +467,10 @@ def test_train_bst_ranker_model_uses_val_unseen_ndcg_for_listwise_primary_metric
         lr_scheduler_factor=0.5,
         lr_scheduler_patience=2,
         gradient_clip_max_norm=1.0,
-        bst_training_mode="listwise",
         metrics_top_ks=[1],
     )
 
     assert results["primary_metric_name"] == "val_unseen_ndcg@1"
     assert results["history"]["val_unseen_ndcg@1"] == val_unseen_ndcg_values
-    assert "train_auc_roc" not in results["history"]
-    assert "val_auc_roc" not in results["history"]
-    assert "val_unseen_auc_roc" not in results["history"]
-    assert "train_classification_average_precision" not in results["history"]
-    assert "val_classification_average_precision" not in results["history"]
-    assert "val_unseen_classification_average_precision" not in results["history"]
     assert results["best_val_metric"] == 0.75
     assert (tmp_path / "bst_ranker_best.pth").exists()
