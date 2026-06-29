@@ -203,11 +203,11 @@ python cli.py --model-type bst-ranker \
   --stop-after train
 ```
 
-BST training uses matrix ranking over capped same-hour candidate sets. It requires `bst_num_transformer_layers: 1` because it uses the optimized one-layer matrix scorer.
+BST training uses matrix ranking over same-hour candidate sets with additional sampled negatives. It requires `bst_num_transformer_layers: 1` because it uses the optimized one-layer matrix scorer.
 
 Useful options:
 
-- `--candidate-sample-size`
+- `--bst-additional-batch-negatives`
 - `--content-projection-dim`
 - `--author-projection-dim`
 - `--bst-model-dim`

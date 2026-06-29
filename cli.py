@@ -109,7 +109,7 @@ DEFAULTS: Dict[str, Any] = {
     "content_projection_dim": 128,
     "author_projection_dim": 32,
     "prediction_hidden_dims": [64, 32, 16],
-    "candidate_sample_size": 64,
+    "bst_additional_batch_negatives": 64,
     "bst_model_dim": 128,
     "bst_time_embedding_dim": 16,
     "bst_num_attention_heads": 4,
@@ -552,7 +552,7 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
     time_embedding_dim = int(args.bst_time_embedding_dim)
     num_attention_heads = int(args.bst_num_attention_heads)
     num_transformer_layers = int(args.bst_num_transformer_layers)
-    candidate_sample_size = int(args.candidate_sample_size)
+    bst_additional_batch_negatives = int(args.bst_additional_batch_negatives)
     batch_size = int(args.batch_size)
     bst_max_train_batches_per_epoch = args.bst_max_train_batches_per_epoch
     if model_dim <= 0:
@@ -569,8 +569,8 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
         raise ValueError("--bst-model-dim + --bst-time-embedding-dim must be divisible by --bst-num-attention-heads.")
     if num_transformer_layers != 1:
         raise ValueError("BST ranker requires --bst-num-transformer-layers=1.")
-    if candidate_sample_size <= 0:
-        raise ValueError("--candidate-sample-size must be positive.")
+    if bst_additional_batch_negatives <= 0:
+        raise ValueError("--bst-additional-batch-negatives must be positive.")
     if batch_size <= 0:
         raise ValueError("--batch-size must be positive.")
     if bst_max_train_batches_per_epoch is not None and int(bst_max_train_batches_per_epoch) <= 0:
@@ -883,8 +883,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Ranker author branch projection dimension")
     _add_arg_with_default(p_all, "--prediction-hidden-dims", type=int, nargs="*", default=argparse.SUPPRESS,
                           help_text="Ranker prediction-head hidden dimensions. Use no values for a direct linear head")
-    _add_arg_with_default(p_all, "--candidate-sample-size", type=int, default=argparse.SUPPRESS,
-                          help_text="Candidate cap for listwise ranker training batches")
+    _add_arg_with_default(p_all, "--bst-additional-batch-negatives", type=int, default=argparse.SUPPRESS,
+                          help_text="Additional same-hour negative-pool posts to sample per BST training batch")
     # BST ranker specific options
     _add_arg_with_default(p_all, "--bst-model-dim", type=int, default=argparse.SUPPRESS,
                           help_text="BST ranker fused post/author model dimension")

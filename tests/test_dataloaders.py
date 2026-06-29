@@ -167,7 +167,7 @@ def test_bucketed_collate_dedupes_candidates(bucketed_dataset):
     assert batch["label_matrix"][0].tolist() == [1.0, 1.0, 0.0, 0.0, 0.0]
 
 
-def test_bucketed_collate_candidate_cap_keeps_all_positives(
+def test_bucketed_collate_additional_negatives_are_added_after_positives(
     mock_embeddings_mmap,
     mock_likes_core_df,
     mock_posts_core_df,
@@ -181,7 +181,7 @@ def test_bucketed_collate_candidate_cap_keeps_all_positives(
         split="train",
         max_history_len=3,
         embed_dim=4,
-        candidate_sample_size=4,
+        bst_additional_batch_negatives=1,
         seed=0,
     )
 
@@ -189,6 +189,7 @@ def test_bucketed_collate_candidate_cap_keeps_all_positives(
 
     assert len(batch["candidate_post_id"]) == 4
     assert {"p1", "p2", "p3"} <= set(batch["candidate_post_id"])
+    assert len(set(batch["candidate_post_id"]).intersection({"n1", "p4"})) == 1
     positive_indices = {
         post_id: idx
         for idx, post_id in enumerate(batch["candidate_post_id"])
@@ -199,7 +200,7 @@ def test_bucketed_collate_candidate_cap_keeps_all_positives(
     assert batch["label_matrix"][1, positive_indices["p2"]].item() == 1.0
 
 
-def test_bucketed_collate_candidate_cap_allows_positive_overflow(
+def test_bucketed_collate_additional_negatives_do_not_cap_positives(
     mock_embeddings_mmap,
     mock_likes_core_df,
     mock_posts_core_df,
@@ -213,14 +214,14 @@ def test_bucketed_collate_candidate_cap_allows_positive_overflow(
         split="train",
         max_history_len=3,
         embed_dim=4,
-        candidate_sample_size=2,
+        bst_additional_batch_negatives=2,
         seed=0,
     )
 
     batch = dataset.collate_batch([dataset[0], dataset[1]])
 
-    assert batch["candidate_post_id"] == ["p1", "p3", "p2"]
-    assert batch["label_matrix"].shape == (2, 3)
+    assert batch["candidate_post_id"] == ["p1", "p3", "p2", "n1", "p4"]
+    assert batch["label_matrix"].shape == (2, 5)
 
 
 def test_bucketed_candidate_sampling_changes_by_epoch(
@@ -237,7 +238,7 @@ def test_bucketed_candidate_sampling_changes_by_epoch(
         split="train",
         max_history_len=3,
         embed_dim=4,
-        candidate_sample_size=4,
+        bst_additional_batch_negatives=1,
         seed=0,
     )
 
@@ -267,7 +268,7 @@ def test_bucketed_validation_candidate_sampling_is_deterministic(
         split="train",
         max_history_len=3,
         embed_dim=4,
-        candidate_sample_size=4,
+        bst_additional_batch_negatives=1,
         seed=0,
     )
 

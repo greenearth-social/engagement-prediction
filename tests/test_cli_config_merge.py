@@ -221,7 +221,7 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
             bst_time_delta_bucket_boundaries_hours: [1, 2, 4]
             prediction_hidden_dims: [128, 64]
             bst_weight_decay: 0.02
-            candidate_sample_size: 32
+            bst_additional_batch_negatives: 32
             batch_size: 16
             bst_max_train_batches_per_epoch: 5
             """
@@ -240,7 +240,7 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
     assert merged.bst_time_embedding_dim == 32
     assert merged.bst_num_attention_heads == 8
     assert merged.prediction_hidden_dims == [128, 64]
-    assert merged.candidate_sample_size == 32
+    assert merged.bst_additional_batch_negatives == 32
     assert merged.batch_size == 16
     assert merged.bst_max_train_batches_per_epoch == 5
     cli._validate_bst_config(merged)
@@ -254,7 +254,7 @@ def test_bst_ranker_training_defaults():
     ])
     merged = cli._merge_args_with_config(raw)
 
-    assert merged.candidate_sample_size == 64
+    assert merged.bst_additional_batch_negatives == 64
     assert merged.batch_size == cli.DEFAULTS["batch_size"]
     assert merged.bst_max_train_batches_per_epoch is None
     cli._validate_bst_config(merged)
@@ -276,7 +276,7 @@ def test_bst_ranker_requires_one_transformer_layer():
 @pytest.mark.parametrize(
     ("flag", "message"),
     [
-        ("--candidate-sample-size", "candidate-sample-size"),
+        ("--bst-additional-batch-negatives", "bst-additional-batch-negatives"),
         ("--batch-size", "batch-size"),
         ("--bst-max-train-batches-per-epoch", "bst-max-train-batches-per-epoch"),
     ],

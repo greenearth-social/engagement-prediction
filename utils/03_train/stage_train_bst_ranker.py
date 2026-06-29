@@ -856,7 +856,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     author_embedding_dim = int(args.author_embedding_dim)
     author_unknown_dropout_rate = float(args.author_unknown_dropout_rate)
     batch_size = int(args.batch_size)
-    candidate_sample_size = int(args.candidate_sample_size)
+    bst_additional_batch_negatives = int(args.bst_additional_batch_negatives)
     bst_max_train_batches_per_epoch = getattr(args, "bst_max_train_batches_per_epoch", None)
     if bst_max_train_batches_per_epoch is not None:
         bst_max_train_batches_per_epoch = int(bst_max_train_batches_per_epoch)
@@ -927,7 +927,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "author_table_num_rows": author_table_num_rows,
         "author_pad_idx": AUTHOR_PAD_IDX,
         "author_unk_idx": AUTHOR_UNK_IDX,
-        "candidate_sample_size": candidate_sample_size,
+        "bst_additional_batch_negatives": bst_additional_batch_negatives,
     }
     training_config = {
         **config,
@@ -956,7 +956,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         json.dump(training_config, f, indent=2)
     logger.info(f"Training config written to: {training_config_path}")
 
-    log_operation_start("Create capped bucketed BST datasets", STAGE_LOG_NAME, logger)
+    log_operation_start("Create bucketed BST datasets", STAGE_LOG_NAME, logger)
     train_dataset = BucketedEngagementDataset(
         embeddings_mmap=embeddings_mmap,
         likes_core_df=likes_core_df,
@@ -966,7 +966,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         max_history_len=max_history_len,
         embed_dim=embed_dim,
         use_author_embedding_table=use_author_embedding_table,
-        candidate_sample_size=candidate_sample_size,
+        bst_additional_batch_negatives=bst_additional_batch_negatives,
         seed=random_seed,
         logger=logger,
     )
@@ -979,7 +979,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         max_history_len=max_history_len,
         embed_dim=embed_dim,
         use_author_embedding_table=use_author_embedding_table,
-        candidate_sample_size=candidate_sample_size,
+        bst_additional_batch_negatives=bst_additional_batch_negatives,
         seed=random_seed,
         logger=logger,
     )
@@ -992,7 +992,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         max_history_len=max_history_len,
         embed_dim=embed_dim,
         use_author_embedding_table=use_author_embedding_table,
-        candidate_sample_size=candidate_sample_size,
+        bst_additional_batch_negatives=bst_additional_batch_negatives,
         seed=random_seed,
         logger=logger,
     )
@@ -1180,7 +1180,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "stage: train_bst_ranker",
         f"timestamp: {timestamp}",
         f"runtime_seconds: {runtime:.2f}",
-        f"settings: batch_size={batch_size}, candidate_sample_size={candidate_sample_size}, lr={learning_rate}, epochs={epochs}, max_history_len={max_history_len}, early_stopping_min_delta={early_stopping_min_delta}",
+        f"settings: batch_size={batch_size}, bst_additional_batch_negatives={bst_additional_batch_negatives}, lr={learning_rate}, epochs={epochs}, max_history_len={max_history_len}, early_stopping_min_delta={early_stopping_min_delta}",
         f"train_samples: {len(train_dataset)}",
         f"val_samples: {len(val_dataset)}",
         f"val_unseen_samples: {len(val_unseen_dataset)}",

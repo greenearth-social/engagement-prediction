@@ -996,20 +996,20 @@ class BucketedEngagementDataset(Dataset):
         max_history_len: int,
         embed_dim: int,
         use_author_embedding_table: bool = False,
-        candidate_sample_size: Optional[int] = None,
+        bst_additional_batch_negatives: Optional[int] = None,
         seed: int = 0,
         logger: Optional[logging.Logger] = None,
     ):
         if max_history_len <= 0:
             raise ValueError("max_history_len must be positive")
-        if candidate_sample_size is not None and candidate_sample_size <= 0:
-            raise ValueError("candidate_sample_size must be positive when provided")
+        if bst_additional_batch_negatives is not None and bst_additional_batch_negatives <= 0:
+            raise ValueError("bst_additional_batch_negatives must be positive when provided")
         self.embeddings = embeddings_mmap
         self.split = str(split)
         self.max_history_len = int(max_history_len)
         self.embed_dim = int(embed_dim)
         self.use_author_embedding_table = bool(use_author_embedding_table)
-        self.candidate_sample_size = int(candidate_sample_size) if candidate_sample_size is not None else None
+        self.bst_additional_batch_negatives = int(bst_additional_batch_negatives) if bst_additional_batch_negatives is not None else None
         self.seed = int(seed)
 
         likes_columns = ["did", "subject_uri", "split", "like_hour_bucket", "emb_idx"]
@@ -1173,18 +1173,15 @@ class BucketedEngagementDataset(Dataset):
             for post in self.sampled_posts_by_bucket.get(bucket, [])
             if post["post_id"] not in candidate_to_idx
         ]
-        if self.candidate_sample_size is None:
+        if self.bst_additional_batch_negatives is None:
             return sampled_posts
-        remaining_slots = self.candidate_sample_size - len(candidate_to_idx)
-        if remaining_slots <= 0:
-            return []
-        if len(sampled_posts) <= remaining_slots:
+        if len(sampled_posts) <= self.bst_additional_batch_negatives:
             return sampled_posts
 
         sorted_row_indices = sorted(int(row_idx) for row_idx in row_indices)
         row_seed = sum((pos + 1) * (row_idx + 1) for pos, row_idx in enumerate(sorted_row_indices))
         rng = np.random.default_rng(self.seed + int(epoch) * max(len(self.user_ids), 1) + row_seed)
-        selected_indices = sorted(rng.choice(len(sampled_posts), size=remaining_slots, replace=False).tolist())
+        selected_indices = sorted(rng.choice(len(sampled_posts), size=self.bst_additional_batch_negatives, replace=False).tolist())
         return [sampled_posts[idx] for idx in selected_indices]
 
     def collate_batch(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
