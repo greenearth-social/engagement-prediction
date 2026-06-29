@@ -4,6 +4,7 @@ import importlib
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 
@@ -394,6 +395,27 @@ def test_compute_bst_listwise_loss_and_preds_returns_finite_multi_positive_loss_
         if param.grad is not None
     )
     assert grad_sum > 0
+
+
+def test_bst_listwise_loss_ignores_invalid_false_negative_candidates(monkeypatch):
+    model = _make_model()
+    batch = _listwise_batch()
+    batch["label_matrix"] = torch.tensor([[1.0, 0.0], [1.0, 0.0]], dtype=torch.float32)
+    batch["candidate_valid_mask"] = torch.tensor([[True, False], [True, True]])
+    fixed_scores = torch.tensor([[0.0, 10.0], [0.0, 1.0]], dtype=torch.float32)
+
+    def fake_score_candidate_matrix_one_layer(**kwargs):
+        return fixed_scores
+
+    monkeypatch.setattr(model, "score_candidate_matrix_one_layer", fake_score_candidate_matrix_one_layer)
+
+    loss, scores, labels = _compute_bst_listwise_loss_and_preds(model, batch, "cpu")
+
+    expected_scores = fixed_scores.masked_fill(~batch["candidate_valid_mask"], -1.0e9)
+    targets = labels / labels.sum(dim=1, keepdim=True)
+    expected = -(targets * F.log_softmax(expected_scores, dim=1)).sum(dim=1).mean()
+    assert torch.allclose(scores, fixed_scores)
+    assert torch.allclose(loss, expected)
 
 
 def test_run_bst_listwise_epoch_computes_rank_metrics():

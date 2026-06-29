@@ -1041,6 +1041,13 @@ class BucketedEngagementDataset(Dataset):
             dict.fromkeys(history_columns, None),
         )
 
+        self.all_liked_emb_indices_by_user: Dict[str, set[int]] = {}
+        for row in likes_core_df.select(["did", "emb_idx"]).iter_rows(named=True):
+            emb_idx = row["emb_idx"]
+            if emb_idx is None:
+                continue
+            self.all_liked_emb_indices_by_user.setdefault(str(row["did"]), set()).add(int(emb_idx))
+
         like_ordered_df = (
             likes_core_df
             .filter(pl.col("split") == self.split)
@@ -1248,12 +1255,18 @@ class BucketedEngagementDataset(Dataset):
             np.array(self.embeddings[np.array(candidate_emb_indices, dtype=np.int64)], dtype=np.float32)
         )
         label_matrix = torch.zeros((len(user_ids), len(candidate_post_ids)), dtype=torch.float32)
+        candidate_valid_mask = torch.ones((len(user_ids), len(candidate_post_ids)), dtype=torch.bool)
         for row_idx in row_indices:
             user_idx = user_to_batch_idx[self.user_ids[row_idx]]
             for post_id in self.liked_post_ids[row_idx]:
                 candidate_idx = candidate_to_idx.get(post_id)
                 if candidate_idx is not None:
                     label_matrix[user_idx, candidate_idx] = 1.0
+            all_liked_emb_indices = self.all_liked_emb_indices_by_user.get(str(self.user_ids[row_idx]), set())
+            current_liked_emb_indices = {int(emb_idx) for emb_idx in self.liked_post_emb_indices[row_idx]}
+            for candidate_idx, emb_idx in enumerate(candidate_emb_indices):
+                if int(emb_idx) in all_liked_emb_indices and int(emb_idx) not in current_liked_emb_indices:
+                    candidate_valid_mask[user_idx, candidate_idx] = False
 
         output: Dict[str, Any] = {
             "history_embeddings": torch.stack(history_tensors, dim=0),
@@ -1261,6 +1274,7 @@ class BucketedEngagementDataset(Dataset):
             "history_time_deltas_hours": torch.stack(time_delta_tensors, dim=0),
             "candidate_post_embeddings": candidate_post_embeddings,
             "label_matrix": label_matrix,
+            "candidate_valid_mask": candidate_valid_mask,
             "user_id": user_ids,
             "candidate_post_id": candidate_post_ids,
             "bucket": bucket,

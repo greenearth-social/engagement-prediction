@@ -4,6 +4,7 @@ import importlib
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from utils.matrix_ranking import ranking_rows_for_batch
 
@@ -120,6 +121,28 @@ def test_mlp_compute_loss_and_preds_matrix_multi_positive_rows():
     assert loss.shape == ()
     assert torch.isfinite(loss)
     assert scores.shape == batch["label_matrix"].shape
+
+
+def test_mlp_loss_ignores_invalid_false_negative_candidates():
+    model = _make_mlp()
+    batch = _matrix_batch()
+    batch["history_embeddings"] = batch["history_embeddings"][:1]
+    batch["history_mask"] = batch["history_mask"][:1]
+    batch["label_matrix"] = torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    batch["candidate_valid_mask"] = torch.tensor([[True, False, True]])
+    fixed_scores = torch.tensor([[0.0, 10.0, 1.0]], dtype=torch.float32)
+
+    def fake_score_matrix(history_embeddings, history_mask, post_embeddings, history_author_indices=None, candidate_post_author_idx=None):
+        return fixed_scores
+
+    model.score_matrix = fake_score_matrix
+
+    loss, scores = model.compute_loss_and_preds(batch, device="cpu", embed_dim=4)
+
+    expected_scores = fixed_scores.masked_fill(~batch["candidate_valid_mask"], -1.0e9)
+    expected = -F.log_softmax(expected_scores, dim=1)[0, 0]
+    assert torch.allclose(scores, fixed_scores)
+    assert torch.allclose(loss, expected)
 
 
 def test_summarized_mean_outputs_expected_masked_history_summary():

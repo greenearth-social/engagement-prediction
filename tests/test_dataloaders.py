@@ -156,6 +156,12 @@ def test_bucketed_collate_builds_candidates_and_same_hour_labels(bucketed_datase
     }
     assert labels_by_user["u1"] == [1.0, 1.0, 0.0, 0.0, 0.0]
     assert labels_by_user["u2"] == [0.0, 0.0, 1.0, 0.0, 0.0]
+    valid_mask_by_user = {
+        user_id: batch["candidate_valid_mask"][idx].tolist()
+        for idx, user_id in enumerate(batch["user_id"])
+    }
+    assert valid_mask_by_user["u1"] == [True, True, True, True, False]
+    assert valid_mask_by_user["u2"] == [True, True, True, True, True]
 
 
 def test_bucketed_collate_dedupes_candidates(bucketed_dataset):
@@ -165,6 +171,7 @@ def test_bucketed_collate_dedupes_candidates(bucketed_dataset):
     assert batch["candidate_post_id"] == ["p1", "p3", "n1", "p2", "p4"]
     assert batch["label_matrix"].shape == (1, 5)
     assert batch["label_matrix"][0].tolist() == [1.0, 1.0, 0.0, 0.0, 0.0]
+    assert batch["candidate_valid_mask"][0].tolist() == [True, True, True, True, False]
 
 
 def test_bucketed_collate_additional_negatives_are_added_after_positives(
@@ -285,6 +292,7 @@ def test_bucketed_collate_handles_empty_sampled_negative_bucket(bucketed_dataset
     assert batch["user_id"] == ["u3"]
     assert batch["candidate_post_id"] == ["p5"]
     assert batch["label_matrix"].tolist() == [[1.0]]
+    assert batch["candidate_valid_mask"].tolist() == [[True]]
 
 
 def test_bucketed_collate_returns_author_tensors_when_enabled(
@@ -361,4 +369,4 @@ def test_create_bucketed_data_loaders_returns_iterable_loaders(
     assert isinstance(val_unseen_loader, DataLoader)
     assert holdout_loader is None
     batch = next(iter(train_loader))
-    assert {"history_embeddings", "history_mask", "history_time_deltas_hours", "candidate_post_embeddings", "label_matrix"} <= set(batch)
+    assert {"history_embeddings", "history_mask", "history_time_deltas_hours", "candidate_post_embeddings", "label_matrix", "candidate_valid_mask"} <= set(batch)
