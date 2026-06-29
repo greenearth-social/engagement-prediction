@@ -47,10 +47,13 @@ Extract liked post URIs:
 
 Process posts (single scan, metadata only):
   - Scan all posts parquet files (no batching) and apply --posts-start/--posts-end.
-  - Join prior-hour cumulative like counts and keep posts meeting --min-likes-per-negative-post at that hour.
-  - Weight posts by prior_cumulative_likes ** --negative-sampling-alpha within each hour bucket, targeting --negative-samples-per-hour per bucket.
+  - Build global like counts for hash-sampled negative candidates over the configured likes window.
+  - Keep candidates meeting --min-likes-per-negative-post globally.
+  - Expand each candidate into its fixed 24-hour eligibility window from created-hour through created-hour + 23.
+  - Weight posts by global_like_count ** --negative-sampling-alpha within each negative_hour_bucket, targeting --negative-samples-per-hour per bucket.
   - Left-join liked URIs.
   - Keep posts that are in the negative sample OR are liked.
+  - Compute exact prior_cumulative_likes afterward for only the selected positive and negative post-hour pairs.
   - Collect metadata-only DataFrame (NO embedding expansion here).
   - Assign emb_idx as row number for later memmap lookup.
 
@@ -91,7 +94,7 @@ Deferred embedding handling:
   Parquet files are small (metadata only, ~50 MB vs ~800 MB).
 
 Popularity-weighted negative sample:
-  The negative sample is drawn from posts with enough prior-hour likes.
+  The negative sample is drawn from hash-sampled posts with enough global likes.
   Some liked posts can appear in the negative sample; this is expected.
 
 ================================================================================
@@ -435,14 +438,14 @@ def _get_eligible_user_counts_lf(
 
 
 def _get_sampled_user_cohorts_with_min_likes(
-    likes_lf: pl.LazyFrame,
+    raw_likes_lf: pl.LazyFrame,
     min_likes_per_user: int,
     max_trainval_users: Optional[int],
     max_unseen_eval_users: Optional[int],
     random_seed: int
 ) -> Tuple[pl.DataFrame, int, int, int, int, int]:
     user_counts_lf, n_users_initial, n_likes_initial, n_users_eligible = _get_eligible_user_counts_lf(
-        likes_lf,
+        raw_likes_lf,
         min_likes_per_user,
     )
     eligible_lf = user_counts_lf.with_columns(
@@ -546,23 +549,34 @@ def _add_post_split_window(
     val_start: str,
     holdout_start: Optional[str],
 ) -> pl.DataFrame:
+    split_timestamp_col = "_split_timestamp"
     train_window, val_window, holdout_window = _split_window_exprs(
-        TIMESTAMP_COL_NAME,
+        split_timestamp_col,
         train_start,
         val_start,
         holdout_start,
         parse_literals_as_datetime=True,
     )
 
-    return posts_df.with_columns(
-        pl.when(train_window)
-        .then(pl.lit("train"))
-        .when(val_window)
-        .then(pl.lit("val"))
-        .when(holdout_window)
-        .then(pl.lit("holdout"))
-        .otherwise(None)
-        .alias("split_window")
+    return (
+        posts_df
+        .with_columns(
+            pl.when(pl.col("in_random_sample") & pl.col("negative_hour_bucket").is_not_null())
+            .then(pl.col("negative_hour_bucket"))
+            .otherwise(pl.col(TIMESTAMP_COL_NAME))
+            .alias(split_timestamp_col)
+        )
+        .with_columns(
+            pl.when(train_window)
+            .then(pl.lit("train"))
+            .when(val_window)
+            .then(pl.lit("val"))
+            .when(holdout_window)
+            .then(pl.lit("holdout"))
+            .otherwise(None)
+            .alias("split_window")
+        )
+        .drop(split_timestamp_col)
     )
 
 
@@ -609,79 +623,217 @@ def _apply_per_user_recency_cap(
     )
 
 
-def _build_prior_cumulative_likes_df(
+def _build_global_like_counts_df(
     raw_likes_lf: pl.LazyFrame,
-    liked_post_uris_df: pl.DataFrame,
     random_seed: int,
     initial_negative_sampling_pct: float,
-) -> pl.DataFrame:
-    liked_uri_marker_lf = (
-        liked_post_uris_df
-        .with_columns(pl.lit(True).alias("_force_include"))
-        .lazy()
-    )
-    return (
+    min_likes_per_negative_post: int,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[pl.DataFrame, Dict[str, int]]:
+    counts_df = (
         raw_likes_lf
-        .select(["subject_uri", TIMESTAMP_COL_NAME])
-        .join(liked_uri_marker_lf, on="subject_uri", how="left")
+        .select("subject_uri")
         .with_columns(
-            ((pl.col("subject_uri").hash(seed=random_seed).cast(pl.Float64) / float(2**64 - 1)) < initial_negative_sampling_pct)
-            .alias("is_negative_candidate_seed")
+            (
+                (pl.col("subject_uri").hash(seed=random_seed).cast(pl.Float64) / float(2**64 - 1)) < initial_negative_sampling_pct
+            ).alias("is_negative_candidate_seed")
         )
         .filter(
             pl.col("is_negative_candidate_seed")
-            | pl.col("_force_include").fill_null(False)
         )
+        .group_by("subject_uri")
+        .len()
+        .rename({"len": "global_like_count"})
         .with_columns(
-            _hour_bucket_key_expr(TIMESTAMP_COL_NAME).str.to_datetime(time_zone="UTC").alias("_like_hour_bucket")
-        ) # subject_uri, record_created_at, _force_include, is_negative_candidate_seed, _like_hour_bucket
-        .group_by(["subject_uri", "_like_hour_bucket"])
-        .agg(
-            pl.len().alias("likes_this_hour"),
-            pl.col("is_negative_candidate_seed").any(),
-        ) # subject_uri, _like_hour_bucket, likes_this_hour, is_negative_candidate_seed
-        .sort(["subject_uri", "_like_hour_bucket"])
-        .with_columns(
-            pl.col("likes_this_hour").cum_sum().over("subject_uri").alias("prior_cumulative_likes")
-        ) # subject_uri, _like_hour_bucket, likes_this_hour, is_negative_candidate_seed, prior_cumulative_likes
-        .select(
-            "subject_uri",
-            (pl.col("_like_hour_bucket") + pl.duration(hours=1)).alias("popularity_hour_bucket"),
-            pl.col("prior_cumulative_likes").cast(pl.UInt64),
-            "is_negative_candidate_seed",
-        ) # subject_uri, popularity_hour_bucket, prior_cumulative_likes, is_negative_candidate_seed
+            pl.col("global_like_count").cast(pl.UInt64)
+        )
         .collect(engine="streaming")
+    )
+    n_candidate_posts_before_min = counts_df.height
+    n_candidate_likes_before_min = int(counts_df["global_like_count"].sum()) if counts_df.height > 0 else 0
+    counts_df = counts_df.filter(
+        pl.col("global_like_count") >= min_likes_per_negative_post
+    )
+    stats = {
+        "n_global_negative_candidate_posts_before_min_likes": n_candidate_posts_before_min,
+        "n_global_negative_candidate_like_rows_before_min_likes": n_candidate_likes_before_min,
+        "n_global_negative_candidate_posts": counts_df.height,
+        "n_global_negative_candidate_like_rows": int(counts_df["global_like_count"].sum()) if counts_df.height > 0 else 0,
+    }
+    if logger is not None:
+        logger.info(
+            "Built global negative candidate counts: "
+            f"{stats['n_global_negative_candidate_posts']:,} posts "
+            f"from {stats['n_global_negative_candidate_like_rows']:,} likes "
+            f"(before min_likes filter: {n_candidate_posts_before_min:,} posts, "
+            f"{n_candidate_likes_before_min:,} likes)"
+        )
+    return counts_df, stats
+
+
+def _build_needed_post_hours_df(
+    likes_core_df: pl.DataFrame,
+    posts_core_df: pl.DataFrame,
+) -> pl.DataFrame:
+    positive_pairs_df = (
+        likes_core_df
+        .select(
+            pl.col("subject_uri"),
+            pl.col("like_hour_bucket").alias("target_hour"),
+        )
+        .unique()
+    )
+    negative_pairs_df = (
+        posts_core_df
+        .filter(pl.col("in_random_sample") & pl.col("negative_hour_bucket").is_not_null())
+        .select(
+            pl.col("at_uri").alias("subject_uri"),
+            pl.col("negative_hour_bucket").alias("target_hour"),
+        )
+        .unique()
+    )
+    if positive_pairs_df.height == 0 and negative_pairs_df.height == 0:
+        return pl.DataFrame(schema={
+            "subject_uri": pl.Utf8,
+            "target_hour": pl.Datetime(time_zone="UTC"),
+        })
+    return (
+        pl.concat([positive_pairs_df, negative_pairs_df], how="vertical_relaxed")
+        .unique()
     )
 
 
+def _build_exact_prior_cumulative_likes_df(
+    raw_likes_lf: pl.LazyFrame,
+    needed_post_hours_df: pl.DataFrame,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[pl.DataFrame, Dict[str, int]]:
+    output_schema = {
+        "subject_uri": pl.Utf8,
+        "target_hour": pl.Datetime(time_zone="UTC"),
+        "prior_cumulative_likes": pl.UInt64,
+    }
+    if needed_post_hours_df.height == 0:
+        stats = {
+            "n_needed_prior_count_pairs": 0,
+            "n_needed_prior_count_posts": 0,
+            "n_exact_prior_source_like_rows": 0,
+            "n_exact_prior_hourly_rows": 0,
+            "n_exact_prior_output_rows": 0,
+        }
+        return pl.DataFrame(schema=output_schema), stats
+
+    needed_posts_lf = needed_post_hours_df.select("subject_uri").unique().lazy()
+    hourly_likes_df = (
+        raw_likes_lf
+        .select(["subject_uri", TIMESTAMP_COL_NAME])
+        .join(needed_posts_lf, on="subject_uri", how="semi")
+        .with_columns(
+            _hour_bucket_key_expr(TIMESTAMP_COL_NAME).str.to_datetime(time_zone="UTC").alias("_like_hour_bucket")
+        )
+        .group_by(["subject_uri", "_like_hour_bucket"])
+        .len()
+        .rename({"len": "likes_this_hour"})
+        .with_columns(
+            pl.col("likes_this_hour").cast(pl.UInt64)
+        )
+        .collect(engine="streaming")
+    )
+    n_source_like_rows = int(hourly_likes_df["likes_this_hour"].sum()) if hourly_likes_df.height > 0 else 0
+    if hourly_likes_df.height == 0:
+        prior_counts_df = needed_post_hours_df.with_columns(
+            pl.lit(0, dtype=pl.UInt64).alias("prior_cumulative_likes")
+        )
+    else:
+        sparse_prior_df = (
+            hourly_likes_df
+            .sort(["subject_uri", "_like_hour_bucket"])
+            .with_columns(
+                pl.col("likes_this_hour").cum_sum().over("subject_uri").alias("prior_cumulative_likes")
+            )
+            .select(
+                "subject_uri",
+                (pl.col("_like_hour_bucket") + pl.duration(hours=1)).alias("popularity_hour_bucket"),
+                pl.col("prior_cumulative_likes").cast(pl.UInt64),
+            )
+        )
+        prior_counts_df = (
+            needed_post_hours_df
+            .sort(["target_hour", "subject_uri"])
+            .join_asof(
+                sparse_prior_df.sort(["popularity_hour_bucket", "subject_uri"]),
+                left_on="target_hour",
+                right_on="popularity_hour_bucket",
+                by="subject_uri",
+                strategy="backward",
+                check_sortedness=False,
+            )
+            .drop("popularity_hour_bucket")
+            .with_columns(
+                pl.col("prior_cumulative_likes").fill_null(0).cast(pl.UInt64)
+            )
+        )
+    stats = {
+        "n_needed_prior_count_pairs": needed_post_hours_df.height,
+        "n_needed_prior_count_posts": needed_post_hours_df["subject_uri"].n_unique(),
+        "n_exact_prior_source_like_rows": n_source_like_rows,
+        "n_exact_prior_hourly_rows": hourly_likes_df.height,
+        "n_exact_prior_output_rows": prior_counts_df.height,
+    }
+    if logger is not None:
+        logger.info(
+            "Built exact prior counts: "
+            f"{stats['n_exact_prior_output_rows']:,} needed pairs across "
+            f"{stats['n_needed_prior_count_posts']:,} posts; "
+            f"{stats['n_exact_prior_source_like_rows']:,} raw like rows -> "
+            f"{stats['n_exact_prior_hourly_rows']:,} sparse hourly rows"
+        )
+    return prior_counts_df.select(list(output_schema.keys())), stats
+
+
 def _add_prior_cumulative_likes_to_likes(
-    likes_df: pl.DataFrame,
-    prior_likes_df: pl.DataFrame,
+    likes_core_df: pl.DataFrame,
+    prior_counts_df: pl.DataFrame,
 ) -> pl.DataFrame:
     return (
-        likes_df # did, subject_uri, record_created_at, split, like_hour_bucket
-        .sort(["like_hour_bucket", "subject_uri"])
-        .join_asof(
-            prior_likes_df
-            .select(["subject_uri", "popularity_hour_bucket", "prior_cumulative_likes"])
-            .sort(["popularity_hour_bucket", "subject_uri"]),
-            left_on="like_hour_bucket",
-            right_on="popularity_hour_bucket",
-            by="subject_uri",
-            strategy="backward",
-            check_sortedness=False,
+        likes_core_df # did, subject_uri, record_created_at, split, like_hour_bucket
+        .join(
+            prior_counts_df.rename({"target_hour": "like_hour_bucket"}),
+            on=["subject_uri", "like_hour_bucket"],
+            how="left",
         )
-        .drop("popularity_hour_bucket")
         .with_columns(
             pl.col("prior_cumulative_likes").fill_null(0).cast(pl.UInt64)
         ) # did, subject_uri, record_created_at, split, like_hour_bucket, prior_cumulative_likes
     )
 
 
+def _add_prior_cumulative_likes_to_posts(
+    posts_core_df: pl.DataFrame,
+    prior_counts_df: pl.DataFrame,
+) -> pl.DataFrame:
+    prior_posts_df = prior_counts_df.rename({
+        "subject_uri": "at_uri",
+        "target_hour": "negative_hour_bucket",
+    })
+    return (
+        posts_core_df
+        .join(
+            prior_posts_df,
+            on=["at_uri", "negative_hour_bucket"],
+            how="left",
+        )
+        .with_columns(
+            pl.when(pl.col("in_random_sample"))
+            .then(pl.col("prior_cumulative_likes").fill_null(0).cast(pl.UInt64))
+            .otherwise(pl.lit(None, dtype=pl.UInt64))
+            .alias("prior_cumulative_likes")
+        )
+    )
+
+
 def _load_likes_core_polars(
-    start_str: Optional[str],
-    end_str: Optional[str],
-    paths: List[str],
+    raw_likes_lf: pl.LazyFrame,
     *,
     max_trainval_users: Optional[int],
     max_unseen_eval_users: Optional[int],
@@ -708,13 +860,6 @@ def _load_likes_core_polars(
     Returns:
         Tuple of (likes_lf: pl.DataFrame, stats: Dict with filtering statistics)
     """
-    if not paths:
-        raise ValueError(f"No likes parquet files found for time range {start_str} to {end_str}")
-    
-    logger.info(f"Found {len(paths)} likes parquet files")
-    
-    raw_lf = pl.scan_parquet(paths)
-    base_lf = apply_time_filter(raw_lf, start_str, end_str)
     train_start_dt = parse_one_ts(train_start)
     val_start_dt = parse_one_ts(val_start)
     holdout_start_dt = parse_one_ts(holdout_start)
@@ -743,7 +888,7 @@ def _load_likes_core_polars(
         n_trainval_users,
         n_unseen_eval_users,
     ) = _get_sampled_user_cohorts_with_min_likes(
-        base_lf, 
+        raw_likes_lf, 
         min_likes_per_user,
         max_trainval_users,
         max_unseen_eval_users,
@@ -774,7 +919,7 @@ def _load_likes_core_polars(
     
     # ===== PASS 2: Filter likes to sampled users (lazy) =====
     logger.info("Pass 2: Filtering likes to sampled users")
-    likes_lf = base_lf.join(
+    likes_lf = raw_likes_lf.join(
         sampled_users_df.select(["did", "_user_cohort"]).lazy(),
         on='did',
         how='inner',
@@ -855,7 +1000,7 @@ def _load_likes_core_polars(
 
     stats['n_likes_final'] = n_after_cap
 
-    return likes_df, stats
+    return likes_df, stats # did, subject_uri, record_created_at, split, like_hour_bucket
 
 
 def _load_posts_core_polars(
@@ -864,10 +1009,9 @@ def _load_posts_core_polars(
     liked_post_uris_df: pl.DataFrame,
     paths: List[str],
     *,
-    prior_likes_df: pl.DataFrame,
+    global_like_counts_df: pl.DataFrame,
     negative_samples_per_hour: int,
     negative_sampling_alpha: float,
-    min_likes_per_negative_post: int,
     embedding_model: str,
     random_seed: int,
     train_start: str,
@@ -884,7 +1028,7 @@ def _load_posts_core_polars(
 
     Processing flow:
     1. Scan all parquet files and apply the time filter.
-    2. Sample posts by prior-hour popularity within hourly buckets, targeting negative_samples_per_hour per bucket.
+    2. Sample post-hour negatives by global popularity within fixed 24-hour eligibility windows.
     3. Left-join liked_post_uris.
     4. Keep posts that are either in the negative sample or liked.
     5. Collect metadata-only DataFrame (no embeddings).
@@ -896,14 +1040,14 @@ def _load_posts_core_polars(
     Embeddings are validated and written to a separate memmap file later in the pipeline.
     The emb_idx column is added after embedding validation is complete.
 
-    Posts that are both liked AND negatively sampled appear once with in_random_sample=True.
+    Posts that are both liked AND negatively sampled use sampled negative rows with in_random_sample=True.
 
     Output columns:
     - in_random_sample: True if post was selected by hash-sampling,
                         False if included only because it was liked
     - is_liked: True if post is in likes core dataset, False otherwise
     - negative_hour_bucket: Hour bucket for sampled negatives; null for liked-only rows
-    - prior_cumulative_likes: Prior-hour like count used for negative sampling; null for liked-only rows
+    - prior_cumulative_likes: Exact prior-hour like count; null for liked-only rows
 
     Returns:
         Tuple of (posts_df: pl.DataFrame, stats: Dict, embedding_dim: int)
@@ -932,16 +1076,19 @@ def _load_posts_core_polars(
     logger.info(f"Finding popular posts to sample as negatives...")
     negative_posts_df = _get_negative_sample_posts(
         posts_lf,
-        prior_likes_df,
+        global_like_counts_df,
+        liked_post_uris_df,
         cols_metadata,
         negative_samples_per_hour,
         random_seed,
         negative_sampling_alpha,
-        min_likes_per_negative_post,
+        train_start,
+        end_str,
+        holdout_end,
     )
     logger.info(f"Done finding popular posts to sample as negatives.")
     logger.info(f"Getting post info for liked posts...")
-    liked_posts_df = _get_liked_posts_metadata_df(posts_lf, liked_post_uris_df, cols_metadata)
+    liked_posts_df = _get_liked_posts_metadata_df(posts_lf, liked_post_uris_df, negative_posts_df, cols_metadata)
     logger.info(f"Done getting post info for liked posts.")
     posts_core_df = _combine_posts_dfs(negative_posts_df, liked_posts_df, cols_metadata)
 
@@ -983,9 +1130,11 @@ def _load_posts_core_polars(
 
     # calculate metrics
     n_posts_core = posts_core_df.height
-    n_liked_only = posts_core_df.filter(pl.col("is_liked") & ~pl.col("in_random_sample")).height
-    n_liked_in_random = posts_core_df.filter(pl.col("is_liked") & pl.col("in_random_sample")).height
+    n_posts_core_unique = posts_core_df["at_uri"].n_unique()
+    n_liked_only = posts_core_df.filter(pl.col("is_liked") & ~pl.col("in_random_sample"))["at_uri"].n_unique()
+    n_liked_in_random = posts_core_df.filter(pl.col("is_liked") & pl.col("in_random_sample"))["at_uri"].n_unique()
     n_random_sample = posts_core_df.filter(pl.col("in_random_sample")).height
+    n_random_sample_unique_posts = posts_core_df.filter(pl.col("in_random_sample"))["at_uri"].n_unique()
     n_random_sample_buckets = posts_core_df.filter(pl.col("in_random_sample"))["negative_hour_bucket"].n_unique()
 
     logger.info(f"Collected posts_core: {n_posts_core:,} rows")
@@ -993,10 +1142,10 @@ def _load_posts_core_polars(
     logger.info(f"Liked only: {n_liked_only:,}")
     logger.info(f"Liked in random sample: {n_liked_in_random:,}")
     logger.info(f"Random sample total: {n_random_sample:,}")
+    logger.info(f"Random sample unique posts: {n_random_sample_unique_posts:,}")
     logger.info(f"Random sample buckets: {n_random_sample_buckets:,}; target per hour: {negative_samples_per_hour:,}")
 
-    # Total liked posts = those only in liked set + those also in random sample
-    n_total_liked_posts = n_liked_only + n_liked_in_random
+    n_total_liked_posts = posts_core_df.filter(pl.col("is_liked"))["at_uri"].n_unique()
     liked_post_match_rate = 100.0 * n_total_liked_posts / liked_post_uris_df.height if liked_post_uris_df.height > 0 else 0
     logger.info(f"Loaded {n_total_liked_posts:,} liked posts ({liked_post_match_rate:.1f}% match rate)")
     
@@ -1007,11 +1156,12 @@ def _load_posts_core_polars(
         'n_liked_in_random_sample': n_liked_in_random,  # Liked posts that are also in random sample
         'liked_post_match_rate': liked_post_match_rate,
         'n_random_sample': n_random_sample,
+        'n_random_sample_unique_posts': n_random_sample_unique_posts,
         'n_random_sample_buckets': n_random_sample_buckets,
         'negative_samples_per_hour': negative_samples_per_hour,
         'negative_sampling_alpha': negative_sampling_alpha,
-        'min_likes_per_negative_post': min_likes_per_negative_post,
         'n_posts_core': n_posts_core,
+        'n_posts_core_unique': n_posts_core_unique,
         'embedding_dim': embed_dim,
     }
     
@@ -1037,115 +1187,115 @@ def _hour_bucket_key_expr(col_name: str) -> pl.Expr:
     ])
 
 
-def _get_hourly_sample_rates_df(
-    posts_lf: pl.LazyFrame,
-    negative_samples_per_hour: int,
-) -> pl.DataFrame:
-    bucket_counts_df = (
-        posts_lf
-        .select(
-            _hour_bucket_key_expr(TIMESTAMP_COL_NAME).alias("_hour_bucket_key")
-        )
-        .group_by("_hour_bucket_key")
-        .len()
-        .collect(engine="streaming")
-    )
-    if negative_samples_per_hour <= 0:
-        return bucket_counts_df.with_columns(
-            pl.lit(0.0).alias("_sample_probability")
-        ).select(["_hour_bucket_key", "_sample_probability"])
-    return (
-        bucket_counts_df
-        .with_columns(
-            (pl.lit(float(negative_samples_per_hour)) / pl.col("len").cast(pl.Float64))
-            .clip(0.0, 1.0)
-            .alias("_sample_probability")
-        )
-        .select(["_hour_bucket_key", "_sample_probability"])
-    )
-
-
 def _get_negative_sample_posts(
     posts_lf: pl.LazyFrame,
-    prior_likes_df: pl.DataFrame,
+    global_like_counts_df: pl.DataFrame,
+    liked_post_uris_df: pl.DataFrame,
     cols_metadata: List[str],
     negative_samples_per_hour: int,
     random_seed: int,
     negative_sampling_alpha: float,
-    min_likes_per_negative_post: int,
+    train_start: str,
+    posts_end: Optional[str],
+    holdout_end: Optional[str],
 ) -> pl.DataFrame:
-    metadata_lf = posts_lf.select(cols_metadata)
-    prior_candidates_lf = (
-        prior_likes_df
-        .filter(pl.col("is_negative_candidate_seed"))
+    metadata_lf = posts_lf.select(cols_metadata).unique(subset=["at_uri"])
+    global_counts_lf = (
+        global_like_counts_df
         .rename({
             "subject_uri": "at_uri",
-            "popularity_hour_bucket": "negative_hour_bucket",
         })
         .lazy()
     )
+    liked_marker_lf = (
+        liked_post_uris_df
+        .with_columns(pl.lit(True).alias("is_liked"))
+        .lazy()
+    )
     posts_with_weights_df = (
-        prior_candidates_lf
-        .select(["at_uri", "negative_hour_bucket", "prior_cumulative_likes"])
+        metadata_lf
+        .join(global_counts_lf, on="at_uri", how="inner")
         .with_columns(
-            pl.col("prior_cumulative_likes").fill_null(0).cast(pl.UInt64)
-        ) # at_uri, negative_hour_bucket, prior_cumulative_likes
+            _hour_bucket_key_expr(TIMESTAMP_COL_NAME).str.to_datetime(time_zone="UTC").alias("_created_hour_bucket"),
+            pl.int_ranges(0, 24).alias("_eligibility_hour_offset"),
+        ) # at_uri, record_created_at, did, record_text, global_like_count, _created_hour_bucket, _eligibility_hour_offset
+        .explode("_eligibility_hour_offset")
+        .with_columns(
+            (pl.col("_created_hour_bucket") + pl.duration(hours=pl.col("_eligibility_hour_offset"))).alias("negative_hour_bucket")
+        ) # at_uri, record_created_at, did, record_text, global_like_count, _created_hour_bucket, _eligibility_hour_offset, negative_hour_bucket
+        .drop(["_created_hour_bucket", "_eligibility_hour_offset"])
         .filter(
-            pl.col("prior_cumulative_likes") >= min_likes_per_negative_post
+            pl.col("negative_hour_bucket") >= pl.lit(train_start).str.to_datetime(time_zone="UTC")
         )
         .with_columns(
-            (pl.col("prior_cumulative_likes") ** negative_sampling_alpha).alias("_weight"),
+            (pl.col("global_like_count") ** negative_sampling_alpha).alias("_weight"),
             (
                 pl.concat_str([
                     pl.col("at_uri"),
                     pl.col("negative_hour_bucket").cast(pl.Utf8),
                 ]).hash(seed=random_seed).cast(pl.Float64) / float(2**64 - 1)
             ).alias("_rand_val"),
-        ) # at_uri, record_created_at, did, record_text, negative_hour_bucket, prior_cumulative_likes, _weight, _rand_val
+        ) # at_uri, record_created_at, did, record_text, global_like_count, negative_hour_bucket, _weight, _rand_val
         .with_columns(
             (-pl.col("_rand_val").log() / pl.col("_weight")).alias("_sample_score"),
-        ) # at_uri, record_created_at, did, record_text, negative_hour_bucket, prior_cumulative_likes, _weight, _rand_val, _sample_score
+        ) # at_uri, record_created_at, did, record_text, global_like_count, negative_hour_bucket, _weight, _rand_val, _sample_score
         .with_columns(
             pl.col("_sample_score").rank("ordinal").over("negative_hour_bucket").alias("_sample_rank")
-        ) # at_uri, record_created_at, did, record_text, negative_hour_bucket, prior_cumulative_likes, _weight, _rand_val, _sample_score, _sample_rank
+        ) # at_uri, record_created_at, did, record_text, global_like_count, negative_hour_bucket, _weight, _rand_val, _sample_score, _sample_rank
         .filter(
             pl.col("_sample_rank") <= negative_samples_per_hour
         )
-        .join(metadata_lf, on="at_uri", how="inner")
+        .join(liked_marker_lf, on="at_uri", how="left")
+        .with_columns(
+            pl.col("is_liked").fill_null(False),
+            pl.lit(True).alias("in_random_sample"),
+        )
         .collect(engine="streaming")
     )
+    if posts_end is not None:
+        posts_with_weights_df = posts_with_weights_df.filter(
+            pl.col("negative_hour_bucket") < pl.lit(posts_end).str.to_datetime(time_zone="UTC")
+        )
+    if holdout_end is not None:
+        posts_with_weights_df = posts_with_weights_df.filter(
+            pl.col("negative_hour_bucket") < pl.lit(holdout_end).str.to_datetime(time_zone="UTC")
+        )
     return (
         posts_with_weights_df
-        .drop(["_weight", "_rand_val", "_sample_score", "_sample_rank"])
-        .with_columns(
-            pl.lit(False).alias("is_liked"),
-            pl.lit(True).alias("in_random_sample"),
-        ) # negative_hour_bucket, at_uri, record_created_at, did, record_text, is_liked, in_random_sample
+        .select(cols_metadata + ["is_liked", "in_random_sample", "negative_hour_bucket"])
     )
 
 
 def _get_liked_posts_metadata_df(
     posts_lf: pl.LazyFrame,
     liked_post_uris_df: pl.DataFrame,
+    negative_posts_df: pl.DataFrame,
     cols_metadata: List[str],
 ) -> pl.DataFrame:
     """
     Only selects metadata columns - embeddings are handled separately at the end of the pipeline.
     """
+    negative_post_uris_lf = (
+        negative_posts_df
+        .select("at_uri")
+        .unique()
+        .lazy()
+    )
     return (
         posts_lf
         .select(cols_metadata) # at_uri, record_created_at, did, record_text
+        .unique(subset=["at_uri"])
         .join(
             liked_post_uris_df.with_columns(pl.lit(True).alias("is_liked")).lazy(),
             left_on="at_uri",
             right_on="subject_uri",
             how="inner",
         ) # at_uri, record_created_at, did, record_text, is_liked
+        .join(negative_post_uris_lf, on="at_uri", how="anti")
         .with_columns(
             pl.lit(False).alias("in_random_sample"),
             pl.lit(None).alias("negative_hour_bucket"),
-            pl.lit(None, dtype=pl.UInt64).alias("prior_cumulative_likes"),
-        ) # at_uri, record_created_at, did, record_text, is_liked, in_random_sample, negative_hour_bucket, prior_cumulative_likes
+        ) # at_uri, record_created_at, did, record_text, is_liked, in_random_sample, negative_hour_bucket
         .collect(engine="streaming")
     )
 
@@ -1158,21 +1308,14 @@ def _combine_posts_dfs(
     return (
         pl
         .concat([
-            negative_posts_df.select(cols_metadata + ["is_liked", "in_random_sample", "negative_hour_bucket", "prior_cumulative_likes"]),
-            liked_posts_df.select(cols_metadata + ["is_liked", "in_random_sample", "negative_hour_bucket", "prior_cumulative_likes"]),
-        ])
-        .group_by(cols_metadata)
-        .agg(
-            pl.col("is_liked").any(),
-            pl.col("in_random_sample").any(),
-            pl.col("negative_hour_bucket").drop_nulls().first(),
-            pl.col("prior_cumulative_likes").drop_nulls().first().cast(pl.UInt64),
-        )
+            negative_posts_df.select(cols_metadata + ["is_liked", "in_random_sample", "negative_hour_bucket"]),
+            liked_posts_df.select(cols_metadata + ["is_liked", "in_random_sample", "negative_hour_bucket"]),
+        ], how="vertical_relaxed")
+        .unique(subset=cols_metadata + ["negative_hour_bucket"])
     )
 
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
-    run_dir = Path(context.run_dir).resolve()
     out_dir = context.new_stage_dir('01_get_data')
 
     # Initialize logger
@@ -1636,10 +1779,12 @@ def _run_greenearth_pipeline(
     # PHASE 1: Load and filter likes (no emb_idx yet)
     # ========================================================================
     log_operation_start('Load and filter likes data', '01_GET_DATA', logger)
+    if not likes_paths:
+        raise ValueError(f"No likes parquet files found for time range {likes_start} to {likes_end}")
+    logger.info(f"Found {len(likes_paths)} likes parquet files")
+    raw_likes_lf = apply_time_filter(pl.scan_parquet(likes_paths), likes_start, likes_end)
     likes_core_df, likes_stats = _load_likes_core_polars(
-        start_str=likes_start,
-        end_str=likes_end,
-        paths=likes_paths,
+        raw_likes_lf=raw_likes_lf,
         max_trainval_users=max_trainval_users,
         max_unseen_eval_users=max_unseen_eval_users,
         max_likes_per_user=max_likes_per_user,
@@ -1665,24 +1810,18 @@ def _run_greenearth_pipeline(
     logger.info(f"Extracted {len(liked_post_uris_df):,} unique liked post URIs")
     mem_tracker.checkpoint("after_uri_extraction", quiet=True)
 
-    log_operation_start('Build prior cumulative like counts', '01_GET_DATA', logger)
-    prior_likes_lf = apply_time_filter(pl.scan_parquet(likes_paths), likes_start, likes_end)
-    prior_likes_df = _build_prior_cumulative_likes_df(
-        raw_likes_lf=prior_likes_lf,
-        liked_post_uris_df=liked_post_uris_df,
+    log_operation_start('Build global negative candidate like counts', '01_GET_DATA', logger)
+    global_like_counts_df, global_like_stats = _build_global_like_counts_df(
+        raw_likes_lf=raw_likes_lf,
         random_seed=cap_random_seed,
         initial_negative_sampling_pct=initial_negative_sampling_pct,
+        min_likes_per_negative_post=min_likes_per_negative_post,
+        logger=logger,
     )
-    likes_core_df = _add_prior_cumulative_likes_to_likes(likes_core_df, prior_likes_df)
+    all_stats['negative_candidates'] = global_like_stats
     all_stats['likes']['initial_negative_sampling_pct'] = initial_negative_sampling_pct
-    all_stats['likes']['n_prior_cumulative_like_rows'] = prior_likes_df.height
-    all_stats['likes']['n_prior_cumulative_like_posts'] = prior_likes_df['subject_uri'].n_unique() if prior_likes_df.height > 0 else 0
     all_stats['likes']['min_likes_per_negative_post'] = min_likes_per_negative_post
-    logger.info(
-        f"Built prior cumulative like counts: {all_stats['likes']['n_prior_cumulative_like_rows']:,} hourly rows "
-        f"for {all_stats['likes']['n_prior_cumulative_like_posts']:,} posts"
-    )
-    mem_tracker.checkpoint("after_prior_like_counts", quiet=True)
+    mem_tracker.checkpoint("after_global_negative_like_counts", quiet=True)
     
     # Load posts metadata (NO embeddings - those are handled at the end)
     log_operation_start('Load posts metadata (no embeddings)', '01_GET_DATA', logger)
@@ -1694,10 +1833,9 @@ def _run_greenearth_pipeline(
         end_str=posts_end,
         liked_post_uris_df=liked_post_uris_df,
         paths=posts_paths,
-        prior_likes_df=prior_likes_df,
+        global_like_counts_df=global_like_counts_df,
         negative_samples_per_hour=negative_samples_per_hour,
         negative_sampling_alpha=negative_sampling_alpha,
-        min_likes_per_negative_post=min_likes_per_negative_post,
         embedding_model=embedding_model,
         random_seed=cap_random_seed,
         train_start=train_start,
@@ -1707,11 +1845,29 @@ def _run_greenearth_pipeline(
         logger=logger,
         embed_dim_override=embed_dim_override,
     )
-    del prior_likes_df
+    del global_like_counts_df
     gc.collect()
     all_stats['posts'] = posts_stats
     all_stats['embedding_dim'] = embed_dim
     mem_tracker.checkpoint("after_posts_load", quiet=True)
+
+    log_operation_start('Build exact prior cumulative like counts for needed post-hours', '01_GET_DATA', logger)
+    needed_post_hours_df = _build_needed_post_hours_df(likes_core_df, posts_core_df)
+    logger.info(
+        f"Need exact prior counts for {needed_post_hours_df.height:,} post-hour pairs "
+        f"across {needed_post_hours_df['subject_uri'].n_unique() if needed_post_hours_df.height > 0 else 0:,} posts"
+    )
+    exact_prior_counts_df, exact_prior_stats = _build_exact_prior_cumulative_likes_df(
+        raw_likes_lf=raw_likes_lf,
+        needed_post_hours_df=needed_post_hours_df,
+        logger=logger,
+    )
+    likes_core_df = _add_prior_cumulative_likes_to_likes(likes_core_df, exact_prior_counts_df)
+    posts_core_df = _add_prior_cumulative_likes_to_posts(posts_core_df, exact_prior_counts_df)
+    all_stats['prior_counts'] = exact_prior_stats
+    del needed_post_hours_df, exact_prior_counts_df
+    gc.collect()
+    mem_tracker.checkpoint("after_exact_prior_like_counts", quiet=True)
 
     ts_name = out_dir.name
     embeddings_path: Optional[Path] = None
@@ -1730,13 +1886,24 @@ def _run_greenearth_pipeline(
         all_stats['embeddings'] = embedding_stats
         mem_tracker.checkpoint("after_embeddings_write", quiet=True)
 
-        # Assign emb_idx sequentially (no embedding validation)
+        # Assign emb_idx by unique URI (no embedding validation)
         log_operation_start('Assign emb_idx without embedding validation', '01_GET_DATA', logger)
-        posts_core_df = posts_core_df.with_row_index(name="emb_idx")
-        logger.info(f"✓ Added emb_idx to {len(posts_core_df):,} posts (embeddings skipped)")
+        uri_to_idx_df = (
+            posts_core_df
+            .select("at_uri")
+            .unique()
+            .sort("at_uri")
+            .with_row_index(name="emb_idx")
+        )
+        posts_core_df = posts_core_df.join(uri_to_idx_df, on="at_uri", how="left")
+        logger.info(
+            f"✓ Added emb_idx to {len(posts_core_df):,} post-hour rows "
+            f"({uri_to_idx_df.height:,} unique posts, embeddings skipped)"
+        )
 
         all_stats['posts']['n_posts_dropped_no_embedding'] = 0
         all_stats['posts']['n_posts_core'] = len(posts_core_df)
+        all_stats['posts']['n_posts_core_unique'] = posts_core_df["at_uri"].n_unique()
         mem_tracker.checkpoint("after_posts_emb_filter", quiet=True)
     else:
         # ========================================================================
@@ -1796,6 +1963,7 @@ def _run_greenearth_pipeline(
         # Update posts stats with embedding filter results
         all_stats['posts']['n_posts_dropped_no_embedding'] = n_posts_dropped
         all_stats['posts']['n_posts_core'] = n_posts_after_emb_filter
+        all_stats['posts']['n_posts_core_unique'] = posts_core_df["at_uri"].n_unique()
 
         mem_tracker.checkpoint("after_posts_emb_filter", quiet=True)
     
@@ -1830,6 +1998,7 @@ def _run_greenearth_pipeline(
             pl.col("emb_idx"),
             pl.col("did").alias("author_did"),
         ])
+        .unique(subset=["at_uri"])
     )
     likes_core_df = (
         likes_core_df
@@ -2113,6 +2282,7 @@ def _log_data_attrition_report(
     n_random_sample_buckets = posts_stats.get('n_random_sample_buckets', 0)
     negative_samples_per_hour = posts_stats.get('negative_samples_per_hour', 0)
     n_posts_core = posts_stats.get('n_posts_core', 0)
+    n_posts_core_unique = posts_stats.get('n_posts_core_unique', n_posts_core)
     n_posts_dropped_no_emb = posts_stats.get('n_posts_dropped_no_embedding', 0)
     match_rate = posts_stats.get('liked_post_match_rate', 0)
     
@@ -2129,7 +2299,7 @@ def _log_data_attrition_report(
     # Memory stats
     peak_actual = memory_actual.get('peak_process_gb', 0)
     mem_after_likes = mem_checkpoints.get('after_likes_load', {}).get('process_gb', 0)
-    mem_after_posts = mem_checkpoints.get('after_posts_load_and_expansion', {}).get('process_gb', 0)
+    mem_after_posts = mem_checkpoints.get('after_posts_load', {}).get('process_gb', 0)
     
     # Build the report
     sep = "=" * 80
@@ -2251,7 +2421,7 @@ def _log_data_attrition_report(
     logger.info("FINAL OUTPUT")
     logger.info(sep2)
     logger.info(f"likes_core.parquet:  {fmt(n_users_final_join)} users, {fmt(n_likes_final_join)} likes")
-    logger.info(f"posts_core.parquet:  {fmt(n_posts_core)} posts ({fmt(n_liked_only)} liked + {fmt(n_random_sample)} random)")
+    logger.info(f"posts_core.parquet:  {fmt(n_posts_core)} rows, {fmt(n_posts_core_unique)} unique posts ({fmt(n_liked_only)} liked-only + {fmt(n_random_sample)} random rows)")
     logger.info(f"embeddings.npy:      {fmt(n_emb_valid)} embeddings ({memmap_size_mb:.1f} MB)")
     logger.info(sep2)
     
@@ -2268,9 +2438,9 @@ def _log_data_attrition_report(
         likes_retained_pct = pct(n_likes_final_join, n_likes_initial)
         logger.info(f"Likes: {fmt(n_likes_initial)} -> {fmt(n_likes_final_join)} ({likes_retained_pct:.2f}% retained)")
     
-    if n_posts_total > 0 and n_posts_core > 0:
-        posts_retained_pct = pct(n_posts_core, n_posts_total)
-        logger.info(f"Posts: {fmt(n_posts_total)} -> {fmt(n_posts_core)} ({posts_retained_pct:.2f}% retained)")
+    if n_posts_total > 0 and n_posts_core_unique > 0:
+        posts_retained_pct = pct(n_posts_core_unique, n_posts_total)
+        logger.info(f"Posts: {fmt(n_posts_total)} -> {fmt(n_posts_core_unique)} unique ({posts_retained_pct:.2f}% retained)")
     
     logger.info(sep2)
     
@@ -2530,6 +2700,10 @@ def _attrition_stats_to_experiment_tracker(
         context.tracker.log_single_value(
             name="Posts - 4 Final (valid embeddings)",
             value=posts_stats.get('n_posts_core', 0)
+        )
+        context.tracker.log_single_value(
+            name="Posts - 4 Final Unique Posts",
+            value=posts_stats.get('n_posts_core_unique', 0)
         )
         context.tracker.log_single_value(
             name="Posts - Dropped (no embedding)",

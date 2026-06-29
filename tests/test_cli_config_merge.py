@@ -86,7 +86,7 @@ def test_negative_sampling_popularity_args_merge_from_cli_and_config(tmp_path):
     assert merged.negative_sampling_alpha == 0.25
     assert merged.min_likes_per_negative_post == 12
     assert merged.initial_negative_sampling_pct == 0.2
-    assert cli.DEFAULTS["negative_sampling_alpha"] == 0.5
+    assert cli.DEFAULTS["negative_sampling_alpha"] == 0.15
     assert cli.DEFAULTS["min_likes_per_negative_post"] == 50
     assert cli.DEFAULTS["initial_negative_sampling_pct"] == 0.1
 

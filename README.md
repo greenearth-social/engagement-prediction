@@ -116,9 +116,11 @@ Important Stage 1 behavior:
 - `max_likes_per_user` applies a deterministic random per-user cap.
 - `max_trainval_users` samples users eligible for train/validation/seen-holdout rows.
 - `max_unseen_eval_users` samples users used only for unseen validation and holdout.
-- `negative_samples_per_hour` controls the same-hour post pool used for matrix ranker training.
-- `negative_sampling_alpha`, `min_likes_per_negative_post`, and `initial_negative_sampling_pct` control popularity-weighted negative sampling.
-- `prior_cumulative_likes` is written to `likes_core` and `posts_core` as a prior-hour count from the configured likes window; same-hour likes are not included.
+- `initial_negative_sampling_pct` hash-samples posts before global like counts are built for negative candidates.
+- `min_likes_per_negative_post` filters negative candidates by global like count over the configured likes window.
+- `negative_samples_per_hour` controls sampled negative post-hour rows. Each candidate is eligible from its created-hour through created-hour + 23.
+- `negative_sampling_alpha` weights negative sampling by `global_like_count ** alpha`.
+- `prior_cumulative_likes` is written to `likes_core` and `posts_core` as an exact prior-hour count from the configured likes window for selected positive and negative post-hour rows; same-hour likes are not included.
 - `min_author_support` controls which authors get dedicated author embedding rows when author features are enabled.
 
 Primary artifacts include `likes_core_*.parquet`, `posts_core_*.parquet`, `embeddings_*.npy`, and, when available, `author_idx_*.parquet`.
