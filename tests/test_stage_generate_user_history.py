@@ -49,6 +49,7 @@ def _make_likes(
     timestamps: list[datetime],
     subject_uris: list[str],
     emb_idxs: list[int],
+    prior_cumulative_likes: list[int | None] | None = None,
     author_idxs: list[int | None] | None = None,
     like_hour_buckets: list[datetime] | None = None,
 ) -> pl.LazyFrame:
@@ -58,6 +59,7 @@ def _make_likes(
         "like_hour_bucket": like_hour_buckets or [_hour(ts) for ts in timestamps],
         "subject_uri": subject_uris,
         "emb_idx": emb_idxs,
+        "prior_cumulative_likes": [0] * len(emb_idxs) if prior_cumulative_likes is None else prior_cumulative_likes,
     }
     if author_idxs is not None:
         data["author_idx"] = author_idxs
@@ -78,6 +80,13 @@ def _history_ages_by_bucket(df: pl.DataFrame) -> dict[datetime, list[float]]:
     }
 
 
+def _history_popularity_by_bucket(df: pl.DataFrame) -> dict[datetime, list[int]]:
+    return {
+        row["like_hour_bucket"]: list(row["prior_cumulative_likes"])
+        for row in df.iter_rows(named=True)
+    }
+
+
 def test_user_hour_history_preserves_empty_first_bucket(build_history):
     logger = _make_test_logger()
     likes_lf = _make_likes(
@@ -89,6 +98,7 @@ def test_user_hour_history_preserves_empty_first_bucket(build_history):
         ],
         ["p1", "p2", "p3"],
         [100, 200, 300],
+        [5, 15, 25],
     )
 
     result = build_history(
@@ -106,6 +116,10 @@ def test_user_hour_history_preserves_empty_first_bucket(build_history):
     assert age_histories[datetime(2024, 1, 1, 10)] == []
     assert age_histories[datetime(2024, 1, 1, 11)] == pytest.approx([0.75])
     assert age_histories[datetime(2024, 1, 1, 12)] == pytest.approx([2.0 / 3.0, 1.75])
+    popularity_histories = _history_popularity_by_bucket(result)
+    assert popularity_histories[datetime(2024, 1, 1, 10)] == []
+    assert popularity_histories[datetime(2024, 1, 1, 11)] == [5]
+    assert popularity_histories[datetime(2024, 1, 1, 12)] == [15, 5]
     assert result.filter(pl.col("like_hour_bucket") == datetime(2024, 1, 1, 10))["raw_prior_count"][0] == 0
 
 
@@ -121,6 +135,7 @@ def test_user_hour_history_recency_ordering_and_capping(build_history):
         ],
         ["p1", "p2", "p3", "p4"],
         [10, 20, 30, 40],
+        [50, 10, 100, 70],
     )
 
     result = build_history(
@@ -132,6 +147,7 @@ def test_user_hour_history_recency_ordering_and_capping(build_history):
     row = result.filter(pl.col("like_hour_bucket") == datetime(2024, 1, 10))
     assert row["prior_emb_indices"][0].to_list() == [40, 10]
     assert row["prior_like_age_hours_at_bucket_start"][0].to_list() == pytest.approx([72.0, 120.0])
+    assert row["prior_cumulative_likes"][0].to_list() == [70, 50]
     assert row["raw_prior_count"][0] == 3
 
 
@@ -146,6 +162,7 @@ def test_user_hour_history_excludes_same_hour_likes(build_history):
         ],
         ["p1", "p2", "p3"],
         [1, 2, 3],
+        [7, 8, 9],
     )
 
     result = build_history(
@@ -157,6 +174,7 @@ def test_user_hour_history_excludes_same_hour_likes(build_history):
     row = result.filter(pl.col("like_hour_bucket") == datetime(2024, 1, 1, 11))
     assert row["prior_emb_indices"][0].to_list() == [1]
     assert row["prior_like_age_hours_at_bucket_start"][0].to_list() == pytest.approx([55.0 / 60.0])
+    assert row["prior_cumulative_likes"][0].to_list() == [7]
     assert row["raw_prior_count"][0] == 1
 
 
@@ -209,9 +227,29 @@ def test_user_hour_history_output_schema(build_history):
         "prior_emb_indices",
         "raw_prior_count",
         "prior_like_age_hours_at_bucket_start",
+        "prior_cumulative_likes",
     ]
     assert result.schema["prior_emb_indices"] == pl.List(pl.UInt32)
     assert result.schema["prior_like_age_hours_at_bucket_start"] == pl.List(pl.Float32)
+    assert result.schema["prior_cumulative_likes"] == pl.List(pl.UInt64)
+
+
+def test_user_hour_history_requires_prior_cumulative_likes(build_history):
+    logger = _make_test_logger()
+    likes_lf = pl.DataFrame({
+        "did": ["u1"],
+        "record_created_at": [datetime(2024, 1, 1, 0, 0)],
+        "like_hour_bucket": [datetime(2024, 1, 1, 0, 0)],
+        "subject_uri": ["p1"],
+        "emb_idx": [100],
+    }).lazy()
+
+    with pytest.raises(ValueError, match="prior_cumulative_likes"):
+        build_history(
+            likes_lf=likes_lf,
+            max_prior_likes=None,
+            logger=logger,
+        )
 
 
 def test_user_hour_author_indices_preserve_order_and_unknowns(build_history):
@@ -226,6 +264,7 @@ def test_user_hour_author_indices_preserve_order_and_unknowns(build_history):
         ],
         ["p1", "p2", "p3", "p4"],
         [100, 200, 300, 400],
+        [10, None, 30, 40],
         author_idxs=[2, None, 4, 9],
     )
 
@@ -238,6 +277,7 @@ def test_user_hour_author_indices_preserve_order_and_unknowns(build_history):
     row = result.filter(pl.col("like_hour_bucket") == datetime(2024, 1, 1, 13))
     assert row["prior_emb_indices"][0].to_list() == [300, 200, 100]
     assert row["prior_like_age_hours_at_bucket_start"][0].to_list() == pytest.approx([1.0, 2.0, 3.0])
+    assert row["prior_cumulative_likes"][0].to_list() == [30, 0, 10]
     assert row["prior_author_indices"][0].to_list() == [4, None, 2]
 
 
