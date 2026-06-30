@@ -73,8 +73,6 @@ For foreground local iteration:
 python cli.py --config config.yml --background false --experiment-tracker none
 ```
 
-For a small Stage 1 smoke run, see `config_test.yml`.
-
 ### Output Layout
 
 By default, outputs are written under `outputs/` in two coordinated views:
@@ -104,6 +102,9 @@ max_trainval_users: 1000
 max_unseen_eval_users: 100
 max_likes_per_user: 16
 negative_samples_per_hour: 10
+negative_sampling_alpha: 0.5
+min_likes_per_negative_post: 50
+initial_negative_sampling_pct: 0.1
 min_likes_per_user: 0
 memory_check: "skip"
 ```
@@ -113,7 +114,11 @@ Important Stage 1 behavior:
 - `max_likes_per_user` applies a deterministic random per-user cap.
 - `max_trainval_users` samples users eligible for train/validation/seen-holdout rows.
 - `max_unseen_eval_users` samples users used only for unseen validation and holdout.
-- `negative_samples_per_hour` controls the same-hour post pool used for matrix ranker training.
+- `initial_negative_sampling_pct` hash-samples posts before global like counts are built for negative candidates.
+- `min_likes_per_negative_post` filters negative candidates by global like count over the configured likes window.
+- `negative_samples_per_hour` controls sampled negative post-hour rows. Each candidate is eligible from its created-hour through created-hour + 23.
+- `negative_sampling_alpha` weights negative sampling by `global_like_count ** alpha`.
+- `prior_cumulative_likes` is written to `likes_core` and `posts_core` as an exact prior-hour count from the configured likes window for selected positive and negative post-hour rows; same-hour likes are not included.
 - `min_author_support` controls which authors get dedicated author embedding rows when author features are enabled.
 
 Primary artifacts include `likes_core_*.parquet`, `posts_core_*.parquet`, `embeddings_*.npy`, and, when available, `author_idx_*.parquet`.
