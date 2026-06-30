@@ -10,8 +10,9 @@ import json
 import time
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Final, List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -63,8 +64,50 @@ def _validate_time_delta_bucket_boundaries(boundaries_hours: Sequence[float]) ->
     return boundaries
 
 
+def _compute_bst_popularity_log_stats(dataset: BucketedEngagementDataset) -> Tuple[float, float]:
+    if not getattr(dataset, "use_popularity_feature", False):
+        return 0.0, 1.0
+
+    count_arrays: List[np.ndarray] = []
+    if dataset.prior_cumulative_likes is not None:
+        count_arrays.extend(
+            counts.astype(np.float64, copy=False)
+            for counts in dataset.prior_cumulative_likes
+            if len(counts) > 0
+        )
+    if dataset.liked_post_prior_cumulative_likes is not None:
+        count_arrays.extend(
+            counts.astype(np.float64, copy=False)
+            for counts in dataset.liked_post_prior_cumulative_likes
+            if len(counts) > 0
+        )
+    negative_counts = [
+        float(post.get("prior_cumulative_likes") or 0.0)
+        for posts in dataset.sampled_posts_by_bucket.values()
+        for post in posts
+    ]
+    if negative_counts:
+        count_arrays.append(np.array(negative_counts, dtype=np.float64))
+    if not count_arrays:
+        return 0.0, 1.0
+
+    counts = np.concatenate(count_arrays)
+    log_counts = np.log1p(np.clip(counts, a_min=0.0, a_max=None))
+    if log_counts.size == 0:
+        return 0.0, 1.0
+    mean = float(log_counts.mean())
+    std = float(log_counts.std())
+    if not np.isfinite(mean):
+        mean = 0.0
+    if not np.isfinite(std) or std < 1.0e-6:
+        std = 1.0
+    return mean, std
+
+
 class BSTRanker(nn.Module):
     """Behavior Sequence Transformer encoder for one user-history/candidate pair."""
+
+    __constants__ = ["use_popularity_feature"]
 
     def __init__(
         self,
@@ -83,6 +126,10 @@ class BSTRanker(nn.Module):
         norm_first: bool,
         time_delta_bucket_boundaries_hours: List[float],
         prediction_hidden_dims: List[int],
+        use_popularity_feature: bool = False,
+        popularity_projection_dim: int = 0,
+        popularity_log_mean: float = 0.0,
+        popularity_log_std: float = 1.0,
     ):
         super().__init__()
         if time_embedding_dim <= 0:
@@ -95,6 +142,10 @@ class BSTRanker(nn.Module):
             raise ValueError("transformer_ff_dim must be positive")
         if not 0.0 <= dropout_rate <= 1.0:
             raise ValueError("dropout_rate must be in [0, 1]")
+        if use_popularity_feature and popularity_projection_dim <= 0:
+            raise ValueError("popularity_projection_dim must be positive when popularity features are enabled")
+        if use_popularity_feature and popularity_log_std <= 0.0:
+            raise ValueError("popularity_log_std must be positive when popularity features are enabled")
 
         self.post_embedding_dim = int(post_embedding_dim)
         self.content_projection_dim = int(content_projection_dim)
@@ -102,6 +153,10 @@ class BSTRanker(nn.Module):
         self.model_dim = int(model_dim)
         self.time_embedding_dim = int(time_embedding_dim)
         self.dropout_rate = float(dropout_rate)
+        self.use_popularity_feature: Final[bool] = bool(use_popularity_feature)
+        self.popularity_projection_dim = int(popularity_projection_dim) if self.use_popularity_feature else 0
+        self.popularity_log_mean = float(popularity_log_mean)
+        self.popularity_log_std = float(popularity_log_std)
         self.time_delta_bucket_boundaries_hours = _validate_time_delta_bucket_boundaries(
             time_delta_bucket_boundaries_hours
         )
@@ -123,6 +178,10 @@ class BSTRanker(nn.Module):
             author_projection_dim=author_projection_dim,
             model_dim=model_dim,
             author_unknown_dropout_rate=author_unknown_dropout_rate,
+            use_popularity_feature=use_popularity_feature,
+            popularity_projection_dim=popularity_projection_dim,
+            popularity_log_mean=popularity_log_mean,
+            popularity_log_std=popularity_log_std,
         )
         self.time_delta_embedding = nn.Embedding(
             num_embeddings=self.num_time_delta_buckets,
@@ -171,6 +230,8 @@ class BSTRanker(nn.Module):
         candidate_post_embeddings: torch.Tensor,
         history_author_indices: torch.Tensor,
         candidate_post_author_idx: torch.Tensor,
+        history_prior_cumulative_likes: Optional[torch.Tensor] = None,
+        candidate_prior_cumulative_likes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if history_embeddings.dim() != 3:
             raise ValueError("history_embeddings must have shape [B, H, D]")
@@ -191,6 +252,15 @@ class BSTRanker(nn.Module):
             raise ValueError("history_author_indices must have shape [B, H]")
         if candidate_post_author_idx.shape != (batch_size,):
             raise ValueError("candidate_post_author_idx must have shape [B]")
+        if self.use_popularity_feature:
+            if history_prior_cumulative_likes is None:
+                raise ValueError("history_prior_cumulative_likes is required when popularity features are enabled")
+            if candidate_prior_cumulative_likes is None:
+                raise ValueError("candidate_prior_cumulative_likes is required when popularity features are enabled")
+            if history_prior_cumulative_likes.shape != (batch_size, max_history_len):
+                raise ValueError("history_prior_cumulative_likes must have shape [B, H]")
+            if candidate_prior_cumulative_likes.shape != (batch_size,):
+                raise ValueError("candidate_prior_cumulative_likes must have shape [B]")
 
         device = history_embeddings.device
         history_mask = history_mask.to(device=device, dtype=torch.bool)
@@ -198,11 +268,21 @@ class BSTRanker(nn.Module):
         candidate_post_embeddings = candidate_post_embeddings.to(device=device)
         history_author_indices = history_author_indices.to(device=device, dtype=torch.long)
         candidate_post_author_idx = candidate_post_author_idx.to(device=device, dtype=torch.long)
+        history_prior_cumulative_likes_tensor = history_prior_cumulative_likes
+        candidate_prior_cumulative_likes_tensor = candidate_prior_cumulative_likes
+        if self.use_popularity_feature:
+            history_prior_cumulative_likes_tensor = torch.jit._unwrap_optional(history_prior_cumulative_likes).to(device=device, dtype=torch.float32)
+            candidate_prior_cumulative_likes_tensor = torch.jit._unwrap_optional(candidate_prior_cumulative_likes).to(device=device, dtype=torch.float32)
 
-        history_post_vectors = self.post_feature_encoder(history_embeddings, history_author_indices)
+        history_post_vectors = self.post_feature_encoder(
+            history_embeddings,
+            history_author_indices,
+            history_prior_cumulative_likes_tensor,
+        )
         candidate_post_vector = self.post_feature_encoder(
             candidate_post_embeddings,
             candidate_post_author_idx,
+            candidate_prior_cumulative_likes_tensor,
         ).unsqueeze(1)
         post_sequence = torch.cat([history_post_vectors, candidate_post_vector], dim=1)
 
@@ -313,6 +393,8 @@ class BSTRanker(nn.Module):
         candidate_post_embeddings: torch.Tensor,
         history_author_indices: torch.Tensor,
         candidate_post_author_idx: torch.Tensor,
+        history_prior_cumulative_likes: Optional[torch.Tensor] = None,
+        candidate_prior_cumulative_likes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         self._validate_one_layer_matrix_scorer()
         if history_embeddings.dim() != 3:
@@ -335,6 +417,15 @@ class BSTRanker(nn.Module):
             raise ValueError("history_author_indices must have shape [U, H]")
         if candidate_post_author_idx.shape != (num_candidates,):
             raise ValueError("candidate_post_author_idx must have shape [C]")
+        if self.use_popularity_feature:
+            if history_prior_cumulative_likes is None:
+                raise ValueError("history_prior_cumulative_likes is required when popularity features are enabled")
+            if candidate_prior_cumulative_likes is None:
+                raise ValueError("candidate_prior_cumulative_likes is required when popularity features are enabled")
+            if history_prior_cumulative_likes.shape != (num_users, max_history_len):
+                raise ValueError("history_prior_cumulative_likes must have shape [U, H]")
+            if candidate_prior_cumulative_likes.shape != (num_candidates,):
+                raise ValueError("candidate_prior_cumulative_likes must have shape [C]")
 
         return self.score_candidate_matrix(
             history_embeddings=history_embeddings,
@@ -343,6 +434,8 @@ class BSTRanker(nn.Module):
             candidate_post_embeddings=candidate_post_embeddings,
             history_author_indices=history_author_indices,
             candidate_post_author_idx=candidate_post_author_idx,
+            history_prior_cumulative_likes=history_prior_cumulative_likes,
+            candidate_prior_cumulative_likes=candidate_prior_cumulative_likes,
         )
 
     @torch.jit.export
@@ -354,6 +447,8 @@ class BSTRanker(nn.Module):
         candidate_post_embeddings: torch.Tensor,
         history_author_indices: torch.Tensor,
         candidate_post_author_idx: torch.Tensor,
+        history_prior_cumulative_likes: Optional[torch.Tensor] = None,
+        candidate_prior_cumulative_likes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if len(self.transformer_encoder.layers) != 1:
             raise RuntimeError("score_candidate_matrix requires exactly one transformer layer")
@@ -367,11 +462,29 @@ class BSTRanker(nn.Module):
         candidate_post_embeddings = candidate_post_embeddings.to(device=device)
         history_author_indices = history_author_indices.to(device=device, dtype=torch.long)
         candidate_post_author_idx = candidate_post_author_idx.to(device=device, dtype=torch.long)
+        history_prior_cumulative_likes_tensor = history_prior_cumulative_likes
+        candidate_prior_cumulative_likes_tensor = candidate_prior_cumulative_likes
+        if self.use_popularity_feature:
+            if history_prior_cumulative_likes is None:
+                raise RuntimeError("history_prior_cumulative_likes is required when popularity features are enabled")
+            if candidate_prior_cumulative_likes is None:
+                raise RuntimeError("candidate_prior_cumulative_likes is required when popularity features are enabled")
+            if history_prior_cumulative_likes.size(0) != num_users or history_prior_cumulative_likes.size(1) != history_embeddings.size(1):
+                raise RuntimeError("history_prior_cumulative_likes must have shape [U, H]")
+            if candidate_prior_cumulative_likes.size(0) != num_candidates:
+                raise RuntimeError("candidate_prior_cumulative_likes must have shape [C]")
+            history_prior_cumulative_likes_tensor = torch.jit._unwrap_optional(history_prior_cumulative_likes).to(device=device, dtype=torch.float32)
+            candidate_prior_cumulative_likes_tensor = torch.jit._unwrap_optional(candidate_prior_cumulative_likes).to(device=device, dtype=torch.float32)
 
-        history_post_vectors = self.post_feature_encoder(history_embeddings, history_author_indices)
+        history_post_vectors = self.post_feature_encoder(
+            history_embeddings,
+            history_author_indices,
+            history_prior_cumulative_likes_tensor,
+        )
         candidate_post_vectors = self.post_feature_encoder(
             candidate_post_embeddings,
             candidate_post_author_idx,
+            candidate_prior_cumulative_likes_tensor,
         )
         history_time_bucket_ids = self._bucketize_time_deltas_hours(history_time_deltas_hours)
         history_time_embeddings = self.time_delta_embedding(history_time_bucket_ids)
@@ -453,6 +566,8 @@ class BSTRanker(nn.Module):
         candidate_post_embeddings: torch.Tensor,
         history_author_indices: torch.Tensor,
         candidate_post_author_idx: torch.Tensor,
+        history_prior_cumulative_likes: Optional[torch.Tensor] = None,
+        candidate_prior_cumulative_likes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         transformer_output = self._forward_transformer(
             history_embeddings=history_embeddings,
@@ -461,6 +576,8 @@ class BSTRanker(nn.Module):
             candidate_post_embeddings=candidate_post_embeddings,
             history_author_indices=history_author_indices,
             candidate_post_author_idx=candidate_post_author_idx,
+            history_prior_cumulative_likes=history_prior_cumulative_likes,
+            candidate_prior_cumulative_likes=candidate_prior_cumulative_likes,
         )
         logits = self.prediction_head(transformer_output)
         if logits.dim() == 2 and logits.shape == (transformer_output.size(0), 1):
@@ -483,6 +600,13 @@ def _compute_bst_listwise_loss_and_preds(
         raise RuntimeError("BST listwise batches must include author index tensors")
     history_author_indices = batch["history_author_indices"].to(device, dtype=torch.long, non_blocking=True)
     candidate_post_author_idx = batch["candidate_post_author_idx"].to(device, dtype=torch.long, non_blocking=True)
+    history_prior_cumulative_likes = None
+    candidate_prior_cumulative_likes = None
+    if model.use_popularity_feature:
+        if "history_prior_cumulative_likes" not in batch or "candidate_prior_cumulative_likes" not in batch:
+            raise RuntimeError("BST listwise batches must include popularity tensors when popularity features are enabled")
+        history_prior_cumulative_likes = batch["history_prior_cumulative_likes"].to(device, dtype=torch.float32, non_blocking=True)
+        candidate_prior_cumulative_likes = batch["candidate_prior_cumulative_likes"].to(device, dtype=torch.float32, non_blocking=True)
 
     scores = model.score_candidate_matrix_one_layer(
         history_embeddings=history_embeddings,
@@ -491,6 +615,8 @@ def _compute_bst_listwise_loss_and_preds(
         candidate_post_embeddings=candidate_post_embeddings,
         history_author_indices=history_author_indices,
         candidate_post_author_idx=candidate_post_author_idx,
+        history_prior_cumulative_likes=history_prior_cumulative_likes,
+        candidate_prior_cumulative_likes=candidate_prior_cumulative_likes,
     )
     if scores.shape != labels.shape:
         raise RuntimeError("Expected BST scores and label_matrix to have matching [num_users, num_candidates] shapes")
@@ -855,6 +981,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     use_author_embedding_table = bool(args.use_author_embedding_table)
     author_embedding_dim = int(args.author_embedding_dim)
     author_unknown_dropout_rate = float(args.author_unknown_dropout_rate)
+    use_popularity_feature = bool(args.bst_use_popularity_feature)
+    popularity_projection_dim = int(args.bst_popularity_projection_dim)
     batch_size = int(args.batch_size)
     bst_additional_batch_negatives = int(args.bst_additional_batch_negatives)
     bst_max_train_batches_per_epoch = getattr(args, "bst_max_train_batches_per_epoch", None)
@@ -906,6 +1034,59 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     persistent_workers = bool(args.dataloader_persistent_workers)
     prefetch_factor = int(args.dataloader_prefetch_factor)
 
+    log_operation_start("Create bucketed BST datasets", STAGE_LOG_NAME, logger)
+    train_dataset = BucketedEngagementDataset(
+        embeddings_mmap=embeddings_mmap,
+        likes_core_df=likes_core_df,
+        posts_core_df=posts_core_df,
+        history_df=history_df,
+        split="train",
+        max_history_len=max_history_len,
+        embed_dim=embed_dim,
+        use_author_embedding_table=use_author_embedding_table,
+        use_popularity_feature=use_popularity_feature,
+        bst_additional_batch_negatives=bst_additional_batch_negatives,
+        seed=random_seed,
+        logger=logger,
+    )
+    val_dataset = BucketedEngagementDataset(
+        embeddings_mmap=embeddings_mmap,
+        likes_core_df=likes_core_df,
+        posts_core_df=posts_core_df,
+        history_df=history_df,
+        split="val",
+        max_history_len=max_history_len,
+        embed_dim=embed_dim,
+        use_author_embedding_table=use_author_embedding_table,
+        use_popularity_feature=use_popularity_feature,
+        bst_additional_batch_negatives=bst_additional_batch_negatives,
+        seed=random_seed,
+        logger=logger,
+    )
+    val_unseen_dataset = BucketedEngagementDataset(
+        embeddings_mmap=embeddings_mmap,
+        likes_core_df=likes_core_df,
+        posts_core_df=posts_core_df,
+        history_df=history_df,
+        split="val_unseen_users",
+        max_history_len=max_history_len,
+        embed_dim=embed_dim,
+        use_author_embedding_table=use_author_embedding_table,
+        use_popularity_feature=use_popularity_feature,
+        bst_additional_batch_negatives=bst_additional_batch_negatives,
+        seed=random_seed,
+        logger=logger,
+    )
+    popularity_log_mean, popularity_log_std = _compute_bst_popularity_log_stats(train_dataset)
+    if use_popularity_feature:
+        logger.info(
+            "BST popularity feature enabled: "
+            f"popularity_projection_dim={popularity_projection_dim}, "
+            f"log_mean={popularity_log_mean:.6f}, log_std={popularity_log_std:.6f}"
+        )
+    else:
+        logger.info("BST popularity feature disabled")
+
     config = {
         "model_type": "bst-ranker",
         "post_embedding_dim": embed_dim,
@@ -928,6 +1109,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "author_pad_idx": AUTHOR_PAD_IDX,
         "author_unk_idx": AUTHOR_UNK_IDX,
         "bst_additional_batch_negatives": bst_additional_batch_negatives,
+        "bst_use_popularity_feature": use_popularity_feature,
+        "bst_popularity_projection_dim": popularity_projection_dim,
+        "bst_popularity_log_mean": popularity_log_mean,
+        "bst_popularity_log_std": popularity_log_std,
     }
     training_config = {
         **config,
@@ -955,47 +1140,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     with open(training_config_path, "w") as f:
         json.dump(training_config, f, indent=2)
     logger.info(f"Training config written to: {training_config_path}")
-
-    log_operation_start("Create bucketed BST datasets", STAGE_LOG_NAME, logger)
-    train_dataset = BucketedEngagementDataset(
-        embeddings_mmap=embeddings_mmap,
-        likes_core_df=likes_core_df,
-        posts_core_df=posts_core_df,
-        history_df=history_df,
-        split="train",
-        max_history_len=max_history_len,
-        embed_dim=embed_dim,
-        use_author_embedding_table=use_author_embedding_table,
-        bst_additional_batch_negatives=bst_additional_batch_negatives,
-        seed=random_seed,
-        logger=logger,
-    )
-    val_dataset = BucketedEngagementDataset(
-        embeddings_mmap=embeddings_mmap,
-        likes_core_df=likes_core_df,
-        posts_core_df=posts_core_df,
-        history_df=history_df,
-        split="val",
-        max_history_len=max_history_len,
-        embed_dim=embed_dim,
-        use_author_embedding_table=use_author_embedding_table,
-        bst_additional_batch_negatives=bst_additional_batch_negatives,
-        seed=random_seed,
-        logger=logger,
-    )
-    val_unseen_dataset = BucketedEngagementDataset(
-        embeddings_mmap=embeddings_mmap,
-        likes_core_df=likes_core_df,
-        posts_core_df=posts_core_df,
-        history_df=history_df,
-        split="val_unseen_users",
-        max_history_len=max_history_len,
-        embed_dim=embed_dim,
-        use_author_embedding_table=use_author_embedding_table,
-        bst_additional_batch_negatives=bst_additional_batch_negatives,
-        seed=random_seed,
-        logger=logger,
-    )
     train_loader, val_loader, val_unseen_loader, _ = create_bucketed_data_loaders(
         train_dataset=train_dataset,
         val_dataset=val_dataset,
@@ -1027,6 +1171,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         norm_first=norm_first,
         time_delta_bucket_boundaries_hours=time_delta_bucket_boundaries_hours,
         prediction_hidden_dims=prediction_hidden_dims,
+        use_popularity_feature=use_popularity_feature,
+        popularity_projection_dim=popularity_projection_dim,
+        popularity_log_mean=popularity_log_mean,
+        popularity_log_std=popularity_log_std,
     )
 
     log_operation_start(f"Train BST ranker (epochs={epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)

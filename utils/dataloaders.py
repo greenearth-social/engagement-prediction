@@ -972,6 +972,26 @@ def _list_to_float_array(value: Any) -> np.ndarray:
     return np.array(value, dtype=np.float32)
 
 
+def _prior_count_or_zero(value: Any) -> float:
+    if value is None:
+        return 0.0
+    try:
+        if value != value:  # NaN
+            return 0.0
+    except TypeError:
+        pass
+    return float(value)
+
+
+def _list_to_prior_count_array(value: Any) -> np.ndarray:
+    if value is None or len(value) == 0:
+        return np.array([], dtype=np.float32)
+    return np.array([
+        _prior_count_or_zero(item)
+        for item in value
+    ], dtype=np.float32)
+
+
 def _author_idx_list_to_table_rows(
     author_indices: Any,
 ) -> np.ndarray:
@@ -996,6 +1016,7 @@ class BucketedEngagementDataset(Dataset):
         max_history_len: int,
         embed_dim: int,
         use_author_embedding_table: bool = False,
+        use_popularity_feature: bool = False,
         bst_additional_batch_negatives: Optional[int] = None,
         seed: int = 0,
         logger: Optional[logging.Logger] = None,
@@ -1009,12 +1030,17 @@ class BucketedEngagementDataset(Dataset):
         self.max_history_len = int(max_history_len)
         self.embed_dim = int(embed_dim)
         self.use_author_embedding_table = bool(use_author_embedding_table)
+        self.use_popularity_feature = bool(use_popularity_feature)
         self.bst_additional_batch_negatives = int(bst_additional_batch_negatives) if bst_additional_batch_negatives is not None else None
         self.seed = int(seed)
 
         likes_columns = ["did", "subject_uri", "split", "like_hour_bucket", "emb_idx"]
         posts_columns = ["at_uri", "in_random_sample", "negative_hour_bucket", "split_window", "emb_idx"]
         history_columns = ["did", "like_hour_bucket", "prior_emb_indices"]
+        if self.use_popularity_feature:
+            likes_columns.append("prior_cumulative_likes")
+            posts_columns.append("prior_cumulative_likes")
+            history_columns.append("prior_cumulative_likes")
         self.has_history_time_deltas = "prior_like_age_hours_at_bucket_start" in history_df.columns
         if self.has_history_time_deltas:
             history_columns.append("prior_like_age_hours_at_bucket_start")
@@ -1051,6 +1077,13 @@ class BucketedEngagementDataset(Dataset):
             pl.col("emb_idx").sort_by("_like_order").alias("liked_post_emb_indices"),
             pl.col("_like_order").min().alias("_first_like_order"),
         ]
+        if self.use_popularity_feature:
+            agg_exprs.append(
+                pl.col("prior_cumulative_likes")
+                .fill_null(0)
+                .sort_by("_like_order")
+                .alias("liked_post_prior_cumulative_likes")
+            )
         if self.use_author_embedding_table:
             agg_exprs.append(pl.col("author_idx").sort_by("_like_order").alias("liked_post_author_indices"))
         
@@ -1084,6 +1117,17 @@ class BucketedEngagementDataset(Dataset):
             _list_to_int_array(value)
             for value in joined["prior_emb_indices"].to_list()
         ]
+        self.liked_post_prior_cumulative_likes: Optional[List[np.ndarray]] = None
+        self.prior_cumulative_likes: Optional[List[np.ndarray]] = None
+        if self.use_popularity_feature:
+            self.liked_post_prior_cumulative_likes = [
+                _list_to_prior_count_array(value)
+                for value in joined["liked_post_prior_cumulative_likes"].to_list()
+            ]
+            self.prior_cumulative_likes = [
+                _list_to_prior_count_array(value)
+                for value in joined["prior_cumulative_likes"].to_list()
+            ]
         if self.has_history_time_deltas:
             self.prior_like_age_hours_at_bucket_start = [
                 _list_to_float_array(value)
@@ -1120,11 +1164,14 @@ class BucketedEngagementDataset(Dataset):
         self.sampled_posts_by_bucket: Dict[Any, List[Dict[str, Any]]] = {}
         for row in sampled_posts_df.iter_rows(named=True):
             author_idx = _author_idx_or_unk(row.get("author_idx")) if self.use_author_embedding_table else None
-            self.sampled_posts_by_bucket.setdefault(row["negative_hour_bucket"], []).append({
+            post: Dict[str, Any] = {
                 "post_id": row["at_uri"],
                 "emb_idx": int(row["emb_idx"]),
                 "author_idx": author_idx,
-            })
+            }
+            if self.use_popularity_feature:
+                post["prior_cumulative_likes"] = _prior_count_or_zero(row.get("prior_cumulative_likes"))
+            self.sampled_posts_by_bucket.setdefault(row["negative_hour_bucket"], []).append(post)
 
     def __len__(self) -> int:
         return len(self.user_ids)
@@ -1159,6 +1206,13 @@ class BucketedEngagementDataset(Dataset):
     def _padded_time_deltas_for_row(self, row_idx: int) -> torch.Tensor:
         deltas = self.prior_like_age_hours_at_bucket_start[row_idx]
         padded = get_padded_history_time_deltas(deltas, self.max_history_len)
+        return torch.from_numpy(padded)
+
+    def _padded_popularity_history_for_row(self, row_idx: int) -> torch.Tensor:
+        if self.prior_cumulative_likes is None:
+            raise ValueError("prior_cumulative_likes must be available when popularity features are enabled")
+        counts = self.prior_cumulative_likes[row_idx]
+        padded = get_padded_history_time_deltas(counts, self.max_history_len)
         return torch.from_numpy(padded)
 
     def _sample_candidate_posts_for_batch(
@@ -1215,14 +1269,22 @@ class BucketedEngagementDataset(Dataset):
         candidate_post_ids: List[str] = []
         candidate_emb_indices: List[int] = []
         candidate_author_indices: List[int] = []
+        candidate_prior_cumulative_likes: List[float] = []
         candidate_to_idx: Dict[str, int] = {}
 
-        def add_candidate(post_id: str, emb_idx: int, author_idx: Optional[int]) -> None:
+        def add_candidate(
+            post_id: str,
+            emb_idx: int,
+            author_idx: Optional[int],
+            prior_cumulative_likes: Optional[float],
+        ) -> None:
             if post_id in candidate_to_idx:
                 return
             candidate_to_idx[post_id] = len(candidate_post_ids)
             candidate_post_ids.append(post_id)
             candidate_emb_indices.append(int(emb_idx))
+            if self.use_popularity_feature:
+                candidate_prior_cumulative_likes.append(_prior_count_or_zero(prior_cumulative_likes))
             if self.use_author_embedding_table:
                 candidate_author_indices.append(
                     int(author_idx) if author_idx is not None else AUTHOR_UNK_IDX
@@ -1234,15 +1296,26 @@ class BucketedEngagementDataset(Dataset):
                 if self.liked_post_author_indices is not None
                 else [None] * len(self.liked_post_ids[row_idx])
             )
-            for post_id, emb_idx, author_idx in zip(
+            prior_cumulative_likes = (
+                self.liked_post_prior_cumulative_likes[row_idx]
+                if self.liked_post_prior_cumulative_likes is not None
+                else [None] * len(self.liked_post_ids[row_idx])
+            )
+            for post_id, emb_idx, author_idx, prior_count in zip(
                 self.liked_post_ids[row_idx],
                 self.liked_post_emb_indices[row_idx],
                 author_indices,
+                prior_cumulative_likes,
             ):
-                add_candidate(post_id, int(emb_idx), int(author_idx) if author_idx is not None else None)
+                add_candidate(
+                    post_id,
+                    int(emb_idx),
+                    int(author_idx) if author_idx is not None else None,
+                    float(prior_count) if prior_count is not None else None,
+                )
 
         for post in self._sample_candidate_posts_for_batch(row_indices, bucket, epoch, candidate_to_idx):
-            add_candidate(post["post_id"], int(post["emb_idx"]), post.get("author_idx"))
+            add_candidate(post["post_id"], int(post["emb_idx"]), post.get("author_idx"), post.get("prior_cumulative_likes"))
 
         candidate_post_embeddings = torch.from_numpy(
             np.array(self.embeddings[np.array(candidate_emb_indices, dtype=np.int64)], dtype=np.float32)
@@ -1271,6 +1344,12 @@ class BucketedEngagementDataset(Dataset):
                 dim=0,
             )
             output["candidate_post_author_idx"] = torch.tensor(candidate_author_indices, dtype=torch.long)
+        if self.use_popularity_feature:
+            output["history_prior_cumulative_likes"] = torch.stack(
+                [self._padded_popularity_history_for_row(row_idx) for row_idx in row_indices],
+                dim=0,
+            )
+            output["candidate_prior_cumulative_likes"] = torch.tensor(candidate_prior_cumulative_likes, dtype=torch.float32)
         return output
 
 

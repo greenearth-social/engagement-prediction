@@ -42,6 +42,7 @@ def mock_likes_core_df():
         ],
         "like_hour_bucket": [_dt(10), _dt(10), _dt(10), _dt(11), _dt(12), _dt(13), _dt(13)],
         "emb_idx": [0, 1, 2, 3, 4, 5, 6],
+        "prior_cumulative_likes": [101, 102, 103, 104, 105, 106, 107],
         "author_idx": pl.Series([2, 3, 4, None, 2, 2, 4], dtype=pl.UInt32),
     })
 
@@ -54,6 +55,7 @@ def mock_posts_core_df():
         "negative_hour_bucket": [_dt(10), _dt(10), _dt(10), _dt(10), _dt(11), _dt(13), _dt(14)],
         "split_window": ["train", "train", "train", "train", "train", "val", "holdout"],
         "emb_idx": [20, 1, 2, 3, 21, 22, 23],
+        "prior_cumulative_likes": [None, 202, 203, 204, 205, 206, 207],
         "author_idx": pl.Series([2, 3, 4, None, 2, 4, 2], dtype=pl.UInt32),
     })
 
@@ -65,6 +67,7 @@ def mock_history_df():
         "like_hour_bucket": [_dt(10), _dt(10), _dt(11), _dt(12), _dt(13), _dt(13)],
         "prior_emb_indices": [[5, 6, 7], [], [8], [], [9], [10]],
         "prior_like_age_hours_at_bucket_start": [[1.0, 2.0, 3.0], [], [0.25], [], [4.0], [5.0]],
+        "prior_cumulative_likes": [[15, None, 17], [], [18], [], [19], [20]],
         "prior_author_indices": [[2, None, 4], [], [3], [], [2], [4]],
     })
 
@@ -149,6 +152,8 @@ def test_bucketed_collate_builds_candidates_and_same_hour_labels(bucketed_datase
         atol=1e-6,
     )
     assert batch["candidate_post_embeddings"].shape == (5, 4)
+    assert "history_prior_cumulative_likes" not in batch
+    assert "candidate_prior_cumulative_likes" not in batch
 
     labels_by_user = {
         user_id: batch["label_matrix"][idx].tolist()
@@ -222,6 +227,44 @@ def test_bucketed_collate_additional_negatives_do_not_cap_positives(
 
     assert batch["candidate_post_id"] == ["p1", "p3", "p2", "n1", "p4"]
     assert batch["label_matrix"].shape == (2, 5)
+
+
+def test_bucketed_collate_returns_popularity_tensors_when_enabled(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+):
+    dataset = BucketedEngagementDataset(
+        embeddings_mmap=mock_embeddings_mmap,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
+        history_df=mock_history_df,
+        split="train",
+        max_history_len=4,
+        embed_dim=4,
+        use_popularity_feature=True,
+    )
+
+    batch = dataset.collate_batch([dataset[0], dataset[1]])
+
+    assert batch["history_prior_cumulative_likes"].shape == (2, 4)
+    np.testing.assert_allclose(
+        batch["history_prior_cumulative_likes"].numpy(),
+        np.array([
+            [15.0, 0.0, 17.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ], dtype=np.float32),
+        rtol=0,
+        atol=1e-6,
+    )
+    assert batch["candidate_post_id"] == ["p1", "p3", "p2", "n1", "p4"]
+    np.testing.assert_allclose(
+        batch["candidate_prior_cumulative_likes"].numpy(),
+        np.array([101.0, 103.0, 102.0, 0.0, 204.0], dtype=np.float32),
+        rtol=0,
+        atol=1e-6,
+    )
 
 
 def test_bucketed_candidate_sampling_changes_by_epoch(

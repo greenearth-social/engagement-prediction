@@ -254,6 +254,8 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
             bst_additional_batch_negatives: 32
             batch_size: 16
             bst_max_train_batches_per_epoch: 5
+            bst_use_popularity_feature: false
+            bst_popularity_projection_dim: 12
             """
         ).strip()
         + "\n"
@@ -273,6 +275,8 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
     assert merged.bst_additional_batch_negatives == 32
     assert merged.batch_size == 16
     assert merged.bst_max_train_batches_per_epoch == 5
+    assert merged.bst_use_popularity_feature is False
+    assert merged.bst_popularity_projection_dim == 12
     cli._validate_bst_config(merged)
 
 
@@ -287,6 +291,8 @@ def test_bst_ranker_training_defaults():
     assert merged.bst_additional_batch_negatives == 64
     assert merged.batch_size == cli.DEFAULTS["batch_size"]
     assert merged.bst_max_train_batches_per_epoch is None
+    assert merged.bst_use_popularity_feature is True
+    assert merged.bst_popularity_projection_dim == 8
     cli._validate_bst_config(merged)
 
 
@@ -309,6 +315,7 @@ def test_bst_ranker_requires_one_transformer_layer():
         ("--bst-additional-batch-negatives", "bst-additional-batch-negatives"),
         ("--batch-size", "batch-size"),
         ("--bst-max-train-batches-per-epoch", "bst-max-train-batches-per-epoch"),
+        ("--bst-popularity-projection-dim", "bst-popularity-projection-dim"),
     ],
 )
 def test_bst_ranker_rejects_non_positive_listwise_training_controls(flag, message):

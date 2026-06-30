@@ -241,6 +241,11 @@ def cmd_compare_rankers(
         model_specs=parsed_specs,
         model_configs=model_configs,
     )
+    use_popularity_feature_for_compare = any(
+        spec["model_type"] == "bst-ranker"
+        and bool(model_configs[spec["name"]].get("bst_use_popularity_feature", False))
+        for spec in parsed_specs
+    )
 
     print(f"Batch Size: {batch_size}")
     print(f"Candidate Chunk Size: {bst_candidate_chunk_size}")
@@ -323,6 +328,7 @@ def cmd_compare_rankers(
             max_history_len=eval_max_history_len,
             embed_dim=embed_dim,
             use_author_embedding_table=True,
+            use_popularity_feature=use_popularity_feature_for_compare,
             logger=logger,
         )
         split_row_counts[split_name] = len(dataset)

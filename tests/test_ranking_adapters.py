@@ -93,6 +93,10 @@ def _make_bst_model(config):
         norm_first=config["norm_first"],
         time_delta_bucket_boundaries_hours=config["time_delta_bucket_boundaries_hours"],
         prediction_hidden_dims=config["prediction_hidden_dims"],
+        use_popularity_feature=bool(config.get("bst_use_popularity_feature", False)),
+        popularity_projection_dim=int(config.get("bst_popularity_projection_dim") or 0),
+        popularity_log_mean=float(config.get("bst_popularity_log_mean") or 0.0),
+        popularity_log_std=float(config.get("bst_popularity_log_std") or 1.0),
     )
 
 
@@ -105,6 +109,8 @@ def _bst_bucketed_batch():
         "history_author_indices": torch.tensor([[2, 3, 0], [4, 0, 0]]),
         "candidate_post_author_idx": torch.tensor([2, 3, 5]),
         "label_matrix": torch.tensor([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]]),
+        "history_prior_cumulative_likes": torch.tensor([[1.0, 5.0, 0.0], [7.0, 0.0, 0.0]]),
+        "candidate_prior_cumulative_likes": torch.tensor([2.0, 20.0, 30.0]),
     }
 
 
@@ -203,6 +209,41 @@ def test_bst_pth_adapter_scores_bucketed_batch_in_candidate_chunks(tmp_path):
     torch.testing.assert_close(scores, expected)
 
 
+def test_bst_pth_adapter_scores_popularity_checkpoint_in_candidate_chunks(tmp_path):
+    torch.manual_seed(17)
+    config = _bst_config()
+    config.update({
+        "bst_use_popularity_feature": True,
+        "bst_popularity_projection_dim": 2,
+        "bst_popularity_log_mean": 1.0,
+        "bst_popularity_log_std": 2.0,
+    })
+    model = _make_bst_model(config)
+    model.eval()
+    checkpoint_path = tmp_path / "bst_ranker_popularity.pth"
+    torch.save({"model_state_dict": model.state_dict(), "config": config}, checkpoint_path)
+    batch = _bst_bucketed_batch()
+
+    adapter = BstPthAdapter(checkpoint_path, candidate_chunk_size=2)
+    adapter.prepare_for_eval("cpu")
+    scores = adapter.score_batch(batch, "cpu").scores
+
+    num_users = batch["history_embeddings"].shape[0]
+    num_candidates = batch["candidate_post_embeddings"].shape[0]
+    with torch.inference_mode():
+        expected = model(
+            history_embeddings=batch["history_embeddings"].repeat_interleave(num_candidates, dim=0),
+            history_mask=batch["history_mask"].repeat_interleave(num_candidates, dim=0),
+            history_time_deltas_hours=batch["history_time_deltas_hours"].repeat_interleave(num_candidates, dim=0),
+            candidate_post_embeddings=batch["candidate_post_embeddings"].repeat(num_users, 1),
+            history_author_indices=batch["history_author_indices"].repeat_interleave(num_candidates, dim=0),
+            candidate_post_author_idx=batch["candidate_post_author_idx"].repeat(num_users),
+            history_prior_cumulative_likes=batch["history_prior_cumulative_likes"].repeat_interleave(num_candidates, dim=0),
+            candidate_prior_cumulative_likes=batch["candidate_prior_cumulative_likes"].repeat(num_users),
+        ).reshape(num_users, num_candidates)
+    torch.testing.assert_close(scores, expected)
+
+
 def test_bst_pth_adapter_rejects_non_positive_candidate_chunk_size(tmp_path):
     with pytest.raises(ValueError, match="candidate_chunk_size"):
         BstPthAdapter(tmp_path / "bst_ranker.pth", candidate_chunk_size=0)
@@ -238,3 +279,23 @@ def test_bst_pth_adapter_requires_bucketed_bst_fields(tmp_path):
             "history_author_indices": torch.ones((1, 3), dtype=torch.long),
             "candidate_post_author_idx": torch.ones(2, dtype=torch.long),
         }, "cpu")
+
+
+def test_bst_pth_adapter_requires_popularity_fields_for_popularity_checkpoint(tmp_path):
+    torch.manual_seed(18)
+    config = _bst_config()
+    config.update({
+        "bst_use_popularity_feature": True,
+        "bst_popularity_projection_dim": 2,
+        "bst_popularity_log_mean": 1.0,
+        "bst_popularity_log_std": 2.0,
+    })
+    model = _make_bst_model(config)
+    checkpoint_path = tmp_path / "bst_ranker_popularity.pth"
+    torch.save({"model_state_dict": model.state_dict(), "config": config}, checkpoint_path)
+    batch = _bst_bucketed_batch()
+    del batch["history_prior_cumulative_likes"]
+    adapter = BstPthAdapter(checkpoint_path, candidate_chunk_size=2)
+
+    with pytest.raises(RuntimeError, match="history_prior_cumulative_likes"):
+        adapter.score_batch(batch, "cpu")

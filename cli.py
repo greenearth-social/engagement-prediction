@@ -121,6 +121,8 @@ DEFAULTS: Dict[str, Any] = {
     "bst_time_delta_bucket_boundaries_hours": [1.0, 3.0, 6.0, 12.0, 24.0, 72.0, 168.0, 720.0, 2160.0],
     "bst_weight_decay": 0.01,
     "bst_max_train_batches_per_epoch": None,
+    "bst_use_popularity_feature": True,
+    "bst_popularity_projection_dim": 8,
     "hidden_dims": [64, 32, 16],
     "dropout_rate_mlp": 0.5,
     "dropout_rate_two_tower": 0.1,
@@ -556,6 +558,7 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
     bst_additional_batch_negatives = int(args.bst_additional_batch_negatives)
     batch_size = int(args.batch_size)
     bst_max_train_batches_per_epoch = args.bst_max_train_batches_per_epoch
+    bst_popularity_projection_dim = int(args.bst_popularity_projection_dim)
     if model_dim <= 0:
         raise ValueError("--bst-model-dim must be positive.")
     if content_projection_dim <= 0:
@@ -576,6 +579,8 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
         raise ValueError("--batch-size must be positive.")
     if bst_max_train_batches_per_epoch is not None and int(bst_max_train_batches_per_epoch) <= 0:
         raise ValueError("--bst-max-train-batches-per-epoch must be positive when provided.")
+    if bst_popularity_projection_dim <= 0:
+        raise ValueError("--bst-popularity-projection-dim must be positive.")
 
 
 def _get_stage_order_for_model_type(train_key: str) -> List[str]:
@@ -914,6 +919,11 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Weight decay for BST ranker model")
     _add_arg_with_default(p_all, "--bst-max-train-batches-per-epoch", type=int, default=argparse.SUPPRESS,
                           help_text="Optional cap on BST train batches per epoch for fast experiments")
+    _add_arg_with_default(p_all, "--bst-use-popularity-feature", action=argparse.BooleanOptionalAction,
+                          default=argparse.SUPPRESS,
+                          help_text="Enable or disable BST prior-cumulative-like popularity features")
+    _add_arg_with_default(p_all, "--bst-popularity-projection-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="BST popularity feature projection dimension")
     # Stage 3 options (shared)
     _add_arg_with_default(p_all, "--epochs", type=int, default=argparse.SUPPRESS,
                           help_text="Training epochs")
