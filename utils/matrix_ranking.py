@@ -50,25 +50,6 @@ class TorchMatrixModelScorer:
         return MatrixBatchScores(scores=scores, loss=loss)
 
 
-def candidate_valid_mask_for_batch(batch: Dict[str, Any], labels: torch.Tensor) -> torch.Tensor:
-    mask_value = batch.get("candidate_valid_mask")
-    if mask_value is None:
-        return torch.ones_like(labels, dtype=torch.bool, device=labels.device)
-    if isinstance(mask_value, torch.Tensor):
-        candidate_valid_mask = mask_value.to(device=labels.device, dtype=torch.bool, non_blocking=True)
-    else:
-        candidate_valid_mask = torch.as_tensor(mask_value, device=labels.device, dtype=torch.bool)
-    if candidate_valid_mask.shape != labels.shape:
-        raise RuntimeError("Expected candidate_valid_mask and label_matrix to have matching [num_users, num_candidates] shapes")
-    return candidate_valid_mask | (labels > 0)
-
-
-def mask_scores_for_valid_candidates(scores: torch.Tensor, candidate_valid_mask: torch.Tensor) -> torch.Tensor:
-    if scores.shape != candidate_valid_mask.shape:
-        raise RuntimeError("Expected scores and candidate_valid_mask to have matching [num_users, num_candidates] shapes")
-    return scores.masked_fill(~candidate_valid_mask, -1.0e9)
-
-
 def empty_rank_metric_sums(metrics_top_ks: list[int]) -> Dict[str, float]:
     metric_sums = {f"dcg@{k}": 0.0 for k in metrics_top_ks}
     metric_sums.update({f"ndcg@{k}": 0.0 for k in metrics_top_ks})
@@ -80,7 +61,6 @@ def empty_rank_metric_sums(metrics_top_ks: list[int]) -> Dict[str, float]:
 def calc_baseline_rank_metrics_for_batch(
     unranked_labels: torch.Tensor,
     metrics_top_ks: list[int],
-    candidate_valid_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[Dict[str, float], int]:
     """Calculate expected rank metrics for a uniformly random candidate order."""
     if unranked_labels.dim() != 2:
@@ -88,54 +68,6 @@ def calc_baseline_rank_metrics_for_batch(
 
     with torch.no_grad():
         labels = unranked_labels.to(dtype=torch.float32)
-        if candidate_valid_mask is not None:
-            candidate_valid_mask = candidate_valid_mask.to(device=labels.device, dtype=torch.bool)
-            if candidate_valid_mask.shape != labels.shape:
-                raise RuntimeError("Expected candidate_valid_mask and unranked_labels to have matching [num_users, num_candidates] shapes")
-            candidate_valid_mask = candidate_valid_mask | (labels > 0)
-            metric_sums = empty_rank_metric_sums(metrics_top_ks)
-            eligible_count = 0
-            max_requested_k = max(metrics_top_ks)
-            for row_idx in range(labels.size(0)):
-                row_labels = labels[row_idx][candidate_valid_mask[row_idx]]
-                total_relevant = row_labels.sum()
-                if total_relevant <= 0:
-                    continue
-                num_candidates = int(row_labels.numel())
-                if num_candidates <= 0:
-                    continue
-                eligible_count += 1
-                max_k = min(max_requested_k, num_candidates)
-                discounts = 1.0 / torch.log2(
-                    torch.arange(max_k, device=labels.device, dtype=torch.float32) + 2.0
-                )
-                cumulative_discounts = discounts.cumsum(dim=0)
-                relevant_probability = total_relevant / float(num_candidates)
-                positions = torch.arange(1, num_candidates + 1, device=labels.device, dtype=torch.float32)
-                if num_candidates == 1:
-                    expected_average_precision = torch.ones_like(total_relevant)
-                else:
-                    harmonic_sum = (1.0 / positions).sum()
-                    tail_sum = ((positions - 1.0) / positions).sum()
-                    expected_average_precision = (
-                        harmonic_sum + tail_sum * ((total_relevant - 1.0) / float(num_candidates - 1))
-                    ) / float(num_candidates)
-                metric_sums["mean_average_precision"] += float(expected_average_precision.item())
-
-                for k in metrics_top_ks:
-                    k_eff = min(k, num_candidates)
-                    discount_sum = cumulative_discounts[k_eff - 1]
-                    dcg = relevant_probability * discount_sum
-                    ideal_count = int(min(float(total_relevant.item()), float(k_eff)))
-                    idcg = cumulative_discounts[ideal_count - 1].clamp(min=1.0e-12)
-                    recall = float(k_eff) / float(num_candidates)
-
-                    metric_sums[f"dcg@{k}"] += float(dcg.item())
-                    metric_sums[f"ndcg@{k}"] += float((dcg / idcg).item())
-                    metric_sums[f"recall@{k}"] += recall
-
-            return metric_sums, eligible_count
-
         total_relevant = labels.sum(dim=1)
         eligible = total_relevant > 0
         eligible_count = int(eligible.sum().item())
@@ -180,7 +112,6 @@ def calc_baseline_rank_metrics_for_batch(
 def rank_metric_sums_for_batch(
     ranked_labels: torch.Tensor,
     metrics_top_ks: list[int],
-    ranked_valid_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[Dict[str, float], int]:
     """Return summed per-user rank metrics for one [users, ranked_candidates] batch."""
     if ranked_labels.dim() != 2:
@@ -188,50 +119,6 @@ def rank_metric_sums_for_batch(
 
     with torch.no_grad():
         ranked_labels = ranked_labels.to(dtype=torch.float32)
-        if ranked_valid_mask is not None:
-            ranked_valid_mask = ranked_valid_mask.to(device=ranked_labels.device, dtype=torch.bool)
-            if ranked_valid_mask.shape != ranked_labels.shape:
-                raise RuntimeError("Expected ranked_valid_mask and ranked_labels to have matching [num_users, num_candidates] shapes")
-            ranked_valid_mask = ranked_valid_mask | (ranked_labels > 0)
-            metric_sums = empty_rank_metric_sums(metrics_top_ks)
-            eligible_count = 0
-            max_requested_k = max(metrics_top_ks)
-            for row_idx in range(ranked_labels.size(0)):
-                row_labels = ranked_labels[row_idx][ranked_valid_mask[row_idx]]
-                total_relevant = row_labels.sum()
-                if total_relevant <= 0:
-                    continue
-                eligible_count += 1
-                positions = torch.arange(
-                    1,
-                    row_labels.numel() + 1,
-                    device=ranked_labels.device,
-                    dtype=torch.float32,
-                )
-                cumulative_relevant = row_labels.cumsum(dim=0)
-                precision_at_rank = cumulative_relevant / positions
-                average_precision = (precision_at_rank * row_labels).sum() / total_relevant
-                metric_sums["mean_average_precision"] += float(average_precision.item())
-
-                max_k = min(max_requested_k, row_labels.numel())
-                discounts = 1.0 / torch.log2(
-                    torch.arange(max_k, device=ranked_labels.device, dtype=torch.float32) + 2.0
-                )
-                cumulative_discounts = discounts.cumsum(dim=0)
-                for k in metrics_top_ks:
-                    k_eff = min(k, row_labels.numel())
-                    top_labels = row_labels[:k_eff]
-                    dcg = (top_labels * discounts[:k_eff]).sum()
-                    ideal_count = int(min(float(total_relevant.item()), float(k_eff)))
-                    idcg = cumulative_discounts[ideal_count - 1].clamp(min=1.0e-12)
-                    recall = top_labels.sum() / total_relevant
-
-                    metric_sums[f"dcg@{k}"] += float(dcg.item())
-                    metric_sums[f"ndcg@{k}"] += float((dcg / idcg).item())
-                    metric_sums[f"recall@{k}"] += float(recall.item())
-
-            return metric_sums, eligible_count
-
         total_relevant = ranked_labels.sum(dim=1)
         eligible = total_relevant > 0
         eligible_count = int(eligible.sum().item())
@@ -291,7 +178,6 @@ def ranking_rows_for_batch(
     scores: torch.Tensor,
     labels: torch.Tensor,
     metrics_top_ks: list[int],
-    candidate_valid_mask: Optional[torch.Tensor] = None,
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     user_ids = batch["user_id"]
@@ -299,18 +185,10 @@ def ranking_rows_for_batch(
     history_mask = batch["history_mask"].detach().cpu()
     labels_cpu = labels.detach().cpu()
     scores_cpu = scores.detach().cpu()
-    if candidate_valid_mask is None:
-        valid_mask_cpu = torch.ones_like(labels_cpu, dtype=torch.bool)
-    else:
-        valid_mask_cpu = candidate_valid_mask.detach().cpu().to(dtype=torch.bool)
-        if valid_mask_cpu.shape != labels_cpu.shape:
-            raise RuntimeError("Expected candidate_valid_mask and labels to have matching [num_users, num_candidates] shapes")
-        valid_mask_cpu = valid_mask_cpu | (labels_cpu > 0)
 
     for user_idx, user_id in enumerate(user_ids):
-        row_valid_mask = valid_mask_cpu[user_idx]
-        row_labels = labels_cpu[user_idx][row_valid_mask].to(dtype=torch.float32)
-        row_scores = scores_cpu[user_idx][row_valid_mask].to(dtype=torch.float32)
+        row_labels = labels_cpu[user_idx].to(dtype=torch.float32)
+        row_scores = scores_cpu[user_idx].to(dtype=torch.float32)
         ranked_indices = torch.argsort(row_scores, descending=True)
         ranked_labels = row_labels[ranked_indices]
         positive_count = int(row_labels.sum().item())
@@ -398,13 +276,11 @@ def run_matrix_epoch(
 
             loss, scores = model.compute_loss_and_preds(batch, device, embed_dim)
             labels = batch["label_matrix"].to(device, dtype=torch.float32, non_blocking=True)
-            candidate_valid_mask = candidate_valid_mask_for_batch(batch, labels)
 
             if calc_baseline_metrics:
                 baseline_batch_metric_sums, baseline_batch_metric_user_count = calc_baseline_rank_metrics_for_batch(
                     labels,
                     metrics_top_ks,
-                    candidate_valid_mask,
                 )
                 baseline_metric_user_count += baseline_batch_metric_user_count
                 for key, value in baseline_batch_metric_sums.items():
@@ -412,12 +288,7 @@ def run_matrix_epoch(
 
             ranked_indices = torch.argsort(scores.detach(), dim=1, descending=True)
             ranked_labels = torch.gather(labels, dim=1, index=ranked_indices)
-            ranked_valid_mask = torch.gather(candidate_valid_mask, dim=1, index=ranked_indices)
-            batch_metric_sums, batch_metric_user_count = rank_metric_sums_for_batch(
-                ranked_labels,
-                metrics_top_ks,
-                ranked_valid_mask,
-            )
+            batch_metric_sums, batch_metric_user_count = rank_metric_sums_for_batch(ranked_labels, metrics_top_ks)
 
             if train and optimizer is not None:
                 loss.backward()
@@ -472,16 +343,10 @@ def evaluate_matrix_scorer(
             labels = batch["label_matrix"].to(device, dtype=torch.float32, non_blocking=True)
             if scores.shape != labels.shape:
                 raise RuntimeError("Expected scores and label_matrix to have matching [num_users, num_candidates] shapes")
-            candidate_valid_mask = candidate_valid_mask_for_batch(batch, labels)
 
             ranked_indices = torch.argsort(scores, dim=1, descending=True)
             ranked_labels = torch.gather(labels, dim=1, index=ranked_indices)
-            ranked_valid_mask = torch.gather(candidate_valid_mask, dim=1, index=ranked_indices)
-            batch_metric_sums, batch_metric_user_count = rank_metric_sums_for_batch(
-                ranked_labels,
-                metrics_top_ks,
-                ranked_valid_mask,
-            )
+            batch_metric_sums, batch_metric_user_count = rank_metric_sums_for_batch(ranked_labels, metrics_top_ks)
 
             if batch_scores.loss is not None:
                 loss_sum += batch_scores.loss.detach().to(device)
@@ -491,10 +356,10 @@ def evaluate_matrix_scorer(
                 metric_sums[key] += value
 
             if collect_ranking_rows:
-                ranking_rows.extend(ranking_rows_for_batch(batch, scores, labels, metrics_top_ks, candidate_valid_mask))
+                ranking_rows.extend(ranking_rows_for_batch(batch, scores, labels, metrics_top_ks))
 
-            flat_labels = labels[candidate_valid_mask].detach().cpu().numpy().astype(np.int8, copy=False)
-            flat_scores = scores[candidate_valid_mask].detach().cpu().numpy().astype(np.float64, copy=False)
+            flat_labels = labels.detach().flatten().cpu().numpy().astype(np.int8, copy=False)
+            flat_scores = scores.detach().flatten().cpu().numpy().astype(np.float64, copy=False)
             classification_pair_count += int(flat_labels.size)
             classification_positive_count += int(flat_labels.sum())
             if max_classification_metric_pairs is None:

@@ -45,10 +45,8 @@ from utils.dataloaders import (
 )
 from utils.author_features import PostAuthorFeatureEncoder
 from utils.matrix_ranking import (
-    candidate_valid_mask_for_batch,
     evaluate_matrix_model,
     log_final_classification_metrics,
-    mask_scores_for_valid_candidates,
     run_matrix_epoch,
     stage_info_metric_lines,
     write_ranking_rows,
@@ -287,10 +285,8 @@ class MLPModel(nn.Module):
         if torch.any(positive_counts <= 0):
             raise RuntimeError("Each user row in label_matrix must contain at least one positive candidate")
 
-        candidate_valid_mask = candidate_valid_mask_for_batch(batch, label_matrix)
-        scores_for_loss = mask_scores_for_valid_candidates(scores, candidate_valid_mask)
         targets = label_matrix / positive_counts
-        loss_per_user = -(targets * F.log_softmax(scores_for_loss, dim=1)).sum(dim=1)
+        loss_per_user = -(targets * F.log_softmax(scores, dim=1)).sum(dim=1)
         loss = loss_per_user.mean()
         return loss, scores
 

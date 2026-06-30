@@ -49,19 +49,6 @@ def test_rank_metric_sums_for_batch_matches_macro_rank_metrics():
     assert metrics["mean_average_precision"] == pytest.approx(0.75)
 
 
-def test_rank_metric_sums_for_batch_ignores_invalid_ranked_candidates():
-    ranked_labels = torch.tensor([[0.0, 1.0, 0.0]])
-    ranked_valid_mask = torch.tensor([[False, True, True]])
-
-    metric_sums, user_count = _rank_metric_sums_for_batch(ranked_labels, [1, 2], ranked_valid_mask)
-    metrics = _finalize_rank_metrics(metric_sums, user_count)
-
-    assert user_count == 1
-    assert metrics["ndcg@1"] == pytest.approx(1.0)
-    assert metrics["recall@1"] == pytest.approx(1.0)
-    assert metrics["mean_average_precision"] == pytest.approx(1.0)
-
-
 def test_baseline_rank_metrics_use_expected_random_order_value():
     labels = torch.tensor([
         [1.0, 0.0, 1.0, 0.0],
@@ -83,24 +70,6 @@ def test_baseline_rank_metrics_use_expected_random_order_value():
     assert metrics["dcg@3"] == pytest.approx((0.5 * discount_sum_3 + 0.25 * discount_sum_3) / 2.0)
     assert metrics["ndcg@3"] == pytest.approx((row_1_ndcg_3 + row_2_ndcg_3) / 2.0)
     assert metrics["recall@3"] == pytest.approx(0.75)
-
-
-def test_baseline_rank_metrics_use_valid_candidate_counts():
-    labels = torch.tensor([[1.0, 0.0, 0.0]])
-    candidate_valid_mask = torch.tensor([[True, False, True]])
-
-    metric_sums, user_count = _calc_baseline_rank_metrics_for_batch(labels, [1, 2], candidate_valid_mask)
-    metrics = _finalize_rank_metrics(metric_sums, user_count)
-
-    discount_2 = 1.0 / math.log2(3.0)
-    assert user_count == 1
-    assert metrics["dcg@1"] == pytest.approx(0.5)
-    assert metrics["ndcg@1"] == pytest.approx(0.5)
-    assert metrics["recall@1"] == pytest.approx(0.5)
-    assert metrics["dcg@2"] == pytest.approx(0.5 * (1.0 + discount_2))
-    assert metrics["ndcg@2"] == pytest.approx(0.5 * (1.0 + discount_2))
-    assert metrics["recall@2"] == pytest.approx(1.0)
-    assert metrics["mean_average_precision"] == pytest.approx(0.75)
 
 
 class DummyTwoTowerForEpoch(nn.Module):
@@ -191,38 +160,6 @@ def test_evaluate_matrix_scorer_reports_metrics_without_loss():
     assert metrics["mean_average_precision"] == pytest.approx(1.0)
     assert metrics["classification_metric_pair_count"] == 6
     assert len(result["ranking_rows"]) == 2
-
-
-def test_evaluate_matrix_scorer_filters_invalid_pairs_from_metrics_and_rows():
-    labels = torch.tensor([[1.0, 0.0, 0.0]])
-    scores = torch.tensor([[0.2, 100.0, 0.1]])
-    scorer = DummyMatrixScorer([scores])
-    dataloader = [{
-        "label_matrix": labels,
-        "candidate_valid_mask": torch.tensor([[True, False, True]]),
-        "user_id": ["u1"],
-        "bucket": "2026-05-01T00:00:00Z",
-        "history_mask": torch.tensor([[True, False, False]]),
-    }]
-
-    result = _evaluate_matrix_scorer(
-        scorer=scorer,
-        data_loader=dataloader,
-        device="cpu",
-        metrics_top_ks=[1, 2],
-        max_classification_metric_pairs=None,
-        collect_ranking_rows=True,
-    )
-
-    metrics = result["metrics"]
-    assert metrics["ndcg@1"] == pytest.approx(1.0)
-    assert metrics["recall@1"] == pytest.approx(1.0)
-    assert metrics["classification_metric_pair_count"] == 2
-    assert metrics["classification_metric_positive_count"] == 1
-    assert metrics["auc_roc"] == pytest.approx(1.0)
-    assert metrics["classification_average_precision"] == pytest.approx(1.0)
-    assert result["ranking_rows"][0]["candidate_count"] == 2
-    assert result["ranking_rows"][0]["positive_rank_min"] == pytest.approx(1.0)
 
 
 def test_evaluate_matrix_scorer_reports_mean_average_precision_separately_from_classification_ap():
@@ -1151,46 +1088,6 @@ def test_two_tower_multi_positive_loss_averages_per_user():
 
     targets = label_matrix / label_matrix.sum(dim=1, keepdim=True)
     expected = -(targets * F.log_softmax(fixed_scores, dim=1)).sum(dim=1).mean()
-    assert torch.allclose(scores, fixed_scores)
-    assert torch.allclose(loss, expected)
-
-
-def test_two_tower_loss_ignores_invalid_false_negative_candidates():
-    model = TwoTowerModel(
-        post_embedding_dim=3,
-        shared_dim=2,
-        user_hidden_dim=4,
-        post_hidden_dim=4,
-        num_attention_heads=1,
-        num_attention_layers=1,
-        max_history_len=1,
-        dropout_rate=0.0,
-        similarity_temperature=1.0,
-        user_encoder_type="cross_attention",
-        use_post_encoder=True,
-        l2_normalize_embeddings=False,
-    )
-
-    fixed_scores = torch.tensor([[0.0, 10.0, 1.0]])
-    label_matrix = torch.tensor([[1.0, 0.0, 0.0]])
-    candidate_valid_mask = torch.tensor([[True, False, True]])
-
-    def fake_forward(history_embeddings, history_mask, post_embeddings, history_author_indices=None, target_author_indices=None):
-        return fixed_scores
-
-    model.forward = fake_forward
-    batch = {
-        "history_embeddings": torch.randn(1, 1, 3),
-        "history_mask": torch.ones(1, 1, dtype=torch.bool),
-        "candidate_post_embeddings": torch.randn(3, 3),
-        "label_matrix": label_matrix,
-        "candidate_valid_mask": candidate_valid_mask,
-    }
-
-    loss, scores = model.compute_loss_and_preds(batch, device="cpu", embed_dim=3)
-
-    expected_scores = fixed_scores.masked_fill(~candidate_valid_mask, -1.0e9)
-    expected = -F.log_softmax(expected_scores, dim=1)[0, 0]
     assert torch.allclose(scores, fixed_scores)
     assert torch.allclose(loss, expected)
 

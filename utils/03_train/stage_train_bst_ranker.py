@@ -37,10 +37,8 @@ from utils.helpers import (
 )
 from utils.matrix_ranking import (
     MatrixBatchScores,
-    candidate_valid_mask_for_batch,
     empty_rank_metric_sums,
     evaluate_matrix_scorer,
-    mask_scores_for_valid_candidates,
     rank_metric_sums_for_batch,
     stage_info_metric_lines,
 )
@@ -500,10 +498,8 @@ def _compute_bst_listwise_loss_and_preds(
     if torch.any(positive_counts <= 0):
         raise RuntimeError("Each user row in label_matrix must contain at least one positive candidate")
 
-    candidate_valid_mask = candidate_valid_mask_for_batch(batch, labels)
-    scores_for_loss = mask_scores_for_valid_candidates(scores, candidate_valid_mask)
     targets = labels / positive_counts
-    loss_per_user = -(targets * F.log_softmax(scores_for_loss, dim=1)).sum(dim=1)
+    loss_per_user = -(targets * F.log_softmax(scores, dim=1)).sum(dim=1)
     return loss_per_user.mean(), scores, labels
 
 
@@ -540,14 +536,11 @@ def run_bst_listwise_epoch(
                 optimizer.zero_grad()
 
             loss, scores, labels = _compute_bst_listwise_loss_and_preds(model, batch, device)
-            candidate_valid_mask = candidate_valid_mask_for_batch(batch, labels)
             ranked_indices = torch.argsort(scores.detach(), dim=1, descending=True)
             ranked_labels = torch.gather(labels, dim=1, index=ranked_indices)
-            ranked_valid_mask = torch.gather(candidate_valid_mask, dim=1, index=ranked_indices)
             batch_metric_sums, batch_metric_user_count = rank_metric_sums_for_batch(
                 ranked_labels,
                 metrics_top_ks,
-                ranked_valid_mask,
             )
 
             if train and optimizer is not None:
