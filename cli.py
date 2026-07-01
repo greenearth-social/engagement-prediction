@@ -78,6 +78,9 @@ DEFAULTS: Dict[str, Any] = {
     "skip_embeddings": False,
     # Stage 1 split labels / Stage 2 history
     "max_prior_likes": None,  # Stage 2: cap on prior likes per target for user history (None = no cap)
+    "generate_post_liker_history": False,  # Stage 2: optionally build post-hour recent liker artifacts
+    "min_post_liker_user_support": 2,  # Stage 2: minimum train likes required for a post-liker user_idx row
+    "max_recent_likers_per_post": 100,  # Stage 2: cap stored recent indexed likers per post-hour
     "train_start": None,
     "val_start": None,
     "holdout_start": None,
@@ -832,6 +835,13 @@ def build_parser() -> argparse.ArgumentParser:
     # Stage 1 split / Stage 2 options
     _add_arg_with_default(p_all, "--max-prior-likes", type=int, default=argparse.SUPPRESS,
                           help_text="Cap on prior likes per target in Stage 2 user history (None = no cap, keeps all prior likes)")
+    _add_arg_with_default(p_all, "--generate-post-liker-history", action=argparse.BooleanOptionalAction,
+                          default=argparse.SUPPRESS,
+                          help_text="Generate Stage 2 post-hour recent liker artifacts")
+    _add_arg_with_default(p_all, "--min-post-liker-user-support", type=int, default=argparse.SUPPRESS,
+                          help_text="Minimum train likes required for a user to receive a post-liker user_idx row")
+    _add_arg_with_default(p_all, "--max-recent-likers-per-post", type=int, default=argparse.SUPPRESS,
+                          help_text="Cap on stored recent indexed likers per post-hour in Stage 2")
     _add_arg_with_default(p_all, "--train-start", type=str, default=argparse.SUPPRESS,
                           help_text="ISO date string for start of training dataset window")
     _add_arg_with_default(p_all, "--val-start", type=str, default=argparse.SUPPRESS,
