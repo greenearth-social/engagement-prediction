@@ -24,10 +24,10 @@ class BSTPostAuthorFeatureEncoder(nn.Module):
         author_projection_dim: int,
         model_dim: int,
         author_unknown_dropout_rate: float,
-        use_popularity_feature: bool = False,
-        popularity_projection_dim: int = 0,
-        popularity_log_mean: float = 0.0,
-        popularity_log_std: float = 1.0,
+        use_popularity_feature: bool,
+        popularity_projection_dim: int,
+        popularity_log_mean: float,
+        popularity_log_std: float,
     ):
         super().__init__()
         if post_embedding_dim <= 0:
