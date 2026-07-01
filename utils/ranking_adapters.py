@@ -159,6 +159,7 @@ class BstPthAdapter:
                 raise ValueError(f"Expected bst-ranker checkpoint, got model_type={config.get('model_type')!r}")
             if not bool(config.get("use_author_embedding_table", False)):
                 raise ValueError("BstPthAdapter requires a BST checkpoint trained with author embeddings")
+            use_popularity_feature = bool(config.get("bst_use_popularity_feature", False))
 
             stage_train_bst_ranker = importlib.import_module("utils.03_train.stage_train_bst_ranker")
             model = stage_train_bst_ranker.BSTRanker(
@@ -177,6 +178,10 @@ class BstPthAdapter:
                 norm_first=bool(_require_config(config, "norm_first")),
                 time_delta_bucket_boundaries_hours=list(_require_config(config, "time_delta_bucket_boundaries_hours")),
                 prediction_hidden_dims=list(_require_config(config, "prediction_hidden_dims")),
+                use_popularity_feature=use_popularity_feature,
+                popularity_projection_dim=int(config.get("bst_popularity_projection_dim") or 0),
+                popularity_log_mean=float(config.get("bst_popularity_log_mean") or 0.0),
+                popularity_log_std=float(config.get("bst_popularity_log_std") or 1.0),
             )
             model.load_state_dict(checkpoint["model_state_dict"])
             self.model = model
@@ -201,6 +206,11 @@ class BstPthAdapter:
             "history_author_indices",
             "candidate_post_author_idx",
         )
+        if self.model.use_popularity_feature:
+            required_fields = required_fields + (
+                "history_prior_cumulative_likes",
+                "candidate_prior_cumulative_likes",
+            )
         missing = [field for field in required_fields if field not in batch]
         if missing:
             raise RuntimeError(f"BstPthAdapter batch is missing required fields: {', '.join(missing)}")
@@ -211,6 +221,11 @@ class BstPthAdapter:
         candidate_post_embeddings = batch["candidate_post_embeddings"].to(device, non_blocking=True)
         history_author_indices = batch["history_author_indices"].to(device, dtype=torch.long, non_blocking=True)
         candidate_post_author_idx = batch["candidate_post_author_idx"].to(device, dtype=torch.long, non_blocking=True)
+        history_prior_cumulative_likes = None
+        candidate_prior_cumulative_likes = None
+        if self.model.use_popularity_feature:
+            history_prior_cumulative_likes = batch["history_prior_cumulative_likes"].to(device, dtype=torch.float32, non_blocking=True)
+            candidate_prior_cumulative_likes = batch["candidate_prior_cumulative_likes"].to(device, dtype=torch.float32, non_blocking=True)
 
         num_candidates = int(candidate_post_embeddings.size(0))
         score_chunks = []
@@ -218,6 +233,11 @@ class BstPthAdapter:
             end = min(start + self.candidate_chunk_size, num_candidates)
             candidate_embeddings_chunk = candidate_post_embeddings[start:end]
             candidate_author_chunk = candidate_post_author_idx[start:end]
+            candidate_popularity_chunk = (
+                candidate_prior_cumulative_likes[start:end]
+                if candidate_prior_cumulative_likes is not None
+                else None
+            )
             logits = self.model.score_candidate_matrix_one_layer(
                 history_embeddings=history_embeddings,
                 history_mask=history_mask,
@@ -225,6 +245,8 @@ class BstPthAdapter:
                 candidate_post_embeddings=candidate_embeddings_chunk,
                 history_author_indices=history_author_indices,
                 candidate_post_author_idx=candidate_author_chunk,
+                history_prior_cumulative_likes=history_prior_cumulative_likes,
+                candidate_prior_cumulative_likes=candidate_popularity_chunk,
             )
             score_chunks.append(logits)
 

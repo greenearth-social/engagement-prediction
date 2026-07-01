@@ -239,11 +239,13 @@ def test_compare_rankers_evaluates_models_and_writes_metrics(tmp_path, monkeypat
             max_history_len,
             embed_dim,
             use_author_embedding_table=False,
+            use_popularity_feature=False,
             logger=None,
         ):
             created_datasets.append({
                 "split": split,
                 "use_author_embedding_table": use_author_embedding_table,
+                "use_popularity_feature": use_popularity_feature,
                 "max_history_len": max_history_len,
                 "embed_dim": embed_dim,
             })
@@ -321,8 +323,8 @@ def test_compare_rankers_evaluates_models_and_writes_metrics(tmp_path, monkeypat
     assert cli.cmd_compare_rankers(raw) == 0
 
     assert created_datasets == [
-        {"split": "val", "use_author_embedding_table": True, "max_history_len": 5, "embed_dim": 2},
-        {"split": "empty", "use_author_embedding_table": True, "max_history_len": 5, "embed_dim": 2},
+        {"split": "val", "use_author_embedding_table": True, "use_popularity_feature": False, "max_history_len": 5, "embed_dim": 2},
+        {"split": "empty", "use_author_embedding_table": True, "use_popularity_feature": False, "max_history_len": 5, "embed_dim": 2},
     ]
     assert len(eval_calls) == 2
     assert all(call["device"] == "cpu" for call in eval_calls)

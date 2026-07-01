@@ -24,6 +24,8 @@ def _make_model(
     num_transformer_layers: int = 1,
     norm_first: bool = False,
     prediction_hidden_dims=(8, 4),
+    use_popularity_feature: bool = False,
+    popularity_projection_dim: int | None = None,
 ) -> BSTRanker:
     torch.manual_seed(123)
     return BSTRanker(
@@ -42,6 +44,10 @@ def _make_model(
         norm_first=norm_first,
         time_delta_bucket_boundaries_hours=DEFAULT_TIME_DELTA_BUCKET_BOUNDARIES_HOURS,
         prediction_hidden_dims=prediction_hidden_dims,
+        use_popularity_feature=use_popularity_feature,
+        popularity_projection_dim=(2 if popularity_projection_dim is None else popularity_projection_dim) if use_popularity_feature else 0,
+        popularity_log_mean=1.0,
+        popularity_log_std=2.0,
     )
 
 
@@ -86,17 +92,36 @@ def _batch() -> dict[str, torch.Tensor]:
     }
 
 
+def _batch_with_popularity() -> dict[str, torch.Tensor]:
+    batch = _batch()
+    return {
+        **batch,
+        "history_prior_cumulative_likes": torch.tensor(
+            [
+                [1.0, 5.0, 999.0],
+                [10.0, 888.0, 777.0],
+            ],
+            dtype=torch.float32,
+        ),
+        "candidate_prior_cumulative_likes": torch.tensor([2.0, 20.0], dtype=torch.float32),
+    }
+
+
 def _expected_matrix_scores(model: BSTRanker, batch: dict[str, torch.Tensor]) -> torch.Tensor:
     num_users = batch["history_embeddings"].shape[0]
     num_candidates = batch["candidate_post_embeddings"].shape[0]
-    return model(
-        history_embeddings=batch["history_embeddings"].repeat_interleave(num_candidates, dim=0),
-        history_mask=batch["history_mask"].repeat_interleave(num_candidates, dim=0),
-        history_time_deltas_hours=batch["history_time_deltas_hours"].repeat_interleave(num_candidates, dim=0),
-        candidate_post_embeddings=batch["candidate_post_embeddings"].repeat(num_users, 1),
-        history_author_indices=batch["history_author_indices"].repeat_interleave(num_candidates, dim=0),
-        candidate_post_author_idx=batch["candidate_post_author_idx"].repeat(num_users),
-    ).reshape(num_users, num_candidates)
+    kwargs = {
+        "history_embeddings": batch["history_embeddings"].repeat_interleave(num_candidates, dim=0),
+        "history_mask": batch["history_mask"].repeat_interleave(num_candidates, dim=0),
+        "history_time_deltas_hours": batch["history_time_deltas_hours"].repeat_interleave(num_candidates, dim=0),
+        "candidate_post_embeddings": batch["candidate_post_embeddings"].repeat(num_users, 1),
+        "history_author_indices": batch["history_author_indices"].repeat_interleave(num_candidates, dim=0),
+        "candidate_post_author_idx": batch["candidate_post_author_idx"].repeat(num_users),
+    }
+    if "history_prior_cumulative_likes" in batch:
+        kwargs["history_prior_cumulative_likes"] = batch["history_prior_cumulative_likes"].repeat_interleave(num_candidates, dim=0)
+        kwargs["candidate_prior_cumulative_likes"] = batch["candidate_prior_cumulative_likes"].repeat(num_users)
+    return model(**kwargs).reshape(num_users, num_candidates)
 
 
 def _listwise_batch() -> dict[str, torch.Tensor]:
@@ -174,6 +199,41 @@ def test_bst_ranker_score_candidate_matrix_one_layer_supports_training_gradients
     assert grad_sum > 0
 
 
+@pytest.mark.parametrize("norm_first", [False, True])
+def test_bst_ranker_popularity_matrix_scorer_matches_repeated_path(norm_first):
+    model = _make_model(norm_first=norm_first, use_popularity_feature=True)
+    model.eval()
+    batch = _batch_with_popularity()
+
+    with torch.inference_mode():
+        expected = _expected_matrix_scores(model, batch)
+        scores = model.score_candidate_matrix_one_layer(**batch)
+
+    assert scores.shape == (2, 2)
+    torch.testing.assert_close(scores, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_bst_ranker_popularity_changes_scores_for_valid_tokens():
+    model = _make_model(use_popularity_feature=True)
+    model.eval()
+    batch = _batch_with_popularity()
+
+    output = model.score_candidate_matrix_one_layer(**batch)
+    changed_batch = {key: value.clone() for key, value in batch.items()}
+    changed_batch["candidate_prior_cumulative_likes"] = torch.tensor([2000.0, 20.0], dtype=torch.float32)
+    changed_output = model.score_candidate_matrix_one_layer(**changed_batch)
+
+    assert not torch.allclose(changed_output, output)
+
+
+def test_bst_ranker_popularity_requires_tensors_when_enabled():
+    model = _make_model(use_popularity_feature=True)
+    batch = _batch()
+
+    with pytest.raises(ValueError, match="history_prior_cumulative_likes"):
+        model.score_candidate_matrix_one_layer(**batch)
+
+
 def test_bst_ranker_score_candidate_matrix_one_layer_rejects_multi_layer_model():
     model = _make_model(num_transformer_layers=2)
     model.eval()
@@ -201,6 +261,10 @@ def test_bst_ranker_rejects_attention_head_mismatch():
             norm_first=False,
             time_delta_bucket_boundaries_hours=DEFAULT_TIME_DELTA_BUCKET_BOUNDARIES_HOURS,
             prediction_hidden_dims=(7,),
+            use_popularity_feature=False,
+            popularity_projection_dim=0,
+            popularity_log_mean=0.0,
+            popularity_log_std=1.0,
         )
 
 
@@ -250,6 +314,21 @@ def test_bst_ranker_score_candidate_matrix_one_layer_masks_padded_history_positi
     changed_batch["history_time_deltas_hours"][1, 1:] = torch.tensor([200000.0, 300000.0])
     changed_batch["history_author_indices"][0, 2] = 2
     changed_batch["history_author_indices"][1, 1:] = torch.tensor([3, 4])
+
+    changed_output = model.score_candidate_matrix_one_layer(**changed_batch)
+
+    torch.testing.assert_close(changed_output, output, atol=1e-6, rtol=1e-6)
+
+
+def test_bst_ranker_score_candidate_matrix_one_layer_masks_padded_history_popularity():
+    model = _make_model(use_popularity_feature=True)
+    model.eval()
+    batch = _batch_with_popularity()
+
+    output = model.score_candidate_matrix_one_layer(**batch)
+    changed_batch = {key: value.clone() for key, value in batch.items()}
+    changed_batch["history_prior_cumulative_likes"][0, 2] = 100000.0
+    changed_batch["history_prior_cumulative_likes"][1, 1:] = torch.tensor([200000.0, 300000.0])
 
     changed_output = model.score_candidate_matrix_one_layer(**changed_batch)
 
@@ -311,6 +390,18 @@ def test_bst_ranker_gradients_flow_through_post_time_transformer_and_head_parame
     assert prediction_head_grad_sum > 0
 
 
+def test_bst_ranker_gradients_flow_through_popularity_projection():
+    model = _make_model(use_popularity_feature=True)
+    batch = _batch_with_popularity()
+
+    output = model(**batch)
+    loss = output.square().sum()
+    loss.backward()
+
+    assert model.post_feature_encoder.popularity_projection.weight.grad is not None
+    assert model.post_feature_encoder.popularity_projection.weight.grad.abs().sum() > 0
+
+
 def test_bst_ranker_supports_direct_linear_prediction_head():
     model = _make_model(prediction_hidden_dims=())
     model.eval()
@@ -363,9 +454,47 @@ def test_bst_ranker_torchscript_exports_matrix_scorer():
     torch.testing.assert_close(scripted_scores, expected, atol=1e-5, rtol=1e-5)
 
 
+def test_bst_ranker_torchscript_supports_popularity_features():
+    model = _make_model(use_popularity_feature=True).eval()
+    batch = _batch_with_popularity()
+
+    with torch.no_grad():
+        eager_output = model(**batch)
+        eager_scores = model.score_candidate_matrix_one_layer(**batch)
+        scripted_model = torch.jit.script(model)
+        scripted_output = scripted_model(
+            batch["history_embeddings"],
+            batch["history_mask"],
+            batch["history_time_deltas_hours"],
+            batch["candidate_post_embeddings"],
+            batch["history_author_indices"],
+            batch["candidate_post_author_idx"],
+            batch["history_prior_cumulative_likes"],
+            batch["candidate_prior_cumulative_likes"],
+        )
+        scripted_scores = scripted_model.score_candidate_matrix(
+            batch["history_embeddings"],
+            batch["history_mask"],
+            batch["history_time_deltas_hours"],
+            batch["candidate_post_embeddings"],
+            batch["history_author_indices"],
+            batch["candidate_post_author_idx"],
+            batch["history_prior_cumulative_likes"],
+            batch["candidate_prior_cumulative_likes"],
+        )
+
+    torch.testing.assert_close(scripted_output, eager_output, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(scripted_scores, eager_scores, atol=1e-5, rtol=1e-5)
+
+
 def test_bst_ranker_rejects_invalid_prediction_hidden_dims():
     with pytest.raises(ValueError, match="hidden_dims"):
         _make_model(prediction_hidden_dims=[0])
+
+
+def test_bst_ranker_rejects_invalid_popularity_projection_dim():
+    with pytest.raises(ValueError, match="popularity_projection_dim"):
+        _make_model(use_popularity_feature=True, popularity_projection_dim=0)
 
 
 def test_bst_ranker_rejects_invalid_prediction_head_output_shape():

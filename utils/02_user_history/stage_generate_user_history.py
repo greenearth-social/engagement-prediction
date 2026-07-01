@@ -10,17 +10,19 @@ during training and stable author-history features.
 
 Inputs:
 - likes_core_*.parquet from 01_get_data: Contains
-  {did, subject_uri, record_created_at, like_hour_bucket, emb_idx, author_idx}
+  {did, subject_uri, record_created_at, like_hour_bucket, emb_idx, prior_cumulative_likes, author_idx}
 - author_idx_*.parquet from 01_get_data, when available: Author index mapping with
   {author_did, author_train_count, author_idx}
 
 Outputs under <run_dir>/02_user_history/<timestamp>/:
 - history_posts_<timestamp>.parquet:
-  {did, like_hour_bucket, prior_emb_indices, prior_like_age_hours_at_bucket_start}
+  {did, like_hour_bucket, prior_emb_indices, prior_like_age_hours_at_bucket_start, prior_cumulative_likes}
   and, when author_idx is available, {prior_author_indices}
   where prior_emb_indices is a List[UInt32] of embedding indices sorted by recency (most recent first),
   prior_like_age_hours_at_bucket_start is a List[Float32] aligned element-wise with
   prior_emb_indices and measured from the target like_hour_bucket,
+  prior_cumulative_likes is a List[UInt64] aligned element-wise with
+  prior_emb_indices,
   prior_author_indices is a List[UInt32] aligned element-wise with
   prior_emb_indices, and user-hour rows where the user has no prior likes in
   the dataset get empty lists.
@@ -61,17 +63,19 @@ def _build_user_history_directory(
     5. Left-join back to ensure every user-hour appears, including empty histories
 
     Args:
-        likes_lf: LazyFrame with columns [did, like_hour_bucket, record_created_at, emb_idx]
+        likes_lf: LazyFrame with columns [did, like_hour_bucket, record_created_at, emb_idx, prior_cumulative_likes]
         max_prior_likes: Optional cap on prior likes per target (None = no cap)
         logger: Logger instance
 
     Returns:
         LazyFrame with columns [did, like_hour_bucket, prior_emb_indices, raw_prior_count,
-        prior_like_age_hours_at_bucket_start]
+        prior_like_age_hours_at_bucket_start, prior_cumulative_likes]
         where raw_prior_count is the uncapped number of prior likes (for distribution analysis).
     """
     logger.info("Building user history directory...")
     likes_schema = likes_lf.collect_schema()
+    if "prior_cumulative_likes" not in likes_schema:
+        raise ValueError("likes_core must contain prior_cumulative_likes for user-history popularity features")
     include_author_idx = "author_idx" in likes_schema
 
     user_bucket_pairs_lf = (
@@ -82,7 +86,7 @@ def _build_user_history_directory(
 
     # Join targets with likes on user identity
     # This creates one row per (target, like) pair for each user
-    likes_cols = ['did', TIMESTAMP_COL_NAME, 'emb_idx']
+    likes_cols = ['did', TIMESTAMP_COL_NAME, 'emb_idx', 'prior_cumulative_likes']
     if include_author_idx:
         likes_cols.append('author_idx')
     pairs_with_prior_likes_lf = (
@@ -100,9 +104,10 @@ def _build_user_history_directory(
                 / 3600.0
             )
             .cast(pl.Float32)
-            .alias("prior_like_age_hours_at_bucket_start")
+            .alias("prior_like_age_hours_at_bucket_start"),
+            pl.col("prior_cumulative_likes").fill_null(0).cast(pl.UInt64).alias("prior_cumulative_likes"),
         )
-    ) # [did, like_hour_bucket, record_created_at, emb_idx, (author_idx)]
+    ) # [did, like_hour_bucket, record_created_at, emb_idx, prior_cumulative_likes, (author_idx)]
 
     def _get_agg_expr(col_name: str):
         # Build aggregation expression: sort by recency (descending) and optionally cap
@@ -119,6 +124,7 @@ def _build_user_history_directory(
         _get_agg_expr("emb_idx").alias("prior_emb_indices"),
         pl.len().alias("raw_prior_count"),
         _get_agg_expr("prior_like_age_hours_at_bucket_start").alias("prior_like_age_hours_at_bucket_start"),
+        _get_agg_expr("prior_cumulative_likes").alias("prior_cumulative_likes"),
     ]
     if include_author_idx:
         agg_exprs += [_get_agg_expr("author_idx").alias("prior_author_indices")]
@@ -143,8 +149,12 @@ def _build_user_history_directory(
             .then(pl.lit([]).cast(pl.List(pl.Float32)))
             .otherwise(pl.col("prior_like_age_hours_at_bucket_start").cast(pl.List(pl.Float32)))
             .alias("prior_like_age_hours_at_bucket_start"),
+            pl.when(pl.col("prior_cumulative_likes").is_null())
+            .then(pl.lit([]).cast(pl.List(pl.UInt64)))
+            .otherwise(pl.col("prior_cumulative_likes").cast(pl.List(pl.UInt64)))
+            .alias("prior_cumulative_likes"),
         )
-    ) # [did, like_hour_bucket, prior_emb_indices, raw_prior_count, prior_like_age_hours_at_bucket_start]
+    ) # [did, like_hour_bucket, prior_emb_indices, raw_prior_count, prior_like_age_hours_at_bucket_start, prior_cumulative_likes]
     
     if include_author_idx:
         pairs_with_history_list_lf = (
@@ -155,7 +165,7 @@ def _build_user_history_directory(
                 .otherwise(pl.col("prior_author_indices").cast(pl.List(pl.UInt32)))
                 .alias("prior_author_indices"),
             )
-        ) # [did, like_hour_bucket, prior_emb_indices, raw_prior_count, (prior_author_indices)]
+        ) # [did, like_hour_bucket, prior_emb_indices, raw_prior_count, prior_like_age_hours_at_bucket_start, prior_cumulative_likes, (prior_author_indices)]
 
     return pairs_with_history_list_lf
 
@@ -327,6 +337,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         TIMESTAMP_COL_NAME: pl.Datetime,
         "subject_uri": str,
         "emb_idx": int,
+        "prior_cumulative_likes": int,
     }
     validate_dataframe_schema(likes_lf, likes_schema)
     logger.info("✓ likes_core schema validated")
