@@ -109,29 +109,24 @@ def test_post_liker_history_args_merge_from_cli_and_config(tmp_path):
     raw = parser.parse_args([
         "--generate-post-liker-history",
         "--min-post-liker-user-support", "7",
-        "--max-recent-likers-per-post", "42",
     ])
     merged = cli._merge_args_with_config(raw)
 
     assert merged.generate_post_liker_history is True
     assert merged.min_post_liker_user_support == 7
-    assert merged.max_recent_likers_per_post == 42
     assert cli.DEFAULTS["generate_post_liker_history"] is False
     assert cli.DEFAULTS["min_post_liker_user_support"] == 2
-    assert cli.DEFAULTS["max_recent_likers_per_post"] == 100
 
     config_path = Path(tmp_path) / "post_liker_history.yml"
     config_path.write_text(
         "generate_post_liker_history: true\n"
         "min_post_liker_user_support: 5\n"
-        "max_recent_likers_per_post: 88\n"
     )
     raw = parser.parse_args(["--config", str(config_path), "--no-generate-post-liker-history"])
     merged = cli._merge_args_with_config(raw)
 
     assert merged.generate_post_liker_history is False
     assert merged.min_post_liker_user_support == 5
-    assert merged.max_recent_likers_per_post == 88
 
 
 def test_user_sampling_args_replace_old_names(tmp_path):
