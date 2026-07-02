@@ -36,13 +36,8 @@ def build_post_liker_user_idx(stage_module):
 
 
 @pytest.fixture
-def build_needed_post_hour_pairs(stage_module):
-    return stage_module._build_needed_post_hour_pairs
-
-
-@pytest.fixture
-def build_post_recent_likers(stage_module):
-    return stage_module._build_post_recent_likers
+def build_post_liker_events(stage_module):
+    return stage_module._build_post_liker_events
 
 
 def _make_test_logger() -> logging.Logger:
@@ -82,18 +77,6 @@ def _make_likes(
     if splits is not None:
         data["split"] = splits
     return pl.DataFrame(data).lazy()
-
-
-def _make_posts(
-    at_uris: list[str],
-    in_random_sample: list[bool],
-    negative_hour_buckets: list[datetime | None],
-) -> pl.LazyFrame:
-    return pl.DataFrame({
-        "at_uri": pl.Series(at_uris, dtype=pl.String),
-        "in_random_sample": pl.Series(in_random_sample, dtype=pl.Boolean),
-        "negative_hour_bucket": pl.Series(negative_hour_buckets, dtype=pl.Datetime),
-    }).lazy()
 
 
 def _history_by_bucket(df: pl.DataFrame) -> dict[datetime, list[int]]:
@@ -358,51 +341,20 @@ def test_post_liker_user_idx_uses_train_support_threshold_and_stable_offset(buil
     assert result.schema["user_idx"] == pl.UInt32
 
 
-def test_needed_post_hour_pairs_include_positive_and_sampled_negative_pairs(
-    build_needed_post_hour_pairs,
-):
+def test_post_liker_events_include_all_splits_and_omit_unsupported_users(build_post_liker_events):
     likes_lf = _make_likes(
-        ["u1", "u2"],
-        [datetime(2024, 1, 1, 10, 5), datetime(2024, 1, 1, 11, 5)],
-        ["p1", "p2"],
-        [1, 2],
-    )
-    posts_lf = _make_posts(
-        ["p2", "p3", "p4"],
-        [True, True, False],
-        [datetime(2024, 1, 1, 11), datetime(2024, 1, 1, 12), datetime(2024, 1, 1, 13)],
-    )
-
-    result = build_needed_post_hour_pairs(likes_lf, posts_lf).collect().sort(["subject_uri", "target_hour"])
-
-    assert result.to_dict(as_series=False) == {
-        "subject_uri": ["p1", "p2", "p3"],
-        "target_hour": [
-            datetime(2024, 1, 1, 10),
-            datetime(2024, 1, 1, 11),
-            datetime(2024, 1, 1, 12),
-        ],
-    }
-
-
-def test_post_recent_likers_are_prior_recent_indexed_and_counted(build_post_recent_likers):
-    likes_lf = _make_likes(
-        ["u1", "u4", "u2", "u3", "u5"],
+        ["u1", "u2", "u1", "u3", "u1", "u4"],
         [
-            datetime(2024, 1, 1, 9, 10),
             datetime(2024, 1, 1, 10, 0),
-            datetime(2024, 1, 1, 10, 30),
-            datetime(2024, 1, 1, 11, 5),
-            datetime(2024, 1, 1, 10, 15),
+            datetime(2024, 1, 1, 10, 0),
+            datetime(2024, 1, 1, 12, 0),
+            datetime(2024, 1, 1, 13, 0),
+            datetime(2024, 1, 2, 9, 0),
+            datetime(2024, 1, 2, 10, 0),
         ],
-        ["p1", "p1", "p1", "p1", "p2"],
-        [1, 2, 3, 4, 5],
-        splits=["train", "train", "train", "train", "train"],
-    )
-    posts_lf = _make_posts(
-        ["p2"],
-        [True],
-        [datetime(2024, 1, 1, 10)],
+        ["p1", "p1", "p1", "p1", "p2", "p2"],
+        [10, 10, 10, 10, 20, 20],
+        splits=["train", "train", "val", "train", "holdout_seen_users", "train"],
     )
     user_idx_lf = pl.DataFrame({
         "did": ["u1", "u2"],
@@ -410,108 +362,91 @@ def test_post_recent_likers_are_prior_recent_indexed_and_counted(build_post_rece
         "user_idx": [2, 3],
     }).lazy()
 
-    result = build_post_recent_likers(
+    result = build_post_liker_events(
         likes_lf=likes_lf,
-        posts_lf=posts_lf,
         user_idx_lf=user_idx_lf,
-        max_recent_likers_per_post=100,
-    ).collect().sort(["subject_uri", "target_hour"])
+    ).collect().sort("emb_idx")
 
-    p1 = result.filter(
-        (pl.col("subject_uri") == "p1")
-        & (pl.col("target_hour") == datetime(2024, 1, 1, 11))
-    )
-    assert p1["dataset_prior_liker_count"][0] == 3
-    assert p1["indexed_prior_liker_count"][0] == 2
-    assert p1["prior_recent_liker_user_indices"][0].to_list() == [3, 2]
-    assert p1["prior_recent_liker_timestamps"][0].to_list() == [
-        datetime(2024, 1, 1, 10, 30),
-        datetime(2024, 1, 1, 9, 10),
+    assert result.columns == [
+        "emb_idx",
+        "liker_user_indices",
+        "liker_timestamps",
+        "indexed_liker_count",
+    ]
+    assert result.schema["emb_idx"] == pl.UInt32
+    assert result.schema["liker_user_indices"] == pl.List(pl.UInt32)
+    assert result.schema["liker_timestamps"] == pl.List(pl.Datetime(time_unit="us"))
+    assert result.schema["indexed_liker_count"] == pl.UInt64
+
+    p1 = result.filter(pl.col("emb_idx") == 10)
+    assert p1["indexed_liker_count"][0] == 3
+    assert p1["liker_user_indices"][0].to_list() == [2, 3, 2]
+    assert p1["liker_timestamps"][0].to_list() == [
+        datetime(2024, 1, 1, 10, 0),
+        datetime(2024, 1, 1, 10, 0),
+        datetime(2024, 1, 1, 12, 0),
     ]
 
-    p2_negative = result.filter(
-        (pl.col("subject_uri") == "p2")
-        & (pl.col("target_hour") == datetime(2024, 1, 1, 10))
+    p2 = result.filter(pl.col("emb_idx") == 20)
+    assert p2["indexed_liker_count"][0] == 1
+    assert p2["liker_user_indices"][0].to_list() == [2]
+    assert p2["liker_timestamps"][0].to_list() == [datetime(2024, 1, 2, 9, 0)]
+
+
+def test_post_liker_events_retain_duplicate_like_rows(build_post_liker_events):
+    likes_lf = _make_likes(
+        ["u1", "u1"],
+        [datetime(2024, 1, 1, 9, 0), datetime(2024, 1, 1, 9, 0)],
+        ["p1", "p1"],
+        [10, 10],
+        splits=["train", "train"],
     )
-    assert p2_negative["dataset_prior_liker_count"][0] == 0
-    assert p2_negative["indexed_prior_liker_count"][0] == 0
-    assert p2_negative["prior_recent_liker_user_indices"][0].to_list() == []
-    assert p2_negative["prior_recent_liker_timestamps"][0].to_list() == []
-    assert result.schema["prior_recent_liker_user_indices"] == pl.List(pl.UInt32)
-    assert result.schema["prior_recent_liker_timestamps"] == pl.List(pl.Datetime(time_unit="us"))
+    user_idx_lf = pl.DataFrame({
+        "did": ["u1"],
+        "user_train_like_count": [2],
+        "user_idx": [2],
+    }).lazy()
+
+    result = build_post_liker_events(
+        likes_lf=likes_lf,
+        user_idx_lf=user_idx_lf,
+    ).collect()
+
+    assert result["indexed_liker_count"][0] == 2
+    assert result["liker_user_indices"][0].to_list() == [2, 2]
+    assert result["liker_timestamps"][0].to_list() == [
+        datetime(2024, 1, 1, 9, 0),
+        datetime(2024, 1, 1, 9, 0),
+    ]
 
 
-def test_post_recent_likers_emit_empty_lists_when_no_users_are_indexed(build_post_recent_likers):
+def test_post_liker_events_emit_typed_empty_artifact_when_no_users_are_indexed(build_post_liker_events):
     likes_lf = _make_likes(
         ["u1", "u2"],
         [datetime(2024, 1, 1, 9, 0), datetime(2024, 1, 1, 10, 5)],
         ["p1", "p1"],
-        [1, 2],
+        [10, 10],
         splits=["train", "train"],
     )
-    posts_lf = _make_posts([], [], [])
     user_idx_lf = pl.DataFrame({
         "did": pl.Series([], dtype=pl.String),
         "user_train_like_count": pl.Series([], dtype=pl.UInt64),
         "user_idx": pl.Series([], dtype=pl.UInt32),
     }).lazy()
 
-    result = build_post_recent_likers(
+    result = build_post_liker_events(
         likes_lf=likes_lf,
-        posts_lf=posts_lf,
         user_idx_lf=user_idx_lf,
-        max_recent_likers_per_post=100,
     ).collect()
 
-    row = result.filter(
-        (pl.col("subject_uri") == "p1")
-        & (pl.col("target_hour") == datetime(2024, 1, 1, 10))
-    )
-    assert row["dataset_prior_liker_count"][0] == 1
-    assert row["indexed_prior_liker_count"][0] == 0
-    assert row["prior_recent_liker_user_indices"][0].to_list() == []
-    assert row["prior_recent_liker_timestamps"][0].to_list() == []
-
-
-def test_post_recent_likers_cap_stored_rows_without_changing_pre_cap_count(build_post_recent_likers):
-    timestamps = [
-        datetime(2024, 1, 1, 8, 0),
-        datetime(2024, 1, 1, 9, 0),
-        datetime(2024, 1, 1, 10, 0),
-        datetime(2024, 1, 1, 11, 0),
-        datetime(2024, 1, 1, 12, 0),
-        datetime(2024, 1, 1, 13, 0),
+    assert result.height == 0
+    assert result.columns == [
+        "emb_idx",
+        "liker_user_indices",
+        "liker_timestamps",
+        "indexed_liker_count",
     ]
-    likes_lf = _make_likes(
-        ["u1", "u2", "u3", "u4", "u5", "target"],
-        timestamps,
-        ["p1", "p1", "p1", "p1", "p1", "p1"],
-        [1, 2, 3, 4, 5, 6],
-        splits=["train"] * 6,
-    )
-    posts_lf = _make_posts([], [], [])
-    user_idx_lf = pl.DataFrame({
-        "did": ["u1", "u2", "u3", "u4", "u5"],
-        "user_train_like_count": [1, 1, 1, 1, 1],
-        "user_idx": [2, 3, 4, 5, 6],
-    }).lazy()
-
-    result = build_post_recent_likers(
-        likes_lf=likes_lf,
-        posts_lf=posts_lf,
-        user_idx_lf=user_idx_lf,
-        max_recent_likers_per_post=3,
-    ).collect()
-
-    row = result.filter(
-        (pl.col("subject_uri") == "p1")
-        & (pl.col("target_hour") == datetime(2024, 1, 1, 13))
-    )
-    assert row["dataset_prior_liker_count"][0] == 5
-    assert row["indexed_prior_liker_count"][0] == 5
-    assert row["prior_recent_liker_user_indices"][0].to_list() == [6, 5, 4]
-    assert row["prior_recent_liker_timestamps"][0].to_list() == [
-        datetime(2024, 1, 1, 12),
-        datetime(2024, 1, 1, 11),
-        datetime(2024, 1, 1, 10),
-    ]
+    assert result.schema["emb_idx"] == pl.UInt32
+    assert result.schema["liker_user_indices"] == pl.List(pl.UInt32)
+    assert result.schema["liker_timestamps"] == pl.List(pl.Datetime(time_unit="us"))
+    assert result.schema["indexed_liker_count"] == pl.UInt64

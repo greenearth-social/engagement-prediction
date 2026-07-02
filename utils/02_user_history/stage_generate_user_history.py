@@ -26,7 +26,7 @@ Outputs under <run_dir>/02_user_history/<timestamp>/:
   prior_author_indices is a List[UInt32] aligned element-wise with
   prior_emb_indices, and user-hour rows where the user has no prior likes in
   the dataset get empty lists.
-- user_idx_<timestamp>.parquet and post_recent_likers_<timestamp>.parquet when
+- user_idx_<timestamp>.parquet and post_liker_events_<timestamp>.parquet when
   post-liker history generation is enabled.
 """
 
@@ -196,185 +196,37 @@ def _build_post_liker_user_idx(
     )
 
 
-def _build_needed_post_hour_pairs(
+def _build_post_liker_events(
     likes_lf: pl.LazyFrame,
-    posts_lf: pl.LazyFrame,
-) -> pl.LazyFrame:
-    positive_pairs_lf = (
-        likes_lf
-        .select(
-            pl.col("subject_uri"),
-            pl.col("like_hour_bucket").alias("target_hour"),
-        )
-        .unique()
-    )
-    negative_pairs_lf = (
-        posts_lf
-        .filter(pl.col("in_random_sample") & pl.col("negative_hour_bucket").is_not_null())
-        .select(
-            pl.col("at_uri").alias("subject_uri"),
-            pl.col("negative_hour_bucket").alias("target_hour"),
-        )
-        .unique()
-    )
-    return (
-        pl.concat([positive_pairs_lf, negative_pairs_lf], how="vertical_relaxed")
-        .unique()
-        .sort(["subject_uri", "target_hour"])
-    )
-
-
-def _source_likes_for_needed_posts(
-    likes_lf: pl.LazyFrame,
-    needed_pairs_lf: pl.LazyFrame,
-) -> pl.LazyFrame:
-    needed_posts_lf = needed_pairs_lf.select("subject_uri").unique()
-    return (
-        likes_lf
-        .select(["subject_uri", "did", TIMESTAMP_COL_NAME])
-        .join(needed_posts_lf, on="subject_uri", how="semi")
-    )
-
-
-def _build_prior_liker_count_lf(
-    needed_pairs_lf: pl.LazyFrame,
-    source_likes_lf: pl.LazyFrame,
-    count_col: str,
-) -> pl.LazyFrame:
-    hourly_counts_lf = (
-        source_likes_lf
-        .with_columns(
-            pl.col(TIMESTAMP_COL_NAME).dt.truncate("1h").alias("_like_hour")
-        )
-        .group_by(["subject_uri", "_like_hour"])
-        .len()
-        .rename({"len": "_likes_this_hour"})
-        .with_columns(pl.col("_likes_this_hour").cast(pl.UInt64))
-        # subject_uri, _like_hour, _likes_this_hour
-    )
-    sparse_counts_lf = (
-        hourly_counts_lf
-        .sort(["subject_uri", "_like_hour"])
-        .with_columns(
-            pl.col("_likes_this_hour").cum_sum().over("subject_uri").alias(count_col)
-        )
-        .select(
-            "subject_uri",
-            (pl.col("_like_hour") + pl.duration(hours=1)).alias("_available_at_hour"),
-            pl.col(count_col).cast(pl.UInt64),
-        )
-        # subject_uri, _available_at_hour, dataset_prior_liker_count
-    )
-    return (
-        needed_pairs_lf
-        .sort(["target_hour", "subject_uri"])
-        .join_asof(
-            sparse_counts_lf.sort(["_available_at_hour", "subject_uri"]),
-            left_on="target_hour",
-            right_on="_available_at_hour",
-            by="subject_uri",
-            strategy="backward",
-            check_sortedness=False,
-        )
-        .drop("_available_at_hour")
-        .with_columns(pl.col(count_col).fill_null(0).cast(pl.UInt64))
-    )
-
-
-def _empty_timestamp_list_expr(likes_lf: pl.LazyFrame) -> pl.Expr:
-    timestamp_dtype = likes_lf.collect_schema()[TIMESTAMP_COL_NAME]
-    return pl.lit([]).cast(pl.List(timestamp_dtype))
-
-
-def _build_post_recent_likers(
-    likes_lf: pl.LazyFrame,
-    posts_lf: pl.LazyFrame,
     user_idx_lf: pl.LazyFrame,
-    max_recent_likers_per_post: int,
 ) -> pl.LazyFrame:
-    if max_recent_likers_per_post <= 0:
-        raise ValueError("max_recent_likers_per_post must be positive")
-
-    needed_pairs_lf = _build_needed_post_hour_pairs(likes_lf, posts_lf)
-    source_likes_lf = _source_likes_for_needed_posts(likes_lf, needed_pairs_lf)
-    dataset_counts_lf = _build_prior_liker_count_lf(
-        needed_pairs_lf,
-        source_likes_lf,
-        "dataset_prior_liker_count",
-    )
-    indexed_likes_lf = (
-        source_likes_lf
+    timestamp_dtype = likes_lf.collect_schema()[TIMESTAMP_COL_NAME]
+    indexed_events_lf = (
+        likes_lf
+        .select(["did", "emb_idx", TIMESTAMP_COL_NAME])
         .join(user_idx_lf.select(["did", "user_idx"]), on="did", how="inner")
-        .select(["subject_uri", TIMESTAMP_COL_NAME, "user_idx"])
-        .with_columns(pl.col("user_idx").cast(pl.UInt32))
-    )
-    indexed_counts_lf = _build_prior_liker_count_lf(
-        needed_pairs_lf,
-        indexed_likes_lf,
-        "indexed_prior_liker_count",
-    )
-    pairs_with_counts_lf = (
-        dataset_counts_lf
-        .join(indexed_counts_lf, on=["subject_uri", "target_hour"], how="left")
-        .with_columns(
-            pl.col("indexed_prior_liker_count").fill_null(0).cast(pl.UInt64)
+        .select(
+            pl.col("emb_idx").cast(pl.UInt32),
+            pl.col(TIMESTAMP_COL_NAME),
+            pl.col("user_idx").cast(pl.UInt32),
         )
     )
-
-    indexed_event_lists_lf = (
-        indexed_likes_lf
-        .sort(["subject_uri", TIMESTAMP_COL_NAME, "user_idx"])
-        .group_by("subject_uri")
-        .agg(
-            pl.col("user_idx").alias("_all_liker_user_indices"),
-            pl.col(TIMESTAMP_COL_NAME).alias("_all_liker_timestamps"),
-        )
-    )
-    pairs_with_slices_lf = (
-        pairs_with_counts_lf
-        .with_columns(
-            pl.when(pl.col("indexed_prior_liker_count") > max_recent_likers_per_post)
-            .then(pl.col("indexed_prior_liker_count") - max_recent_likers_per_post)
-            .otherwise(0)
-            .cast(pl.Int64)
-            .alias("_slice_start")
-        )
-        .with_columns(
-            (pl.col("indexed_prior_liker_count").cast(pl.Int64) - pl.col("_slice_start"))
-            .cast(pl.Int64)
-            .alias("_slice_len")
-        )
-    )
+    sort_keys = [pl.col(TIMESTAMP_COL_NAME), pl.col("user_idx")]
     return (
-        pairs_with_slices_lf
-        .join(indexed_event_lists_lf, on="subject_uri", how="left")
-        .with_columns(
-            pl.when(pl.col("_all_liker_user_indices").is_null())
-            .then(pl.lit([]).cast(pl.List(pl.UInt32)))
-            .otherwise(
-                pl.col("_all_liker_user_indices")
-                .list.slice(pl.col("_slice_start"), pl.col("_slice_len"))
-                .list.reverse()
-            )
-            .alias("prior_recent_liker_user_indices"),
-            pl.when(pl.col("_all_liker_timestamps").is_null())
-            .then(_empty_timestamp_list_expr(likes_lf))
-            .otherwise(
-                pl.col("_all_liker_timestamps")
-                .list.slice(pl.col("_slice_start"), pl.col("_slice_len"))
-                .list.reverse()
-            )
-            .alias("prior_recent_liker_timestamps"),
+        indexed_events_lf
+        .group_by("emb_idx")
+        .agg(
+            pl.col("user_idx").sort_by(sort_keys).alias("liker_user_indices"),
+            pl.col(TIMESTAMP_COL_NAME).sort_by(sort_keys).alias("liker_timestamps"),
+            pl.len().alias("indexed_liker_count"),
         )
-        .select([
-            "subject_uri",
-            "target_hour",
-            "prior_recent_liker_user_indices",
-            "prior_recent_liker_timestamps",
-            "dataset_prior_liker_count",
-            "indexed_prior_liker_count",
-        ])
-        .sort(["subject_uri", "target_hour"])
+        .select(
+            pl.col("emb_idx").cast(pl.UInt32),
+            pl.col("liker_user_indices").cast(pl.List(pl.UInt32)),
+            pl.col("liker_timestamps").cast(pl.List(timestamp_dtype)),
+            pl.col("indexed_liker_count").cast(pl.UInt64),
+        )
+        .sort("emb_idx")
     )
 
 
@@ -536,11 +388,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         max_prior_likes = None  # Treat 0 or negative as "no cap"
     generate_post_liker_history = bool(args.generate_post_liker_history)
     min_post_liker_user_support = int(args.min_post_liker_user_support)
-    max_recent_likers_per_post = int(args.max_recent_likers_per_post)
     if min_post_liker_user_support <= 0:
         raise ValueError("min_post_liker_user_support must be positive")
-    if max_recent_likers_per_post <= 0:
-        raise ValueError("max_recent_likers_per_post must be positive")
 
     # === Load data ===
     log_operation_start('Load likes_core from prior stage', 'STAGE_02_USER_HISTORY', logger)
@@ -557,34 +406,15 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     if generate_post_liker_history:
         likes_schema.update({
             "split": str,
-            "like_hour_bucket": pl.Datetime,
         })
     validate_dataframe_schema(likes_lf, likes_schema)
     logger.info("✓ likes_core schema validated")
-
-    posts_lf: Optional[pl.LazyFrame] = None
-    if generate_post_liker_history:
-        log_operation_start('Load posts_core from prior stage', 'STAGE_02_USER_HISTORY', logger)
-        posts_lf = load_parquet_from_prior(prior_get_data, "posts_core_")
-        validate_dataframe_schema(
-            posts_lf,
-            {
-                "at_uri": str,
-                "in_random_sample": bool,
-                "negative_hour_bucket": pl.Datetime,
-            },
-        )
-        logger.info("✓ posts_core schema validated")
 
     mem_tracker.checkpoint("after_load_inputs", quiet=True)
 
     # Log input sizes (collect counts efficiently)
     n_likes = likes_lf.select(pl.len()).collect(engine="streaming").item()
     logger.info(f"Input: {n_likes:,} likes")
-    n_posts = None
-    if posts_lf is not None:
-        n_posts = posts_lf.select(pl.len()).collect(engine="streaming").item()
-        logger.info(f"Input: {n_posts:,} post rows")
 
     # === Build user history directory ===
     log_operation_start('Build user history directory', 'STAGE_02_USER_HISTORY', logger)
@@ -637,9 +467,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     }
     post_liker_info_lines = []
     if generate_post_liker_history:
-        if posts_lf is None:
-            raise RuntimeError("posts_core must be loaded when post-liker history generation is enabled")
-
         log_operation_start('Build post-liker user index', 'STAGE_02_USER_HISTORY', logger)
         user_idx_lf = _build_post_liker_user_idx(
             likes_lf=likes_lf,
@@ -651,45 +478,39 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         logger.info(f"✓ Wrote {len(user_idx_df):,} post-liker user index rows to {user_idx_output_path.name}")
         mem_tracker.checkpoint("after_post_liker_user_idx", quiet=True)
 
-        log_operation_start('Build post recent-liker history', 'STAGE_02_USER_HISTORY', logger)
-        post_recent_likers_lf = _build_post_recent_likers(
+        log_operation_start('Build post-liker event lists', 'STAGE_02_USER_HISTORY', logger)
+        logger.info("Building event lists from indexed likes using did, emb_idx, and record_created_at only")
+        post_liker_events_lf = _build_post_liker_events(
             likes_lf=likes_lf,
-            posts_lf=posts_lf,
             user_idx_lf=user_idx_df.lazy(),
-            max_recent_likers_per_post=max_recent_likers_per_post,
         )
-        post_recent_likers_df = post_recent_likers_lf.collect(engine="streaming")
-        post_recent_likers_output_path = out_dir / f"post_recent_likers_{out_dir.name}.parquet"
-        post_recent_likers_df.write_parquet(post_recent_likers_output_path, compression="zstd")
-        n_post_liker_rows = len(post_recent_likers_df)
-        n_with_recent_likers = post_recent_likers_df.filter(
-            pl.col("prior_recent_liker_user_indices").list.len() > 0
-        ).height
-        max_stored_likers = (
-            int(post_recent_likers_df["prior_recent_liker_user_indices"].list.len().max())
+        mem_tracker.checkpoint("after_post_liker_events_plan", quiet=True)
+        post_liker_events_df = post_liker_events_lf.collect(engine="streaming")
+        mem_tracker.checkpoint("after_post_liker_events_collect", quiet=True)
+        post_liker_events_output_path = out_dir / f"post_liker_events_{out_dir.name}.parquet"
+        post_liker_events_df.write_parquet(post_liker_events_output_path, compression="zstd")
+        n_post_liker_rows = len(post_liker_events_df)
+        n_indexed_liker_events = int(post_liker_events_df["indexed_liker_count"].sum() or 0)
+        max_indexed_likers_per_post = (
+            int(post_liker_events_df["indexed_liker_count"].max())
             if n_post_liker_rows > 0 else 0
         )
-        logger.info(f"✓ Wrote {n_post_liker_rows:,} post-liker rows to {post_recent_likers_output_path.name}")
-        logger.info(
-            f"  With stored indexed likers: {n_with_recent_likers:,} "
-            f"({100*n_with_recent_likers/max(n_post_liker_rows, 1):.1f}%)"
-        )
-        logger.info(f"  Max stored recent likers per post-hour: {max_stored_likers:,}")
-        mem_tracker.checkpoint("after_post_recent_likers", quiet=True)
+        logger.info(f"✓ Wrote {n_post_liker_rows:,} post-liker event-list rows to {post_liker_events_output_path.name}")
+        logger.info(f"  Indexed liker events: {n_indexed_liker_events:,}")
+        logger.info(f"  Max indexed liker events per post: {max_indexed_likers_per_post:,}")
+        mem_tracker.checkpoint("after_post_liker_events_write", quiet=True)
 
         artifacts.update({
             'post_liker_user_idx_path': str(user_idx_output_path),
-            'post_recent_likers_path': str(post_recent_likers_output_path),
+            'post_liker_events_path': str(post_liker_events_output_path),
         })
         post_liker_info_lines = [
             f"settings: generate_post_liker_history={generate_post_liker_history}",
             f"settings: min_post_liker_user_support={min_post_liker_user_support}",
-            f"settings: max_recent_likers_per_post={max_recent_likers_per_post}",
             f"outputs: post_liker_user_idx ({len(user_idx_df):,} rows)",
-            f"outputs: post_recent_likers ({n_post_liker_rows:,} rows)",
-            f"stats: post_liker_needed_pairs={n_post_liker_rows:,}",
-            f"stats: post_liker_rows_with_stored_likers={n_with_recent_likers:,}",
-            f"stats: post_liker_max_stored_likers={max_stored_likers}",
+            f"outputs: post_liker_events ({n_post_liker_rows:,} rows)",
+            f"stats: post_liker_indexed_events={n_indexed_liker_events:,}",
+            f"stats: post_liker_max_events_per_post={max_indexed_likers_per_post}",
         ]
 
     # Memory summary
@@ -703,7 +524,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"runtime_seconds: {runtime:.2f}",
         f"settings: max_prior_likes={max_prior_likes}",
         f"inputs: likes_core ({n_likes:,})",
-        *( [f"inputs: posts_core ({n_posts:,})"] if n_posts is not None else [] ),
         f"outputs: user_history_directory ({n_output:,} entries)",
         f"stats: with_history={n_with_history:,}, empty_history={n_empty_history:,}",
         f"stats: mean_prior={mean_prior:.1f}, max_prior={max_prior}",
