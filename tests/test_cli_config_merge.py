@@ -281,6 +281,8 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
             bst_max_train_batches_per_epoch: 5
             bst_use_popularity_feature: false
             bst_popularity_projection_dim: 12
+            bst_use_post_liker_user_pooling: true
+            bst_max_recent_likers_per_post: 25
             """
         ).strip()
         + "\n"
@@ -302,6 +304,8 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
     assert merged.bst_max_train_batches_per_epoch == 5
     assert merged.bst_use_popularity_feature is False
     assert merged.bst_popularity_projection_dim == 12
+    assert merged.bst_use_post_liker_user_pooling is True
+    assert merged.bst_max_recent_likers_per_post == 25
     cli._validate_bst_config(merged)
 
 
@@ -318,6 +322,8 @@ def test_bst_ranker_training_defaults():
     assert merged.bst_max_train_batches_per_epoch is None
     assert merged.bst_use_popularity_feature is True
     assert merged.bst_popularity_projection_dim == 8
+    assert merged.bst_use_post_liker_user_pooling is False
+    assert merged.bst_max_recent_likers_per_post == 50
     cli._validate_bst_config(merged)
 
 
@@ -406,6 +412,20 @@ def test_bst_ranker_validates_projection_dims(arg_name, error_match):
     setattr(merged, arg_name, 0)
 
     with pytest.raises(ValueError, match=error_match):
+        cli._validate_bst_config(merged)
+
+
+def test_bst_ranker_validates_post_liker_max_when_enabled():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "bst-ranker",
+        "--use-author-embedding-table",
+        "--bst-use-post-liker-user-pooling",
+        "--bst-max-recent-likers-per-post", "0",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    with pytest.raises(ValueError, match="bst-max-recent-likers-per-post"):
         cli._validate_bst_config(merged)
 
 

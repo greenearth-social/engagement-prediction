@@ -125,6 +125,8 @@ DEFAULTS: Dict[str, Any] = {
     "bst_max_train_batches_per_epoch": None,
     "bst_use_popularity_feature": True,
     "bst_popularity_projection_dim": 8,
+    "bst_use_post_liker_user_pooling": False,
+    "bst_max_recent_likers_per_post": 50,
     "hidden_dims": [64, 32, 16],
     "dropout_rate_mlp": 0.5,
     "dropout_rate_two_tower": 0.1,
@@ -561,6 +563,7 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
     batch_size = int(args.batch_size)
     bst_max_train_batches_per_epoch = args.bst_max_train_batches_per_epoch
     bst_popularity_projection_dim = int(args.bst_popularity_projection_dim)
+    bst_max_recent_likers_per_post = int(args.bst_max_recent_likers_per_post)
     if model_dim <= 0:
         raise ValueError("--bst-model-dim must be positive.")
     if content_projection_dim <= 0:
@@ -583,6 +586,8 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
         raise ValueError("--bst-max-train-batches-per-epoch must be positive when provided.")
     if bst_popularity_projection_dim <= 0:
         raise ValueError("--bst-popularity-projection-dim must be positive.")
+    if bool(args.bst_use_post_liker_user_pooling) and bst_max_recent_likers_per_post <= 0:
+        raise ValueError("--bst-max-recent-likers-per-post must be positive when post-liker user pooling is enabled.")
 
 
 def _get_stage_order_for_model_type(train_key: str) -> List[str]:
@@ -931,6 +936,11 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Enable or disable BST prior-cumulative-like popularity features")
     _add_arg_with_default(p_all, "--bst-popularity-projection-dim", type=int, default=argparse.SUPPRESS,
                           help_text="BST popularity feature projection dimension")
+    _add_arg_with_default(p_all, "--bst-use-post-liker-user-pooling", action=argparse.BooleanOptionalAction,
+                          default=argparse.SUPPRESS,
+                          help_text="Emit BST post-liker user index and age tensors from Stage 2 post-liker events")
+    _add_arg_with_default(p_all, "--bst-max-recent-likers-per-post", type=int, default=argparse.SUPPRESS,
+                          help_text="Maximum recent prior liker events to slice per history or candidate post for BST")
     # Stage 3 options (shared)
     _add_arg_with_default(p_all, "--epochs", type=int, default=argparse.SUPPRESS,
                           help_text="Training epochs")
