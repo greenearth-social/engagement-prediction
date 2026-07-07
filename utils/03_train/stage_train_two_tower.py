@@ -78,6 +78,8 @@ Inputs (from prior pipeline stages):
 
 Outputs under <run_dir>/03_train/<timestamp>/:
     - checkpoints/two_tower_best.pth (best-by-validation checkpoint during training)
+    - checkpoints/engagement_user_tower_best.pt (best-by-validation user tower TorchScript)
+    - checkpoints/engagement_post_tower_best.pt (best-by-validation post tower TorchScript)
     - checkpoints/two_tower_<timestamp>.pth (final model checkpoint)
     - logs/ (training logs)
     - training_config.json (hyperparameters and configuration)
@@ -606,6 +608,20 @@ class TwoTowerModel(nn.Module):
         return loss, scores
 
 
+def _save_torchscript_towers(
+    model_to_save: TwoTowerModel,
+    checkpoints_dir: Path,
+    user_tower_name: str,
+    post_tower_name: str,
+) -> Tuple[Path, Path]:
+    torchscript_model = copy.deepcopy(model_to_save).cpu().eval()
+    torchscript_user_path = checkpoints_dir / f"{user_tower_name}.pt"
+    torch.jit.script(torchscript_model.user_tower).save(torchscript_user_path)
+    torchscript_post_path = checkpoints_dir / f"{post_tower_name}.pt"
+    torch.jit.script(torchscript_model.post_tower).save(torchscript_post_path)
+    return torchscript_user_path, torchscript_post_path
+
+
 # =============================================================================
 # Training Loop
 # =============================================================================
@@ -838,6 +854,12 @@ def train_two_tower_model(
                         "history": history,
                     },
                     checkpoints_dir / "two_tower_best.pth",
+                )
+                _save_torchscript_towers(
+                    model,
+                    checkpoints_dir,
+                    "engagement_user_tower_best",
+                    "engagement_post_tower_best",
                 )
 
         significant_improvement = (
@@ -1108,17 +1130,18 @@ def run(context: Context, args) -> Dict[str, Any]:
 
         # Save TorchScript file, which is the format needed for ClearML serving
         # Save the post and user towers separately
-        torchscript_model = copy.deepcopy(model_to_save).cpu().eval()
         torchscript_user_name = "engagement_user_tower"
-        torchscript_user_path = checkpoints_dir / f"{torchscript_user_name}.pt"
-        torch.jit.script(torchscript_model.user_tower).save(torchscript_user_path)
+        torchscript_post_name = "engagement_post_tower"
+        torchscript_user_path, torchscript_post_path = _save_torchscript_towers(
+            model_to_save,
+            checkpoints_dir,
+            torchscript_user_name,
+            torchscript_post_name,
+        )
         user_model_metadata = context.tracker.log_artifact(name=f"{torchscript_user_name}", path=torchscript_user_path)
         user_model_id = user_model_metadata.get("model_id", "")
         logger.info(f"User tower model id: {user_model_id}")
 
-        torchscript_post_name = "engagement_post_tower"
-        torchscript_post_path = checkpoints_dir / f"{torchscript_post_name}.pt"
-        torch.jit.script(torchscript_model.post_tower).save(torchscript_post_path)
         post_model_metadata = context.tracker.log_artifact(name=f"{torchscript_post_name}", path=torchscript_post_path)
         post_model_id = post_model_metadata.get("model_id", "")
         logger.info(f"Post tower model id: {post_model_id}")
