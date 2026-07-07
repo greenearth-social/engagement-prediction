@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
 import importlib.util
 import json
 import os
@@ -95,6 +96,7 @@ class ModelBundle:
     user_tower: Any
     post_tower: Any
     author_idx_by_did: Optional[dict[str, int]]
+    load_source: str
 
     @property
     def use_author_embedding_table(self) -> bool:
@@ -241,13 +243,137 @@ def resolve_model_paths(train_artifacts_dir: Path, run_id: str) -> dict[str, Pat
         "train_dir": train_dir,
         "user_tower": train_dir / "checkpoints/engagement_user_tower.pt",
         "post_tower": train_dir / "checkpoints/engagement_post_tower.pt",
+        "best_user_tower": train_dir / "checkpoints/engagement_user_tower_best.pt",
+        "best_post_tower": train_dir / "checkpoints/engagement_post_tower_best.pt",
+        "best_checkpoint": train_dir / "checkpoints/two_tower_best.pth",
         "training_config": train_dir / "training_config.json",
         "manifest": train_dir / "manifest.json",
+        "partial_manifest": train_dir / "manifest.partial.json",
     }
-    missing = [str(path) for key, path in paths.items() if key != "train_dir" and not path.exists()]
+    missing = [
+        str(paths[key])
+        for key in ("training_config",)
+        if not paths[key].exists()
+    ]
     if missing:
         raise FileNotFoundError(f"Model run {run_id} is missing required artifact(s): {', '.join(missing)}")
+    if not has_model_load_source(paths):
+        raise FileNotFoundError(
+            f"Model run {run_id} has no supported model artifacts. Expected one of: "
+            f"{paths['user_tower']} + {paths['post_tower']}, "
+            f"{paths['best_user_tower']} + {paths['best_post_tower']}, "
+            f"or {paths['best_checkpoint']}"
+        )
     return paths
+
+
+def load_train_manifest(paths: dict[str, Path]) -> dict[str, Any]:
+    if paths["manifest"].exists():
+        return _read_json(paths["manifest"])
+    if paths["partial_manifest"].exists():
+        return _read_json(paths["partial_manifest"])
+    return {}
+
+
+def has_model_load_source(paths: dict[str, Path]) -> bool:
+    return (
+        paths["user_tower"].exists()
+        and paths["post_tower"].exists()
+    ) or (
+        paths["best_user_tower"].exists()
+        and paths["best_post_tower"].exists()
+    ) or paths["best_checkpoint"].exists()
+
+
+def _load_checkpoint(checkpoint_path: Path) -> dict[str, Any]:
+    try:
+        checkpoint = torch.load(str(checkpoint_path), map_location="cpu", weights_only=True)
+    except TypeError:
+        checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"Expected checkpoint at {checkpoint_path} to contain a dictionary")
+    if "model_state_dict" not in checkpoint:
+        raise ValueError(f"Checkpoint at {checkpoint_path} is missing model_state_dict")
+    return checkpoint
+
+
+def _require_config(config: dict[str, Any], key: str) -> Any:
+    if key not in config:
+        raise ValueError(f"Model config is missing required key: {key}")
+    return config[key]
+
+
+def reconstruct_model_from_checkpoint(
+    checkpoint_path: Path,
+    training_config: dict[str, Any],
+    device: torch.device,
+) -> Any:
+    checkpoint = _load_checkpoint(checkpoint_path)
+    checkpoint_config = checkpoint.get("config")
+    config = {**training_config, **checkpoint_config} if isinstance(checkpoint_config, dict) else training_config
+    if config.get("model_type") not in ("two_tower", "two-tower"):
+        raise ValueError(f"Expected two-tower checkpoint, got model_type={config.get('model_type')!r}")
+
+    stage_train_two_tower = importlib.import_module("utils.03_train.stage_train_two_tower")
+    model = stage_train_two_tower.TwoTowerModel(
+        post_embedding_dim=int(_require_config(config, "post_embedding_dim")),
+        shared_dim=int(_require_config(config, "shared_dim")),
+        user_hidden_dim=int(_require_config(config, "user_hidden_dim")),
+        post_hidden_dim=int(_require_config(config, "post_hidden_dim")),
+        num_attention_heads=int(_require_config(config, "num_attention_heads")),
+        num_attention_layers=int(_require_config(config, "num_attention_layers")),
+        max_history_len=int(_require_config(config, "max_history_len")),
+        dropout_rate=float(_require_config(config, "dropout_rate")),
+        l2_normalize_embeddings=bool(_require_config(config, "l2_normalize_embeddings")),
+        similarity_temperature=float(_require_config(config, "similarity_temperature")),
+        user_encoder_type=str(_require_config(config, "user_encoder_type")),
+        use_post_encoder=bool(_require_config(config, "use_post_encoder")),
+        use_author_embedding_table=bool(config.get("use_author_embedding_table", False)),
+        author_table_num_rows=(
+            int(config["author_table_num_rows"])
+            if config.get("use_author_embedding_table")
+            else None
+        ),
+        author_embedding_dim=(
+            int(config["author_embedding_dim"])
+            if config.get("use_author_embedding_table")
+            else None
+        ),
+        content_projection_dim=(
+            int(_require_config(config, "content_projection_dim"))
+            if config.get("use_author_embedding_table")
+            else None
+        ),
+        author_projection_dim=(
+            int(_require_config(config, "author_projection_dim"))
+            if config.get("use_author_embedding_table")
+            else None
+        ),
+        author_unknown_dropout_rate=float(config.get("author_unknown_dropout_rate") or 0.0),
+    )
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model = model.to(device)
+    model.eval()
+    return model
+
+
+def load_towers_from_paths(
+    paths: dict[str, Path],
+    training_config: dict[str, Any],
+    device: torch.device,
+) -> tuple[Any, Any, str]:
+    if paths["user_tower"].exists() and paths["post_tower"].exists():
+        user_tower = torch.jit.load(str(paths["user_tower"]), map_location=device).eval()
+        post_tower = torch.jit.load(str(paths["post_tower"]), map_location=device).eval()
+        return user_tower, post_tower, "torchscript_final"
+
+    if paths["best_user_tower"].exists() and paths["best_post_tower"].exists():
+        user_tower = torch.jit.load(str(paths["best_user_tower"]), map_location=device).eval()
+        post_tower = torch.jit.load(str(paths["best_post_tower"]), map_location=device).eval()
+        return user_tower, post_tower, "torchscript_best"
+
+    model = reconstruct_model_from_checkpoint(paths["best_checkpoint"], training_config, device)
+    return model.user_tower, model.post_tower, "pth_best"
 
 
 def resolve_author_idx_path(get_data_dir: Path) -> Path:
@@ -270,16 +396,16 @@ def load_author_idx_map(get_data_dir: Path) -> dict[str, int]:
 def load_model_bundle(train_artifacts_dir: Path, run_id: str, device: torch.device) -> ModelBundle:
     paths = resolve_model_paths(train_artifacts_dir, run_id)
     training_config = _read_json(paths["training_config"])
-    manifest = _read_json(paths["manifest"])
-    user_tower = torch.jit.load(str(paths["user_tower"]), map_location=device).eval()
-    post_tower = torch.jit.load(str(paths["post_tower"]), map_location=device).eval()
+    manifest = load_train_manifest(paths)
+    user_tower, post_tower, load_source = load_towers_from_paths(paths, training_config, device)
 
     author_idx_by_did = None
     if bool(training_config.get("use_author_embedding_table")):
         get_data_dir = Path(manifest.get("inputs", {}).get("01_get_data", ""))
         if not get_data_dir.exists():
             raise FileNotFoundError(
-                f"Model run {run_id} uses author embeddings, but manifest input 01_get_data was not found: {get_data_dir}"
+                f"Model run {run_id} uses author embeddings, but manifest input 01_get_data was not found: {get_data_dir}. "
+                "A manifest with the training 01_get_data path is required to map author DIDs to author_idx values."
             )
         author_idx_by_did = load_author_idx_map(get_data_dir)
 
@@ -291,6 +417,7 @@ def load_model_bundle(train_artifacts_dir: Path, run_id: str, device: torch.devi
         user_tower=user_tower,
         post_tower=post_tower,
         author_idx_by_did=author_idx_by_did,
+        load_source=load_source,
     )
 
 
@@ -726,6 +853,7 @@ def build_summary(
         scores = [post.score for post in top_posts]
         model_summaries[model.run_id] = {
             "train_dir": str(model.train_dir),
+            "load_source": model.load_source,
             "use_author_embedding_table": model.use_author_embedding_table,
             "author_counts": author_counts_by_model.get(model.run_id, []),
             "top_k_returned": len(top_posts),

@@ -81,6 +81,7 @@ Outputs under <run_dir>/03_train/<timestamp>/:
     - checkpoints/engagement_user_tower_best.pt (best-by-validation user tower TorchScript)
     - checkpoints/engagement_post_tower_best.pt (best-by-validation post tower TorchScript)
     - checkpoints/two_tower_<timestamp>.pth (final model checkpoint)
+    - manifest.partial.json (partial pipeline metadata written before training starts)
     - logs/ (training logs)
     - training_config.json (hyperparameters and configuration)
     - training_results.json (end-of-training metrics and results)
@@ -922,6 +923,13 @@ def run(context: Context, args) -> Dict[str, Any]:
         context, logger=logger,
     )
     log_prior_stage_inputs(context, logger)
+    partial_manifest_path = context.write_partial_stage_manifest(
+        output_dir=out_dir,
+        stage_key="train_two_tower",
+        stage_folder="03_train",
+        argv=getattr(args, "_argv", None),
+    )
+    logger.info(f"Partial stage manifest written to: {partial_manifest_path}")
     num_total_likes_by_user = {
         str(row["did"]): int(row["num_total_likes"])
         for row in (

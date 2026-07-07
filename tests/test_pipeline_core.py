@@ -101,6 +101,31 @@ def test_stage_metadata_json_includes_nulls(tmp_path):
     assert resolved["foo"] is None
 
 
+def test_write_partial_stage_manifest_records_active_inputs(tmp_path):
+    run_dir = Path(tmp_path) / "runs" / "run1"
+    artifacts_dir = Path(tmp_path) / "artifacts"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    prior_dir = artifacts_dir / "01_get_data" / "20260101_000000_abcd1234"
+    prior_dir.mkdir(parents=True, exist_ok=True)
+
+    ctx = Context(run_dir=run_dir, artifacts_dir=artifacts_dir, runs_dir=Path(tmp_path) / "runs", pipeline_run_id="run1")
+    ctx.begin_stage("train_two_tower", "03_train")
+    ctx.record_prior_input("01_get_data", prior_dir)
+    out_dir = ctx.new_stage_dir(tag="test")
+
+    manifest_path = ctx.write_partial_stage_manifest(output_dir=out_dir, argv=["pipeline", "all"])
+
+    assert manifest_path == out_dir / "manifest.partial.json"
+    assert not (out_dir / "manifest.json").exists()
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["status"] == "partial"
+    assert manifest["stage_key"] == "train_two_tower"
+    assert manifest["stage_folder"] == "03_train"
+    assert manifest["argv"] == ["pipeline", "all"]
+    assert manifest["inputs"] == {"01_get_data": str(prior_dir.resolve())}
+
+
 def test_finalize_stage_appends_prior_inputs_to_stage_info(tmp_path):
     run_dir = Path(tmp_path) / "runs" / "run1"
     artifacts_dir = Path(tmp_path) / "artifacts"

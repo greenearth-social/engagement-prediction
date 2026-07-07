@@ -33,6 +33,9 @@ class FakeTower:
             return args[0]
         return self.output
 
+    def eval(self):
+        return self
+
 
 def _model(module, *, run_id="model-a", use_author=False, user_tower=None, post_tower=None):
     return module.ModelBundle(
@@ -47,6 +50,7 @@ def _model(module, *, run_id="model-a", use_author=False, user_tower=None, post_
         user_tower=user_tower or FakeTower(torch.tensor([[1.0, 0.0]])),
         post_tower=post_tower or FakeTower(passthrough=True),
         author_idx_by_did={"did:a": 7} if use_author else None,
+        load_source="test",
     )
 
 
@@ -251,6 +255,7 @@ def test_output_dir_and_json_artifacts_are_written_by_default(retrieval_eval_mod
     assert (output_dir / "history_posts.json").exists()
     assert (output_dir / "top_k_posts.json").exists()
     assert set(summary["models"].keys()) == {"model-a", "model-b"}
+    assert summary["models"]["model-a"]["load_source"] == "test"
     assert top_k_rows[0]["at_uri"] == "at://did:a/app.bsky.feed.post/p1"
     assert top_k_rows[0]["url"] == "https://bsky.app/profile/did:a/post/p1"
     assert top_k_rows[0]["author_did"] == "did:a"
@@ -285,3 +290,93 @@ def test_missing_artifacts_fail_clearly(retrieval_eval_module, tmp_path):
 
     with pytest.raises(FileNotFoundError, match="No author_idx_.*parquet"):
         retrieval_eval_module.resolve_author_idx_path(tmp_path)
+
+
+def test_resolve_model_paths_accepts_best_checkpoint_without_torchscript(retrieval_eval_module, tmp_path):
+    train_dir = tmp_path / "run-a"
+    checkpoints_dir = train_dir / "checkpoints"
+    checkpoints_dir.mkdir(parents=True)
+    (train_dir / "training_config.json").write_text("{}")
+    (checkpoints_dir / "two_tower_best.pth").write_bytes(b"checkpoint")
+
+    paths = retrieval_eval_module.resolve_model_paths(tmp_path, "run-a")
+
+    assert paths["best_checkpoint"] == checkpoints_dir / "two_tower_best.pth"
+    assert not paths["manifest"].exists()
+
+
+def test_load_train_manifest_prefers_final_manifest_then_partial(retrieval_eval_module, tmp_path):
+    train_dir = tmp_path / "run-a"
+    checkpoints_dir = train_dir / "checkpoints"
+    checkpoints_dir.mkdir(parents=True)
+    (train_dir / "training_config.json").write_text("{}")
+    (checkpoints_dir / "two_tower_best.pth").write_bytes(b"checkpoint")
+    (train_dir / "manifest.partial.json").write_text('{"inputs": {"01_get_data": "/partial"}}')
+
+    paths = retrieval_eval_module.resolve_model_paths(tmp_path, "run-a")
+
+    assert retrieval_eval_module.load_train_manifest(paths)["inputs"]["01_get_data"] == "/partial"
+
+    (train_dir / "manifest.json").write_text('{"inputs": {"01_get_data": "/final"}}')
+
+    assert retrieval_eval_module.load_train_manifest(paths)["inputs"]["01_get_data"] == "/final"
+
+
+def test_resolve_model_paths_rejects_run_with_no_supported_model_artifact(retrieval_eval_module, tmp_path):
+    train_dir = tmp_path / "run-a"
+    train_dir.mkdir(parents=True)
+    (train_dir / "training_config.json").write_text("{}")
+    (train_dir / "manifest.json").write_text("{}")
+
+    with pytest.raises(FileNotFoundError, match="no supported model artifacts"):
+        retrieval_eval_module.resolve_model_paths(tmp_path, "run-a")
+
+
+def test_load_towers_prefers_final_then_best_then_pth(retrieval_eval_module, tmp_path, monkeypatch):
+    checkpoints_dir = tmp_path / "checkpoints"
+    checkpoints_dir.mkdir()
+    paths = {
+        "user_tower": checkpoints_dir / "engagement_user_tower.pt",
+        "post_tower": checkpoints_dir / "engagement_post_tower.pt",
+        "best_user_tower": checkpoints_dir / "engagement_user_tower_best.pt",
+        "best_post_tower": checkpoints_dir / "engagement_post_tower_best.pt",
+        "best_checkpoint": checkpoints_dir / "two_tower_best.pth",
+    }
+    loaded_paths = []
+
+    def fake_jit_load(path, map_location=None):
+        loaded_paths.append(Path(path).name)
+        return FakeTower()
+
+    monkeypatch.setattr(retrieval_eval_module.torch.jit, "load", fake_jit_load)
+    for key in ("user_tower", "post_tower", "best_user_tower", "best_post_tower", "best_checkpoint"):
+        paths[key].write_bytes(b"x")
+
+    _, _, source = retrieval_eval_module.load_towers_from_paths(paths, {}, torch.device("cpu"))
+
+    assert source == "torchscript_final"
+    assert loaded_paths == ["engagement_user_tower.pt", "engagement_post_tower.pt"]
+
+    paths["user_tower"].unlink()
+    paths["post_tower"].unlink()
+    loaded_paths.clear()
+    _, _, source = retrieval_eval_module.load_towers_from_paths(paths, {}, torch.device("cpu"))
+
+    assert source == "torchscript_best"
+    assert loaded_paths == ["engagement_user_tower_best.pt", "engagement_post_tower_best.pt"]
+
+    paths["best_user_tower"].unlink()
+    paths["best_post_tower"].unlink()
+
+    class FakeModel:
+        user_tower = FakeTower()
+        post_tower = FakeTower()
+
+    monkeypatch.setattr(
+        retrieval_eval_module,
+        "reconstruct_model_from_checkpoint",
+        lambda checkpoint_path, training_config, device: FakeModel(),
+    )
+    _, _, source = retrieval_eval_module.load_towers_from_paths(paths, {}, torch.device("cpu"))
+
+    assert source == "pth_best"

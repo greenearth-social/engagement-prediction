@@ -38,6 +38,7 @@ DEFAULT_ARTIFACTS_DIR = ROOT / "artifacts"
 DEFAULT_RUNS_DIR = ROOT / "runs"
 LINEAGE_FILENAME = "lineage.json"
 STAGE_MANIFEST_FILENAME = "manifest.json"
+STAGE_PARTIAL_MANIFEST_FILENAME = "manifest.partial.json"
 STAGE_RESOLVED_CONFIG_FILENAME = "resolved_config.json"
 
 
@@ -63,6 +64,32 @@ def _normalize_for_json(value: Any) -> Any:
 
 def _write_json(path: Path, data: Dict[str, Any]) -> None:
     path.write_text(json.dumps(_normalize_for_json(data), indent=2, sort_keys=True) + "\n")
+
+
+def _build_stage_manifest(
+    *,
+    stage_key: str,
+    stage_folder: str,
+    output_dir: Path,
+    pipeline_run_dir: Path,
+    pipeline_run_id: Optional[str],
+    argv: Optional[Iterable[str]],
+    inputs: Dict[str, str],
+    status: Optional[str] = None,
+) -> Dict[str, Any]:
+    manifest: Dict[str, Any] = {
+        "stage_key": stage_key,
+        "stage_folder": stage_folder,
+        "stage_run_id": Path(output_dir).resolve().name,
+        "pipeline_run_id": pipeline_run_id or Path(pipeline_run_dir).resolve().name,
+        "created_at": datetime.now().isoformat(),
+        "git_sha": _git_sha(ROOT),
+        "argv": list(argv) if argv is not None else None,
+        "inputs": inputs.copy(),
+    }
+    if status is not None:
+        manifest["status"] = status
+    return manifest
 
 
 def _git_sha(repo_root: Path) -> Optional[str]:
@@ -216,16 +243,15 @@ class Context:
         _write_json(resolved_config_path, args_dict)
 
         manifest_path = output_dir / STAGE_MANIFEST_FILENAME
-        manifest: Dict[str, Any] = {
-            "stage_key": stage_key,
-            "stage_folder": stage_folder,
-            "stage_run_id": stage_run_id,
-            "pipeline_run_id": self.pipeline_run_id or pipeline_run_dir.name,
-            "created_at": datetime.now().isoformat(),
-            "git_sha": _git_sha(ROOT),
-            "argv": list(argv) if argv is not None else None,
-            "inputs": self._active_stage_inputs.copy(),
-        }
+        manifest = _build_stage_manifest(
+            stage_key=stage_key,
+            stage_folder=stage_folder,
+            output_dir=output_dir,
+            pipeline_run_dir=pipeline_run_dir,
+            pipeline_run_id=self.pipeline_run_id,
+            argv=argv,
+            inputs=self._active_stage_inputs,
+        )
         _write_json(manifest_path, manifest)
         self._append_stage_info_inputs(output_dir)
 
@@ -237,6 +263,33 @@ class Context:
             resolved_config_path=resolved_config_path,
             manifest_path=manifest_path,
         )
+
+    def write_partial_stage_manifest(
+        self,
+        *,
+        output_dir: Path,
+        stage_key: Optional[str] = None,
+        stage_folder: Optional[str] = None,
+        argv: Optional[Iterable[str]] = None,
+    ) -> Path:
+        stage_key = stage_key or self._active_stage_key
+        stage_folder = stage_folder or self._active_stage_folder
+        if not stage_key or not stage_folder:
+            raise RuntimeError("write_partial_stage_manifest requires stage_key/stage_folder or Context.begin_stage().")
+        output_dir = Path(output_dir).resolve()
+        manifest_path = output_dir / STAGE_PARTIAL_MANIFEST_FILENAME
+        manifest = _build_stage_manifest(
+            stage_key=stage_key,
+            stage_folder=stage_folder,
+            output_dir=output_dir,
+            pipeline_run_dir=Path(self.run_dir).resolve(),
+            pipeline_run_id=self.pipeline_run_id,
+            argv=argv,
+            inputs=self._active_stage_inputs,
+            status="partial",
+        )
+        _write_json(manifest_path, manifest)
+        return manifest_path
 
     def record_artifact(self, stage: str, output_dir: Path, extras: Optional[Dict[str, Any]] = None) -> None:
         self.artifacts[stage] = {
