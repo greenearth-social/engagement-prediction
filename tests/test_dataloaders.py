@@ -21,6 +21,15 @@ def _dt(hour: int) -> datetime:
     return datetime(2024, 1, 1, hour, tzinfo=timezone.utc)
 
 
+def _packed_slices(flat_tensor, offsets_tensor):
+    flat = flat_tensor.tolist()
+    offsets = offsets_tensor.tolist()
+    return [
+        flat[offsets[idx]:offsets[idx + 1]]
+        for idx in range(len(offsets) - 1)
+    ]
+
+
 @pytest.fixture
 def mock_embeddings_mmap():
     values = np.arange(40 * 4, dtype=np.float32).reshape(40, 4)
@@ -182,8 +191,8 @@ def test_bucketed_collate_builds_candidates_and_same_hour_labels(bucketed_datase
     assert batch["candidate_post_embeddings"].shape == (5, 4)
     assert "history_prior_cumulative_likes" not in batch
     assert "candidate_prior_cumulative_likes" not in batch
-    assert "history_post_liker_user_indices" not in batch
-    assert "candidate_post_liker_user_indices" not in batch
+    assert "history_post_liker_user_indices_flat" not in batch
+    assert "candidate_post_liker_user_indices_flat" not in batch
 
     labels_by_user = {
         user_id: batch["label_matrix"][idx].tolist()
@@ -193,33 +202,38 @@ def test_bucketed_collate_builds_candidates_and_same_hour_labels(bucketed_datase
     assert labels_by_user["u2"] == [0.0, 0.0, 1.0, 0.0, 0.0]
 
 
-def test_post_liker_event_lookup_slices_prior_events_with_padding(mock_post_liker_events_df):
+def test_post_liker_event_lookup_slices_prior_events_as_variable_length_replay(mock_post_liker_events_df):
     lookup = PostLikerEventLookup.from_dataframe(mock_post_liker_events_df)
 
-    user_indices, age_hours = lookup.recent_likers_before(
+    user_indices, time_gap_hours = lookup.liker_events_before(
         emb_idx=0,
         target_time_us=_timestamp_to_epoch_us(_dt(10)),
-        max_recent_likers=3,
     )
 
-    assert user_indices.tolist() == [3, 2, 0]
-    np.testing.assert_allclose(age_hours, np.array([1.0, 2.0, 0.0], dtype=np.float32))
+    assert user_indices.tolist() == [2, 3]
+    np.testing.assert_allclose(time_gap_hours, np.array([0.0, 1.0], dtype=np.float32))
 
-    duplicate_indices, duplicate_age_hours = lookup.recent_likers_before(
+    duplicate_indices, duplicate_time_gap_hours = lookup.liker_events_before(
         emb_idx=1,
         target_time_us=_timestamp_to_epoch_us(_dt(10)),
-        max_recent_likers=3,
     )
-    assert duplicate_indices.tolist() == [5, 4, 0]
-    np.testing.assert_allclose(duplicate_age_hours, np.array([1.0, 1.0, 0.0], dtype=np.float32))
+    assert duplicate_indices.tolist() == [4, 5]
+    np.testing.assert_allclose(duplicate_time_gap_hours, np.array([0.0, 0.0], dtype=np.float32))
 
-    missing_indices, missing_age_hours = lookup.recent_likers_before(
+    capped_indices, capped_time_gap_hours = lookup.liker_events_before(
+        emb_idx=0,
+        target_time_us=_timestamp_to_epoch_us(_dt(11)),
+        max_replay_events=2,
+    )
+    assert capped_indices.tolist() == [3, 4]
+    np.testing.assert_allclose(capped_time_gap_hours, np.array([0.0, 1.0], dtype=np.float32))
+
+    missing_indices, missing_time_gap_hours = lookup.liker_events_before(
         emb_idx=999,
         target_time_us=_timestamp_to_epoch_us(_dt(10)),
-        max_recent_likers=2,
     )
-    assert missing_indices.tolist() == [0, 0]
-    np.testing.assert_allclose(missing_age_hours, np.zeros(2, dtype=np.float32))
+    assert missing_indices.tolist() == []
+    np.testing.assert_allclose(missing_time_gap_hours, np.array([], dtype=np.float32))
 
 
 def test_bucketed_collate_returns_post_liker_tensors_when_enabled(
@@ -239,47 +253,67 @@ def test_bucketed_collate_returns_post_liker_tensors_when_enabled(
         embed_dim=4,
         use_post_liker_user_pooling=True,
         post_liker_event_lookup=PostLikerEventLookup.from_dataframe(mock_post_liker_events_df),
-        max_recent_likers_per_post=2,
     )
 
     batch = dataset.collate_batch([dataset[0], dataset[1]])
 
     assert batch["candidate_post_id"] == ["p1", "p3", "p2", "n1", "p4"]
-    assert batch["history_post_liker_user_indices"].shape == (2, 3, 2)
-    assert batch["history_post_liker_age_hours"].shape == (2, 3, 2)
-    assert batch["candidate_post_liker_user_indices"].shape == (5, 2)
-    assert batch["candidate_post_liker_age_hours"].shape == (5, 2)
-    assert batch["history_post_liker_user_indices"][0].tolist() == [
-        [11, 10],
-        [13, 0],
-        [0, 0],
-    ]
+    assert batch["history_post_liker_offsets"].shape == (7,)
+    assert batch["candidate_post_liker_offsets"].shape == (6,)
+    assert _packed_slices(
+        batch["history_post_liker_user_indices_flat"],
+        batch["history_post_liker_offsets"],
+    ) == [[10, 11], [13], [], [], [], []]
     np.testing.assert_allclose(
-        batch["history_post_liker_age_hours"][0].numpy(),
-        np.array([
-            [1.0, 2.0],
-            [1.0, 0.0],
-            [0.0, 0.0],
-        ], dtype=np.float32),
+        batch["history_post_liker_time_gap_hours_flat"].numpy(),
+        np.array([0.0, 1.0, 0.0], dtype=np.float32),
     )
-    assert batch["history_post_liker_user_indices"][1].tolist() == [[0, 0], [0, 0], [0, 0]]
-    assert batch["candidate_post_liker_user_indices"].tolist() == [
-        [3, 2],
-        [0, 0],
-        [5, 4],
-        [8, 0],
-        [9, 0],
-    ]
+    assert _packed_slices(
+        batch["candidate_post_liker_user_indices_flat"],
+        batch["candidate_post_liker_offsets"],
+    ) == [[2, 3], [], [4, 5], [8], [9]]
     np.testing.assert_allclose(
-        batch["candidate_post_liker_age_hours"].numpy(),
-        np.array([
-            [1.0, 2.0],
-            [0.0, 0.0],
-            [1.0, 1.0],
-            [3.0, 0.0],
-            [1.0, 0.0],
-        ], dtype=np.float32),
+        batch["candidate_post_liker_time_gap_hours_flat"].numpy(),
+        np.array([0.0, 1.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
     )
+    assert batch["post_liker_replay_event_count"] == 9
+    assert batch["post_liker_replay_max_events_per_post"] == 2
+
+
+def test_bucketed_post_liker_replay_cap_keeps_most_recent_prior_events(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+    mock_post_liker_events_df,
+):
+    dataset = BucketedEngagementDataset(
+        embeddings_mmap=mock_embeddings_mmap,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
+        history_df=mock_history_df,
+        split="train",
+        max_history_len=3,
+        embed_dim=4,
+        use_post_liker_user_pooling=True,
+        post_liker_event_lookup=PostLikerEventLookup.from_dataframe(mock_post_liker_events_df),
+        max_post_liker_replay_events_per_post=1,
+    )
+
+    batch = dataset.collate_batch([dataset[0], dataset[1]])
+
+    assert _packed_slices(
+        batch["history_post_liker_user_indices_flat"],
+        batch["history_post_liker_offsets"],
+    ) == [[11], [13], [], [], [], []]
+    np.testing.assert_allclose(
+        batch["history_post_liker_time_gap_hours_flat"].numpy(),
+        np.array([0.0, 0.0], dtype=np.float32),
+    )
+    assert _packed_slices(
+        batch["candidate_post_liker_user_indices_flat"],
+        batch["candidate_post_liker_offsets"],
+    ) == [[3], [], [5], [8], [9]]
 
 
 def test_bucketed_post_liker_history_uses_current_bucket_time(
@@ -299,16 +333,18 @@ def test_bucketed_post_liker_history_uses_current_bucket_time(
         embed_dim=4,
         use_post_liker_user_pooling=True,
         post_liker_event_lookup=PostLikerEventLookup.from_dataframe(mock_post_liker_events_df),
-        max_recent_likers_per_post=2,
     )
 
     batch = dataset.collate_batch([dataset[2]])
 
     assert batch["bucket"] == _dt(11)
-    assert batch["history_post_liker_user_indices"][0].tolist() == [[14, 0], [0, 0], [0, 0]]
+    assert _packed_slices(
+        batch["history_post_liker_user_indices_flat"],
+        batch["history_post_liker_offsets"],
+    ) == [[14], [], []]
     np.testing.assert_allclose(
-        batch["history_post_liker_age_hours"][0].numpy(),
-        np.array([[1.0, 0.0], [0.0, 0.0], [0.0, 0.0]], dtype=np.float32),
+        batch["history_post_liker_time_gap_hours_flat"].numpy(),
+        np.array([0.0], dtype=np.float32),
     )
 
 
@@ -328,7 +364,6 @@ def test_bucketed_post_liker_requires_event_artifact_when_enabled(
             max_history_len=3,
             embed_dim=4,
             use_post_liker_user_pooling=True,
-            max_recent_likers_per_post=2,
         )
 
 

@@ -282,7 +282,7 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
             bst_use_popularity_feature: false
             bst_popularity_projection_dim: 12
             bst_use_post_liker_user_pooling: true
-            bst_max_recent_likers_per_post: 25
+            bst_max_post_liker_replay_events_per_post: 25
             """
         ).strip()
         + "\n"
@@ -305,7 +305,7 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
     assert merged.bst_use_popularity_feature is False
     assert merged.bst_popularity_projection_dim == 12
     assert merged.bst_use_post_liker_user_pooling is True
-    assert merged.bst_max_recent_likers_per_post == 25
+    assert merged.bst_max_post_liker_replay_events_per_post == 25
     cli._validate_bst_config(merged)
 
 
@@ -323,7 +323,7 @@ def test_bst_ranker_training_defaults():
     assert merged.bst_use_popularity_feature is True
     assert merged.bst_popularity_projection_dim == 8
     assert merged.bst_use_post_liker_user_pooling is False
-    assert merged.bst_max_recent_likers_per_post == 50
+    assert merged.bst_max_post_liker_replay_events_per_post is None
     cli._validate_bst_config(merged)
 
 
@@ -415,18 +415,31 @@ def test_bst_ranker_validates_projection_dims(arg_name, error_match):
         cli._validate_bst_config(merged)
 
 
-def test_bst_ranker_validates_post_liker_max_when_enabled():
+def test_bst_ranker_validates_post_liker_replay_cap_when_configured():
     parser = cli.build_parser()
     raw = parser.parse_args([
         "--model-type", "bst-ranker",
         "--use-author-embedding-table",
-        "--bst-use-post-liker-user-pooling",
-        "--bst-max-recent-likers-per-post", "0",
+        "--bst-max-post-liker-replay-events-per-post", "0",
     ])
     merged = cli._merge_args_with_config(raw)
 
-    with pytest.raises(ValueError, match="bst-max-recent-likers-per-post"):
+    with pytest.raises(ValueError, match="bst-max-post-liker-replay-events-per-post"):
         cli._validate_bst_config(merged)
+
+
+def test_bst_ranker_rejects_removed_post_liker_recent_cap(tmp_path):
+    parser = cli.build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--bst-max-recent-likers-per-post", "25"])
+
+    config_path = Path(tmp_path) / "old_post_liker_cap.yml"
+    config_path.write_text("bst_max_recent_likers_per_post: 25\n")
+    raw = parser.parse_args(["--config", str(config_path)])
+
+    with pytest.raises(ValueError, match="bst_max_recent_likers_per_post"):
+        cli._merge_args_with_config(raw)
 
 
 def test_bst_ranker_validates_transformer_head_divisibility():
