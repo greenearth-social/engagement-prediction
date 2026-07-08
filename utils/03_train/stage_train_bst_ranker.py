@@ -1050,10 +1050,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     author_unknown_dropout_rate = float(args.author_unknown_dropout_rate)
     popularity_projection_dim = int(args.bst_popularity_projection_dim)
     use_post_liker_user_pooling = bool(args.bst_use_post_liker_user_pooling)
-    bst_max_recent_likers_per_post = int(args.bst_max_recent_likers_per_post)
+    bst_max_post_liker_replay_events_per_post = args.bst_max_post_liker_replay_events_per_post
+    if bst_max_post_liker_replay_events_per_post is not None:
+        bst_max_post_liker_replay_events_per_post = int(bst_max_post_liker_replay_events_per_post)
     batch_size = int(args.batch_size)
     bst_additional_batch_negatives = int(args.bst_additional_batch_negatives)
-    bst_max_train_batches_per_epoch = getattr(args, "bst_max_train_batches_per_epoch", None)
+    bst_max_train_batches_per_epoch = args.bst_max_train_batches_per_epoch
     if bst_max_train_batches_per_epoch is not None:
         bst_max_train_batches_per_epoch = int(bst_max_train_batches_per_epoch)
     metrics_top_ks = list(args.metrics_top_ks)
@@ -1105,7 +1107,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         post_liker_event_lookup = PostLikerEventLookup.from_dataframe(post_liker_events_df)
         logger.info(
             "BST post-liker user pooling dataloader tensors enabled: "
-            f"max_recent_likers_per_post={bst_max_recent_likers_per_post}, "
+            f"max_post_liker_replay_events_per_post={bst_max_post_liker_replay_events_per_post}, "
             f"post_liker_event_rows={len(post_liker_events_df):,}, "
             f"post_liker_user_idx_rows={len(post_liker_user_idx_df):,}"
         )
@@ -1130,7 +1132,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         use_popularity_feature=use_popularity_feature,
         use_post_liker_user_pooling=use_post_liker_user_pooling,
         post_liker_event_lookup=post_liker_event_lookup,
-        max_recent_likers_per_post=bst_max_recent_likers_per_post,
+        max_post_liker_replay_events_per_post=bst_max_post_liker_replay_events_per_post,
         bst_additional_batch_negatives=bst_additional_batch_negatives,
         seed=random_seed,
         logger=logger,
@@ -1147,7 +1149,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         use_popularity_feature=use_popularity_feature,
         use_post_liker_user_pooling=use_post_liker_user_pooling,
         post_liker_event_lookup=post_liker_event_lookup,
-        max_recent_likers_per_post=bst_max_recent_likers_per_post,
+        max_post_liker_replay_events_per_post=bst_max_post_liker_replay_events_per_post,
         bst_additional_batch_negatives=bst_additional_batch_negatives,
         seed=random_seed,
         logger=logger,
@@ -1164,7 +1166,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         use_popularity_feature=use_popularity_feature,
         use_post_liker_user_pooling=use_post_liker_user_pooling,
         post_liker_event_lookup=post_liker_event_lookup,
-        max_recent_likers_per_post=bst_max_recent_likers_per_post,
+        max_post_liker_replay_events_per_post=bst_max_post_liker_replay_events_per_post,
         bst_additional_batch_negatives=bst_additional_batch_negatives,
         seed=random_seed,
         logger=logger,
@@ -1206,7 +1208,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "bst_popularity_log_mean": popularity_log_mean,
         "bst_popularity_log_std": popularity_log_std,
         "bst_use_post_liker_user_pooling": use_post_liker_user_pooling,
-        "bst_max_recent_likers_per_post": bst_max_recent_likers_per_post,
+        "bst_max_post_liker_replay_events_per_post": bst_max_post_liker_replay_events_per_post,
     }
     training_config = {
         **config,
