@@ -170,6 +170,7 @@ class BstPthAdapter:
             if not bool(config.get("use_author_embedding_table", False)):
                 raise ValueError("BstPthAdapter requires a BST checkpoint trained with author embeddings")
             use_popularity_feature = bool(config.get("bst_use_popularity_feature", False))
+            use_post_liker_user_pooling = bool(config.get("bst_use_post_liker_user_pooling", False))
 
             stage_train_bst_ranker = importlib.import_module("utils.03_train.stage_train_bst_ranker")
             model = stage_train_bst_ranker.BSTRanker(
@@ -192,6 +193,11 @@ class BstPthAdapter:
                 popularity_projection_dim=int(config.get("bst_popularity_projection_dim") or 0),
                 popularity_log_mean=float(config.get("bst_popularity_log_mean") or 0.0),
                 popularity_log_std=float(config.get("bst_popularity_log_std") or 1.0),
+                use_post_liker_user_pooling=use_post_liker_user_pooling,
+                post_liker_user_table_num_rows=int(config.get("bst_post_liker_user_table_num_rows") or 2),
+                post_liker_user_embedding_dim=int(config.get("bst_post_liker_user_embedding_dim") or 16),
+                post_liker_projection_dim=int(config.get("bst_post_liker_projection_dim") or 16),
+                post_liker_pooling_tau_hours=float(config.get("bst_post_liker_pooling_tau_hours") or 168.0),
             )
             model.load_state_dict(checkpoint["model_state_dict"])
             self.model = model
@@ -221,6 +227,13 @@ class BstPthAdapter:
                 "history_prior_cumulative_likes",
                 "candidate_prior_cumulative_likes",
             )
+        if self.model.use_post_liker_user_pooling:
+            required_fields = required_fields + (
+                "history_post_liker_user_indices",
+                "history_post_liker_time_gap_hours",
+                "candidate_post_liker_user_indices",
+                "candidate_post_liker_time_gap_hours",
+            )
         missing = [field for field in required_fields if field not in batch]
         if missing:
             raise RuntimeError(f"BstPthAdapter batch is missing required fields: {', '.join(missing)}")
@@ -236,6 +249,15 @@ class BstPthAdapter:
         if self.model.use_popularity_feature:
             history_prior_cumulative_likes = batch["history_prior_cumulative_likes"].to(device, dtype=torch.float32, non_blocking=True)
             candidate_prior_cumulative_likes = batch["candidate_prior_cumulative_likes"].to(device, dtype=torch.float32, non_blocking=True)
+        history_post_liker_user_indices = None
+        history_post_liker_time_gap_hours = None
+        candidate_post_liker_user_indices = None
+        candidate_post_liker_time_gap_hours = None
+        if self.model.use_post_liker_user_pooling:
+            history_post_liker_user_indices = batch["history_post_liker_user_indices"].to(device, dtype=torch.long, non_blocking=True)
+            history_post_liker_time_gap_hours = batch["history_post_liker_time_gap_hours"].to(device, dtype=torch.float32, non_blocking=True)
+            candidate_post_liker_user_indices = batch["candidate_post_liker_user_indices"].to(device, dtype=torch.long, non_blocking=True)
+            candidate_post_liker_time_gap_hours = batch["candidate_post_liker_time_gap_hours"].to(device, dtype=torch.float32, non_blocking=True)
 
         num_candidates = int(candidate_post_embeddings.size(0))
         score_chunks = []
@@ -248,6 +270,11 @@ class BstPthAdapter:
                 if candidate_prior_cumulative_likes is not None
                 else None
             )
+            candidate_liker_user_chunk = None
+            candidate_liker_gap_chunk = None
+            if self.model.use_post_liker_user_pooling:
+                candidate_liker_user_chunk = candidate_post_liker_user_indices[start:end]
+                candidate_liker_gap_chunk = candidate_post_liker_time_gap_hours[start:end]
             logits = self.model.score_candidate_matrix_one_layer(
                 history_embeddings=history_embeddings,
                 history_mask=history_mask,
@@ -257,6 +284,10 @@ class BstPthAdapter:
                 candidate_post_author_idx=candidate_author_chunk,
                 history_prior_cumulative_likes=history_prior_cumulative_likes,
                 candidate_prior_cumulative_likes=candidate_popularity_chunk,
+                history_post_liker_user_indices=history_post_liker_user_indices,
+                history_post_liker_time_gap_hours=history_post_liker_time_gap_hours,
+                candidate_post_liker_user_indices=candidate_liker_user_chunk,
+                candidate_post_liker_time_gap_hours=candidate_liker_gap_chunk,
             )
             score_chunks.append(logits)
 

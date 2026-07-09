@@ -126,7 +126,10 @@ DEFAULTS: Dict[str, Any] = {
     "bst_use_popularity_feature": True,
     "bst_popularity_projection_dim": 8,
     "bst_use_post_liker_user_pooling": False,
-    "bst_max_post_liker_replay_events_per_post": None,
+    "bst_post_liker_user_embedding_dim": 16,
+    "bst_post_liker_projection_dim": 16,
+    "bst_post_liker_pooling_tau_hours": 168.0,
+    "bst_max_post_liker_replay_events_per_post": 32,
     "hidden_dims": [64, 32, 16],
     "dropout_rate_mlp": 0.5,
     "dropout_rate_two_tower": 0.1,
@@ -563,6 +566,9 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
     batch_size = int(args.batch_size)
     bst_max_train_batches_per_epoch = args.bst_max_train_batches_per_epoch
     bst_popularity_projection_dim = int(args.bst_popularity_projection_dim)
+    bst_post_liker_user_embedding_dim = int(args.bst_post_liker_user_embedding_dim)
+    bst_post_liker_projection_dim = int(args.bst_post_liker_projection_dim)
+    bst_post_liker_pooling_tau_hours = float(args.bst_post_liker_pooling_tau_hours)
     bst_max_post_liker_replay_events_per_post = args.bst_max_post_liker_replay_events_per_post
     if model_dim <= 0:
         raise ValueError("--bst-model-dim must be positive.")
@@ -586,6 +592,14 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
         raise ValueError("--bst-max-train-batches-per-epoch must be positive when provided.")
     if bst_popularity_projection_dim <= 0:
         raise ValueError("--bst-popularity-projection-dim must be positive.")
+    if bst_post_liker_user_embedding_dim <= 0:
+        raise ValueError("--bst-post-liker-user-embedding-dim must be positive.")
+    if bst_post_liker_projection_dim <= 0:
+        raise ValueError("--bst-post-liker-projection-dim must be positive.")
+    if bst_post_liker_pooling_tau_hours <= 0.0:
+        raise ValueError("--bst-post-liker-pooling-tau-hours must be positive.")
+    if bool(args.bst_use_post_liker_user_pooling) and bst_max_post_liker_replay_events_per_post is None:
+        raise ValueError("--bst-max-post-liker-replay-events-per-post is required when post-liker pooling is enabled.")
     if (
         bst_max_post_liker_replay_events_per_post is not None
         and int(bst_max_post_liker_replay_events_per_post) <= 0
@@ -942,6 +956,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--bst-use-post-liker-user-pooling", action=argparse.BooleanOptionalAction,
                           default=argparse.SUPPRESS,
                           help_text="Emit BST post-liker packed replay tensors from Stage 2 post-liker events")
+    _add_arg_with_default(p_all, "--bst-post-liker-user-embedding-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="BST post-liker learned user ID embedding dimension")
+    _add_arg_with_default(p_all, "--bst-post-liker-projection-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="BST post-liker pooled-vector projection dimension")
+    _add_arg_with_default(p_all, "--bst-post-liker-pooling-tau-hours", type=float, default=argparse.SUPPRESS,
+                          help_text="BST post-liker recursive EMA time constant in hours")
     _add_arg_with_default(p_all, "--bst-max-post-liker-replay-events-per-post", type=int, default=argparse.SUPPRESS,
                           help_text="Optional tail cap on prior liker events replayed per history or candidate post for BST")
     # Stage 3 options (shared)

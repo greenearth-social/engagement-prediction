@@ -101,6 +101,11 @@ def _make_bst_model(config):
         popularity_projection_dim=int(config.get("bst_popularity_projection_dim") or 0),
         popularity_log_mean=float(config.get("bst_popularity_log_mean") or 0.0),
         popularity_log_std=float(config.get("bst_popularity_log_std") or 1.0),
+        use_post_liker_user_pooling=bool(config.get("bst_use_post_liker_user_pooling", False)),
+        post_liker_user_table_num_rows=int(config.get("bst_post_liker_user_table_num_rows") or 2),
+        post_liker_user_embedding_dim=int(config.get("bst_post_liker_user_embedding_dim") or 16),
+        post_liker_projection_dim=int(config.get("bst_post_liker_projection_dim") or 16),
+        post_liker_pooling_tau_hours=float(config.get("bst_post_liker_pooling_tau_hours") or 168.0),
     )
 
 
@@ -115,6 +120,43 @@ def _bst_bucketed_batch():
         "label_matrix": torch.tensor([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]]),
         "history_prior_cumulative_likes": torch.tensor([[1.0, 5.0, 0.0], [7.0, 0.0, 0.0]]),
         "candidate_prior_cumulative_likes": torch.tensor([2.0, 20.0, 30.0]),
+    }
+
+
+def _bst_bucketed_batch_with_post_likers():
+    batch = _bst_bucketed_batch()
+    return {
+        **batch,
+        "history_post_liker_user_indices": torch.tensor(
+            [
+                [[2, 3, 0], [4, 0, 0], [0, 0, 0]],
+                [[5, 2, 0], [0, 0, 0], [0, 0, 0]],
+            ],
+            dtype=torch.long,
+        ),
+        "history_post_liker_time_gap_hours": torch.tensor(
+            [
+                [[0.0, 2.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+                [[0.0, 4.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            ],
+            dtype=torch.float32,
+        ),
+        "candidate_post_liker_user_indices": torch.tensor(
+            [
+                [2, 4, 0],
+                [3, 0, 0],
+                [5, 2, 0],
+            ],
+            dtype=torch.long,
+        ),
+        "candidate_post_liker_time_gap_hours": torch.tensor(
+            [
+                [0.0, 3.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [0.0, 5.0, 0.0],
+            ],
+            dtype=torch.float32,
+        ),
     }
 
 
@@ -250,6 +292,32 @@ def test_bst_pth_adapter_scores_popularity_checkpoint_in_candidate_chunks(tmp_pa
     torch.testing.assert_close(scores, expected)
 
 
+def test_bst_pth_adapter_scores_post_liker_checkpoint_in_candidate_chunks(tmp_path):
+    torch.manual_seed(19)
+    config = _bst_config()
+    config.update({
+        "bst_use_post_liker_user_pooling": True,
+        "bst_post_liker_user_table_num_rows": 8,
+        "bst_post_liker_user_embedding_dim": 3,
+        "bst_post_liker_projection_dim": 2,
+        "bst_post_liker_pooling_tau_hours": 10.0,
+    })
+    model = _make_bst_model(config)
+    model.eval()
+    checkpoint_path = tmp_path / "bst_ranker_post_likers.pth"
+    torch.save({"model_state_dict": model.state_dict(), "config": config}, checkpoint_path)
+    batch = _bst_bucketed_batch_with_post_likers()
+
+    adapter = BstPthAdapter(checkpoint_path, candidate_chunk_size=1)
+    adapter.prepare_for_eval("cpu")
+    scores = adapter.score_batch(batch, "cpu").scores
+
+    model_kwargs = {key: value for key, value in batch.items() if key != "label_matrix"}
+    with torch.inference_mode():
+        expected = model.score_candidate_matrix_one_layer(**model_kwargs)
+    torch.testing.assert_close(scores, expected)
+
+
 def test_bst_pth_adapter_rejects_non_positive_candidate_chunk_size(tmp_path):
     with pytest.raises(ValueError, match="candidate_chunk_size"):
         BstPthAdapter(tmp_path / "bst_ranker.pth", candidate_chunk_size=0)
@@ -305,3 +373,22 @@ def test_bst_pth_adapter_requires_popularity_fields_for_popularity_checkpoint(tm
 
     with pytest.raises(RuntimeError, match="history_prior_cumulative_likes"):
         adapter.score_batch(batch, "cpu")
+
+
+def test_bst_pth_adapter_requires_post_liker_fields_for_post_liker_checkpoint(tmp_path):
+    torch.manual_seed(20)
+    config = _bst_config()
+    config.update({
+        "bst_use_post_liker_user_pooling": True,
+        "bst_post_liker_user_table_num_rows": 8,
+        "bst_post_liker_user_embedding_dim": 3,
+        "bst_post_liker_projection_dim": 2,
+        "bst_post_liker_pooling_tau_hours": 10.0,
+    })
+    model = _make_bst_model(config)
+    checkpoint_path = tmp_path / "bst_ranker_post_likers.pth"
+    torch.save({"model_state_dict": model.state_dict(), "config": config}, checkpoint_path)
+    adapter = BstPthAdapter(checkpoint_path, candidate_chunk_size=2)
+
+    with pytest.raises(RuntimeError, match="history_post_liker_user_indices"):
+        adapter.score_batch(_bst_bucketed_batch(), "cpu")

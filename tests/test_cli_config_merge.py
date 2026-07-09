@@ -282,6 +282,9 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
             bst_use_popularity_feature: false
             bst_popularity_projection_dim: 12
             bst_use_post_liker_user_pooling: true
+            bst_post_liker_user_embedding_dim: 24
+            bst_post_liker_projection_dim: 10
+            bst_post_liker_pooling_tau_hours: 72.0
             bst_max_post_liker_replay_events_per_post: 25
             """
         ).strip()
@@ -305,6 +308,9 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
     assert merged.bst_use_popularity_feature is False
     assert merged.bst_popularity_projection_dim == 12
     assert merged.bst_use_post_liker_user_pooling is True
+    assert merged.bst_post_liker_user_embedding_dim == 24
+    assert merged.bst_post_liker_projection_dim == 10
+    assert merged.bst_post_liker_pooling_tau_hours == 72.0
     assert merged.bst_max_post_liker_replay_events_per_post == 25
     cli._validate_bst_config(merged)
 
@@ -323,7 +329,10 @@ def test_bst_ranker_training_defaults():
     assert merged.bst_use_popularity_feature is True
     assert merged.bst_popularity_projection_dim == 8
     assert merged.bst_use_post_liker_user_pooling is False
-    assert merged.bst_max_post_liker_replay_events_per_post is None
+    assert merged.bst_post_liker_user_embedding_dim == 16
+    assert merged.bst_post_liker_projection_dim == 16
+    assert merged.bst_post_liker_pooling_tau_hours == 168.0
+    assert merged.bst_max_post_liker_replay_events_per_post == 32
     cli._validate_bst_config(merged)
 
 
@@ -347,6 +356,9 @@ def test_bst_ranker_requires_one_transformer_layer():
         ("--batch-size", "batch-size"),
         ("--bst-max-train-batches-per-epoch", "bst-max-train-batches-per-epoch"),
         ("--bst-popularity-projection-dim", "bst-popularity-projection-dim"),
+        ("--bst-post-liker-user-embedding-dim", "bst-post-liker-user-embedding-dim"),
+        ("--bst-post-liker-projection-dim", "bst-post-liker-projection-dim"),
+        ("--bst-post-liker-pooling-tau-hours", "bst-post-liker-pooling-tau-hours"),
     ],
 )
 def test_bst_ranker_rejects_non_positive_listwise_training_controls(flag, message):
@@ -422,6 +434,29 @@ def test_bst_ranker_validates_post_liker_replay_cap_when_configured():
         "--use-author-embedding-table",
         "--bst-max-post-liker-replay-events-per-post", "0",
     ])
+    merged = cli._merge_args_with_config(raw)
+
+    with pytest.raises(ValueError, match="bst-max-post-liker-replay-events-per-post"):
+        cli._validate_bst_config(merged)
+
+
+def test_bst_ranker_requires_post_liker_replay_cap_when_pooling_enabled(tmp_path):
+    config_path = Path(tmp_path) / "bst_post_liker_null_cap.yml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            model_type: bst-ranker
+            use_author_embedding_table: true
+            prediction_hidden_dims: [128, 64]
+            bst_use_post_liker_user_pooling: true
+            bst_max_post_liker_replay_events_per_post:
+            """
+        ).strip()
+        + "\n"
+    )
+
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--config", str(config_path)])
     merged = cli._merge_args_with_config(raw)
 
     with pytest.raises(ValueError, match="bst-max-post-liker-replay-events-per-post"):
