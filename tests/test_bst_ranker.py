@@ -11,6 +11,7 @@ stage_train_bst_ranker = importlib.import_module("utils.03_train.stage_train_bst
 BSTRanker = stage_train_bst_ranker.BSTRanker
 LinearPredictionHead = stage_train_bst_ranker.LinearPredictionHead
 ProjectedPostFeatureEncoder = stage_train_bst_ranker.ProjectedPostFeatureEncoder
+PostLikerUserPooler = stage_train_bst_ranker.PostLikerUserPooler
 _compute_bst_listwise_loss_and_preds = stage_train_bst_ranker._compute_bst_listwise_loss_and_preds
 run_bst_listwise_epoch = stage_train_bst_ranker.run_bst_listwise_epoch
 train_bst_ranker_model = stage_train_bst_ranker.train_bst_ranker_model
@@ -27,6 +28,7 @@ def _make_model(
     prediction_hidden_dims=(8, 4),
     use_popularity_feature: bool = False,
     popularity_projection_dim: int | None = None,
+    use_post_liker_user_pooling: bool = False,
 ) -> BSTRanker:
     torch.manual_seed(123)
     return BSTRanker(
@@ -49,6 +51,11 @@ def _make_model(
         popularity_projection_dim=(2 if popularity_projection_dim is None else popularity_projection_dim) if use_popularity_feature else 0,
         popularity_log_mean=1.0,
         popularity_log_std=2.0,
+        use_post_liker_user_pooling=use_post_liker_user_pooling,
+        post_liker_user_table_num_rows=8,
+        post_liker_user_embedding_dim=3,
+        post_liker_projection_dim=2,
+        post_liker_pooling_tau_hours=10.0,
     )
 
 
@@ -108,6 +115,65 @@ def _batch_with_popularity() -> dict[str, torch.Tensor]:
     }
 
 
+def _batch_with_post_likers() -> dict[str, torch.Tensor]:
+    batch = _batch()
+    return {
+        **batch,
+        "history_post_liker_user_indices": torch.tensor(
+            [
+                [[2, 3, 0], [4, 0, 0], [0, 0, 0]],
+                [[5, 2, 0], [0, 0, 0], [0, 0, 0]],
+            ],
+            dtype=torch.long,
+        ),
+        "history_post_liker_time_gap_hours": torch.tensor(
+            [
+                [[0.0, 2.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+                [[0.0, 4.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            ],
+            dtype=torch.float32,
+        ),
+        "candidate_post_liker_user_indices": torch.tensor(
+            [
+                [2, 4, 0],
+                [3, 0, 0],
+            ],
+            dtype=torch.long,
+        ),
+        "candidate_post_liker_time_gap_hours": torch.tensor(
+            [
+                [0.0, 3.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+            dtype=torch.float32,
+        ),
+    }
+
+
+def _expected_matrix_scores_with_post_likers(model: BSTRanker, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    num_users = batch["history_embeddings"].shape[0]
+    num_candidates = batch["candidate_post_embeddings"].shape[0]
+    rows = []
+    for user_idx in range(num_users):
+        row_scores = []
+        for candidate_idx in range(num_candidates):
+            score = model(
+                history_embeddings=batch["history_embeddings"][user_idx:user_idx + 1],
+                history_mask=batch["history_mask"][user_idx:user_idx + 1],
+                history_time_deltas_hours=batch["history_time_deltas_hours"][user_idx:user_idx + 1],
+                candidate_post_embeddings=batch["candidate_post_embeddings"][candidate_idx:candidate_idx + 1],
+                history_author_indices=batch["history_author_indices"][user_idx:user_idx + 1],
+                candidate_post_author_idx=batch["candidate_post_author_idx"][candidate_idx:candidate_idx + 1],
+                history_post_liker_user_indices=batch["history_post_liker_user_indices"][user_idx:user_idx + 1],
+                history_post_liker_time_gap_hours=batch["history_post_liker_time_gap_hours"][user_idx:user_idx + 1],
+                candidate_post_liker_user_indices=batch["candidate_post_liker_user_indices"][candidate_idx:candidate_idx + 1],
+                candidate_post_liker_time_gap_hours=batch["candidate_post_liker_time_gap_hours"][candidate_idx:candidate_idx + 1],
+            )
+            row_scores.append(score.squeeze(0))
+        rows.append(torch.stack(row_scores))
+    return torch.stack(rows)
+
+
 def _expected_matrix_scores(model: BSTRanker, batch: dict[str, torch.Tensor]) -> torch.Tensor:
     num_users = batch["history_embeddings"].shape[0]
     num_candidates = batch["candidate_post_embeddings"].shape[0]
@@ -127,6 +193,14 @@ def _expected_matrix_scores(model: BSTRanker, batch: dict[str, torch.Tensor]) ->
 
 def _listwise_batch() -> dict[str, torch.Tensor]:
     batch = _batch()
+    return {
+        **batch,
+        "label_matrix": torch.tensor([[1.0, 0.0], [1.0, 1.0]], dtype=torch.float32),
+    }
+
+
+def _listwise_batch_with_post_likers() -> dict[str, torch.Tensor]:
+    batch = _batch_with_post_likers()
     return {
         **batch,
         "label_matrix": torch.tensor([[1.0, 0.0], [1.0, 1.0]], dtype=torch.float32),
@@ -199,6 +273,140 @@ def test_bst_ranker_score_candidate_matrix_one_layer_supports_training_gradients
         if param.grad is not None
     )
     assert grad_sum > 0
+
+
+def test_post_liker_user_pooler_replays_recursive_time_gap_ema():
+    pooler = PostLikerUserPooler(
+        num_post_liker_user_rows=6,
+        user_embedding_dim=2,
+        pooling_tau_hours=10.0,
+    )
+    with torch.no_grad():
+        pooler.user_embedding.weight.copy_(
+            torch.tensor(
+                [
+                    [0.0, 0.0],
+                    [10.0, 10.0],
+                    [1.0, 0.0],
+                    [0.0, 1.0],
+                    [2.0, 2.0],
+                    [3.0, 0.0],
+                ],
+                dtype=torch.float32,
+            )
+        )
+
+    output = pooler(
+        user_indices=torch.tensor(
+            [
+                [0, 0],
+                [2, 3],
+                [5, 0],
+                [0, 0],
+            ],
+            dtype=torch.long,
+        ),
+        time_gap_hours=torch.tensor(
+            [
+                [0.0, 0.0],
+                [0.0, 10.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+            ],
+            dtype=torch.float32,
+        ),
+    )
+
+    alpha = 1.0 - torch.exp(torch.tensor(-1.0))
+    expected_multi = alpha * torch.tensor([0.0, 1.0]) + (1.0 - alpha) * torch.tensor([1.0, 0.0])
+    expected = torch.stack([
+        torch.zeros(2),
+        expected_multi,
+        torch.tensor([3.0, 0.0]),
+        torch.zeros(2),
+    ])
+    torch.testing.assert_close(output, expected)
+
+
+def test_post_liker_user_pooler_zero_gap_duplicate_keeps_previous_state():
+    pooler = PostLikerUserPooler(
+        num_post_liker_user_rows=5,
+        user_embedding_dim=2,
+        pooling_tau_hours=10.0,
+    )
+    with torch.no_grad():
+        pooler.user_embedding.weight.copy_(
+            torch.tensor(
+                [
+                    [0.0, 0.0],
+                    [10.0, 10.0],
+                    [1.0, 0.0],
+                    [0.0, 1.0],
+                    [2.0, 2.0],
+                ],
+                dtype=torch.float32,
+            )
+        )
+
+    output = pooler(
+        user_indices=torch.tensor([[2, 3]], dtype=torch.long),
+        time_gap_hours=torch.tensor([[0.0, 0.0]], dtype=torch.float32),
+    )
+
+    torch.testing.assert_close(output, torch.tensor([[1.0, 0.0]]))
+
+
+def test_post_liker_user_pooler_gradients_flow_to_user_embeddings():
+    pooler = PostLikerUserPooler(
+        num_post_liker_user_rows=5,
+        user_embedding_dim=2,
+        pooling_tau_hours=10.0,
+    )
+
+    output = pooler(
+        user_indices=torch.tensor([[2, 3]], dtype=torch.long),
+        time_gap_hours=torch.tensor([[0.0, 1.0]], dtype=torch.float32),
+    )
+    output.square().sum().backward()
+
+    assert pooler.user_embedding.weight.grad is not None
+    assert pooler.user_embedding.weight.grad[2].abs().sum() > 0
+    assert pooler.user_embedding.weight.grad[3].abs().sum() > 0
+
+
+@pytest.mark.parametrize("norm_first", [False, True])
+def test_bst_ranker_post_liker_matrix_scorer_matches_repeated_path(norm_first):
+    model = _make_model(norm_first=norm_first, use_post_liker_user_pooling=True)
+    model.eval()
+    batch = _batch_with_post_likers()
+
+    with torch.inference_mode():
+        expected = _expected_matrix_scores_with_post_likers(model, batch)
+        scores = model.score_candidate_matrix_one_layer(**batch)
+
+    assert scores.shape == (2, 2)
+    torch.testing.assert_close(scores, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_bst_ranker_post_liker_features_change_scores():
+    model = _make_model(use_post_liker_user_pooling=True)
+    model.eval()
+    batch = _batch_with_post_likers()
+
+    output = model.score_candidate_matrix_one_layer(**batch)
+    changed_batch = {key: value.clone() for key, value in batch.items()}
+    changed_batch["candidate_post_liker_user_indices"][0] = torch.tensor([5, 6, 7], dtype=torch.long)
+    changed_output = model.score_candidate_matrix_one_layer(**changed_batch)
+
+    assert not torch.allclose(changed_output, output)
+
+
+def test_bst_ranker_post_liker_requires_tensors_when_enabled():
+    model = _make_model(use_post_liker_user_pooling=True)
+    batch = _batch()
+
+    with pytest.raises(ValueError, match="history_post_liker_user_indices"):
+        model.score_candidate_matrix_one_layer(**batch)
 
 
 @pytest.mark.parametrize("norm_first", [False, True])
@@ -337,6 +545,28 @@ def test_bst_ranker_score_candidate_matrix_one_layer_masks_padded_history_popula
     torch.testing.assert_close(changed_output, output, atol=1e-6, rtol=1e-6)
 
 
+def test_bst_ranker_score_candidate_matrix_one_layer_masks_padded_history_post_likers():
+    model = _make_model(use_post_liker_user_pooling=True)
+    model.eval()
+    batch = _batch_with_post_likers()
+
+    output = model.score_candidate_matrix_one_layer(**batch)
+    changed_batch = {key: value.clone() for key, value in batch.items()}
+    changed_batch["history_post_liker_user_indices"][0, 2] = torch.tensor([5, 5, 5], dtype=torch.long)
+    changed_batch["history_post_liker_user_indices"][1, 1:] = torch.tensor(
+        [[6, 6, 6], [7, 7, 7]],
+        dtype=torch.long,
+    )
+    changed_batch["history_post_liker_time_gap_hours"][0, 2] = torch.tensor([0.0, 1.0, 2.0])
+    changed_batch["history_post_liker_time_gap_hours"][1, 1:] = torch.tensor(
+        [[0.0, 1.0, 2.0], [0.0, 1.0, 2.0]]
+    )
+
+    changed_output = model.score_candidate_matrix_one_layer(**changed_batch)
+
+    torch.testing.assert_close(changed_output, output, atol=1e-6, rtol=1e-6)
+
+
 def test_bst_ranker_supports_candidate_only_sequence_with_zero_delta_bucket():
     model = _make_model()
     model.eval()
@@ -402,6 +632,20 @@ def test_bst_ranker_gradients_flow_through_popularity_projection():
 
     assert model.post_feature_encoder.popularity_projection.weight.grad is not None
     assert model.post_feature_encoder.popularity_projection.weight.grad.abs().sum() > 0
+
+
+def test_bst_ranker_gradients_flow_through_post_liker_pooler_and_projection():
+    model = _make_model(use_post_liker_user_pooling=True)
+    batch = _batch_with_post_likers()
+
+    output = model(**batch)
+    loss = output.square().sum()
+    loss.backward()
+
+    assert model.post_liker_user_pooler.user_embedding.weight.grad is not None
+    assert model.post_liker_user_pooler.user_embedding.weight.grad.abs().sum() > 0
+    assert model.post_feature_encoder.post_liker_projection.weight.grad is not None
+    assert model.post_feature_encoder.post_liker_projection.weight.grad.abs().sum() > 0
 
 
 def test_bst_ranker_supports_direct_linear_prediction_head():
@@ -489,6 +733,47 @@ def test_bst_ranker_torchscript_supports_popularity_features():
     torch.testing.assert_close(scripted_scores, eager_scores, atol=1e-5, rtol=1e-5)
 
 
+def test_bst_ranker_torchscript_supports_post_liker_features():
+    model = _make_model(use_post_liker_user_pooling=True).eval()
+    batch = _batch_with_post_likers()
+
+    with torch.no_grad():
+        eager_output = model(**batch)
+        eager_scores = model.score_candidate_matrix_one_layer(**batch)
+        scripted_model = torch.jit.script(model)
+        scripted_output = scripted_model(
+            batch["history_embeddings"],
+            batch["history_mask"],
+            batch["history_time_deltas_hours"],
+            batch["candidate_post_embeddings"],
+            batch["history_author_indices"],
+            batch["candidate_post_author_idx"],
+            None,
+            None,
+            batch["history_post_liker_user_indices"],
+            batch["history_post_liker_time_gap_hours"],
+            batch["candidate_post_liker_user_indices"],
+            batch["candidate_post_liker_time_gap_hours"],
+        )
+        scripted_scores = scripted_model.score_candidate_matrix(
+            batch["history_embeddings"],
+            batch["history_mask"],
+            batch["history_time_deltas_hours"],
+            batch["candidate_post_embeddings"],
+            batch["history_author_indices"],
+            batch["candidate_post_author_idx"],
+            None,
+            None,
+            batch["history_post_liker_user_indices"],
+            batch["history_post_liker_time_gap_hours"],
+            batch["candidate_post_liker_user_indices"],
+            batch["candidate_post_liker_time_gap_hours"],
+        )
+
+    torch.testing.assert_close(scripted_output, eager_output, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(scripted_scores, eager_scores, atol=1e-5, rtol=1e-5)
+
+
 def test_bst_ranker_rejects_invalid_prediction_hidden_dims():
     with pytest.raises(ValueError, match="hidden_dims"):
         _make_model(prediction_hidden_dims=[0])
@@ -497,6 +782,36 @@ def test_bst_ranker_rejects_invalid_prediction_hidden_dims():
 def test_bst_ranker_rejects_invalid_popularity_projection_dim():
     with pytest.raises(ValueError, match="popularity_projection_dim"):
         _make_model(use_popularity_feature=True, popularity_projection_dim=0)
+
+
+def test_bst_ranker_rejects_invalid_post_liker_dimensions():
+    with pytest.raises(ValueError, match="post_liker_user_embedding_dim"):
+        BSTRanker(
+            post_embedding_dim=4,
+            author_table_num_rows=8,
+            author_embedding_dim=3,
+            content_projection_dim=6,
+            author_projection_dim=4,
+            model_dim=5,
+            time_embedding_dim=3,
+            num_attention_heads=2,
+            num_transformer_layers=1,
+            transformer_ff_dim=16,
+            dropout_rate=0.0,
+            author_unknown_dropout_rate=0.0,
+            norm_first=False,
+            time_delta_bucket_boundaries_hours=DEFAULT_TIME_DELTA_BUCKET_BOUNDARIES_HOURS,
+            prediction_hidden_dims=(7,),
+            use_popularity_feature=False,
+            popularity_projection_dim=0,
+            popularity_log_mean=0.0,
+            popularity_log_std=1.0,
+            use_post_liker_user_pooling=True,
+            post_liker_user_table_num_rows=8,
+            post_liker_user_embedding_dim=0,
+            post_liker_projection_dim=2,
+            post_liker_pooling_tau_hours=10.0,
+        )
 
 
 def test_bst_ranker_rejects_invalid_prediction_head_output_shape():
@@ -525,6 +840,21 @@ def test_compute_bst_listwise_loss_and_preds_returns_finite_multi_positive_loss_
         if param.grad is not None
     )
     assert grad_sum > 0
+
+
+def test_compute_bst_listwise_loss_and_preds_consumes_post_liker_tensors():
+    model = _make_model(use_post_liker_user_pooling=True)
+    batch = _listwise_batch_with_post_likers()
+
+    loss, scores, labels = _compute_bst_listwise_loss_and_preds(model, batch, "cpu")
+    loss.backward()
+
+    assert loss.shape == ()
+    assert torch.isfinite(loss)
+    assert scores.shape == (2, 2)
+    assert labels.tolist() == [[1.0, 0.0], [1.0, 1.0]]
+    assert model.post_liker_user_pooler.user_embedding.weight.grad is not None
+    assert model.post_liker_user_pooler.user_embedding.weight.grad.abs().sum() > 0
 
 
 def test_run_bst_listwise_epoch_computes_rank_metrics():
