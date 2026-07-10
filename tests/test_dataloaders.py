@@ -103,6 +103,15 @@ def mock_post_liker_events_df():
 
 
 @pytest.fixture
+def mock_post_liker_user_idx_df():
+    return pl.DataFrame({
+        "did": ["u1", "u3"],
+        "user_train_like_count": pl.Series([3, 2], dtype=pl.UInt32),
+        "user_idx": pl.Series([2, 3], dtype=pl.UInt32),
+    })
+
+
+@pytest.fixture
 def bucketed_dataset(mock_embeddings_mmap, mock_likes_core_df, mock_posts_core_df, mock_history_df):
     return BucketedEngagementDataset(
         embeddings_mmap=mock_embeddings_mmap,
@@ -208,6 +217,7 @@ def test_bucketed_collate_builds_candidates_and_same_hour_labels(bucketed_datase
     assert "candidate_prior_cumulative_likes" not in batch
     assert "history_post_liker_user_indices" not in batch
     assert "candidate_post_liker_user_indices" not in batch
+    assert "target_user_indices" not in batch
 
     labels_by_user = {
         user_id: batch["label_matrix"][idx].tolist()
@@ -257,6 +267,7 @@ def test_bucketed_collate_returns_post_liker_tensors_when_enabled(
     mock_posts_core_df,
     mock_history_df,
     mock_post_liker_events_df,
+    mock_post_liker_user_idx_df,
 ):
     max_replay_events = 4
     dataset = BucketedEngagementDataset(
@@ -269,12 +280,14 @@ def test_bucketed_collate_returns_post_liker_tensors_when_enabled(
         embed_dim=4,
         use_post_liker_user_pooling=True,
         post_liker_event_lookup=PostLikerEventLookup.from_dataframe(mock_post_liker_events_df),
+        post_liker_user_idx_df=mock_post_liker_user_idx_df,
         max_post_liker_replay_events_per_post=max_replay_events,
     )
 
     batch = dataset.collate_batch([dataset[0], dataset[1]])
 
     assert batch["candidate_post_id"] == ["p1", "p3", "p2", "n1", "p4"]
+    assert batch["target_user_indices"].tolist() == [2, 1]
     assert batch["history_post_liker_user_indices"].shape == (
         2,
         3,
@@ -333,6 +346,7 @@ def test_bucketed_post_liker_replay_cap_keeps_most_recent_prior_events(
     mock_posts_core_df,
     mock_history_df,
     mock_post_liker_events_df,
+    mock_post_liker_user_idx_df,
 ):
     dataset = BucketedEngagementDataset(
         embeddings_mmap=mock_embeddings_mmap,
@@ -344,6 +358,7 @@ def test_bucketed_post_liker_replay_cap_keeps_most_recent_prior_events(
         embed_dim=4,
         use_post_liker_user_pooling=True,
         post_liker_event_lookup=PostLikerEventLookup.from_dataframe(mock_post_liker_events_df),
+        post_liker_user_idx_df=mock_post_liker_user_idx_df,
         max_post_liker_replay_events_per_post=1,
     )
 
@@ -367,6 +382,7 @@ def test_bucketed_post_liker_history_uses_current_bucket_time(
     mock_posts_core_df,
     mock_history_df,
     mock_post_liker_events_df,
+    mock_post_liker_user_idx_df,
 ):
     dataset = BucketedEngagementDataset(
         embeddings_mmap=mock_embeddings_mmap,
@@ -378,6 +394,7 @@ def test_bucketed_post_liker_history_uses_current_bucket_time(
         embed_dim=4,
         use_post_liker_user_pooling=True,
         post_liker_event_lookup=PostLikerEventLookup.from_dataframe(mock_post_liker_events_df),
+        post_liker_user_idx_df=mock_post_liker_user_idx_df,
         max_post_liker_replay_events_per_post=4,
     )
 
@@ -414,12 +431,34 @@ def test_bucketed_post_liker_requires_event_artifact_when_enabled(
         )
 
 
+def test_bucketed_post_liker_requires_user_idx_artifact_when_enabled(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+    mock_post_liker_events_df,
+):
+    with pytest.raises(ValueError, match="post_liker_user_idx_df"):
+        BucketedEngagementDataset(
+            embeddings_mmap=mock_embeddings_mmap,
+            likes_core_df=mock_likes_core_df,
+            posts_core_df=mock_posts_core_df,
+            history_df=mock_history_df,
+            split="train",
+            max_history_len=3,
+            embed_dim=4,
+            use_post_liker_user_pooling=True,
+            post_liker_event_lookup=PostLikerEventLookup.from_dataframe(mock_post_liker_events_df),
+        )
+
+
 def test_bucketed_post_liker_requires_replay_cap_when_enabled(
     mock_embeddings_mmap,
     mock_likes_core_df,
     mock_posts_core_df,
     mock_history_df,
     mock_post_liker_events_df,
+    mock_post_liker_user_idx_df,
 ):
     with pytest.raises(ValueError, match="max_post_liker_replay_events_per_post"):
         BucketedEngagementDataset(
@@ -432,6 +471,7 @@ def test_bucketed_post_liker_requires_replay_cap_when_enabled(
             embed_dim=4,
             use_post_liker_user_pooling=True,
             post_liker_event_lookup=PostLikerEventLookup.from_dataframe(mock_post_liker_events_df),
+            post_liker_user_idx_df=mock_post_liker_user_idx_df,
         )
 
 
