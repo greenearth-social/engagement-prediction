@@ -198,6 +198,7 @@ class BstPthAdapter:
                 post_liker_user_embedding_dim=int(config.get("bst_post_liker_user_embedding_dim") or 16),
                 post_liker_projection_dim=int(config.get("bst_post_liker_projection_dim") or 16),
                 post_liker_pooling_tau_hours=float(config.get("bst_post_liker_pooling_tau_hours") or 168.0),
+                target_user_projection_dim=int(config.get("bst_target_user_projection_dim") or 16),
             )
             model.load_state_dict(checkpoint["model_state_dict"])
             self.model = model
@@ -233,6 +234,7 @@ class BstPthAdapter:
                 "history_post_liker_time_gap_hours",
                 "candidate_post_liker_user_indices",
                 "candidate_post_liker_time_gap_hours",
+                "target_user_indices",
             )
         missing = [field for field in required_fields if field not in batch]
         if missing:
@@ -253,11 +255,13 @@ class BstPthAdapter:
         history_post_liker_time_gap_hours = None
         candidate_post_liker_user_indices = None
         candidate_post_liker_time_gap_hours = None
+        target_user_indices = None
         if self.model.use_post_liker_user_pooling:
             history_post_liker_user_indices = batch["history_post_liker_user_indices"].to(device, dtype=torch.long, non_blocking=True)
             history_post_liker_time_gap_hours = batch["history_post_liker_time_gap_hours"].to(device, dtype=torch.float32, non_blocking=True)
             candidate_post_liker_user_indices = batch["candidate_post_liker_user_indices"].to(device, dtype=torch.long, non_blocking=True)
             candidate_post_liker_time_gap_hours = batch["candidate_post_liker_time_gap_hours"].to(device, dtype=torch.float32, non_blocking=True)
+            target_user_indices = batch["target_user_indices"].to(device, dtype=torch.long, non_blocking=True)
 
         num_candidates = int(candidate_post_embeddings.size(0))
         score_chunks = []
@@ -288,6 +292,7 @@ class BstPthAdapter:
                 history_post_liker_time_gap_hours=history_post_liker_time_gap_hours,
                 candidate_post_liker_user_indices=candidate_liker_user_chunk,
                 candidate_post_liker_time_gap_hours=candidate_liker_gap_chunk,
+                target_user_indices=target_user_indices,
             )
             score_chunks.append(logits)
 

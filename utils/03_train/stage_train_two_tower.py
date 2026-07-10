@@ -396,6 +396,9 @@ class TwoTowerModel(nn.Module):
                 popularity_projection_dim=0,
                 popularity_log_mean=0.0,
                 popularity_log_std=1.0,
+                use_post_liker_feature=False,
+                post_liker_input_dim=0,
+                post_liker_projection_dim=0,
             )
 
         # Instantiate user tower based on encoder type

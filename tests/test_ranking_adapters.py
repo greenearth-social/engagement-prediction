@@ -106,6 +106,7 @@ def _make_bst_model(config):
         post_liker_user_embedding_dim=int(config.get("bst_post_liker_user_embedding_dim") or 16),
         post_liker_projection_dim=int(config.get("bst_post_liker_projection_dim") or 16),
         post_liker_pooling_tau_hours=float(config.get("bst_post_liker_pooling_tau_hours") or 168.0),
+        target_user_projection_dim=int(config.get("bst_target_user_projection_dim") or 16),
     )
 
 
@@ -157,6 +158,7 @@ def _bst_bucketed_batch_with_post_likers():
             ],
             dtype=torch.float32,
         ),
+        "target_user_indices": torch.tensor([2, 5], dtype=torch.long),
     }
 
 
@@ -301,6 +303,7 @@ def test_bst_pth_adapter_scores_post_liker_checkpoint_in_candidate_chunks(tmp_pa
         "bst_post_liker_user_embedding_dim": 3,
         "bst_post_liker_projection_dim": 2,
         "bst_post_liker_pooling_tau_hours": 10.0,
+        "bst_target_user_projection_dim": 2,
     })
     model = _make_bst_model(config)
     model.eval()
@@ -384,6 +387,7 @@ def test_bst_pth_adapter_requires_post_liker_fields_for_post_liker_checkpoint(tm
         "bst_post_liker_user_embedding_dim": 3,
         "bst_post_liker_projection_dim": 2,
         "bst_post_liker_pooling_tau_hours": 10.0,
+        "bst_target_user_projection_dim": 2,
     })
     model = _make_bst_model(config)
     checkpoint_path = tmp_path / "bst_ranker_post_likers.pth"
@@ -392,3 +396,25 @@ def test_bst_pth_adapter_requires_post_liker_fields_for_post_liker_checkpoint(tm
 
     with pytest.raises(RuntimeError, match="history_post_liker_user_indices"):
         adapter.score_batch(_bst_bucketed_batch(), "cpu")
+
+
+def test_bst_pth_adapter_requires_target_user_indices_for_post_liker_checkpoint(tmp_path):
+    torch.manual_seed(21)
+    config = _bst_config()
+    config.update({
+        "bst_use_post_liker_user_pooling": True,
+        "bst_post_liker_user_table_num_rows": 8,
+        "bst_post_liker_user_embedding_dim": 3,
+        "bst_post_liker_projection_dim": 2,
+        "bst_post_liker_pooling_tau_hours": 10.0,
+        "bst_target_user_projection_dim": 2,
+    })
+    model = _make_bst_model(config)
+    checkpoint_path = tmp_path / "bst_ranker_post_likers.pth"
+    torch.save({"model_state_dict": model.state_dict(), "config": config}, checkpoint_path)
+    batch = _bst_bucketed_batch_with_post_likers()
+    del batch["target_user_indices"]
+    adapter = BstPthAdapter(checkpoint_path, candidate_chunk_size=2)
+
+    with pytest.raises(RuntimeError, match="target_user_indices"):
+        adapter.score_batch(batch, "cpu")

@@ -285,6 +285,7 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
             bst_post_liker_user_embedding_dim: 24
             bst_post_liker_projection_dim: 10
             bst_post_liker_pooling_tau_hours: 72.0
+            bst_target_user_projection_dim: 11
             bst_max_post_liker_replay_events_per_post: 25
             """
         ).strip()
@@ -311,6 +312,7 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
     assert merged.bst_post_liker_user_embedding_dim == 24
     assert merged.bst_post_liker_projection_dim == 10
     assert merged.bst_post_liker_pooling_tau_hours == 72.0
+    assert merged.bst_target_user_projection_dim == 11
     assert merged.bst_max_post_liker_replay_events_per_post == 25
     cli._validate_bst_config(merged)
 
@@ -332,6 +334,7 @@ def test_bst_ranker_training_defaults():
     assert merged.bst_post_liker_user_embedding_dim == 16
     assert merged.bst_post_liker_projection_dim == 16
     assert merged.bst_post_liker_pooling_tau_hours == 168.0
+    assert merged.bst_target_user_projection_dim == 16
     assert merged.bst_max_post_liker_replay_events_per_post == 32
     cli._validate_bst_config(merged)
 
@@ -411,6 +414,7 @@ def test_bst_ranker_accepts_explicit_empty_prediction_hidden_dims():
     [
         ("content_projection_dim", "content-projection-dim"),
         ("author_projection_dim", "author-projection-dim"),
+        ("bst_target_user_projection_dim", "bst-target-user-projection-dim"),
     ],
 )
 def test_bst_ranker_validates_projection_dims(arg_name, error_match):

@@ -76,6 +76,9 @@ from shared.input_data_helpers import (
     AUTHOR_UNK_IDX,
 )
 
+POST_LIKER_USER_PAD_IDX = 0
+POST_LIKER_USER_UNK_IDX = 1
+
 
 def _author_idx_or_unk(author_idx: Any) -> int:
     """Return the Stage 1 author_idx as an embedding-table row, mapping nulls to UNK."""
@@ -1113,6 +1116,14 @@ def _fill_post_liker_event_slice(
     return n_events
 
 
+def _build_post_liker_user_idx_by_did(user_idx_df: pl.DataFrame) -> Dict[str, int]:
+    validate_dataframe_schema(user_idx_df, {"did": None, "user_idx": None})
+    return {
+        str(row["did"]): int(row["user_idx"])
+        for row in user_idx_df.select(["did", "user_idx"]).iter_rows(named=True)
+    }
+
+
 class BucketedEngagementDataset(Dataset):
     """User-hour positives grouped by hour bucket with same-hour candidate posts."""
 
@@ -1129,6 +1140,7 @@ class BucketedEngagementDataset(Dataset):
         use_popularity_feature: bool = False,
         use_post_liker_user_pooling: bool = False,
         post_liker_event_lookup: Optional[PostLikerEventLookup] = None,
+        post_liker_user_idx_df: Optional[pl.DataFrame] = None,
         max_post_liker_replay_events_per_post: Optional[int] = None,
         bst_additional_batch_negatives: Optional[int] = None,
         seed: int = 0,
@@ -1141,6 +1153,8 @@ class BucketedEngagementDataset(Dataset):
         if use_post_liker_user_pooling:
             if post_liker_event_lookup is None:
                 raise ValueError("post_liker_event_lookup is required when post-liker user pooling is enabled")
+            if post_liker_user_idx_df is None:
+                raise ValueError("post_liker_user_idx_df is required when post-liker user pooling is enabled")
             if max_post_liker_replay_events_per_post is None:
                 raise ValueError("max_post_liker_replay_events_per_post is required when post-liker user pooling is enabled")
         if (
@@ -1164,6 +1178,11 @@ class BucketedEngagementDataset(Dataset):
             post_liker_event_lookup
             if self.use_post_liker_user_pooling
             else None
+        )
+        self.post_liker_user_idx_by_did = (
+            _build_post_liker_user_idx_by_did(post_liker_user_idx_df)
+            if self.use_post_liker_user_pooling and post_liker_user_idx_df is not None
+            else {}
         )
         self.bst_additional_batch_negatives = int(bst_additional_batch_negatives) if bst_additional_batch_negatives is not None else None
         self.seed = int(seed)
@@ -1241,6 +1260,12 @@ class BucketedEngagementDataset(Dataset):
             logger.info(f"  BucketedEngagementDataset('{self.split}'): {len(joined):,} user-hour rows")
 
         self.user_ids = joined["did"].to_list()
+        self.target_user_indices: Optional[List[int]] = None
+        if self.use_post_liker_user_pooling:
+            self.target_user_indices = [
+                self.post_liker_user_idx_by_did.get(str(user_id), POST_LIKER_USER_UNK_IDX)
+                for user_id in self.user_ids
+            ]
         self.like_hour_buckets = joined["like_hour_bucket"].to_list()
         self.liked_post_ids = joined["liked_post_ids"].to_list()
         self.liked_post_emb_indices = [
@@ -1582,6 +1607,12 @@ class BucketedEngagementDataset(Dataset):
             output["history_post_liker_time_gap_hours"] = torch.from_numpy(history_time_gap_hours_padded)
             output["candidate_post_liker_user_indices"] = torch.from_numpy(candidate_user_indices_padded)
             output["candidate_post_liker_time_gap_hours"] = torch.from_numpy(candidate_time_gap_hours_padded)
+            if self.target_user_indices is None:
+                raise RuntimeError("target_user_indices were not initialized")
+            output["target_user_indices"] = torch.tensor(
+                [self.target_user_indices[row_idx] for row_idx in row_indices],
+                dtype=torch.long,
+            )
             output["post_liker_replay_event_count"] = int(
                 (history_user_indices_padded != 0).sum().item()
                 + (candidate_user_indices_padded != 0).sum().item()
