@@ -168,6 +168,9 @@ def test_train_two_tower_model_logs_epoch_metrics_to_tracker(tmp_path):
 
     assert len(results["history"]["train_ndcg@1"]) == 2
     assert results["primary_metric_name"] == "ndcg@1"
+    assert (tmp_path / "two_tower_best.pth").exists()
+    assert (tmp_path / "engagement_user_tower_best.pt").exists()
+    assert (tmp_path / "engagement_post_tower_best.pt").exists()
     assert len(tracker.calls) == 48
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train Loss")] == [1, 2]
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Loss")] == [1, 2]
