@@ -412,7 +412,18 @@ def load_model_bundle(train_artifacts_dir: Path, run_id: str, device: torch.devi
 
     author_idx_by_did = None
     if bool(training_config.get("use_author_embedding_table")):
-        get_data_dir = Path(manifest.get("inputs", {}).get("01_get_data", ""))
+        manifest_inputs = manifest.get("inputs", {})
+        get_data_dir_value = (
+            manifest_inputs.get("01_get_data")
+            if isinstance(manifest_inputs, dict)
+            else None
+        )
+        if get_data_dir_value is None or not str(get_data_dir_value).strip():
+            raise FileNotFoundError(
+                f"Model run {run_id} uses author embeddings, but manifest input 01_get_data is missing. "
+                "A manifest with the training 01_get_data path is required to map author DIDs to author_idx values."
+            )
+        get_data_dir = Path(str(get_data_dir_value)).expanduser()
         if not get_data_dir.exists():
             raise FileNotFoundError(
                 f"Model run {run_id} uses author embeddings, but manifest input 01_get_data was not found: {get_data_dir}. "

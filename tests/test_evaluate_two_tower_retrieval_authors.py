@@ -457,6 +457,25 @@ def test_load_train_manifest_prefers_final_manifest_then_partial(retrieval_eval_
     assert retrieval_eval_module.load_train_manifest(paths)["inputs"]["01_get_data"] == "/final"
 
 
+def test_author_aware_model_requires_manifest_get_data_input(retrieval_eval_module, tmp_path, monkeypatch):
+    train_dir = tmp_path / "run-a"
+    checkpoints_dir = train_dir / "checkpoints"
+    checkpoints_dir.mkdir(parents=True)
+    (train_dir / "training_config.json").write_text(
+        '{"max_history_len": 3, "post_embedding_dim": 2, "use_author_embedding_table": true}'
+    )
+    (train_dir / "manifest.json").write_text('{"inputs": {}}')
+    (checkpoints_dir / "two_tower_best.pth").write_bytes(b"checkpoint")
+    monkeypatch.setattr(
+        retrieval_eval_module,
+        "load_towers_from_paths",
+        lambda *_args: (FakeTower(), FakeTower(), "test"),
+    )
+
+    with pytest.raises(FileNotFoundError, match="manifest input 01_get_data is missing"):
+        retrieval_eval_module.load_model_bundle(tmp_path, "run-a", torch.device("cpu"))
+
+
 def test_resolve_model_paths_rejects_run_with_no_supported_model_artifact(retrieval_eval_module, tmp_path):
     train_dir = tmp_path / "run-a"
     train_dir.mkdir(parents=True)
