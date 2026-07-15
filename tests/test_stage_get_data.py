@@ -374,6 +374,37 @@ def test_exact_prior_cumulative_likes_excludes_same_hour_for_positives(stage_get
     assert prior_counts_df.height == 3
 
 
+def test_liked_post_hour_cumulative_likes_covers_final_liked_posts_only(stage_get_data_module):
+    raw_likes_lf = pl.DataFrame([
+        {"did": "user_a", "subject_uri": "post:history", "record_created_at": "2024-01-02T00:10:00"},
+        {"did": "user_b", "subject_uri": "post:history", "record_created_at": "2024-01-02T00:20:00"},
+        {"did": "user_c", "subject_uri": "post:history", "record_created_at": "2024-01-02T01:05:00"},
+        {"did": "user_d", "subject_uri": "post:also_history", "record_created_at": "2024-01-02T02:15:00"},
+        {"did": "user_e", "subject_uri": "post:not_final", "record_created_at": "2024-01-02T00:15:00"},
+    ]).lazy()
+    final_liked_posts_df = pl.DataFrame({
+        "subject_uri": ["post:history", "post:also_history"],
+    })
+
+    curve_df, stats = stage_get_data_module._build_liked_post_hour_cumulative_likes_df(
+        raw_likes_lf=raw_likes_lf,
+        liked_post_uris_df=final_liked_posts_df,
+    )
+
+    rows = {
+        (row["subject_uri"], row["popularity_hour_bucket"].isoformat()): row["prior_cumulative_likes"]
+        for row in curve_df.iter_rows(named=True)
+    }
+    assert rows == {
+        ("post:history", "2024-01-02T01:00:00+00:00"): 2,
+        ("post:history", "2024-01-02T02:00:00+00:00"): 3,
+        ("post:also_history", "2024-01-02T03:00:00+00:00"): 1,
+    }
+    assert "post:not_final" not in curve_df["subject_uri"].to_list()
+    assert stats["n_liked_history_posts"] == 2
+    assert stats["n_liked_post_popularity_source_like_rows"] == 4
+
+
 def test_global_negative_counts_respect_hash_seed_and_min_likes(stage_get_data_module):
     raw_likes_lf = pl.DataFrame([
         {"did": "user_a", "subject_uri": "post:forced", "record_created_at": "2024-01-02T00:10:00"},
