@@ -146,7 +146,6 @@ def _build_user_history_directory(
         _get_agg_expr("emb_idx").alias("prior_emb_indices"),
         pl.len().alias("raw_prior_count"),
         _get_agg_expr("prior_like_age_hours_at_bucket_start").alias("prior_like_age_hours_at_bucket_start"),
-        _get_agg_expr(TIMESTAMP_COL_NAME).alias("_prior_record_created_at"),
     ]
     if include_author_idx:
         agg_exprs += [_get_agg_expr("author_idx").alias("prior_author_indices")]
@@ -166,7 +165,6 @@ def _build_user_history_directory(
         .explode([
             "prior_emb_indices",
             "prior_like_age_hours_at_bucket_start",
-            "_prior_record_created_at",
             *(['prior_author_indices'] if include_author_idx else []),
         ])
         .with_columns(
@@ -197,14 +195,14 @@ def _build_user_history_directory(
         )
     )
     regroup_exprs = [
-        pl.col("prior_emb_indices").sort_by(pl.col("_prior_record_created_at"), descending=True).alias("prior_emb_indices"),
+        pl.col("prior_emb_indices").sort_by(pl.col("prior_like_age_hours_at_bucket_start")).alias("prior_emb_indices"),
         pl.col("raw_prior_count").first().alias("raw_prior_count"),
-        pl.col("prior_like_age_hours_at_bucket_start").sort_by(pl.col("_prior_record_created_at"), descending=True).alias("prior_like_age_hours_at_bucket_start"),
-        pl.col("prior_cumulative_likes").sort_by(pl.col("_prior_record_created_at"), descending=True).alias("prior_cumulative_likes"),
+        pl.col("prior_like_age_hours_at_bucket_start").sort_by(pl.col("prior_like_age_hours_at_bucket_start")).alias("prior_like_age_hours_at_bucket_start"),
+        pl.col("prior_cumulative_likes").sort_by(pl.col("prior_like_age_hours_at_bucket_start")).alias("prior_cumulative_likes"),
     ]
     if include_author_idx:
         regroup_exprs += [
-            pl.col("prior_author_indices").sort_by(pl.col("_prior_record_created_at"), descending=True).alias("prior_author_indices")
+            pl.col("prior_author_indices").sort_by(pl.col("prior_like_age_hours_at_bucket_start")).alias("prior_author_indices")
         ]
     history_lists_with_counts_lf = (
         history_with_popularity_lf
