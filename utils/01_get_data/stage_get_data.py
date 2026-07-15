@@ -105,7 +105,7 @@ OUTPUTS
 Under <run_dir>/01_get_data/<timestamp>/:
   - likes_core_*.parquet: did, subject_uri, record_created_at, like_hour_bucket, split, prior_cumulative_likes, emb_idx, author_did, author_idx
   - posts_core_*.parquet: at_uri, did, record_text, is_liked, in_random_sample, negative_hour_bucket, prior_cumulative_likes, split_window, emb_idx, author_idx
-  - liked_post_hour_cumulative_likes_*.parquet: subject_uri, popularity_hour_bucket, prior_cumulative_likes
+  - liked_post_hour_cumulative_likes_*.parquet: emb_idx, popularity_hour_bucket, prior_cumulative_likes
   - author_idx_*.parquet: author_did, author_train_count, author_idx
   - embeddings_*.npy: memmap file, shape (n_posts, embed_dim), dtype float32
   - summary.json: full filtering statistics and parameters
@@ -795,15 +795,15 @@ def _build_exact_prior_cumulative_likes_df(
 
 def _build_liked_post_hour_cumulative_likes_df(
     raw_likes_lf: pl.LazyFrame,
-    liked_post_uris_df: pl.DataFrame,
+    liked_post_mapping_df: pl.DataFrame,
     logger: Optional[logging.Logger] = None,
 ) -> Tuple[pl.DataFrame, Dict[str, int]]:
     output_schema = {
-        "subject_uri": pl.Utf8,
+        "emb_idx": pl.UInt32,
         "popularity_hour_bucket": pl.Datetime(time_zone="UTC"),
         "prior_cumulative_likes": pl.UInt64,
     }
-    if liked_post_uris_df.height == 0:
+    if liked_post_mapping_df.height == 0:
         stats = {
             "n_liked_history_posts": 0,
             "n_liked_post_popularity_source_like_rows": 0,
@@ -812,41 +812,45 @@ def _build_liked_post_hour_cumulative_likes_df(
         }
         return pl.DataFrame(schema=output_schema), stats
 
-    liked_posts_lf = liked_post_uris_df.lazy()
+    liked_posts_lf = (
+        liked_post_mapping_df
+        .with_columns(pl.col("emb_idx").cast(pl.UInt32))
+        .lazy()
+    )
     hourly_likes_df = (
         raw_likes_lf
         .select(["subject_uri", TIMESTAMP_COL_NAME])
-        .join(liked_posts_lf, on="subject_uri", how="semi")
+        .join(liked_posts_lf, on="subject_uri", how="inner")
         .with_columns(
             _hour_bucket_key_expr(TIMESTAMP_COL_NAME).str.to_datetime(time_zone="UTC").alias("_like_hour_bucket")
         )
-        .group_by(["subject_uri", "_like_hour_bucket"])
+        .group_by(["emb_idx", "_like_hour_bucket"])
         .len()
         .rename({"len": "likes_this_hour"})
         .with_columns(
             pl.col("likes_this_hour").cast(pl.UInt64)
         )
         .collect(engine="streaming")
-    ) # subject_uri, _like_hour_bucket, likes_this_hour
+    ) # emb_idx, _like_hour_bucket, likes_this_hour
     n_source_like_rows = int(hourly_likes_df["likes_this_hour"].sum()) if hourly_likes_df.height > 0 else 0
     if hourly_likes_df.height == 0:
         liked_post_hour_cumulative_likes_df = pl.DataFrame(schema=output_schema)
     else:
         liked_post_hour_cumulative_likes_df = (
             hourly_likes_df
-            .sort(["subject_uri", "_like_hour_bucket"])
+            .sort(["emb_idx", "_like_hour_bucket"])
             .with_columns(
-                pl.col("likes_this_hour").cum_sum().over("subject_uri").alias("prior_cumulative_likes")
+                pl.col("likes_this_hour").cum_sum().over("emb_idx").alias("prior_cumulative_likes")
             )
             .select(
-                "subject_uri",
+                "emb_idx",
                 (pl.col("_like_hour_bucket") + pl.duration(hours=1)).alias("popularity_hour_bucket"),
                 pl.col("prior_cumulative_likes").cast(pl.UInt64),
             )
-        ) # subject_uri, popularity_hour_bucket, prior_cumulative_likes
+        ) # emb_idx, popularity_hour_bucket, prior_cumulative_likes
 
     stats = {
-        "n_liked_history_posts": liked_post_uris_df["subject_uri"].n_unique(),
+        "n_liked_history_posts": liked_post_mapping_df["emb_idx"].n_unique(),
         "n_liked_post_popularity_source_like_rows": n_source_like_rows,
         "n_liked_post_popularity_hourly_rows": hourly_likes_df.height,
         "n_liked_post_popularity_output_rows": liked_post_hour_cumulative_likes_df.height,
@@ -2120,10 +2124,14 @@ def _run_greenearth_pipeline(
 
     log_operation_start('Build liked-post sparse popularity curve', '01_GET_DATA', logger)
     mem_tracker.checkpoint("before_liked_post_popularity_curve", quiet=True)
-    liked_post_uris_for_history_df = likes_core_df.select("subject_uri").unique()
+    liked_post_mapping_for_history_df = (
+        likes_core_df
+        .select(["subject_uri", "emb_idx"])
+        .unique(subset=["subject_uri"])
+    )
     liked_post_hour_cumulative_likes_df, liked_post_popularity_stats = _build_liked_post_hour_cumulative_likes_df(
         raw_likes_lf=raw_likes_lf,
-        liked_post_uris_df=liked_post_uris_for_history_df,
+        liked_post_mapping_df=liked_post_mapping_for_history_df,
         logger=logger,
     )
     all_stats['liked_post_hour_cumulative_likes'] = liked_post_popularity_stats

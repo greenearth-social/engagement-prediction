@@ -384,23 +384,25 @@ def test_liked_post_hour_cumulative_likes_covers_final_liked_posts_only(stage_ge
     ]).lazy()
     final_liked_posts_df = pl.DataFrame({
         "subject_uri": ["post:history", "post:also_history"],
+        "emb_idx": [10, 20],
     })
 
     curve_df, stats = stage_get_data_module._build_liked_post_hour_cumulative_likes_df(
         raw_likes_lf=raw_likes_lf,
-        liked_post_uris_df=final_liked_posts_df,
+        liked_post_mapping_df=final_liked_posts_df,
     )
 
     rows = {
-        (row["subject_uri"], row["popularity_hour_bucket"].isoformat()): row["prior_cumulative_likes"]
+        (row["emb_idx"], row["popularity_hour_bucket"].isoformat()): row["prior_cumulative_likes"]
         for row in curve_df.iter_rows(named=True)
     }
     assert rows == {
-        ("post:history", "2024-01-02T01:00:00+00:00"): 2,
-        ("post:history", "2024-01-02T02:00:00+00:00"): 3,
-        ("post:also_history", "2024-01-02T03:00:00+00:00"): 1,
+        (10, "2024-01-02T01:00:00+00:00"): 2,
+        (10, "2024-01-02T02:00:00+00:00"): 3,
+        (20, "2024-01-02T03:00:00+00:00"): 1,
     }
-    assert "post:not_final" not in curve_df["subject_uri"].to_list()
+    assert "subject_uri" not in curve_df.columns
+    assert curve_df.schema["emb_idx"] == pl.UInt32
     assert stats["n_liked_history_posts"] == 2
     assert stats["n_liked_post_popularity_source_like_rows"] == 4
 

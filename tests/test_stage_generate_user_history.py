@@ -85,9 +85,10 @@ def _default_popularity_curve(likes_lf: pl.LazyFrame) -> pl.LazyFrame:
     likes_df = likes_lf.collect()
     return (
         likes_df
-        .select(["subject_uri", "like_hour_bucket", "prior_cumulative_likes"])
+        .select(["emb_idx", "like_hour_bucket", "prior_cumulative_likes"])
         .rename({"like_hour_bucket": "popularity_hour_bucket"})
         .with_columns(
+            pl.col("emb_idx").cast(pl.UInt32),
             (pl.col("popularity_hour_bucket") + pl.duration(hours=1)).alias("popularity_hour_bucket"),
             pl.col("prior_cumulative_likes").fill_null(0).cast(pl.UInt64),
         )
@@ -96,12 +97,12 @@ def _default_popularity_curve(likes_lf: pl.LazyFrame) -> pl.LazyFrame:
 
 
 def _make_popularity_curve(
-    subject_uris: list[str],
+    emb_idxs: list[int],
     popularity_hour_buckets: list[datetime],
     prior_cumulative_likes: list[int],
 ) -> pl.LazyFrame:
     return pl.DataFrame({
-        "subject_uri": subject_uris,
+        "emb_idx": pl.Series(emb_idxs, dtype=pl.UInt32),
         "popularity_hour_bucket": popularity_hour_buckets,
         "prior_cumulative_likes": pl.Series(prior_cumulative_likes, dtype=pl.UInt64),
     }).lazy()
@@ -232,7 +233,7 @@ def test_user_hour_history_popularity_uses_target_hour_counts(build_history):
         [5, 25],
     )
     popularity_lf = _make_popularity_curve(
-        ["p1", "p1", "p2"],
+        [100, 100, 200],
         [
             datetime(2024, 1, 1, 11),
             datetime(2024, 1, 1, 12),
@@ -266,7 +267,7 @@ def test_user_hour_history_missing_popularity_curve_rows_fill_zero(build_history
         [5, 25],
     )
     popularity_lf = _make_popularity_curve(
-        ["p2"],
+        [200],
         [datetime(2024, 1, 1, 12)],
         [25],
     )

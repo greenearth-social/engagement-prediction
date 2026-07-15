@@ -12,7 +12,7 @@ Inputs:
 - likes_core_*.parquet from 01_get_data: Contains
   {did, subject_uri, record_created_at, like_hour_bucket, emb_idx, prior_cumulative_likes, author_idx}
 - liked_post_hour_cumulative_likes_*.parquet from 01_get_data: Contains
-  {subject_uri, popularity_hour_bucket, prior_cumulative_likes}
+  {emb_idx, popularity_hour_bucket, prior_cumulative_likes}
 - author_idx_*.parquet from 01_get_data, when available: Author index mapping with
   {author_did, author_train_count, author_idx}
 
@@ -69,9 +69,9 @@ def _build_user_history_directory(
     6. Left-join back to ensure every user-hour appears, including empty histories
 
     Args:
-        likes_lf: LazyFrame with columns [did, subject_uri, like_hour_bucket, record_created_at, emb_idx]
+        likes_lf: LazyFrame with columns [did, like_hour_bucket, record_created_at, emb_idx]
         liked_post_hour_cumulative_likes_lf: LazyFrame with columns
-            [subject_uri, popularity_hour_bucket, prior_cumulative_likes]
+            [emb_idx, popularity_hour_bucket, prior_cumulative_likes]
         max_prior_likes: Optional cap on prior likes per target (None = no cap)
         logger: Logger instance
 
@@ -92,7 +92,7 @@ def _build_user_history_directory(
     popularity_schema = liked_post_hour_cumulative_likes_lf.collect_schema()
     missing_popularity_cols = [
         col_name
-        for col_name in ("subject_uri", "popularity_hour_bucket", "prior_cumulative_likes")
+        for col_name in ("emb_idx", "popularity_hour_bucket", "prior_cumulative_likes")
         if col_name not in popularity_schema
     ]
     if missing_popularity_cols:
@@ -109,7 +109,7 @@ def _build_user_history_directory(
 
     # Join targets with likes on user identity
     # This creates one row per (target, like) pair for each user
-    likes_cols = ['did', TIMESTAMP_COL_NAME, 'subject_uri', 'emb_idx']
+    likes_cols = ['did', TIMESTAMP_COL_NAME, 'emb_idx']
     if include_author_idx:
         likes_cols.append('author_idx')
     pairs_with_prior_likes_lf = (
@@ -129,7 +129,7 @@ def _build_user_history_directory(
             .cast(pl.Float32)
             .alias("prior_like_age_hours_at_bucket_start"),
         )
-    ) # [did, like_hour_bucket, record_created_at, subject_uri, emb_idx, (author_idx)]
+    ) # [did, like_hour_bucket, record_created_at, emb_idx, (author_idx)]
 
     def _get_agg_expr(col_name: str):
         # Build aggregation expression: sort by recency (descending) and optionally cap
@@ -143,7 +143,6 @@ def _build_user_history_directory(
         return agg_expr
     
     agg_exprs = [
-        _get_agg_expr("subject_uri").alias("prior_subject_uris"),
         _get_agg_expr("emb_idx").alias("prior_emb_indices"),
         pl.len().alias("raw_prior_count"),
         _get_agg_expr("prior_like_age_hours_at_bucket_start").alias("prior_like_age_hours_at_bucket_start"),
@@ -165,29 +164,31 @@ def _build_user_history_directory(
     exploded_history_lf = (
         history_lists_with_idx_lf
         .explode([
-            "prior_subject_uris",
             "prior_emb_indices",
             "prior_like_age_hours_at_bucket_start",
             "_prior_record_created_at",
             *(['prior_author_indices'] if include_author_idx else []),
         ])
-        .rename({"prior_subject_uris": "subject_uri"})
+        .with_columns(
+            pl.col("prior_emb_indices").cast(pl.UInt32).alias("emb_idx")
+        )
     )
     popularity_lf = (
         liked_post_hour_cumulative_likes_lf
-        .select(["subject_uri", "popularity_hour_bucket", "prior_cumulative_likes"])
+        .select(["emb_idx", "popularity_hour_bucket", "prior_cumulative_likes"])
         .with_columns(
+            pl.col("emb_idx").cast(pl.UInt32),
             pl.col("prior_cumulative_likes").fill_null(0).cast(pl.UInt64)
         )
     )
     history_with_popularity_lf = (
         exploded_history_lf
-        .sort(["like_hour_bucket", "subject_uri"])
+        .sort(["like_hour_bucket", "emb_idx"])
         .join_asof(
-            popularity_lf.sort(["popularity_hour_bucket", "subject_uri"]),
+            popularity_lf.sort(["popularity_hour_bucket", "emb_idx"]),
             left_on="like_hour_bucket",
             right_on="popularity_hour_bucket",
-            by="subject_uri",
+            by="emb_idx",
             strategy="backward",
             check_sortedness=False,
         )
@@ -429,7 +430,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     validate_dataframe_schema(likes_lf, likes_schema)
     logger.info("✓ likes_core schema validated")
     liked_post_popularity_schema = {
-        "subject_uri": str,
+        "emb_idx": int,
         "popularity_hour_bucket": pl.Datetime,
         "prior_cumulative_likes": int,
     }
