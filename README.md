@@ -122,7 +122,7 @@ Important Stage 1 behavior:
 - `liked_post_hour_cumulative_likes_*.parquet` stores sparse prior-hour popularity curves keyed by `emb_idx` for final liked/history posts only. It is used by Stage 2 history features, not sampled negatives.
 - `min_author_support` controls which authors get dedicated author embedding rows when author features are enabled.
 
-Primary artifacts include `likes_core_*.parquet`, `posts_core_*.parquet`, `embeddings_*.npy`, and, when available, `author_idx_*.parquet`.
+Primary artifacts include `likes_core_*.parquet`, `posts_core_*.parquet`, `liked_post_hour_cumulative_likes_*.parquet`, `embeddings_*.npy`, and, when available, `author_idx_*.parquet`.
 
 ### Stage 2: User History
 
