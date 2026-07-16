@@ -459,13 +459,23 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     n_empty_history = n_output - n_with_history
 
     # Stats on prior likes counts
-    prior_counts = directory_df["prior_emb_indices"].list.len()
-    mean_prior = prior_counts.mean()
-    max_prior = prior_counts.max()
-    min_prior = prior_counts.filter(prior_counts > 0).min() if n_with_history > 0 else 0
-    mean_prior_value = float(mean_prior) if mean_prior is not None else 0.0
-    max_prior_value = int(max_prior) if max_prior is not None else 0
-    min_prior_value = int(min_prior) if min_prior is not None else 0
+    prior_count_stats = (
+        directory_df
+        .select(
+            pl.col("prior_emb_indices").list.len().mean().fill_null(0.0).alias("mean_prior"),
+            pl.col("prior_emb_indices").list.len().max().fill_null(0).alias("max_prior"),
+            pl.when(pl.col("prior_emb_indices").list.len() > 0)
+            .then(pl.col("prior_emb_indices").list.len())
+            .otherwise(None)
+            .min()
+            .fill_null(0)
+            .alias("min_prior"),
+        )
+        .row(0)
+    )
+    mean_prior_value = float(prior_count_stats[0])
+    max_prior_value = int(prior_count_stats[1])
+    min_prior_value = int(prior_count_stats[2])
 
     summary = {
         "history_prior_cumulative_likes_semantics": HISTORY_POPULARITY_SEMANTICS,
