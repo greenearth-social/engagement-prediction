@@ -1,5 +1,8 @@
 """Tests for the BST heavy ranker model components."""
 import importlib
+import sys
+from importlib.util import module_from_spec, spec_from_file_location
+from pathlib import Path
 
 import pytest
 import torch
@@ -27,9 +30,10 @@ def _make_model(
     prediction_hidden_dims=(8, 4),
     use_popularity_feature: bool = False,
     popularity_projection_dim: int | None = None,
+    model_cls=BSTRanker,
 ) -> BSTRanker:
     torch.manual_seed(123)
-    return BSTRanker(
+    return model_cls(
         post_embedding_dim=4,
         author_table_num_rows=8,
         author_embedding_dim=3,
@@ -50,6 +54,21 @@ def _make_model(
         popularity_log_mean=1.0,
         popularity_log_std=2.0,
     )
+
+
+def _load_torchscript_safe_bst_module():
+    module_name = "stage_train_bst_ranker"
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        return existing
+    module_path = Path(stage_train_bst_ranker.__file__).resolve()
+    spec = spec_from_file_location(module_name, str(module_path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load {module_path}")
+    module = module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _batch() -> dict[str, torch.Tensor]:
@@ -133,6 +152,24 @@ def _listwise_batch() -> dict[str, torch.Tensor]:
     }
 
 
+def _mixed_zero_history_batch() -> dict[str, torch.Tensor]:
+    batch = {key: value.clone() for key, value in _batch().items()}
+    batch["history_mask"][1] = False
+    return batch
+
+
+def _empty_history_batch() -> dict[str, torch.Tensor]:
+    batch = _batch()
+    num_users = batch["history_embeddings"].shape[0]
+    return {
+        **batch,
+        "history_embeddings": torch.empty((num_users, 0, 4), dtype=torch.float32),
+        "history_mask": torch.empty((num_users, 0), dtype=torch.bool),
+        "history_time_deltas_hours": torch.empty((num_users, 0), dtype=torch.float32),
+        "history_author_indices": torch.empty((num_users, 0), dtype=torch.long),
+    }
+
+
 class _SingleBatchDataset(Dataset):
     def __init__(self, batch: dict[str, torch.Tensor]) -> None:
         self.batch = batch
@@ -173,6 +210,20 @@ def test_bst_ranker_forward_transformer_shape_and_builtin_transformer_encoder():
     assert output.dtype == torch.float32
 
 
+def test_bst_ranker_zero_history_rows_use_empty_history_token():
+    model = _make_model()
+    batch = {key: value.clone() for key, value in _batch().items()}
+    batch["history_mask"] = torch.zeros_like(batch["history_mask"])
+
+    scores = model.score_candidate_matrix_one_layer(**batch)
+    scores.sum().backward()
+
+    assert torch.isfinite(scores).all()
+    assert model.empty_history_token.grad is not None
+    assert torch.isfinite(model.empty_history_token.grad).all()
+    assert model.empty_history_token.grad.abs().sum() > 0
+
+
 def test_bst_ranker_forward_returns_raw_logits():
     model = _make_model()
     model.eval()
@@ -189,6 +240,20 @@ def test_bst_ranker_score_candidate_matrix_one_layer_matches_repeated_path(norm_
     model = _make_model(norm_first=norm_first)
     model.eval()
     batch = _batch()
+
+    with torch.inference_mode():
+        expected = _expected_matrix_scores(model, batch)
+        scores = model.score_candidate_matrix_one_layer(**batch)
+
+    assert scores.shape == (2, 2)
+    torch.testing.assert_close(scores, expected, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("norm_first", [False, True])
+def test_bst_ranker_zero_history_matrix_scorer_matches_repeated_path(norm_first):
+    model = _make_model(norm_first=norm_first)
+    model.eval()
+    batch = _mixed_zero_history_batch()
 
     with torch.inference_mode():
         expected = _expected_matrix_scores(model, batch)
@@ -377,6 +442,27 @@ def test_bst_ranker_supports_candidate_only_sequence_with_zero_delta_bucket():
     assert output.shape == (2,)
 
 
+def test_bst_ranker_score_candidate_matrix_supports_zero_length_history():
+    model = _make_model()
+    model.eval()
+    batch = _empty_history_batch()
+
+    with torch.inference_mode():
+        expected = _expected_matrix_scores(model, batch)
+        scores = model.score_candidate_matrix(
+            batch["history_embeddings"],
+            batch["history_mask"],
+            batch["history_time_deltas_hours"],
+            batch["candidate_post_embeddings"],
+            batch["history_author_indices"],
+            batch["candidate_post_author_idx"],
+        )
+
+    assert scores.shape == (2, 2)
+    assert torch.isfinite(scores).all()
+    torch.testing.assert_close(scores, expected, atol=1e-6, rtol=1e-6)
+
+
 def test_bst_ranker_gradients_flow_through_post_time_transformer_and_head_parameters():
     model = _make_model()
     batch = _batch()
@@ -471,6 +557,39 @@ def test_bst_ranker_torchscript_exports_matrix_scorer():
     torch.testing.assert_close(scripted_scores, expected, atol=1e-5, rtol=1e-5)
 
 
+def test_bst_ranker_torchscript_load_preserves_zero_history_paths(tmp_path):
+    torchscript_safe_module = _load_torchscript_safe_bst_module()
+    model = _make_model(model_cls=torchscript_safe_module.BSTRanker).eval()
+    batch = _mixed_zero_history_batch()
+    model_path = tmp_path / "ranker.pt"
+
+    with torch.no_grad():
+        eager_output = model(**batch)
+        eager_scores = model.score_candidate_matrix_one_layer(**batch)
+        scripted_model = torch.jit.script(model)
+        scripted_model.save(str(model_path))
+        loaded_model = torch.jit.load(str(model_path)).eval()
+        loaded_output = loaded_model(
+            batch["history_embeddings"],
+            batch["history_mask"],
+            batch["history_time_deltas_hours"],
+            batch["candidate_post_embeddings"],
+            batch["history_author_indices"],
+            batch["candidate_post_author_idx"],
+        )
+        loaded_scores = loaded_model.score_candidate_matrix(
+            batch["history_embeddings"],
+            batch["history_mask"],
+            batch["history_time_deltas_hours"],
+            batch["candidate_post_embeddings"],
+            batch["history_author_indices"],
+            batch["candidate_post_author_idx"],
+        )
+
+    torch.testing.assert_close(loaded_output, eager_output, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(loaded_scores, eager_scores, atol=1e-5, rtol=1e-5)
+
+
 def test_bst_ranker_torchscript_supports_popularity_features():
     model = _make_model(use_popularity_feature=True).eval()
     batch = _batch_with_popularity()
@@ -501,6 +620,29 @@ def test_bst_ranker_torchscript_supports_popularity_features():
         )
 
     torch.testing.assert_close(scripted_output, eager_output, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(scripted_scores, eager_scores, atol=1e-5, rtol=1e-5)
+
+
+def test_bst_ranker_torchscript_popularity_supports_zero_history_rows():
+    model = _make_model(use_popularity_feature=True).eval()
+    batch = {key: value.clone() for key, value in _batch_with_popularity().items()}
+    batch["history_mask"][1] = False
+
+    with torch.no_grad():
+        eager_scores = model.score_candidate_matrix_one_layer(**batch)
+        scripted_model = torch.jit.script(model)
+        scripted_scores = scripted_model.score_candidate_matrix(
+            batch["history_embeddings"],
+            batch["history_mask"],
+            batch["history_time_deltas_hours"],
+            batch["candidate_post_embeddings"],
+            batch["history_author_indices"],
+            batch["candidate_post_author_idx"],
+            batch["history_prior_cumulative_likes"],
+            batch["candidate_prior_cumulative_likes"],
+        )
+
+    assert torch.isfinite(scripted_scores).all()
     torch.testing.assert_close(scripted_scores, eager_scores, atol=1e-5, rtol=1e-5)
 
 
