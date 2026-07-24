@@ -67,6 +67,8 @@ artifacts:
     sensitivity: restricted
     scope: restricted
     required_for: [analysis]
+    excludes:
+      - "artifacts/remedies/exclude_*.parquet"
     include:
       - analyses
       - artifacts

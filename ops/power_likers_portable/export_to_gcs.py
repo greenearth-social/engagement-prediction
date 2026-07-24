@@ -20,7 +20,7 @@ import argparse
 import hashlib
 import json
 import os
-import shutil
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -85,7 +85,10 @@ def main() -> int:
 
     for entry in manifest["artifacts"]:
         if entry.get("scope") == "private" and not private_allowed:
-            print(f"SKIP private artifact {entry['id']} (set PL_EXPORT_PRIVATE=1 after IAM review)")
+            print(
+                f"SKIP private artifact {entry['id']} (set PL_EXPORT_PRIVATE=1 after IAM review)",
+                file=sys.stderr,
+            )
             continue
         for source, relative in files_for_entry(entry):
             destination = f"{package_prefix}/{entry['destination'].strip('/')}/{relative.as_posix()}"
