@@ -38,6 +38,7 @@ from utils.helpers import (
 )
 from utils.matrix_ranking import (
     MatrixBatchScores,
+    calc_baseline_rank_metrics_for_batch,
     empty_rank_metric_sums,
     evaluate_matrix_scorer,
     finalize_rank_metrics,
@@ -645,8 +646,9 @@ def run_bst_listwise_epoch(
     disable_progress: bool,
     gradient_clip_max_norm: float,
     metrics_top_ks: List[int],
+    calc_baseline_metrics: bool,
     max_batches: Optional[int] = None,
-) -> Tuple[float, Dict[str, Any]]:
+) -> Tuple[float, Dict[str, Any], Dict[str, float]]:
     if train:
         if optimizer is None:
             raise ValueError("optimizer is required when train=True")
@@ -656,6 +658,8 @@ def run_bst_listwise_epoch(
 
     loss_sum = torch.zeros((), device=device)
     batches = 0
+    baseline_metric_sums = empty_rank_metric_sums(metrics_top_ks)
+    baseline_metric_user_count = 0
     metric_sums = empty_rank_metric_sums(metrics_top_ks)
     metric_user_count = 0
     zero_history_metric_sums = empty_rank_metric_sums(metrics_top_ks)
@@ -669,6 +673,15 @@ def run_bst_listwise_epoch(
                 optimizer.zero_grad()
 
             loss, scores, labels = _compute_bst_listwise_loss_and_preds(model, batch, device)
+            if calc_baseline_metrics:
+                baseline_batch_metric_sums, baseline_batch_metric_user_count = calc_baseline_rank_metrics_for_batch(
+                    labels,
+                    metrics_top_ks,
+                )
+                baseline_metric_user_count += baseline_batch_metric_user_count
+                for key, value in baseline_batch_metric_sums.items():
+                    baseline_metric_sums[key] += value
+
             ranked_indices = torch.argsort(scores.detach(), dim=1, descending=True)
             ranked_labels = torch.gather(labels, dim=1, index=ranked_indices)
             batch_metric_sums, batch_metric_user_count = rank_metric_sums_for_batch(
@@ -696,11 +709,12 @@ def run_bst_listwise_epoch(
                 zero_history_metric_sums[key] += value
 
     loss = (loss_sum / max(batches, 1)).item()
+    baseline_metrics = finalize_rank_metrics(baseline_metric_sums, baseline_metric_user_count)
     metrics: Dict[str, Any] = finalize_rank_metrics(metric_sums, metric_user_count)
     metrics.update(finalize_zero_history_rank_metrics(zero_history_metric_sums, zero_history_metric_user_count))
     metrics["loss"] = loss
     metrics["rank_metric_user_count"] = metric_user_count
-    return loss, metrics
+    return loss, metrics, baseline_metrics
 
 
 class BSTRankerMatrixScorer:
@@ -758,6 +772,10 @@ def _log_bst_listwise_epoch_metrics(
     train_metrics: Dict[str, Any],
     val_metrics: Dict[str, Any],
     val_unseen_metrics: Dict[str, Any],
+    train_baseline_metrics: Dict[str, float],
+    val_baseline_metrics: Dict[str, float],
+    val_unseen_baseline_metrics: Dict[str, float],
+    calc_baseline_metrics: bool,
     metrics_top_ks: List[int],
     primary_metric_name: str,
 ) -> None:
@@ -783,6 +801,19 @@ def _log_bst_listwise_epoch_metrics(
                 if metric_value is None:
                     continue
                 experiment_tracker.log_scalar(metric_label, f"{split_label} {metric_label}", float(metric_value), iteration)
+        if calc_baseline_metrics:
+            for metric_name, metric_label in ((f"ndcg@{k}", f"Baseline NDCG@{k}"), (f"recall@{k}", f"Baseline Recall@{k}")):
+                for split_label, metrics in (
+                    ("Train", train_baseline_metrics),
+                    ("Validation", val_baseline_metrics),
+                    ("Validation Unseen Users", val_unseen_baseline_metrics),
+                ):
+                    experiment_tracker.log_scalar(
+                        metric_label,
+                        f"{split_label} {metric_label}",
+                        float(metrics[metric_name]),
+                        iteration,
+                    )
     log_zero_history_rank_metrics(
         experiment_tracker,
         {
@@ -844,7 +875,8 @@ def train_bst_ranker_model(
     best_state_dict = None
 
     for epoch in tqdm(range(epochs), desc="Training epochs", disable=disable_progress):
-        train_loss, train_metrics = run_bst_listwise_epoch(
+        calc_baseline_metrics = epoch == 0
+        train_loss, train_metrics, train_baseline_metrics = run_bst_listwise_epoch(
             train=True,
             split_name="Train",
             model=model,
@@ -854,9 +886,10 @@ def train_bst_ranker_model(
             disable_progress=disable_progress,
             gradient_clip_max_norm=gradient_clip_max_norm,
             metrics_top_ks=metrics_top_ks,
+            calc_baseline_metrics=calc_baseline_metrics,
             max_batches=bst_max_train_batches_per_epoch,
         )
-        val_loss, val_metrics = run_bst_listwise_epoch(
+        val_loss, val_metrics, val_baseline_metrics = run_bst_listwise_epoch(
             train=False,
             split_name="Validation",
             model=model,
@@ -866,8 +899,9 @@ def train_bst_ranker_model(
             disable_progress=disable_progress,
             gradient_clip_max_norm=gradient_clip_max_norm,
             metrics_top_ks=metrics_top_ks,
+            calc_baseline_metrics=calc_baseline_metrics,
         )
-        val_unseen_loss, val_unseen_metrics = run_bst_listwise_epoch(
+        val_unseen_loss, val_unseen_metrics, val_unseen_baseline_metrics = run_bst_listwise_epoch(
             train=False,
             split_name="Validation Unseen Users",
             model=model,
@@ -877,6 +911,7 @@ def train_bst_ranker_model(
             disable_progress=disable_progress,
             gradient_clip_max_norm=gradient_clip_max_norm,
             metrics_top_ks=metrics_top_ks,
+            calc_baseline_metrics=calc_baseline_metrics,
         )
 
         history["train_loss"].append(train_loss)
@@ -899,6 +934,10 @@ def train_bst_ranker_model(
             train_metrics,
             val_metrics,
             val_unseen_metrics,
+            train_baseline_metrics,
+            val_baseline_metrics,
+            val_unseen_baseline_metrics,
+            calc_baseline_metrics,
             metrics_top_ks,
             primary_metric_name,
         )

@@ -144,6 +144,21 @@ class _SingleBatchDataset(Dataset):
         return self.batch
 
 
+class _RecordingTracker:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def log_scalar(self, title: str, series: str, value: float, iteration: int) -> None:
+        self.calls.append(
+            {
+                "title": title,
+                "series": series,
+                "value": value,
+                "iteration": iteration,
+            }
+        )
+
+
 def test_bst_ranker_forward_transformer_shape_and_builtin_transformer_encoder():
     model = _make_model()
     model.eval()
@@ -532,7 +547,7 @@ def test_run_bst_listwise_epoch_computes_rank_metrics():
     model.eval()
     loader = DataLoader(_SingleBatchDataset(_listwise_batch()), batch_size=None, shuffle=False)
 
-    loss, metrics = run_bst_listwise_epoch(
+    loss, metrics, baseline_metrics = run_bst_listwise_epoch(
         train=False,
         split_name="Validation",
         model=model,
@@ -542,6 +557,7 @@ def test_run_bst_listwise_epoch_computes_rank_metrics():
         disable_progress=True,
         gradient_clip_max_norm=1.0,
         metrics_top_ks=[1, 2],
+        calc_baseline_metrics=True,
     )
 
     assert loss >= 0.0
@@ -550,6 +566,10 @@ def test_run_bst_listwise_epoch_computes_rank_metrics():
     for metric_name in ("ndcg@1", "recall@1", "ndcg@2", "recall@2", "mean_average_precision"):
         assert metric_name in metrics
         assert 0.0 <= metrics[metric_name] <= 1.0
+    assert baseline_metrics["ndcg@1"] == pytest.approx(0.75)
+    assert baseline_metrics["recall@1"] == pytest.approx(0.5)
+    assert baseline_metrics["ndcg@2"] == pytest.approx(0.9077324383928644)
+    assert baseline_metrics["recall@2"] == pytest.approx(1.0)
 
 
 def test_run_bst_listwise_epoch_reports_zero_history_metrics():
@@ -559,7 +579,7 @@ def test_run_bst_listwise_epoch_reports_zero_history_metrics():
     batch["history_mask"][1] = False
     loader = DataLoader(_SingleBatchDataset(batch), batch_size=None, shuffle=False)
 
-    _, metrics = run_bst_listwise_epoch(
+    _, metrics, _ = run_bst_listwise_epoch(
         train=False,
         split_name="Validation",
         model=model,
@@ -569,6 +589,7 @@ def test_run_bst_listwise_epoch_reports_zero_history_metrics():
         disable_progress=True,
         gradient_clip_max_norm=1.0,
         metrics_top_ks=[1, 2],
+        calc_baseline_metrics=False,
     )
 
     assert metrics["zero_history_rank_metric_user_count"] == 1
@@ -588,9 +609,12 @@ def test_train_bst_ranker_model_uses_val_unseen_ndcg_for_listwise_primary_metric
     loader = DataLoader(_SingleBatchDataset(_listwise_batch()), batch_size=None, shuffle=False)
     val_unseen_ndcg_values = [0.25, 0.75, 0.5]
     val_unseen_call_count = 0
+    calc_baseline_metrics_calls = []
+    tracker = _RecordingTracker()
 
     def fake_run_bst_listwise_epoch(**kwargs):
         nonlocal val_unseen_call_count
+        calc_baseline_metrics_calls.append(kwargs["calc_baseline_metrics"])
         split_name = kwargs["split_name"]
         if split_name == "Validation Unseen Users":
             ndcg = val_unseen_ndcg_values[val_unseen_call_count]
@@ -599,13 +623,20 @@ def test_train_bst_ranker_model_uses_val_unseen_ndcg_for_listwise_primary_metric
             ndcg = 0.2
         else:
             ndcg = 0.1
-        return 1.0, {
-            "loss": 1.0,
-            "ndcg@1": ndcg,
-            "recall@1": ndcg,
-            "mean_average_precision": ndcg,
-            "rank_metric_user_count": 2,
-        }
+        return (
+            1.0,
+            {
+                "loss": 1.0,
+                "ndcg@1": ndcg,
+                "recall@1": ndcg,
+                "mean_average_precision": ndcg,
+                "rank_metric_user_count": 2,
+            },
+            {
+                "ndcg@1": 0.4,
+                "recall@1": 0.5,
+            },
+        )
 
     monkeypatch.setattr(stage_train_bst_ranker, "run_bst_listwise_epoch", fake_run_bst_listwise_epoch)
 
@@ -626,9 +657,21 @@ def test_train_bst_ranker_model_uses_val_unseen_ndcg_for_listwise_primary_metric
         lr_scheduler_patience=2,
         gradient_clip_max_norm=1.0,
         metrics_top_ks=[1],
+        experiment_tracker=tracker,
     )
 
     assert results["primary_metric_name"] == "val_unseen_ndcg@1"
     assert results["history"]["val_unseen_ndcg@1"] == val_unseen_ndcg_values
     assert results["best_val_metric"] == 0.75
     assert (tmp_path / "bst_ranker_best.pth").exists()
+    assert calc_baseline_metrics_calls == [True, True, True, False, False, False, False, False, False]
+    for series in (
+        "Train Baseline NDCG@1",
+        "Validation Baseline NDCG@1",
+        "Validation Unseen Users Baseline NDCG@1",
+        "Train Baseline Recall@1",
+        "Validation Baseline Recall@1",
+        "Validation Unseen Users Baseline Recall@1",
+    ):
+        matching_calls = [call for call in tracker.calls if call["series"] == series]
+        assert [call["iteration"] for call in matching_calls] == [1]
