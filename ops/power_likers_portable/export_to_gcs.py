@@ -20,6 +20,7 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -117,32 +118,33 @@ def main() -> int:
         print(json.dumps(index, indent=2))
         return 0
 
-    from google.cloud import storage
-
-    client = storage.Client()
-    bucket = client.bucket(args.bucket)
-    if not bucket.exists():
-        raise RuntimeError(f"Bucket gs://{args.bucket} does not exist; create and restrict it before export.")
+    result = subprocess.run(
+        ["gcloud", "storage", "buckets", "describe", f"gs://{args.bucket}"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        raise RuntimeError(f"Bucket gs://{args.bucket} does not exist or is inaccessible: {result.stderr.strip()}")
 
     for row in planned:
-        blob = bucket.blob(row["destination"])
-        blob.metadata = {
-            "sha256": row["sha256"],
-            "power_likers_artifact": row["artifact"],
-            "sensitivity": row["sensitivity"],
-        }
-        blob.upload_from_filename(row["source"])
+        subprocess.run(
+            ["gcloud", "storage", "cp", row["source"], f"gs://{args.bucket}/{row['destination']}"],
+            check=True,
+        )
 
     with tempfile.TemporaryDirectory() as tmp:
         index_path = Path(tmp) / "SHA256SUMS.json"
         index_path.write_text(json.dumps(index, indent=2) + "\n")
-        index_blob = bucket.blob(f"{package_prefix}/SHA256SUMS.json")
-        index_blob.upload_from_filename(index_path)
-
-    for row in planned:
-        blob = bucket.get_blob(row["destination"])
-        if blob is None or (blob.metadata or {}).get("sha256") != row["sha256"]:
-            raise RuntimeError(f"Checksum metadata verification failed for gs://{args.bucket}/{row['destination']}")
+        subprocess.run(
+            ["gcloud", "storage", "cp", str(index_path), f"gs://{args.bucket}/{package_prefix}/SHA256SUMS.json"],
+            check=True,
+        )
+        remote_index = subprocess.check_output(
+            ["gcloud", "storage", "cat", f"gs://{args.bucket}/{package_prefix}/SHA256SUMS.json"],
+            text=True,
+        )
+        if json.loads(remote_index) != index:
+            raise RuntimeError("Uploaded checksum index did not round-trip.")
     print(f"Verified gs://{args.bucket}/{package_prefix}/SHA256SUMS.json")
     return 0
 
