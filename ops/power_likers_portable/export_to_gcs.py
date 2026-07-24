@@ -113,7 +113,10 @@ def main() -> int:
         "private_included": private_allowed,
         "files": planned,
     }
-    print(f"Prepared {len(planned)} files ({sum(int(row['bytes']) for row in planned):,} bytes).")
+    print(
+        f"Prepared {len(planned)} files ({sum(int(row['bytes']) for row in planned):,} bytes).",
+        file=sys.stderr,
+    )
     if args.dry_run:
         print(json.dumps(index, indent=2))
         return 0
