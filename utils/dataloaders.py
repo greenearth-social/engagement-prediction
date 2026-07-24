@@ -1065,7 +1065,15 @@ def _prepare_split_data(
         else:
             prior_emb_indices_list.append(np.array(row_val, dtype=np.uint32))
 
-    return like_emb_idx, neg_emb_idx, prior_emb_indices_list, target_dids, like_uris, neg_uris
+    # Extract per-row sample weights (always present after stage_target_posts adds
+    # the column unconditionally; fallback to uniform for any parquets written
+    # before this change was deployed).
+    if "sample_weight" in joined.columns:
+        sample_weights = joined["sample_weight"].to_numpy().astype(np.float32)
+    else:
+        sample_weights = np.ones(len(like_emb_idx), dtype=np.float32)
+
+    return like_emb_idx, neg_emb_idx, prior_emb_indices_list, target_dids, like_uris, neg_uris, sample_weights
 
 
 # ---------------------------------------------------------------------------
@@ -1153,6 +1161,7 @@ class SummarizedEngagementDataset(Dataset):
             self.target_dids,
             self.like_uris,
             self.neg_uris,
+            sample_weights,
         ) = _prepare_split_data(target_posts_df, history_df, split, logger)
 
         self._n_rows = len(like_emb_idx)
@@ -1170,6 +1179,7 @@ class SummarizedEngagementDataset(Dataset):
                 user_summaries[i] = summarizer.summarize(hist_embs)
             # else: Users with no history stay as zero vectors
         self._user_summaries = torch.from_numpy(user_summaries)
+        self._sample_weights = torch.from_numpy(sample_weights)
 
         # ── Pre-fetch post embeddings [N, D] for pos and neg ─────────
         # Materialize positive and negative post embeddings into contiguous tensors
@@ -1230,6 +1240,7 @@ class SummarizedEngagementDataset(Dataset):
             "label": torch.tensor(label, dtype=torch.float32),
             "user_id": self.target_dids[row_idx],
             "post_id": post_id,
+            "sample_weight": self._sample_weights[row_idx],
         }
 
 
@@ -1329,6 +1340,7 @@ class SequenceEngagementDataset(Dataset):
             self.target_dids,
             self.like_uris,
             self.neg_uris,
+            sample_weights,
         ) = _prepare_split_data(target_posts_df, history_df, split, logger)
 
         self._n_rows = len(like_emb_idx)
@@ -1340,6 +1352,7 @@ class SequenceEngagementDataset(Dataset):
         neg_embs = np.array(embeddings_mmap[neg_emb_idx], dtype=np.float32)
         self._pos_post_embs = torch.from_numpy(pos_embs)
         self._neg_post_embs = torch.from_numpy(neg_embs)
+        self._sample_weights = torch.from_numpy(sample_weights)
 
         if logger:
             mem_mb = (pos_embs.nbytes + neg_embs.nbytes) / (1024 * 1024)
@@ -1406,6 +1419,7 @@ class SequenceEngagementDataset(Dataset):
             "label": torch.tensor(label, dtype=torch.float32),
             "user_id": self.target_dids[row_idx],
             "post_id": post_id,
+            "sample_weight": self._sample_weights[row_idx],
         }
 
 

@@ -210,7 +210,7 @@ class MLPModel(nn.Module):
 
         labels = batch["label"].to(device)
         preds = self(history_embeddings, history_mask, post_embedding).squeeze(-1)
-        loss = F.binary_cross_entropy(preds, labels)
+        loss = F.binary_cross_entropy(preds, labels, weight=batch["sample_weight"].to(device))
         return loss, preds
 
 

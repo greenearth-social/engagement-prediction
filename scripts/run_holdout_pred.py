@@ -175,6 +175,11 @@ def main() -> int:
                     help="Override device (default: cuda if available)")
     ap.add_argument("--overwrite", action="store_true",
                     help="Re-generate parquet even if it already exists")
+    ap.add_argument("--substrate-run-dir", type=Path, default=None,
+                    help="Load target posts, histories, and embeddings from this run directory. "
+                    "Requires --output-dir so predictions retain their substrate provenance.")
+    ap.add_argument("--output-dir", type=Path, default=None,
+                    help="Write prediction parquets here instead of <train_cell_dir>/predictions.")
     args = ap.parse_args()
 
     logger = _setup_logger()
@@ -183,13 +188,18 @@ def main() -> int:
         logger.error(f"Train cell dir does not exist: {train_cell_dir}")
         return 2
 
+    if args.substrate_run_dir is not None and args.output_dir is None:
+        logger.error("--substrate-run-dir requires --output-dir to avoid overwriting native predictions.")
+        return 2
+
     cfg = _load_training_config(train_cell_dir)
     model_type = cfg.get("model_type", "mlp")
     logger.info(f"Train cell: {train_cell_dir}")
     logger.info(f"Model type: {model_type}; user_encoder={cfg.get('user_encoder') or cfg.get('user_encoder_type')}")
 
-    predictions_dir = train_cell_dir / "predictions"
-    predictions_dir.mkdir(exist_ok=True)
+    predictions_dir = args.output_dir.resolve() if args.output_dir else train_cell_dir / "predictions"
+    predictions_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Prediction output dir: {predictions_dir}")
 
     holdout_types = ["unseen_users", "seen_users"] if args.holdout_type == "both" else [args.holdout_type]
 
@@ -204,8 +214,13 @@ def main() -> int:
         logger.info("Nothing to do.")
         return 0
 
-    # Resolve run_dir + load upstream data
-    run_dir = _resolve_run_dir(train_cell_dir)
+    # Resolve run_dir + load upstream data.  Cross-substrate scoring is useful
+    # for the R1 cap comparison, but must never overwrite native predictions.
+    run_dir = (
+        args.substrate_run_dir.resolve()
+        if args.substrate_run_dir is not None
+        else _resolve_run_dir(train_cell_dir)
+    )
     context = Context(run_dir=run_dir, use_latest=True)
     logger.info(f"Loading upstream data from run_dir={run_dir}")
     embeddings_mmap, target_posts_df, history_df, embed_dim = load_training_data(

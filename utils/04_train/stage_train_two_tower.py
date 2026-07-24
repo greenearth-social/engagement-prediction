@@ -425,7 +425,7 @@ class TwoTowerModel(nn.Module):
 
         scores = self.forward(history_embeddings, history_mask, post_embeddings)
         probs = torch.sigmoid(scores)
-        loss = F.binary_cross_entropy(probs, labels.float())
+        loss = F.binary_cross_entropy(probs, labels.float(), weight=batch["sample_weight"].to(device))
         return loss, scores
 
 

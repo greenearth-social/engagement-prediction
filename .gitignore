@@ -10,6 +10,9 @@ outputs
 
 # Ops subdirectories (analysis scratch work)
 ops/*/
+!ops/power_likers_portable/
+!ops/power_likers_portable/**
+ops/power_likers_portable/__pycache__/
 
 # Jupyter
 .ipynb_checkpoints/

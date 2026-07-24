@@ -117,6 +117,7 @@ from __future__ import annotations
 import gc
 import json
 import argparse
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Callable, Iterable
@@ -530,11 +531,31 @@ def _load_likes_core_polars(
              f"median={stats['likes_per_user_median']:.0f}, max={stats['likes_per_user_max']}, "
              f"p90={stats['likes_per_user_p90']:.0f}, p99={stats['likes_per_user_p99']:.0f}")
     
-    # ===== Apply per-user random cap (NOT recency-based) =====
-    if max_likes_per_user > 0 and n_after_user_sample > 0:
-        likes_lf = _apply_per_user_random_cap(likes_lf, max_likes_per_user, random_seed)
-    
-    likes_df = likes_lf.select(['did', 'subject_uri', 'record_created_at']).unique().collect(engine="streaming")
+    # Fix C step 1: sink the semi-joined, uncapped likes to disk in streaming mode.
+    # rank().over() in _apply_per_user_random_cap is NOT streaming-compatible; if it is
+    # in the lazy plan here, Polars falls back to eager evaluation and OOMs (76+ GiB spike,
+    # confirmed job 0015 v1 run). The lazy plan passed to sink_parquet must contain only
+    # streaming-safe ops. D2 validation (job 0014) used this exact bare-select plan:
+    # 5.4 GiB peak flat across all file counts including the full 2,428-file run.
+    _fixc_tmp = Path(tempfile.mkdtemp()) / "fixc_likes.parquet"
+    try:
+        likes_lf.select(['did', 'subject_uri', 'record_created_at']).sink_parquet(
+            _fixc_tmp, compression='zstd'
+        )
+        likes_df = pl.read_parquet(_fixc_tmp)
+    finally:
+        if _fixc_tmp.exists():
+            _fixc_tmp.unlink()
+
+    # Fix C step 2: apply per-user random cap in-memory on the reloaded DataFrame.
+    # At 55k users this is ~14.7M rows x 3 cols (~3 GiB); rank().over() on an in-memory
+    # DataFrame is safe — no GCS re-scan, no streaming fallback.
+    if max_likes_per_user > 0 and likes_df.height > 0:
+        likes_df = _apply_per_user_random_cap(
+            likes_df.lazy(), max_likes_per_user, random_seed
+        ).collect()
+
+    likes_df = likes_df.unique()
 
     # Compute post-cap counts
     n_after_cap = likes_df.height

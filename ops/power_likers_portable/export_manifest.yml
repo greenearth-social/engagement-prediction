@@ -1,0 +1,75 @@
+version: 1
+project: power_likers
+source_run: 0015_stage1_fixc_v2_20260512_054231
+destination_prefix: power_likers
+
+# `scope` controls the default GCS prefix.  The sync script refuses to upload
+# private entries unless PL_EXPORT_PRIVATE=1 is set deliberately.
+artifacts:
+  - id: training_code
+    source: .
+    destination: code/engagement-prediction
+    sensitivity: internal
+    scope: restricted
+    required_for: [training, evaluation]
+    excludes: [.git, outputs, .pytest_cache, __pycache__, .env, ".env.*", "credentials*", "*.pem"]
+
+  - id: remedy_patch
+    source: /Users/wschulz/Documents/GitHub/power_likers_paper/replication/provenance/gpu_archive/eng_pred_uncommitted_diff_ge-ml-training.patch
+    destination: code/patches/eng_pred_remedies.patch
+    sensitivity: internal
+    scope: restricted
+    required_for: [training, evaluation]
+
+  - id: sweep_configs
+    source: /Users/wschulz/Documents/GitHub/power_likers_paper/replication/provenance/gpu_archive/sweeps
+    destination: code/sweeps
+    sensitivity: internal
+    scope: restricted
+    required_for: [training]
+
+  - id: stage1_core
+    source: /Volumes/projects/greenearth/260428_like_biases/outputs/0015_stage1_fixc_v2_20260512_054231/01_get_data/20260512_054240
+    destination: stage1/0015_stage1_fixc_v2_20260512_054231/01_get_data/20260512_054240
+    sensitivity: pii
+    scope: private
+    required_for: [training, evaluation]
+    include:
+      - likes_core_20260512_054240.parquet
+      - posts_core_20260512_054240.parquet
+      - inferences_core_20260512_054240.parquet
+      - embeddings_20260512_054240.npy
+
+  - id: exclusion_lists
+    source: /Volumes/projects/greenearth/260608_power_likers/artifacts/remedies
+    destination: private/exclusions
+    sensitivity: pii
+    scope: private
+    required_for: [r2_training]
+    include:
+      - exclude_top10pct.parquet
+      - exclude_top20pct.parquet
+      - exclude_top30pct.parquet
+      - exclude_top40pct.parquet
+      - exclude_lorenz50.parquet
+
+  - id: paper_replication
+    source: /Users/wschulz/Documents/GitHub/power_likers_paper/replication
+    destination: replication
+    sensitivity: shareable
+    scope: restricted
+    required_for: [paper]
+    excludes: [.git, __pycache__]
+
+  - id: nas_analyses
+    source: /Volumes/projects/greenearth/260608_power_likers
+    destination: provenance/260608_power_likers
+    sensitivity: restricted
+    scope: restricted
+    required_for: [analysis]
+    include:
+      - analyses
+      - artifacts
+      - jobs
+      - README.md
+      - REPO_LOCATION.md

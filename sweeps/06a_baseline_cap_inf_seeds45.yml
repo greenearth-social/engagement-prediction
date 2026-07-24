@@ -1,0 +1,38 @@
+# Sweep 06a — Seed top-up: baseline cap_inf, MLP seeds 4-5
+#
+# Adds seeds 4 and 5 to the baseline condition (cap_inf, no remedy) so all
+# round-2 conditions compare at equal N=5 MLP seeds.
+# Same config as sweep_04_longer_window cap_inf cells; creates a new Phase A dir
+# (deterministic, outputs identical to original Phase A).
+#
+# Two-tower NOT included — TT stays at 3 seeds (robustness only; very noisy).
+
+sweep_name: 06a_baseline_cap_inf_seeds45
+
+ingestion_run: outputs/0015_stage1_fixc_v2_20260512_054231
+
+caps:
+  - null
+
+architectures:
+  - {model_type: mlp, user_encoder: summarized, user_summarization: ema, ema_alpha: 0.1}
+
+seeds: [4, 5]
+
+epochs: 100
+batch_size: 4096
+patience: 20
+max_parallel_mlp: 2
+skip_holdout_pred_during_train: true
+
+extra_cli_args:
+  - --train-start
+  - "2026-03-01"
+  - --val-start
+  - "2026-04-16"
+  - --holdout-start
+  - "2026-04-21"
+  - --holdout-user-fraction
+  - "0.0909"
+  - --experiment-tracker
+  - "none"

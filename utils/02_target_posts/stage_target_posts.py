@@ -530,6 +530,52 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         n_likes_pre_cap = None
         n_likes_post_cap = None
 
+    # F1: equalize Stage-2 training footprint without changing Stage-3
+    # personalization histories.  This distinction is the point of the
+    # mechanism test, so record it explicitly in stage metadata below.
+    target_footprint_cap = getattr(args, "target_footprint_cap", None)
+    target_footprint_cap_seed = getattr(args, "target_footprint_cap_seed", None)
+    if target_footprint_cap_seed is None:
+        target_footprint_cap_seed = int(getattr(args, "cap_random_seed", 42))
+    if target_footprint_cap is not None and target_footprint_cap > 0:
+        n_pre_footprint = likes_core_lf.select(pl.len()).collect(engine="streaming").item()
+        likes_core_lf = apply_per_user_random_cap(
+            likes_core_lf,
+            int(target_footprint_cap),
+            int(target_footprint_cap_seed),
+        )
+        n_post_footprint = likes_core_lf.select(pl.len()).collect(engine="streaming").item()
+        logger.info(
+            "Applied target_footprint_cap=%s (seed=%s, Stage 2 only): %s -> %s likes.",
+            target_footprint_cap,
+            target_footprint_cap_seed,
+            f"{n_pre_footprint:,}",
+            f"{n_post_footprint:,}",
+        )
+        context.tracker.log_single_value("Target Posts - Footprint Cap", int(target_footprint_cap))
+        context.tracker.log_single_value("Target Posts - Likes After Footprint Cap", int(n_post_footprint))
+
+    # Optional R2 remedy: remove high-volume (power-liker) users from the
+    # training targets.  Applied as a full anti-join on likes_core_lf so that
+    # excluded users appear neither in train nor val targets.  They still have
+    # likes_core rows (Stage 1 data is untouched), so Stage 3 can build
+    # histories for other users that include posts these users liked.
+    # Excluded users end up in holdout_unseen_users, giving an out-of-sample
+    # generalization measure.
+    exclude_users_file = getattr(args, "exclude_users_file", None)
+    n_excluded_users = 0
+    if exclude_users_file is not None:
+        excl = pl.read_parquet(exclude_users_file).select("did")
+        n_users_before = likes_core_lf.select(pl.col("did").n_unique()).collect().item()
+        likes_core_lf = likes_core_lf.join(excl.lazy(), on="did", how="anti")
+        n_users_after = likes_core_lf.select(pl.col("did").n_unique()).collect().item()
+        n_excluded_users = n_users_before - n_users_after
+        logger.info(
+            f"exclude_users_file: dropped {n_excluded_users:,} training users "
+            f"({n_users_before:,} -> {n_users_after:,})"
+        )
+        context.tracker.log_single_value("Target Posts - Excluded Users (power-liker drop)", n_excluded_users)
+
     log_memory_checkpoint('stage_start', logger)
     log_operation_start('Generate target posts dataset from likes and posts', STAGE_NAME_FOR_LOGGING, logger)
     target_posts_lf: pl.LazyFrame = _get_target_posts(args, posts_core_lf, likes_core_lf, logger, context)
@@ -545,6 +591,61 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     })
 
     target_posts_lf = _apply_splits(args, target_posts_lf, logger)
+
+    # R3 remedy: per-user training-loss weights.  Always write a sample_weight
+    # column so downstream dataloaders have a stable schema.  When
+    # --user-weight-mode is None the column is uniformly 1.0 (no-op for the
+    # loss).  Supported modes:
+    #   "inv_log_likes"  : weight ~ 1/(log(1+n)+1)   — original R3; per-user
+    #                      total mass still grows with n_likes (mostly ineffective)
+    #   "inv_sqrt_likes" : weight ~ 1/sqrt(n_likes)  — intermediate equalization
+    #   "inv_likes"      : weight ~ 1/n_likes         — one-user-one-vote; total
+    #                      gradient mass equal across users (mechanism-correct fix)
+    # All modes normalize to mean weight = 1.0 across training users.
+    user_weight_mode = getattr(args, "user_weight_mode", None)
+    VALID_WEIGHT_MODES = {"inv_log_likes", "inv_sqrt_likes", "inv_likes"}
+    if user_weight_mode is not None and user_weight_mode not in VALID_WEIGHT_MODES:
+        raise ValueError(
+            f"Unknown --user-weight-mode {user_weight_mode!r}. "
+            f"Choose from: {sorted(VALID_WEIGHT_MODES)}"
+        )
+    if user_weight_mode in VALID_WEIGHT_MODES:
+        user_n_likes = (
+            likes_core_lf
+            .group_by("did")
+            .agg(pl.len().alias("n_likes"))
+            .collect()
+        )
+        if user_weight_mode == "inv_log_likes":
+            user_n_likes = user_n_likes.with_columns(
+                (1.0 / (pl.col("n_likes").cast(pl.Float64).log1p() + 1.0)).alias("sample_weight")
+            )
+        elif user_weight_mode == "inv_sqrt_likes":
+            user_n_likes = user_n_likes.with_columns(
+                (1.0 / pl.col("n_likes").cast(pl.Float64).sqrt()).alias("sample_weight")
+            )
+        elif user_weight_mode == "inv_likes":
+            user_n_likes = user_n_likes.with_columns(
+                (1.0 / pl.col("n_likes").cast(pl.Float64)).alias("sample_weight")
+            )
+        mean_w = user_n_likes["sample_weight"].mean()
+        user_n_likes = user_n_likes.with_columns(
+            (pl.col("sample_weight") / mean_w).cast(pl.Float32)
+        )
+        target_posts_lf = target_posts_lf.join(
+            user_n_likes.select(["did", "sample_weight"]).lazy(),
+            left_on="target_did",
+            right_on="did",
+            how="left",
+        ).with_columns(pl.col("sample_weight").fill_null(pl.lit(1.0, dtype=pl.Float32)))
+        logger.info(
+            f"user_weight_mode={user_weight_mode}: mean weight={mean_w:.4f}, "
+            f"n_users_weighted={len(user_n_likes):,}"
+        )
+    else:
+        target_posts_lf = target_posts_lf.with_columns(
+            pl.lit(1.0, dtype=pl.Float32).alias("sample_weight")
+        )
 
     log_memory_checkpoint('before_sink_parquet', logger)
     target_posts_output_path = out_dir / f"target_posts_{out_dir.name}.parquet"
@@ -569,6 +670,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"inputs: posts_core, likes_core",
         f"effective_likes_cap: {effective_likes_cap}",
         f"effective_likes_cap_seed: {effective_likes_cap_seed}",
+        f"target_footprint_cap: {target_footprint_cap}",
+        f"target_footprint_cap_seed: {target_footprint_cap_seed}",
+        f"exclude_users_file: {exclude_users_file}",
+        f"excluded_users: {n_excluded_users}",
+        f"user_weight_mode: {user_weight_mode}",
     ]
     if n_likes_pre_cap is not None:
         info_lines.append(f"likes_before_effective_cap: {n_likes_pre_cap}")

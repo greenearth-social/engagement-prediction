@@ -50,6 +50,9 @@ DEFAULTS: Dict[str, Any] = {
     # from GCS.  When None, no additional cap is applied (Stage 1 cap stands).
     "effective_likes_cap": None,
     "effective_likes_cap_seed": None,  # Falls back to cap_random_seed when None.
+    "target_footprint_cap": None,  # Stage 2 only; Stage 3 user histories remain uncapped.
+    "target_footprint_cap_seed": None,  # Falls back to cap_random_seed when None.
+    "exclude_users_file": None,  # parquet with 'did' column; those users excluded from training targets
     "max_memory_gb": None,  # Stage 1: max memory in GB (None = auto based on percentage)
     "max_memory_pct": 0.75,  # Stage 1: max percentage of available RAM to use
     "memory_check": "full",  # Stage 1: memory check mode (full/ignore/skip)
@@ -68,6 +71,7 @@ DEFAULTS: Dict[str, Any] = {
     "holdout_user_seed": 42,
     "holdout_start": None,
     "holdout_end": None,
+    "user_weight_mode": None,  # None | "inv_log_likes" | "inv_sqrt_likes" | "inv_likes"
     # Stage 4 (train) - Model architecture
     "user_summarization": "mean",  # MLP user-history summarization: mean, ema, linear_recency
     "ema_alpha": 0.1,  # EMA smoothing factor (only used when user_summarization=ema)
@@ -530,6 +534,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--effective-likes-cap-seed", type=int, default=argparse.SUPPRESS,
                           help_text="Seed for --effective-likes-cap hashing. None = inherit --cap-random-seed. "
                           "Reuse the same seed across sweep cells so tighter caps are nested subsets of looser caps.")
+    _add_arg_with_default(p_all, "--target-footprint-cap", type=int, default=argparse.SUPPRESS,
+                          help_text="Per-user positive subsample applied only at Stage 2 target_posts. "
+                          "Stage 3 user history remains uncapped; None disables footprint resampling.")
+    _add_arg_with_default(p_all, "--target-footprint-cap-seed", type=int, default=argparse.SUPPRESS,
+                          help_text="Seed for --target-footprint-cap. None = inherit --cap-random-seed.")
+    _add_arg_with_default(p_all, "--exclude-users-file", type=str, default=argparse.SUPPRESS,
+                          help_text="Path to parquet with 'did' column. Matching users excluded from training targets (Stage 2 likes_core anti-join).")
     _add_arg_with_default(p_all, "--negative-posts-sample", type=int, default=argparse.SUPPRESS,
                           help_text="Number of random posts to sample for negative cases in Stage 1")
     _add_arg_with_default(p_all, "--cap-random-seed", type=int, default=argparse.SUPPRESS,
@@ -570,6 +581,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="ISO date string for start of seen-users holdout window. Non-holdout users' rows at/after this date become holdout_seen_users. Must be after val-start.")
     _add_arg_with_default(p_all, "--holdout-end", type=str, default=argparse.SUPPRESS,
                           help_text="ISO date string for end of holdout window. Applies to both holdout_seen_users and holdout_unseen_users. Rows at/after this date get split=None. Default: no upper bound.")
+    _add_arg_with_default(p_all, "--user-weight-mode", type=str, default=argparse.SUPPRESS,
+                          help_text="User weighting for training loss. None = uniform. 'inv_log_likes' = 1/(log(1+n)+1) (original R3; mostly ineffective). 'inv_sqrt_likes' = 1/sqrt(n_likes) (intermediate). 'inv_likes' = 1/n_likes (one-user-one-vote; mechanism-correct). All normalized to mean=1.")
     _add_arg_with_default(p_all, "--global-topic-k", type=int, default=argparse.SUPPRESS,
                           help_text="Number of global topics")
     _add_arg_with_default(p_all, "--min-likes-per-user", type=int, default=argparse.SUPPRESS,

@@ -1,0 +1,47 @@
+# Sweep 05c — Remedy R3: typical-user upweighting (inverse-log-likes IPW)
+#
+# Remedy: Re-weight each training example by 1/log(1 + n_likes) for that user,
+# normalized so the mean weight = 1.  Prolific likers contribute less to the
+# gradient; typical users (few likes) contribute more.  Full user histories are
+# preserved (no users dropped).
+#
+# No per-like cap (cap_inf) — isolates the user-level remedy from the
+# capping confound tested in sweep_04.
+#
+# Cells: 2 architectures × 3 seeds = 6 training runs + 1 prep run.
+#
+# Parent job: 0002_remedy_sweep.md
+# Baseline for comparison: sweep_04_longer_window cap_inf cells
+
+sweep_name: 05c_remedy_R3_ipw
+
+ingestion_run: outputs/0015_stage1_fixc_v2_20260512_054231
+
+caps:
+  - null
+
+architectures:
+  - {model_type: mlp,       user_encoder: summarized,     user_summarization: ema, ema_alpha: 0.1}
+  - {model_type: two-tower, user_encoder: cross_attention}
+
+seeds: [1, 2, 3]
+
+epochs: 100
+batch_size: 4096
+patience: 20
+max_parallel_mlp: 2
+skip_holdout_pred_during_train: true
+
+extra_cli_args:
+  - --train-start
+  - "2026-03-01"
+  - --val-start
+  - "2026-04-16"
+  - --holdout-start
+  - "2026-04-21"
+  - --holdout-user-fraction
+  - "0.0909"
+  - --user-weight-mode
+  - "inv_log_likes"
+  - --experiment-tracker
+  - "none"

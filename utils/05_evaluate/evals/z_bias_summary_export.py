@@ -49,6 +49,7 @@ _CELL_METADATA_KEYS: List[str] = [
     "ema_alpha",
     "effective_likes_cap",
     "effective_likes_cap_seed",
+    "target_footprint_cap",
     "max_likes_per_user",
     "random_seed",
     "epochs",

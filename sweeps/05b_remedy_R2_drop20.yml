@@ -1,0 +1,49 @@
+# Sweep 05b — Remedy R2: drop top-20% power-likers from training targets
+#
+# Remedy: Remove the top-20% of users by like count from training targets.
+# These users never appear in train or val; they end up in holdout_unseen_users.
+#
+# No per-like cap (cap_inf) — isolates the user-level remedy from the
+# capping confound tested in sweep_04.
+#
+# Cells: 2 architectures × 3 seeds = 6 training runs + 1 prep run.
+#
+# Parent job: 0002_remedy_sweep.md
+# Baseline for comparison: sweep_04_longer_window cap_inf cells
+#
+# Pre-requisite: generate exclusion parquets before launching:
+#   python analyses/remedies/make_exclusion_lists.py
+#   (outputs: artifacts/remedies/exclude_top20pct.parquet)
+
+sweep_name: 05b_remedy_R2_drop20
+
+ingestion_run: outputs/0015_stage1_fixc_v2_20260512_054231
+
+caps:
+  - null
+
+architectures:
+  - {model_type: mlp,       user_encoder: summarized,     user_summarization: ema, ema_alpha: 0.1}
+  - {model_type: two-tower, user_encoder: cross_attention}
+
+seeds: [1, 2, 3]
+
+epochs: 100
+batch_size: 4096
+patience: 20
+max_parallel_mlp: 2
+skip_holdout_pred_during_train: true
+
+extra_cli_args:
+  - --train-start
+  - "2026-03-01"
+  - --val-start
+  - "2026-04-16"
+  - --holdout-start
+  - "2026-04-21"
+  - --holdout-user-fraction
+  - "0.0909"
+  - --exclude-users-file
+  - "/mnt/data/wm.s.schulz/modules/engagement-prediction/analyses/remedies/artifacts/exclude_top20pct.parquet"
+  - --experiment-tracker
+  - "none"
