@@ -55,7 +55,11 @@ def main() -> int:
     stage_dir = args.stage_dir.resolve()
     if not (stage_dir / "stage1_manifest.json").is_file():
         raise FileNotFoundError("stage1_manifest.json is required before export")
-    candidates = sorted(path for path in stage_dir.iterdir() if path.is_file()) + args.extra
+    # The generated export manifest is intentionally not an input to itself.
+    candidates = sorted(
+        path for path in stage_dir.iterdir()
+        if path.is_file() and path.name != "fresh_export_manifest.json"
+    ) + args.extra
     files: list[Path] = []
     for path in candidates:
         path = path.resolve()
