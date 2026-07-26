@@ -969,6 +969,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"inferences_file: {inferences_core_path.name if inferences_core_path is not None else 'NONE'}",
     ]
     (out_dir / 'stage_info.txt').write_text('\n'.join(info_lines) + '\n')
+    # Emit this final stage-log line before hashing artifacts into the manifest.
+    logger.info(f"Stage 1 completed in {runtime:.2f}s")
     write_stage1_manifest(
         out_dir / 'stage1_manifest.json', out_dir,
         {
@@ -981,8 +983,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         },
         current_git_commit(Path(__file__).resolve().parents[2]), context.run_timestamp,
     )
-
-    logger.info(f"Stage 1 completed in {runtime:.2f}s")
 
     return {
         'output_dir': out_dir,
