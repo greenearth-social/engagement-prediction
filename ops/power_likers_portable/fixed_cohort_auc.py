@@ -183,6 +183,8 @@ def bootstrap_delta_auc(
 
 
 def source_commit() -> str | None:
+    if os.environ.get("PL_SOURCE_COMMIT"):
+        return os.environ["PL_SOURCE_COMMIT"]
     index = os.environ.get("PL_EXPORT_INDEX")
     if index:
         path = Path(index)
@@ -245,6 +247,9 @@ def main() -> int:
         "common_rows": paired.height,
         "common_users": paired["did"].n_unique(),
         "provenance": {
+            "condition": args.condition,
+            "architecture": args.architecture,
+            "model_seed": args.model_seed,
             "source_commit": source_commit(),
             "baseline_sha256": sha256(args.baseline),
             "remedy_sha256": sha256(args.remedy),

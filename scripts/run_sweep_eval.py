@@ -72,6 +72,7 @@ def run_eval(cap_dir: Path, run_tag: str, cell_dir: Path, log_dir: Path) -> bool
         "--stop-after", "evaluate",
         "--run-tag", run_tag,
         "--prior-train-dir", str(cell_dir),
+        "--experiment-tracker", "none",
     ]
     log.info(f"[{label}] Starting eval")
     with open(log_file, "w") as f:
