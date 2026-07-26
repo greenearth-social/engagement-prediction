@@ -113,6 +113,8 @@ def test_load_likes_filters_time_and_min_likes(tmp_path, stage_get_data_module):
         min_likes_per_user=2,
         random_seed=123,
         logger=logger,
+        artifact_dir=tmp_path,
+        surrogate_salt=b"x" * 32,
     )
 
     assert likes_df.height == 2
@@ -140,13 +142,15 @@ def test_load_likes_per_user_cap(tmp_path, stage_get_data_module):
         min_likes_per_user=0,
         random_seed=42,
         logger=logger,
+        artifact_dir=tmp_path,
+        surrogate_salt=b"x" * 32,
     )
 
     assert likes_df.filter(pl.col("did") == "user_a").height == 2
     assert likes_df.filter(pl.col("did") == "user_b").height == 1
 
 
-def test_get_sampled_users_deterministic(stage_get_data_module):
+def test_get_sampled_users_deterministic(tmp_path, stage_get_data_module):
     likes_rows = [
         {"did": f"user_{i}", "subject_uri": f"post:{i}", "record_created_at": "2024-01-02T00:00:00"}
         for i in range(10)
@@ -158,12 +162,16 @@ def test_get_sampled_users_deterministic(stage_get_data_module):
         min_likes_per_user=1,
         max_liking_users=5,
         random_seed=7,
+        artifact_dir=tmp_path / "first",
+        surrogate_salt=b"x" * 32,
     )
     second, *_ = stage_get_data_module._get_sampled_users_with_min_likes(
         likes_lf=likes_lf,
         min_likes_per_user=1,
         max_liking_users=5,
         random_seed=7,
+        artifact_dir=tmp_path / "second",
+        surrogate_salt=b"x" * 32,
     )
 
     first_set = set(first["did"].to_list())

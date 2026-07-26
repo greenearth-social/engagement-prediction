@@ -379,45 +379,58 @@ def _get_sampled_users_with_min_likes(
     likes_lf: pl.LazyFrame,
     min_likes_per_user: int,
     max_liking_users: Optional[int],
-    random_seed: int
-) -> Tuple[pl.DataFrame, int, int, int]:
-    # get total user and like count
-    likes_summary_df = likes_lf.select(
-        pl.col('did').n_unique().alias('user_count'),
-        pl.len().alias('like_count')
-    ).collect(engine="streaming")
-    n_users_initial = likes_summary_df["user_count"][0]
-    n_likes_initial = likes_summary_df["like_count"][0]
+    random_seed: int,
+    *,
+    artifact_dir: Path,
+    surrogate_salt: bytes,
+) -> Tuple[pl.DataFrame, Dict[str, int]]:
+    """Emit the all-user count population before any eligibility or cap filter.
 
-    # ===== Count likes per user =====
-    user_counts_lf = (
-        likes_lf.group_by('did')
-        .agg(pl.len().alias('like_count'))
-    )
-    # ===== Pre-filter users by min_likes_per_user before sampling =====
-    if min_likes_per_user > 0:
-        user_counts_lf = user_counts_lf.filter(
-            pl.col('like_count') >= min_likes_per_user
-        )
-    # get count of eligible users
-    n_users_eligible = (
-        user_counts_lf
-        .select(pl.len().alias('n'))
-        .collect(engine="streaming")
-        .item()
-    )
-    # ===== Sample users if cap is set =====
-    if max_liking_users is not None and n_users_eligible > max_liking_users:
-        threshold_hash = _compute_random_sample_threshold(n_users_eligible, max_liking_users)
-        user_counts_lf = (
-            user_counts_lf.with_columns(
-                pl.col("did").hash(seed=random_seed).alias("_hash_key"),
-            ).filter(
-                pl.col("_hash_key") <= threshold_hash
-            )
-        )
-    return user_counts_lf.select("did").collect(engine="streaming"), n_users_initial, n_likes_initial, n_users_eligible
+    The grouped DID frame is first streamed to a host-local parquet. Every
+    later operation reads that sink, so a rank/window operation never enters
+    the lazy source scan.
+    """
+    from utils.stage1_emissions import write_surrogate_counts_from_parquet
 
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    raw_counts_path = artifact_dir / ".population_counts_raw.parquet"
+    population_path = artifact_dir / "per_user_like_counts_population.parquet"
+    user_counts_lf = likes_lf.group_by("did").agg(pl.len().alias("like_count"))
+    user_counts_lf.sink_parquet(raw_counts_path, compression="zstd")
+    try:
+        write_surrogate_counts_from_parquet(raw_counts_path, population_path, surrogate_salt)
+        population_lf = pl.scan_parquet(raw_counts_path)
+        totals = population_lf.select(
+            pl.len().alias("n_users_initial"),
+            pl.col("like_count").sum().alias("n_likes_initial"),
+        ).collect(engine="streaming")
+        n_users_initial = int(totals["n_users_initial"][0])
+        n_likes_initial = int(totals["n_likes_initial"][0])
+        eligible_lf = population_lf
+        if min_likes_per_user > 0:
+            eligible_lf = eligible_lf.filter(pl.col("like_count") >= min_likes_per_user)
+        eligible_totals = eligible_lf.select(
+            pl.len().alias("n_users_eligible"),
+            pl.col("like_count").sum().alias("n_likes_eligible"),
+        ).collect(engine="streaming")
+        n_users_eligible = int(eligible_totals["n_users_eligible"][0])
+        n_likes_eligible = int(eligible_totals["n_likes_eligible"][0] or 0)
+        sampled_lf = eligible_lf
+        if max_liking_users is not None and n_users_eligible > max_liking_users:
+            threshold_hash = _compute_random_sample_threshold(n_users_eligible, max_liking_users)
+            sampled_lf = sampled_lf.with_columns(
+                pl.col("did").hash(seed=random_seed).alias("_hash_key")
+            ).filter(pl.col("_hash_key") <= threshold_hash)
+        sampled_users = sampled_lf.select("did").collect(engine="streaming")
+        return sampled_users, {
+            "n_users_initial": n_users_initial,
+            "n_likes_initial": n_likes_initial,
+            "n_users_eligible": n_users_eligible,
+            "n_likes_eligible": n_likes_eligible,
+        }
+    finally:
+        if raw_counts_path.exists():
+            raw_counts_path.unlink()
 
 def _apply_per_user_random_cap(
     likes_lf: pl.LazyFrame,
@@ -445,6 +458,8 @@ def _load_likes_core_polars(
     min_likes_per_user: int,
     random_seed: int,
     logger: logging.Logger,
+    artifact_dir: Path,
+    surrogate_salt: bytes,
 ) -> Tuple[pl.DataFrame, Dict[str, Any]]:
     """
     Load and filter likes data using a streaming Polars pipeline.
@@ -473,18 +488,20 @@ def _load_likes_core_polars(
 
     # Filter users by min likes and then sample down to max liking users
     # n_users_eligible is the number of users that had the minimum number of likes, before we randomly sample
-    sampled_users_df, n_users_initial, n_likes_initial, n_users_eligible = _get_sampled_users_with_min_likes(
-        base_lf, 
+    sampled_users_df, population_stats = _get_sampled_users_with_min_likes(
+        base_lf,
         min_likes_per_user,
         max_liking_users,
-        random_seed
+        random_seed,
+        artifact_dir=artifact_dir,
+        surrogate_salt=surrogate_salt,
     )
+    n_users_initial = population_stats['n_users_initial']
+    n_likes_initial = population_stats['n_likes_initial']
+    n_users_eligible = population_stats['n_users_eligible']
     logger.info(f"Pass 1 complete: {n_likes_initial:,} likes from {n_users_initial:,} users")
-    
-    stats: Dict[str, Any] = {
-        'n_likes_initial': n_likes_initial,
-        'n_users_initial': n_users_initial,
-    }
+
+    stats: Dict[str, Any] = dict(population_stats)
 
     # record stats and log stuff
     n_users_filtered = n_users_initial - n_users_eligible
@@ -494,6 +511,7 @@ def _load_likes_core_polars(
     stats['n_users_eligible_for_sampling'] = n_users_eligible
     stats['n_users_excluded_min_likes'] = n_users_filtered
     stats['n_users_sampled'] = n_users_sampled
+    stats['population_counts_file'] = 'per_user_like_counts_population.parquet'
     logger.info(
         f"Sampled {n_users_sampled:,} liking users "
         f"({100*n_users_sampled/n_users_eligible:.1f}% of eligible)"
@@ -515,13 +533,16 @@ def _load_likes_core_polars(
     logger.info(f"Pass 2 complete: {n_after_user_sample:,} likes ({pct_retained:.1f}% retained)")
     stats['n_likes_after_user_sample'] = n_after_user_sample
     
-    # ===== Capture like count distribution BEFORE cap (for plotting) =====
-    # This shows how many likes each sampled user has before we apply the per-user cap.
-    # The full distribution is used for plotting then removed before JSON serialization.
-    # Only summary statistics (mean, median, etc.) are persisted.
+    # P5: sampled counts before the per-user cap. This is small (at most the
+    # sampled-user limit), unlike the population count sink created in Pass 1.
+    from utils.stage1_emissions import write_concentration, write_surrogate_counts_from_rows
+    sampled_pre_cap_path = artifact_dir / "per_user_like_counts_sampled_pre_cap.parquet"
     if counts_pre_cap_df.height > 0:
         likes_per_user_before_cap = counts_pre_cap_df['like_count'].to_list()
-        stats['likes_per_user_distribution'] = likes_per_user_before_cap  # removed before JSON save
+        write_surrogate_counts_from_rows(
+            counts_pre_cap_df['did'].to_list(), likes_per_user_before_cap,
+            sampled_pre_cap_path, surrogate_salt,
+        )
         stats['likes_per_user_mean'] = float(np.mean(likes_per_user_before_cap))
         stats['likes_per_user_median'] = float(np.median(likes_per_user_before_cap))
         stats['likes_per_user_max'] = int(max(likes_per_user_before_cap))
@@ -530,6 +551,9 @@ def _load_likes_core_polars(
         logger.info(f"Likes per sampled user: mean={stats['likes_per_user_mean']:.1f}, "
              f"median={stats['likes_per_user_median']:.0f}, max={stats['likes_per_user_max']}, "
              f"p90={stats['likes_per_user_p90']:.0f}, p99={stats['likes_per_user_p99']:.0f}")
+    else:
+        write_surrogate_counts_from_rows([], [], sampled_pre_cap_path, surrogate_salt)
+    stats['sampled_pre_cap_counts_file'] = sampled_pre_cap_path.name
     
     # Fix C step 1: sink the semi-joined, uncapped likes to disk in streaming mode.
     # rank().over() in _apply_per_user_random_cap is NOT streaming-compatible; if it is
@@ -557,11 +581,26 @@ def _load_likes_core_polars(
 
     likes_df = likes_df.unique()
 
-    # Compute post-cap counts
+    # P6: post-cap counts are emitted after deduplication, before later
+    # post/embedding joins can remove likes for unrelated reasons.
     n_after_cap = likes_df.height
+    post_cap_counts = likes_df.group_by('did').agg(pl.len().alias('like_count'))
+    sampled_post_cap_path = artifact_dir / "per_user_like_counts_sampled_post_cap.parquet"
+    write_surrogate_counts_from_rows(
+        post_cap_counts['did'].to_list(), post_cap_counts['like_count'].to_list(),
+        sampled_post_cap_path, surrogate_salt,
+    )
+    write_concentration(
+        artifact_dir / "like_concentration_uncapped.json",
+        artifact_dir / "per_user_like_counts_population.parquet",
+        sampled_pre_cap_path,
+    )
     pct_retained = 100.0 * n_after_cap / n_after_user_sample if n_after_user_sample > 0 else 0
     logger.info(f"After per-user cap ({max_likes_per_user}): {n_after_cap:,} likes ({pct_retained:.1f}% retained)")
     stats['n_likes_after_per_user_cap'] = n_after_cap
+    stats['n_users_post_cap'] = post_cap_counts.height
+    stats['sampled_post_cap_counts_file'] = sampled_post_cap_path.name
+    stats['like_concentration_file'] = 'like_concentration_uncapped.json'
 
     # Convert record_created_at to datetime if it exists and is not already datetime
     schema = likes_df.schema
@@ -795,6 +834,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     if max_memory_gb is not None:
         max_memory_gb = float(max_memory_gb)
     max_memory_pct = float(args.max_memory_pct)
+    from utils.stage1_emissions import create_run_salt, current_git_commit, write_stage1_ledger, write_stage1_manifest
+    surrogate_salt, salt_path = create_run_salt(context.run_timestamp)
+    logger.info("Created host-only surrogate salt at %s", salt_path)
 
     (
         likes_core_df, 
@@ -823,6 +865,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         cap_random_seed=cap_random_seed,
         embedding_model=embedding_model,
         skip_embeddings=skip_embeddings,
+        surrogate_salt=surrogate_salt,
     )
 
     # Validate output schemas
@@ -901,6 +944,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     with open(out_dir / 'summary.json', 'w') as f:
         json.dump(summary, f, indent=2)
 
+    write_stage1_ledger(
+        out_dir / 'attrition_ledger.json', out_dir / 'attrition_ledger.md',
+        all_stats, summary['outputs'],
+    )
+
     runtime = time.time() - t0
     
     # Stage info
@@ -919,7 +967,19 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"inferences_file: {inferences_core_path.name if inferences_core_path is not None else 'NONE'}",
     ]
     (out_dir / 'stage_info.txt').write_text('\n'.join(info_lines) + '\n')
-    
+    write_stage1_manifest(
+        out_dir / 'stage1_manifest.json', out_dir,
+        {
+            **summary['parameters'],
+            'likes_start': likes_start, 'likes_end': likes_end,
+            'posts_start': posts_start, 'posts_end': posts_end,
+            'train_start': args.train_start, 'val_start': args.val_start,
+            'holdout_start': args.holdout_start,
+            'holdout_user_fraction': args.holdout_user_fraction,
+        },
+        current_git_commit(Path(__file__).resolve().parents[2]), context.run_timestamp,
+    )
+
     logger.info(f"Stage 1 completed in {runtime:.2f}s")
 
     return {
@@ -1160,6 +1220,7 @@ def _run_greenearth_pipeline(
     cap_random_seed: int,
     embedding_model: str,
     skip_embeddings: bool,
+    surrogate_salt: bytes,
 ) -> Tuple[pl.DataFrame, pl.DataFrame, Path, Path, Optional[Path], int, Optional[Path], Dict[str, Any]]:
     """
     Run the Polars-based filtering pipeline for GreenEarth Ingex data.
@@ -1252,6 +1313,8 @@ def _run_greenearth_pipeline(
         min_likes_per_user=min_likes_per_user,
         random_seed=cap_random_seed,
         logger=logger,
+        artifact_dir=out_dir,
+        surrogate_salt=surrogate_salt,
     )
     all_stats['likes'] = likes_stats
     n_users_final = likes_core_df['did'].n_unique()
@@ -1406,6 +1469,9 @@ def _run_greenearth_pipeline(
         )
         .unique(subset=['did', 'subject_uri'])
     )
+    # P7 must match the persisted likes_core, including this final deduplication.
+    all_stats['join_verify']['n_likes_final_after_join'] = likes_core_df.height
+    all_stats['join_verify']['n_users_final_after_join'] = likes_core_df['did'].n_unique() if likes_core_df.height else 0
     # Verify no nulls in emb_idx (all likes should have matching posts after join filter)
     n_null_idx = likes_core_df.filter(pl.col("emb_idx").is_null()).height
     if n_null_idx > 0:
@@ -1520,16 +1586,13 @@ def _filter_likes_after_post_join(
     # Re-verify min-likes per user
     n_users_removed_by_join_verify = 0
     if min_likes_per_user > 0:
-        # Filter users by min likes
-        # (no need to use the max_liking_users functionality)
-        # Returns: (sampled_users_df, n_users_total, n_likes_total, n_users_eligible)
-        sampled_users_df, n_users_before_min_likes, _, _ = _get_sampled_users_with_min_likes(
-            likes_lf=likes_core_df.lazy(),
-            min_likes_per_user=min_likes_per_user,
-            max_liking_users=None,
-            random_seed=random_seed
-        )
-
+        # Re-verify directly: this is a post-join integrity filter, not a
+        # second population emission.
+        join_user_counts = likes_core_df.group_by('did').agg(pl.len().alias('like_count'))
+        n_users_before_min_likes = join_user_counts.height
+        sampled_users_df = join_user_counts.filter(
+            pl.col('like_count') >= min_likes_per_user
+        ).select('did')
         n_users_after_join_verify = sampled_users_df.height
         n_users_removed_by_join_verify = n_users_before_min_likes - n_users_after_join_verify
 
