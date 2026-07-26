@@ -119,6 +119,8 @@ import json
 import argparse
 import tempfile
 import time
+import os
+import hashlib
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Callable, Iterable
 import polars as pl
@@ -147,6 +149,106 @@ from shared.input_data_helpers import (
     get_embedding_dim_for_known_model,
     get_expanded_embedding_vector,
 )
+
+
+def _read_population_salt() -> str:
+    """Read the VM-local anonymization salt without ever persisting it in outputs."""
+    salt_path = os.environ.get("STAGE1_POPULATION_SALT_FILE")
+    if not salt_path:
+        raise RuntimeError(
+            "STAGE1_POPULATION_SALT_FILE is required for Stage-1 concentration artifacts. "
+            "Create it on the private compute host with mode 0600; never export it."
+        )
+    path = Path(salt_path)
+    if not path.is_file():
+        raise RuntimeError(f"Population salt file does not exist: {path}")
+    salt = path.read_text().strip()
+    if len(salt) < 32:
+        raise RuntimeError("Population salt must contain at least 32 non-whitespace characters")
+    return salt
+
+
+def _anonymize_like_counts(counts_df: pl.DataFrame, salt: str) -> pl.DataFrame:
+    """Return non-reversible surrogate IDs and counts, never a DID-bearing table."""
+    return counts_df.select(
+        pl.col("did").map_elements(
+            lambda did: hashlib.sha256(f"{salt}:{did}".encode("utf-8")).hexdigest(),
+            return_dtype=pl.String,
+        ).alias("surrogate_id"),
+        pl.col("like_count").cast(pl.Int64),
+    )
+
+
+def _concentration_summary(counts: list[int]) -> dict[str, Any]:
+    """Compute an auditable Gini, 1001-point Lorenz curve, and top-share table."""
+    if not counts:
+        return {"n_users": 0, "n_likes": 0, "gini": None, "lorenz_curve": [], "top_percent_likes_share": []}
+    values = np.sort(np.asarray(counts, dtype=np.float64))
+    total = float(values.sum())
+    cumulative = np.concatenate(([0.0], np.cumsum(values) / total))
+    population = np.linspace(0.0, 1.0, len(cumulative))
+    curve_population = np.linspace(0.0, 1.0, 1001)
+    curve_likes = np.interp(curve_population, population, cumulative)
+    n = len(values)
+    gini = float((2.0 * np.dot(np.arange(1, n + 1), values) / (n * total)) - ((n + 1.0) / n))
+    top_rows = []
+    for percent in (0.01, 0.1, 1.0, 5.0, 10.0, 20.0, 50.0):
+        top_n = max(1, int(np.ceil(n * percent / 100.0)))
+        top_rows.append(
+            {
+                "top_percent_users": percent,
+                "n_users": top_n,
+                "likes_share": float(values[-top_n:].sum() / total),
+            }
+        )
+    return {
+        "n_users": n,
+        "n_likes": int(total),
+        "gini": gini,
+        "lorenz_curve": [
+            {"population_share": float(p), "likes_share": float(s)}
+            for p, s in zip(curve_population, curve_likes)
+        ],
+        "top_percent_likes_share": top_rows,
+    }
+
+
+def _write_stage1_attrition_ledger(out_dir: Path, summary: dict[str, Any]) -> None:
+    """Write P1-P9 only; downstream claims are intentionally absent."""
+    likes = summary["filtering_stats"].get("likes", {})
+    posts = summary["filtering_stats"].get("posts", {})
+    embeddings = summary["filtering_stats"].get("embeddings", {})
+    rows = [
+        ("P1", "time-filtered population (>=1 like)", likes.get("n_users_initial"), likes.get("n_likes_initial")),
+        ("P2", "eligible after minimum likes", likes.get("n_users_eligible_for_sampling"), None),
+        ("P3", "deterministic sampled users", likes.get("n_users_sampled"), likes.get("n_likes_after_user_sample")),
+        ("P4", "sampled pre-cap likes", likes.get("n_users_sampled"), likes.get("n_likes_after_user_sample")),
+        ("P5", "after per-user cap", likes.get("n_users_after_per_user_cap"), likes.get("n_likes_after_per_user_cap")),
+        ("P6", "post-join min-likes verified", likes.get("n_users_final_after_join"), likes.get("n_likes_final_after_join")),
+        ("P7", "time-filtered posts", None, posts.get("n_posts_total")),
+        ("P8", "post candidates", None, posts.get("n_posts_core")),
+        ("P9", "valid embeddings", None, embeddings.get("n_embeddings_valid")),
+    ]
+    payload = {
+        "scope": "Stage 1 only (P1-P9); no P10+ downstream claims",
+        "source_summary": "summary.json",
+        "rows": [
+            {"point": point, "stage": "01_get_data", "filter": label, "users": users, "likes_or_posts": value}
+            for point, label, users, value in rows
+        ],
+    }
+    (out_dir / "attrition_ledger.json").write_text(json.dumps(payload, indent=2) + "\n")
+    markdown = [
+        "# Stage-1 attrition ledger (P1-P9 only)",
+        "",
+        "| Point | Filter / measure | Users | Likes / posts |",
+        "|---|---|---:|---:|",
+        *[f"| {point} | {label} | {users if users is not None else ''} | {value if value is not None else ''} |"
+          for point, label, users, value in rows],
+        "",
+        "P10+ claims require downstream paired fixed-cohort analysis and are deliberately not emitted here.",
+    ]
+    (out_dir / "attrition_ledger.md").write_text("\n".join(markdown) + "\n")
 
 
 # ----------------------------------------
@@ -445,6 +547,7 @@ def _load_likes_core_polars(
     min_likes_per_user: int,
     random_seed: int,
     logger: logging.Logger,
+    concentration_out_dir: Optional[Path] = None,
 ) -> Tuple[pl.DataFrame, Dict[str, Any]]:
     """
     Load and filter likes data using a streaming Polars pipeline.
@@ -467,9 +570,20 @@ def _load_likes_core_polars(
     
     raw_lf = pl.scan_parquet(paths)
     base_lf = apply_time_filter(raw_lf, start_str, end_str)
+    population_salt = _read_population_salt() if concentration_out_dir is not None else None
 
     # ===== PASS 1: Filter users =====
     logger.info("Pass 1: Counting likes per user (streaming)...")
+    # This is intentionally captured before *any* min-likes filter, user
+    # sampling, or per-user cap.  Do not replace it with the sampled table.
+    population_counts_df = (
+        base_lf.group_by("did").agg(pl.len().alias("like_count")).collect(engine="streaming")
+    )
+    if concentration_out_dir is not None:
+        _anonymize_like_counts(population_counts_df, population_salt).write_parquet(
+            concentration_out_dir / "per_user_like_counts_population.parquet", compression="zstd"
+        )
+    population_counts = population_counts_df["like_count"].to_list()
 
     # Filter users by min likes and then sample down to max liking users
     # n_users_eligible is the number of users that had the minimum number of likes, before we randomly sample
@@ -485,6 +599,8 @@ def _load_likes_core_polars(
         'n_likes_initial': n_likes_initial,
         'n_users_initial': n_users_initial,
     }
+    if concentration_out_dir is not None:
+        stats["population_count_artifact"] = "per_user_like_counts_population.parquet"
 
     # record stats and log stuff
     n_users_filtered = n_users_initial - n_users_eligible
@@ -509,6 +625,10 @@ def _load_likes_core_polars(
         .agg(pl.len().alias('like_count'))
         .collect(engine='streaming')
     )
+    if concentration_out_dir is not None:
+        _anonymize_like_counts(counts_pre_cap_df, population_salt).write_parquet(
+            concentration_out_dir / "per_user_like_counts_sampled_pre_cap.parquet", compression="zstd"
+        )
     
     n_after_user_sample = int(counts_pre_cap_df['like_count'].sum()) if counts_pre_cap_df.height > 0 else 0
     pct_retained = 100.0 * n_after_user_sample / n_likes_initial if n_likes_initial > 0 else 0
@@ -556,12 +676,40 @@ def _load_likes_core_polars(
         ).collect()
 
     likes_df = likes_df.unique()
+    counts_capped_df = likes_df.group_by("did").agg(pl.len().alias("like_count"))
+    if concentration_out_dir is not None:
+        _anonymize_like_counts(counts_capped_df, population_salt).write_parquet(
+            concentration_out_dir / "per_user_like_counts_sampled_capped.parquet", compression="zstd"
+        )
+        concentration = {
+            "schema_version": 1,
+            "window": {"likes_start": start_str, "likes_end": end_str},
+            "population_before_min_likes_sampling_or_cap": _concentration_summary(population_counts),
+            "sampled_pre_cap": _concentration_summary(counts_pre_cap_df["like_count"].to_list()),
+            "definitions": {
+                "population": "Every user with >=1 time-filtered like before min-likes filtering, user sampling, or cap.",
+                "sampled_pre_cap": "Users retained after min-likes filtering and deterministic user sampling, before per-user cap.",
+                "surrogate_id": "SHA-256 of a VM-only secret salt and DID; neither DIDs nor salt are emitted.",
+            },
+        }
+        (concentration_out_dir / "like_concentration_uncapped.json").write_text(
+            json.dumps(concentration, indent=2) + "\n"
+        )
+        stats["concentration_artifacts"] = {
+            "population_counts": "per_user_like_counts_population.parquet",
+            "sampled_pre_cap_counts": "per_user_like_counts_sampled_pre_cap.parquet",
+            "sampled_capped_counts": "per_user_like_counts_sampled_capped.parquet",
+            "uncapped_summary": "like_concentration_uncapped.json",
+        }
+    del population_counts_df
+    del population_counts
 
     # Compute post-cap counts
     n_after_cap = likes_df.height
     pct_retained = 100.0 * n_after_cap / n_after_user_sample if n_after_user_sample > 0 else 0
     logger.info(f"After per-user cap ({max_likes_per_user}): {n_after_cap:,} likes ({pct_retained:.1f}% retained)")
     stats['n_likes_after_per_user_cap'] = n_after_cap
+    stats['n_users_after_per_user_cap'] = counts_capped_df.height
 
     # Convert record_created_at to datetime if it exists and is not already datetime
     schema = likes_df.schema
@@ -823,6 +971,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         cap_random_seed=cap_random_seed,
         embedding_model=embedding_model,
         skip_embeddings=skip_embeddings,
+        concentration_out_dir=out_dir,
     )
 
     # Validate output schemas
@@ -900,6 +1049,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     }
     with open(out_dir / 'summary.json', 'w') as f:
         json.dump(summary, f, indent=2)
+    _write_stage1_attrition_ledger(out_dir, summary)
 
     runtime = time.time() - t0
     
@@ -930,6 +1080,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             'embeddings_path': str(embeddings_path) if embeddings_path is not None else None,
             'embed_dim': embed_dim,
             'inferences_core_path': str(inferences_core_path) if inferences_core_path is not None else None,
+            'population_counts_path': str(out_dir / "per_user_like_counts_population.parquet"),
+            'sampled_pre_cap_counts_path': str(out_dir / "per_user_like_counts_sampled_pre_cap.parquet"),
+            'sampled_capped_counts_path': str(out_dir / "per_user_like_counts_sampled_capped.parquet"),
+            'like_concentration_path': str(out_dir / "like_concentration_uncapped.json"),
         },
     }
 
@@ -1160,6 +1314,7 @@ def _run_greenearth_pipeline(
     cap_random_seed: int,
     embedding_model: str,
     skip_embeddings: bool,
+    concentration_out_dir: Optional[Path] = None,
 ) -> Tuple[pl.DataFrame, pl.DataFrame, Path, Path, Optional[Path], int, Optional[Path], Dict[str, Any]]:
     """
     Run the Polars-based filtering pipeline for GreenEarth Ingex data.
@@ -1252,6 +1407,7 @@ def _run_greenearth_pipeline(
         min_likes_per_user=min_likes_per_user,
         random_seed=cap_random_seed,
         logger=logger,
+        concentration_out_dir=concentration_out_dir,
     )
     all_stats['likes'] = likes_stats
     n_users_final = likes_core_df['did'].n_unique()
