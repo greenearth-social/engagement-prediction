@@ -12,7 +12,7 @@ artifacts:
     sensitivity: internal
     scope: restricted
     required_for: [training, evaluation]
-    excludes: [.git, outputs, .pytest_cache, __pycache__, .env, ".env.*", "credentials*", "*.pem"]
+    excludes: [.git, outputs, .pytest_cache, __pycache__, .hash_cache.json, .env, ".env.*", "credentials*", "*.pem"]
 
   - id: remedy_patch
     source: /Users/wschulz/Documents/GitHub/power_likers_paper/replication/provenance/gpu_archive/eng_pred_uncommitted_diff_ge-ml-training.patch

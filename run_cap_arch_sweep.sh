@@ -248,6 +248,15 @@ run_train_cell() {
     fi
   fi
 
+  # Training needs the same portable overrides as preparation: time windows,
+  # no-ClearML mode, and (for R2) the exclusion list.  Omitting these makes
+  # a sweep silently fall back to CLI defaults after prep succeeds.
+  if [[ -n "$EXTRA_CLI_ARGS" && "$EXTRA_CLI_ARGS" != "[]" ]]; then
+    while IFS= read -r EXTRA; do
+      [[ -n "$EXTRA" ]] && CMD+=("$EXTRA")
+    done < <(python3 -c "import json,sys; [print(a) for a in json.loads(sys.argv[1])]" "$EXTRA_CLI_ARGS")
+  fi
+
   log "[$CAP_LABEL/$RUN_TAG] Launching: ${CMD[*]}"
   if "${CMD[@]}" > "$RUN_LOG" 2>&1; then
     echo "0" > "$STATUS_FILE"

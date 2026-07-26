@@ -13,6 +13,7 @@ ops/*/
 !ops/power_likers_portable/
 !ops/power_likers_portable/**
 ops/power_likers_portable/__pycache__/
+ops/power_likers_portable/.hash_cache.json
 
 # Jupyter
 .ipynb_checkpoints/
