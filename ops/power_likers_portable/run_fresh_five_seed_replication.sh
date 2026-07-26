@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 import yaml
 base, r2, stage, exclusion, kind, seed, dest = map(Path, sys.argv[1:])
-seed=int(seed); source=base if str(kind)=='baseline' else r2
+seed=int(str(seed)); source=base if str(kind)=='baseline' else r2
 cfg=yaml.safe_load(source.read_text())
 cfg['sweep_name']=f'fresh_replication_{kind}_seed{seed}'
 cfg['ingestion_run']=str(stage); cfg['caps']=[None]
