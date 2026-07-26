@@ -1559,6 +1559,10 @@ class SyntheticFeedModule(EvalModule):
             {
                 "n_pool": n_pool,
                 "top_k": k,
+                # Persist identity as well as indices: a post-hoc D1/D2
+                # reader can prove its deterministic pool reconstruction
+                # matches the scored feed before using user_topk indices.
+                "pool_at_uris": pool_combined["at_uri"].to_list(),
                 "n_users_scored": len(user_scores),
                 "user_topk": {
                     did: idx.tolist() for did, idx in user_topk.items()

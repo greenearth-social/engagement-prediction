@@ -135,6 +135,12 @@ def main() -> int:
         .join(inferences.select("at_uri", "inferences"), on="at_uri", how="inner")
         .sample(n=checkpoint["n_pool"], seed=42)
     )
+    if "pool_at_uris" in checkpoint:
+        if pool["at_uri"].to_list() != checkpoint["pool_at_uris"]:
+            raise RuntimeError(
+                "Deterministic pool reconstruction differs from the scored pool; "
+                "refusing to apply saved top-K indices to different posts."
+            )
     predictions = pl.read_parquet(args.predictions).with_columns(pl.col("did").cast(pl.String))
     liked = (
         predictions.filter(pl.col("y_true") == 1).select("did", "post_id")
