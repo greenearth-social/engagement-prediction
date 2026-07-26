@@ -49,7 +49,7 @@ for source, name, exclude in ((baseline, "baseline", None), (r2, "r2_drop30", ex
     config["seeds"] = [1]
     config["max_parallel_mlp"] = 1
     extra = list(config.get("extra_cli_args", []))
-    for flag, value in (("--train-start", "2026-05-22"), ("--val-start", "2026-07-07"), ("--holdout-start", "2026-07-12"), ("--holdout-user-fraction", "0.0909")):
+    for flag, value in (("--train-start", "2026-05-22"), ("--val-start", "2026-07-07"), ("--holdout-start", "2026-07-12"), ("--holdout-user-fraction", "0.0909"), ("--num-dataloader-workers", "0")):
         set_arg(extra, flag, value)
     if exclude is not None:
         set_arg(extra, "--exclude-users-file", str(exclude))
