@@ -561,7 +561,8 @@ def _load_likes_core_polars(
     # confirmed job 0015 v1 run). The lazy plan passed to sink_parquet must contain only
     # streaming-safe ops. D2 validation (job 0014) used this exact bare-select plan:
     # 5.4 GiB peak flat across all file counts including the full 2,428-file run.
-    _fixc_tmp = Path(tempfile.mkdtemp()) / "fixc_likes.parquet"
+    _fixc_tmp_dir = Path(tempfile.mkdtemp(dir=artifact_dir, prefix=".fixc-"))
+    _fixc_tmp = _fixc_tmp_dir / "fixc_likes.parquet"
     try:
         likes_lf.select(['did', 'subject_uri', 'record_created_at']).sink_parquet(
             _fixc_tmp, compression='zstd'
@@ -570,6 +571,7 @@ def _load_likes_core_polars(
     finally:
         if _fixc_tmp.exists():
             _fixc_tmp.unlink()
+        _fixc_tmp_dir.rmdir()
 
     # Fix C step 2: apply per-user random cap in-memory on the reloaded DataFrame.
     # At 55k users this is ~14.7M rows x 3 cols (~3 GiB); rank().over() on an in-memory
