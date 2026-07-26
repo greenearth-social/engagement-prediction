@@ -69,7 +69,7 @@ assert b.height and b.height==r.height, (b.height,r.height)
 assert b.select(keys).equals(r.select(keys)), 'paired keys differ in order or content'
 PY
   python3 ops/power_likers_portable/fixed_cohort_auc.py --baseline "$basecell/predictions/holdout_unseen_users.parquet" --remedy "$r2pred/holdout_unseen_users.parquet" --likes-core "$likes" --out "$report" 2>&1 | tee -a "$log"
-  python3 - "$manifest" "$seed" "$basecell" "$r2cell" "$report" "$basecell/predictions/holdout_unseen_users.parquet" "$r2pred/holdout_unseen_users.parquet" "$out/configs/baseline_seed${seed}.yml" "$out/configs/r2_seed${seed}.yml" <<'PY'
+  python3 - "$manifest" "$seed" "$basecell" "$r2cell" "$report" "$basecell/checkpoints/engagement_model_best.pth" "$r2cell/checkpoints/engagement_model_best.pth" "$basecell/predictions/holdout_unseen_users.parquet" "$r2pred/holdout_unseen_users.parquet" "$out/configs/baseline_seed${seed}.yml" "$out/configs/r2_seed${seed}.yml" <<'PY'
 import hashlib,json,subprocess,sys
 from datetime import datetime,timezone
 from pathlib import Path
