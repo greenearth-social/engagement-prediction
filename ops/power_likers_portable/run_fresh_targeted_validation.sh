@@ -6,7 +6,7 @@ repo="${PL_REPO_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
 stage1="${PL_FRESH_STAGE1_ROOT:-$repo/outputs/fresh2026q3_full_20260726_1815}"
 exclusions="${PL_FRESH_EXCLUSIONS_DIR:-/mnt/data/wm.s.schulz/private/fresh2026q3_r2_exclusions_20260726}"
 out="${PL_FRESH_VALIDATION_OUT:-$stage1/fresh_targeted_validation}"
-baseline_config="${PL_BASELINE_CONFIG:-$repo/sweeps/04_longer_window.yml}"
+baseline_config="${PL_BASELINE_CONFIG:-$repo/sweeps/06a_baseline_cap_inf_seeds45.yml}"
 r2_config="${PL_R2_CONFIG:-$repo/sweeps/05d_remedy_R2_drop30.yml}"
 python_bin="${PL_PYTHON_BIN:-python3}"
 if [[ -x "$python_bin" ]]; then
@@ -42,6 +42,7 @@ def set_arg(items, flag, value):
         items.extend([flag, value])
 for source, name, exclude in ((baseline, "baseline", None), (r2, "r2_drop30", exclusion)):
     config = yaml.safe_load(source.read_text())
+    config["sweep_name"] = f"fresh_targeted_{name}"
     config["ingestion_run"] = str(stage1)
     config["caps"] = [None]
     config["architectures"] = [item for item in config["architectures"] if item["model_type"] == "mlp"][:1]
@@ -63,8 +64,8 @@ bash run_cap_arch_sweep.sh "$out/configs/baseline.yml" 2>&1 | tee -a "$log"
 printf '[%s] R2-drop30 start\n' "$(date -Is)" | tee -a "$log"
 bash run_cap_arch_sweep.sh "$out/configs/r2_drop30.yml" 2>&1 | tee -a "$log"
 
-baseline_cell="$(ls -dt "$stage1"/sweep_04_longer_window/cap_inf/04_train/*_mlp_summarized_ema_seed1_cap_inf | head -1)"
-r2_cell="$(ls -dt "$stage1"/sweep_05d_remedy_R2_drop30/cap_inf/04_train/*_mlp_summarized_ema_seed1_cap_inf | head -1)"
+baseline_cell="$(ls -dt "$stage1"/sweep_fresh_targeted_baseline/cap_inf/04_train/*_mlp_summarized_ema_seed1_cap_inf | head -1)"
+r2_cell="$(ls -dt "$stage1"/sweep_fresh_targeted_r2_drop30/cap_inf/04_train/*_mlp_summarized_ema_seed1_cap_inf | head -1)"
 [[ -n "$baseline_cell" && -n "$r2_cell" ]] || { echo "Missing targeted validation train cell" >&2; exit 1; }
 baseline_substrate="$(dirname "$(dirname "$baseline_cell")")"
 python3 scripts/run_holdout_pred.py "$baseline_cell" --holdout-type unseen_users --device cuda 2>&1 | tee -a "$log"
