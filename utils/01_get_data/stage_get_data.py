@@ -1472,8 +1472,8 @@ def _run_greenearth_pipeline(
         .unique(subset=['did', 'subject_uri'])
     )
     # P7 must match the persisted likes_core, including this final deduplication.
-    all_stats['join_verify']['n_likes_final_after_join'] = likes_core_df.height
-    all_stats['join_verify']['n_users_final_after_join'] = likes_core_df['did'].n_unique() if likes_core_df.height else 0
+    all_stats['likes']['n_likes_final_after_join'] = likes_core_df.height
+    all_stats['likes']['n_users_final_after_join'] = likes_core_df['did'].n_unique() if likes_core_df.height else 0
     # Verify no nulls in emb_idx (all likes should have matching posts after join filter)
     n_null_idx = likes_core_df.filter(pl.col("emb_idx").is_null()).height
     if n_null_idx > 0:
