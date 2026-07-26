@@ -16,7 +16,8 @@ trap cleanup EXIT
 (while true; do date -Is; nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader; sleep 30; done) >> "$gpu_log" 2>&1 & sidecar=$!
 cd "$repo"
 make_config(){
-  local kind="$1" seed="$2" config="$out/configs/${kind}_seed${seed}.yml"
+  local kind="$1" seed="$2"
+  local config="$out/configs/${kind}_seed${seed}.yml"
   python3 - "$repo/sweeps/06a_baseline_cap_inf_seeds45.yml" "$repo/sweeps/05d_remedy_R2_drop30.yml" "$stage1" "$exclusions/exclude_top30pct.parquet" "$kind" "$seed" "$config" <<'PY'
 import sys
 from pathlib import Path
