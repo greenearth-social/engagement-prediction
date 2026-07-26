@@ -23,15 +23,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 synthetic = importlib.import_module("utils.05_evaluate.evals.synthetic_feed")
 
-FOCAL_ALIASES = {
-    "Neg. Sentiment",
-    "News & Soc. Concern",
-    "Pos. Sentiment",
-    "Annoyance",
-    "Gratitude",
-    "Anger",
-    "Hate",
-    "Diaries",
+# (synthetic-feed group, native feature column) -> paper-facing alias.
+FOCAL_TRAITS = {
+    ("sentiment", "Negative"): "Neg. Sentiment",
+    ("sentiment", "Positive"): "Pos. Sentiment",
+    ("topic", "News & Social Concern"): "News & Soc. Concern",
+    ("topic", "Diaries & Daily Life"): "Diaries",
+    ("moderation", "hate"): "Hate",
+    ("emotion_sentiment", "Annoyance"): "Annoyance",
+    ("emotion_sentiment", "Gratitude"): "Gratitude",
+    ("emotion_sentiment", "Anger"): "Anger",
 }
 
 
@@ -53,7 +54,10 @@ def stage_file(run_dir: Path, prefix: str) -> Path:
     if get_data is None:
         raise FileNotFoundError(f"No Stage-1 output under {run_dir}")
     # Resolve the concrete source path so we can retain text/time columns.
-    return next(sorted(get_data.glob(f"{prefix}*.parquet")))
+    candidates = sorted(get_data.glob(f"{prefix}*.parquet"))
+    if not candidates:
+        raise FileNotFoundError(f"No {prefix} parquet under {get_data}")
+    return candidates[0]
 
 
 def trait_rows(
@@ -95,12 +99,15 @@ def trait_rows(
 
 def structural_features(frame: pl.DataFrame) -> pl.DataFrame:
     text = pl.col("record_text").fill_null("")
-    timestamp = pl.col("record_created_at").str.to_datetime(strict=False, time_zone="UTC")
+    timestamp = (
+        pl.col("record_created_at").cast(pl.String)
+        .str.to_datetime(strict=False, time_zone="UTC")
+    )
     return frame.with_columns(
         [
             text.str.count_matches(r"\S+").cast(pl.Float64).alias("word_count"),
             text.str.contains(r"https?://", literal=False).cast(pl.Float64).alias("has_url"),
-            text.str.contains(r"(?<!\w)#\w+", literal=False).cast(pl.Float64).alias("has_hashtag"),
+            text.str.contains(r"#\w+", literal=False).cast(pl.Float64).alias("has_hashtag"),
             timestamp.dt.hour().cast(pl.Float64).alias("hour_of_day_utc"),
         ]
     )
@@ -145,7 +152,8 @@ def main() -> int:
         pool_group = pool_flat.select(group).unnest(group)
         liked_group = liked_flat.select(group).unnest(group)
         for trait in pool_group.columns:
-            if trait not in FOCAL_ALIASES:
+            alias = FOCAL_TRAITS.get((group, trait))
+            if alias is None:
                 continue
             stats = trait_rows(
                 pool_group[trait].to_numpy().astype(float),
@@ -155,7 +163,9 @@ def main() -> int:
                 typical,
             )
             if stats:
-                d1_rows.append({"group": group, "trait": trait, "stratum": "typical", **stats})
+                d1_rows.append(
+                    {"group": group, "trait": trait, "alias": alias, "stratum": "typical", **stats}
+                )
 
     pool_struct = structural_features(pool).select(
         "word_count", "has_url", "has_hashtag", "hour_of_day_utc"
