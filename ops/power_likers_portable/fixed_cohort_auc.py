@@ -115,6 +115,29 @@ def pair_predictions(
             diagnostics,
         )
 
+    # Model-specific prediction loaders may emit the same held-out examples in
+    # a different batch order.  Preserve the primary paired estimand whenever
+    # the complete key multiset agrees by ordering each repeated key
+    # deterministically with its within-key occurrence number.  This is not a
+    # lossy deduplication: every original row remains in the paired frame.
+    occurrence = pl.col("did").cum_count().over(KEYS).alias("_key_occurrence")
+    ordered_baseline = baseline.with_columns(occurrence).sort([*KEYS, "_key_occurrence"])
+    ordered_remedy = remedy.with_columns(occurrence).sort([*KEYS, "_key_occurrence"])
+    if ordered_baseline.select(KEYS).equals(ordered_remedy.select(KEYS)):
+        diagnostics["pairing"] = "key_sorted_positional"
+        return (
+            pl.DataFrame(
+                {
+                    "did": ordered_baseline["did"],
+                    "post_id": ordered_baseline["post_id"],
+                    "y_true": ordered_baseline["y_true"],
+                    "y_pred_proba": ordered_baseline["y_pred_proba"],
+                    "y_pred_proba_remedy": ordered_remedy["y_pred_proba"],
+                }
+            ),
+            diagnostics,
+        )
+
     if not allow_dedup_fallback:
         raise RuntimeError(
             "Prediction keys differ in content or order. Refusing an unsafe join; "
