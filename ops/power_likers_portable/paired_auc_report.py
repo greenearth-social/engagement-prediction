@@ -29,6 +29,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("inputs", nargs="+", type=Path)
     parser.add_argument("--stratum", default="typical")
+    parser.add_argument(
+        "--architecture",
+        help="Require every input to carry this architecture in its provenance.",
+    )
     parser.add_argument("--margin", type=float, default=0.005)
     parser.add_argument("--bootstrap-repetitions", type=int, default=20_000)
     parser.add_argument("--bootstrap-seed", type=int, default=20260726)
@@ -38,6 +42,12 @@ def main() -> int:
     rows = []
     for path in args.inputs:
         document = json.loads(path.read_text())
+        actual_architecture = document.get("provenance", {}).get("architecture")
+        if args.architecture is not None and actual_architecture != args.architecture:
+            raise RuntimeError(
+                f"{path} has architecture {actual_architecture!r}, expected "
+                f"{args.architecture!r}."
+            )
         cell = document["strata"].get(args.stratum)
         if cell is None or cell["delta_auc"] is None:
             continue
@@ -66,6 +76,7 @@ def main() -> int:
     ci_low, ci_high = np.quantile(bootstrap_means, [0.025, 0.975]).tolist()
     report = {
         "estimand": "mean paired fixed-cohort delta AUC over matched model seeds",
+        "architecture": args.architecture,
         "stratum": args.stratum,
         "non_inferiority_margin": args.margin,
         "n_seed_pairs": len(rows),

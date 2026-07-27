@@ -13,12 +13,51 @@ exclusions="${PL_EXCLUSIONS_DIR:-$HOME/power-likers/private/exclusions}"
 archive_sweeps="${PL_SWEEPS_ROOT:-$HOME/power-likers/code/sweeps}"
 out="${PL_FULL_MATRIX_OUT:-$HOME/power-likers/full_matrix}"
 source_commit="${PL_SOURCE_COMMIT:-unknown}"
+architecture_scope="${PL_MATRIX_ARCH_SCOPE:-all}"
 mkdir -p "$out/configs" "$out/reports"
 cd "$repo"
 
 [[ -d "$stage1/01_get_data" && -d "$archive_sweeps" ]] || {
   echo "Missing Stage-1 substrate or archived sweep configs." >&2
   exit 66
+}
+[[ "$architecture_scope" == "all" || "$architecture_scope" == "mlp" ]] || {
+  echo "PL_MATRIX_ARCH_SCOPE must be 'all' or 'mlp', got: $architecture_scope" >&2
+  exit 64
+}
+
+write_matrix_scope() {
+  python3 - "$out/reports/matrix_scope.json" "$architecture_scope" "$source_commit" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+destination, scope, source_commit = sys.argv[1:]
+deferred = [
+    {"condition": "baseline", "architecture": "two_tower", "seeds": [1, 2, 3]},
+    {"condition": "R2_drop30", "architecture": "two_tower", "seeds": [1, 2, 3]},
+    {"condition": "R2_drop40", "architecture": "two_tower", "seeds": [1, 2, 3]},
+    {"condition": "R3_ipw_sqrt", "architecture": "two_tower", "seeds": [1, 2, 3]},
+    {"condition": "R3_ipw_inv", "architecture": "two_tower", "seeds": [1, 2, 3]},
+    {"condition": "F1_footprint126", "architecture": "two_tower", "seeds": [1, 2, 3]},
+]
+payload = {
+    "architecture_scope": scope,
+    "source_commit": source_commit,
+    "generated_at": datetime.now(timezone.utc).isoformat(),
+    "primary_architecture": "mlp",
+    "deferred_two_tower_cells": deferred if scope == "mlp" else [],
+    "deferred_two_tower_cell_count": 18 if scope == "mlp" else 0,
+    "deferral_reason": (
+        "Two-tower training and scoring intentionally deferred so the "
+        "five-seed MLP primary analysis can be reported first."
+        if scope == "mlp"
+        else None
+    ),
+}
+Path(destination).write_text(json.dumps(payload, indent=2) + "\n")
+PY
 }
 
 write_config() {
@@ -81,15 +120,17 @@ done
 
 # Table A5 robustness cells: exactly three two-tower seeds for the six
 # conditions reported in the manuscript.
-write_config 04_longer_window baseline_tt two-tower 1,2,3 inf
-write_config 05d_remedy_R2_drop30 r2d30_tt two-tower 1,2,3 inf
-write_config 05e_remedy_R2_drop40 r2d40_tt two-tower 1,2,3 inf
-write_config 05f_remedy_R3_ipw_sqrt r3sqrt_tt two-tower 1,2,3 inf
-write_config 05g_remedy_R3_ipw_inv r3inv_tt two-tower 1,2,3 inf
-write_config 05h_remedy_F1_footprint126 f1_tt two-tower 1,2,3 inf
-for config in baseline_tt r2d30_tt r2d40_tt r3sqrt_tt r3inv_tt f1_tt; do
-  run_config "$config"
-done
+if [[ "$architecture_scope" == "all" ]]; then
+  write_config 04_longer_window baseline_tt two-tower 1,2,3 inf
+  write_config 05d_remedy_R2_drop30 r2d30_tt two-tower 1,2,3 inf
+  write_config 05e_remedy_R2_drop40 r2d40_tt two-tower 1,2,3 inf
+  write_config 05f_remedy_R3_ipw_sqrt r3sqrt_tt two-tower 1,2,3 inf
+  write_config 05g_remedy_R3_ipw_inv r3inv_tt two-tower 1,2,3 inf
+  write_config 05h_remedy_F1_footprint126 f1_tt two-tower 1,2,3 inf
+  for config in baseline_tt r2d30_tt r2d40_tt r3sqrt_tt r3inv_tt f1_tt; do
+    run_config "$config"
+  done
+fi
 
 likes="$(find "$stage1/01_get_data" -name 'likes_core_*.parquet' -print -quit)"
 baseline_root="$stage1/sweep_04_longer_window/cap_inf"
@@ -141,6 +182,23 @@ pair_condition() {
     ${exclusion:+--exclusion-file "$exclusions/$exclusion"}
 }
 
+is_mlp_report_for_condition() {
+  local report="$1" condition="$2"
+  python3 - "$report" "$condition" <<'PY'
+import json
+import sys
+
+document = json.load(open(sys.argv[1]))
+provenance = document.get("provenance", {})
+raise SystemExit(
+    0 if (
+        provenance.get("condition") == sys.argv[2]
+        and provenance.get("architecture") == "mlp"
+    ) else 1
+)
+PY
+}
+
 # Explicitly enumerate only the conditions chosen for the paper.
 for seed in 1 2 3 4 5; do
   pair_condition R1_cap5 mlp sweep_04_longer_window cap_5 "$seed"
@@ -154,26 +212,29 @@ for seed in 1 2 3 4 5; do
   pair_condition R3_ipw_inv mlp sweep_05g_remedy_R3_ipw_inv cap_inf "$seed"
   pair_condition F1_footprint126 mlp sweep_05h_remedy_F1_footprint126 cap_inf "$seed"
 done
-for seed in 1 2 3; do
-  pair_condition R2_drop30 two_tower sweep_05d_remedy_R2_drop30 cap_inf "$seed" exclude_top30pct.parquet
-  pair_condition R2_drop40 two_tower sweep_05e_remedy_R2_drop40 cap_inf "$seed" exclude_top40pct.parquet
-  pair_condition R3_ipw_sqrt two_tower sweep_05f_remedy_R3_ipw_sqrt cap_inf "$seed"
-  pair_condition R3_ipw_inv two_tower sweep_05g_remedy_R3_ipw_inv cap_inf "$seed"
-  pair_condition F1_footprint126 two_tower sweep_05h_remedy_F1_footprint126 cap_inf "$seed"
-done
+if [[ "$architecture_scope" == "all" ]]; then
+  for seed in 1 2 3; do
+    pair_condition R2_drop30 two_tower sweep_05d_remedy_R2_drop30 cap_inf "$seed" exclude_top30pct.parquet
+    pair_condition R2_drop40 two_tower sweep_05e_remedy_R2_drop40 cap_inf "$seed" exclude_top40pct.parquet
+    pair_condition R3_ipw_sqrt two_tower sweep_05f_remedy_R3_ipw_sqrt cap_inf "$seed"
+    pair_condition R3_ipw_inv two_tower sweep_05g_remedy_R3_ipw_inv cap_inf "$seed"
+    pair_condition F1_footprint126 two_tower sweep_05h_remedy_F1_footprint126 cap_inf "$seed"
+  done
+fi
 
 for condition in R1_cap5 R1_cap10 R2_drop10 R2_drop20 R2_drop30 R2_drop40 R3_ipw R3_ipw_sqrt R3_ipw_inv F1_footprint126; do
   mapfile -t reports < <(find "$stage1" -path "*/paper_quality/on_baseline_substrate/fixed_cohort_auc.json" -print)
   selected=()
   for report in "${reports[@]}"; do
-    [[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("provenance",{}).get("condition",""))' "$report")" == "$condition" ]] && selected+=("$report")
+    is_mlp_report_for_condition "$report" "$condition" && selected+=("$report")
   done
   (( ${#selected[@]} )) && python3 ops/power_likers_portable/paired_auc_report.py "${selected[@]}" \
-    --out "$out/reports/${condition}_typical_paired_auc.json"
+    --architecture mlp --out "$out/reports/${condition}_typical_paired_auc.json"
 done
 
 stage_summary="$(find "$stage1/01_get_data" -name summary.json -print -quit)"
 [[ -n "$stage_summary" ]] && python3 ops/power_likers_portable/build_attrition_ledger.py \
   --stage1-summary "$stage_summary" --cells-root "$stage1" --out-dir "$out/reports"
 
+write_matrix_scope
 echo "Full matrix complete: $out" | tee -a "$out/full_matrix.log"
