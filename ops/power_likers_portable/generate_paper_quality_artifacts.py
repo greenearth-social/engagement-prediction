@@ -130,17 +130,26 @@ def main() -> int:
     topk = {str(did): indices for did, indices in checkpoint["user_topk"].items()}
     posts = pl.read_parquet(stage_file(args.run_dir, "posts_core_"))
     inferences = pl.read_parquet(stage_file(args.run_dir, "inferences_core_"))
-    pool = (
+    eligible_pool = (
         posts.filter(pl.col("in_random_sample"))
         .join(inferences.select("at_uri", "inferences"), on="at_uri", how="inner")
-        .sample(n=checkpoint["n_pool"], seed=42)
     )
     if "pool_at_uris" in checkpoint:
-        if pool["at_uri"].to_list() != checkpoint["pool_at_uris"]:
+        pool_order = pl.DataFrame(
+            {
+                "at_uri": checkpoint["pool_at_uris"],
+                "_pool_order": range(len(checkpoint["pool_at_uris"])),
+            }
+        )
+        pool = pool_order.join(eligible_pool, on="at_uri", how="left").sort("_pool_order")
+        if pool.height != checkpoint["n_pool"] or pool["inferences"].null_count() > 0:
             raise RuntimeError(
-                "Deterministic pool reconstruction differs from the scored pool; "
-                "refusing to apply saved top-K indices to different posts."
+                "Saved synthetic-feed pool cannot be reconstructed from the "
+                "current Stage-1 artifact; refusing to apply saved top-K indices."
             )
+        pool = pool.drop("_pool_order")
+    else:
+        pool = eligible_pool.sample(n=checkpoint["n_pool"], seed=42)
     predictions = pl.read_parquet(args.predictions).with_columns(pl.col("did").cast(pl.String))
     liked = (
         predictions.filter(pl.col("y_true") == 1).select("did", "post_id")
