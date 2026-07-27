@@ -330,7 +330,7 @@ def test_post_liker_user_pooler_replays_recursive_time_gap_ema():
             ],
             dtype=torch.float32,
         ),
-        user_embedding_weight=user_embedding_weight,
+        user_embedding_weights=user_embedding_weight,
     )
 
     alpha = 1.0 - torch.exp(torch.tensor(-1.0))
@@ -363,7 +363,7 @@ def test_post_liker_user_pooler_zero_gap_duplicate_keeps_previous_state():
     output = pooler(
         user_indices=torch.tensor([[2, 3]], dtype=torch.long),
         time_gap_hours=torch.tensor([[0.0, 0.0]], dtype=torch.float32),
-        user_embedding_weight=user_embedding_weight,
+        user_embedding_weights=user_embedding_weight,
     )
 
     torch.testing.assert_close(output, torch.tensor([[1.0, 0.0]]))
@@ -379,7 +379,7 @@ def test_post_liker_user_pooler_gradients_flow_to_user_embeddings():
     output = pooler(
         user_indices=torch.tensor([[2, 3]], dtype=torch.long),
         time_gap_hours=torch.tensor([[0.0, 1.0]], dtype=torch.float32),
-        user_embedding_weight=user_embedding.weight,
+        user_embedding_weights=user_embedding.weight,
     )
     output.square().sum().backward()
 
@@ -526,6 +526,7 @@ def test_bst_ranker_rejects_attention_head_mismatch():
             post_liker_user_embedding_dim=0,
             post_liker_projection_dim=0,
             post_liker_pooling_tau_hours=10.0,
+            target_user_projection_dim=0,
         )
 
 
@@ -866,6 +867,7 @@ def test_bst_ranker_rejects_invalid_post_liker_dimensions():
             post_liker_user_embedding_dim=0,
             post_liker_projection_dim=2,
             post_liker_pooling_tau_hours=10.0,
+            target_user_projection_dim=2,
         )
 
 

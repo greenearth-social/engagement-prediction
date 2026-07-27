@@ -153,7 +153,7 @@ class PostLikerUserPooler(nn.Module):
         if user_indices.size(-1) <= 0:
             raise ValueError("user_indices must have at least one replay slot")
         if user_embedding_weights.dim() != 2 or user_embedding_weights.size(1) != self.user_embedding_dim:
-            raise ValueError("user_embedding_weight must have shape [num_users, user_embedding_dim]")
+            raise ValueError("user_embedding_weights must have shape [num_users, user_embedding_dim]")
 
         device = user_embedding_weights.device
         user_indices_tensor = user_indices.to(device=device, dtype=torch.long)
