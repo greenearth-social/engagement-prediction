@@ -179,7 +179,7 @@ class ProjectedPostFeatureEncoder(nn.Module):
                 self.projection_activation(self.popularity_projection(popularity_scaled.unsqueeze(-1)))
             )
             features_list.append(popularity_features)
-        
+
         if self.use_post_liker_feature:
             post_liker_features_input = torch.jit._unwrap_optional(post_liker_features)
             post_liker_features_tensor = post_liker_features_input.to(device=post_embeddings.device, dtype=post_embeddings.dtype)

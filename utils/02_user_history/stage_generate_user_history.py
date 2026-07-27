@@ -490,9 +490,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     logger.info(f"Input: {n_likes:,} likes")
     logger.info(f"Input: {n_liked_post_popularity_rows:,} liked-post popularity rows")
     n_posts = None
-    if posts_lf is not None:
-        n_posts = posts_lf.select(pl.len()).collect(engine="streaming").item()
-        logger.info(f"Input: {n_posts:,} post rows")
 
     # === Build user history directory ===
     log_operation_start('Build user history directory', 'STAGE_02_USER_HISTORY', logger)
