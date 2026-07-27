@@ -14,6 +14,16 @@ archive_sweeps="${PL_SWEEPS_ROOT:-$HOME/power-likers/code/sweeps}"
 out="${PL_FULL_MATRIX_OUT:-$HOME/power-likers/full_matrix}"
 source_commit="${PL_SOURCE_COMMIT:-unknown}"
 architecture_scope="${PL_MATRIX_ARCH_SCOPE:-all}"
+matrix_phase="${PL_MATRIX_PHASE:-all}"
+
+if [[ "$matrix_phase" == "harvest" ]]; then
+  exec bash ops/power_likers_portable/harvest_mlp_matrix.sh
+fi
+[[ "$matrix_phase" == "all" ]] || {
+  echo "PL_MATRIX_PHASE must be 'all' or 'harvest', got: $matrix_phase" >&2
+  exit 64
+}
+
 mkdir -p "$out/configs" "$out/reports"
 cd "$repo"
 
