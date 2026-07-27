@@ -46,6 +46,7 @@ from utils.helpers import (
     parse_one_ts_strict
 )
 from utils.likes_cap import apply_per_user_random_cap
+from utils.split_row_subsample import apply_split_row_target
 from utils.memory_helpers import log_memory_checkpoint
 
 STAGE_NAME_FOR_LOGGING = '02_TARGET_POSTS'
@@ -592,6 +593,51 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     target_posts_lf = _apply_splits(args, target_posts_lf, logger)
 
+    # Fair matched-N control: after exclusions and temporal/user splits are
+    # finalized, deterministically downsample only train and validation rows.
+    # Holdout rows remain byte-for-byte unchanged so fixed-cohort scoring stays
+    # paired across remedy arms. Row selection is global (not per-user) to
+    # preserve each arm's post-exclusion composition.
+    train_rows_target = getattr(args, "train_rows_target", None)
+    val_rows_target = getattr(args, "val_rows_target", None)
+    row_subsample_seed = getattr(args, "row_subsample_seed", None)
+    if row_subsample_seed is None:
+        row_subsample_seed = int(getattr(args, "cap_random_seed", 42))
+    split_targets = {"train": train_rows_target, "val": val_rows_target}
+    realized_split_targets: dict[str, int] = {}
+    for split_name, raw_target in split_targets.items():
+        if raw_target is None or raw_target <= 0:
+            continue
+        target_rows = int(raw_target)
+        actual_rows = (
+            target_posts_lf
+            .filter(pl.col("split") == split_name)
+            .select(pl.len())
+            .collect(engine="streaming")
+            .item()
+        )
+        if target_rows > actual_rows:
+            logger.warning(
+                "row target for split=%s exceeds available rows: target=%s, available=%s; keeping all rows",
+                split_name, f"{target_rows:,}", f"{actual_rows:,}",
+            )
+        target_posts_lf = apply_split_row_target(
+            target_posts_lf, split_name, target_rows, int(row_subsample_seed)
+        )
+        realized_rows = min(target_rows, actual_rows)
+        realized_split_targets[split_name] = realized_rows
+        logger.info(
+            "Applied %s_rows_target=%s (seed=%s): %s -> %s rows; holdout splits unchanged",
+            split_name, f"{target_rows:,}", row_subsample_seed,
+            f"{actual_rows:,}", f"{realized_rows:,}",
+        )
+        context.tracker.log_single_value(
+            f"Target Posts - {split_name.title()} Rows Before Subsample", int(actual_rows)
+        )
+        context.tracker.log_single_value(
+            f"Target Posts - {split_name.title()} Rows After Subsample", int(realized_rows)
+        )
+
     # R3 remedy: per-user training-loss weights.  Always write a sample_weight
     # column so downstream dataloaders have a stable schema.  When
     # --user-weight-mode is None the column is uniformly 1.0 (no-op for the
@@ -674,6 +720,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"target_footprint_cap_seed: {target_footprint_cap_seed}",
         f"exclude_users_file: {exclude_users_file}",
         f"excluded_users: {n_excluded_users}",
+        f"train_rows_target: {train_rows_target}",
+        f"val_rows_target: {val_rows_target}",
+        f"row_subsample_seed: {row_subsample_seed}",
+        f"realized_split_targets: {realized_split_targets}",
         f"user_weight_mode: {user_weight_mode}",
     ]
     if n_likes_pre_cap is not None:

@@ -53,6 +53,11 @@ DEFAULTS: Dict[str, Any] = {
     "target_footprint_cap": None,  # Stage 2 only; Stage 3 user histories remain uncapped.
     "target_footprint_cap_seed": None,  # Falls back to cap_random_seed when None.
     "exclude_users_file": None,  # parquet with 'did' column; those users excluded from training targets
+    # Stage 2 only: deterministic global subsampling after split assignment.
+    # Holdout rows are never changed, preserving paired evaluation cohorts.
+    "train_rows_target": None,
+    "val_rows_target": None,
+    "row_subsample_seed": None,  # Falls back to cap_random_seed when None.
     "max_memory_gb": None,  # Stage 1: max memory in GB (None = auto based on percentage)
     "max_memory_pct": 0.75,  # Stage 1: max percentage of available RAM to use
     "memory_check": "full",  # Stage 1: memory check mode (full/ignore/skip)
@@ -541,6 +546,12 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Seed for --target-footprint-cap. None = inherit --cap-random-seed.")
     _add_arg_with_default(p_all, "--exclude-users-file", type=str, default=argparse.SUPPRESS,
                           help_text="Path to parquet with 'did' column. Matching users excluded from training targets (Stage 2 likes_core anti-join).")
+    _add_arg_with_default(p_all, "--train-rows-target", type=int, default=argparse.SUPPRESS,
+                          help_text="Deterministic global target-row count for the Stage-2 train split. Holdout rows are never subsampled.")
+    _add_arg_with_default(p_all, "--val-rows-target", type=int, default=argparse.SUPPRESS,
+                          help_text="Deterministic global target-row count for the Stage-2 val split. Holdout rows are never subsampled.")
+    _add_arg_with_default(p_all, "--row-subsample-seed", type=int, default=argparse.SUPPRESS,
+                          help_text="Seed for --train-rows-target and --val-rows-target. None = inherit --cap-random-seed.")
     _add_arg_with_default(p_all, "--negative-posts-sample", type=int, default=argparse.SUPPRESS,
                           help_text="Number of random posts to sample for negative cases in Stage 1")
     _add_arg_with_default(p_all, "--cap-random-seed", type=int, default=argparse.SUPPRESS,
