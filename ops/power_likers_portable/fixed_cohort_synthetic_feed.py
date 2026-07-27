@@ -277,6 +277,7 @@ def main() -> int:
         "word_count", "has_url", "has_hashtag", "hour_of_day_utc"
     )
     d2_rows: list[dict[str, object]] = []
+    d2_user_rows: list[dict[str, object]] = []
     for feature in pool_struct.columns:
         result = trait_decomposition(
             pool_struct[feature].to_numpy().astype(float),
@@ -287,6 +288,22 @@ def main() -> int:
         )
         if result is not None:
             d2_rows.append({"feature": feature, "stratum": "all", **summary_row(result)})
+            for did, pref, amp, excess in zip(
+                result.user_dids,
+                result.user_pref_std,
+                result.model_amp_std,
+                result.model_excess_std,
+            ):
+                d2_user_rows.append(
+                    {
+                        "feature": feature,
+                        "stratum": "all",
+                        "did": did,
+                        "user_pref_abs": float(pref * result.pool_sd),
+                        "model_amp_abs": float(amp * result.pool_sd),
+                        "model_excess_abs": float(excess * result.pool_sd),
+                    }
+                )
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     pl.DataFrame(d1_rows).write_parquet(args.out_dir / "fixed_cohort_typical_axis_a_focal.parquet")
@@ -294,6 +311,9 @@ def main() -> int:
         args.out_dir / "fixed_cohort_typical_axis_a_user_level.parquet"
     )
     pl.DataFrame(d2_rows).write_parquet(args.out_dir / "fixed_cohort_negative_controls.parquet")
+    pl.DataFrame(d2_user_rows).write_parquet(
+        args.out_dir / "fixed_cohort_negative_controls_user_level.parquet"
+    )
     (args.out_dir / "fixed_cohort_synthetic_feed_topk.json").write_text(
         json.dumps(
             {
@@ -321,6 +341,7 @@ def main() -> int:
         "d1_rows": len(d1_rows),
         "d1_user_rows": len(d1_user_rows),
         "d2_rows": len(d2_rows),
+        "d2_user_rows": len(d2_user_rows),
     }
     (args.out_dir / "fixed_cohort_bias_manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n"
