@@ -85,6 +85,56 @@ def reconstruct_pool(
     return pool.drop("_pool_order")
 
 
+def trait_decomposition(
+    pool_values: np.ndarray,
+    liked_values: np.ndarray,
+    liked_dids: np.ndarray,
+    topk: dict[str, list[int]],
+    dids: list[str],
+):
+    """Return the finite-value decomposition and its paired user identifiers."""
+    actual = {}
+    for did in dids:
+        values = liked_values[liked_dids == did]
+        values = values[np.isfinite(values)]
+        if len(values) >= synthetic.MIN_USER_LIKES:
+            actual[did] = values
+    feed = {}
+    for did, indices in topk.items():
+        if did not in actual:
+            continue
+        values = pool_values[np.asarray(indices, dtype=int)]
+        values = values[np.isfinite(values)]
+        if values.size:
+            feed[did] = values
+    result = synthetic._compute_trait_decomposition(pool_values, actual, feed, dids)
+    if result is None:
+        return None
+    if not (
+        np.isfinite(result.user_pref_std).all()
+        and np.isfinite(result.model_amp_std).all()
+        and np.isfinite(result.model_excess_std).all()
+    ):
+        raise RuntimeError("Fixed-cohort decomposition produced non-finite user statistics.")
+    return result
+
+
+def summary_row(result) -> dict[str, float | int]:
+    return {
+        "mean_user_pref_std": float(np.mean(result.user_pref_std)),
+        "mean_model_amp_std": float(np.mean(result.model_amp_std)),
+        "mean_model_excess_std": float(np.mean(result.model_excess_std)),
+        "mean_user_pref_abs": float(np.mean(result.user_pref_std) * result.pool_sd),
+        "mean_model_amp_abs": float(np.mean(result.model_amp_std) * result.pool_sd),
+        "mean_model_excess_abs": float(np.mean(result.model_excess_std) * result.pool_sd),
+        "pool_mean": float(result.pool_mean),
+        "pool_sd": float(result.pool_sd),
+        "n_users": result.n_users,
+        "cohen_d_amp": float(result.cohen_d_amp),
+        "p_amp": float(result.p_amp),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--train-cell-dir", required=True, type=Path)
@@ -176,6 +226,7 @@ def main() -> int:
     liked_dids = liked_flat["did"].cast(pl.String).to_numpy()
 
     d1_rows: list[dict[str, object]] = []
+    d1_user_rows: list[dict[str, object]] = []
     for group in groups:
         pool_group = pool_flat.select(group).unnest(group)
         liked_group = liked_flat.select(group).unnest(group)
@@ -183,23 +234,41 @@ def main() -> int:
             alias = artifacts.FOCAL_TRAITS.get((group, trait))
             if alias is None:
                 continue
-            stats = artifacts.trait_rows(
+            result = trait_decomposition(
                 pool_group[trait].to_numpy().astype(float),
                 liked_group[trait].to_numpy().astype(float),
                 liked_dids,
                 topk,
                 typical,
             )
-            if stats is not None:
+            if result is not None:
                 d1_rows.append(
                     {
                         "group": group,
                         "trait": trait,
                         "alias": alias,
                         "stratum": "typical",
-                        **stats,
+                        **summary_row(result),
                     }
                 )
+                for did, pref, amp, excess in zip(
+                    result.user_dids,
+                    result.user_pref_std,
+                    result.model_amp_std,
+                    result.model_excess_std,
+                ):
+                    d1_user_rows.append(
+                        {
+                            "group": group,
+                            "trait": trait,
+                            "alias": alias,
+                            "stratum": "typical",
+                            "did": did,
+                            "user_pref_abs": float(pref * result.pool_sd),
+                            "model_amp_abs": float(amp * result.pool_sd),
+                            "model_excess_abs": float(excess * result.pool_sd),
+                        }
+                    )
 
     pool_struct = artifacts.structural_features(pool).select(
         "word_count", "has_url", "has_hashtag", "hour_of_day_utc"
@@ -209,18 +278,21 @@ def main() -> int:
     )
     d2_rows: list[dict[str, object]] = []
     for feature in pool_struct.columns:
-        stats = artifacts.trait_rows(
+        result = trait_decomposition(
             pool_struct[feature].to_numpy().astype(float),
             liked_struct[feature].to_numpy().astype(float),
             liked_dids,
             topk,
             sorted(topk),
         )
-        if stats is not None:
-            d2_rows.append({"feature": feature, "stratum": "all", **stats})
+        if result is not None:
+            d2_rows.append({"feature": feature, "stratum": "all", **summary_row(result)})
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     pl.DataFrame(d1_rows).write_parquet(args.out_dir / "fixed_cohort_typical_axis_a_focal.parquet")
+    pl.DataFrame(d1_user_rows).write_parquet(
+        args.out_dir / "fixed_cohort_typical_axis_a_user_level.parquet"
+    )
     pl.DataFrame(d2_rows).write_parquet(args.out_dir / "fixed_cohort_negative_controls.parquet")
     (args.out_dir / "fixed_cohort_synthetic_feed_topk.json").write_text(
         json.dumps(
@@ -247,6 +319,7 @@ def main() -> int:
         "n_typical_users": len(typical),
         "n_power_users": len(set(topk) & power),
         "d1_rows": len(d1_rows),
+        "d1_user_rows": len(d1_user_rows),
         "d2_rows": len(d2_rows),
     }
     (args.out_dir / "fixed_cohort_bias_manifest.json").write_text(
