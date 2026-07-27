@@ -73,15 +73,32 @@ def trait_rows(
         vals = vals[np.isfinite(vals)]
         if len(vals) >= synthetic.MIN_USER_LIKES:
             actual[did] = vals
-    feed = {
-        did: pool_values[np.asarray(indices, dtype=int)]
-        for did, indices in topk.items()
-        if did in dids
-    }
-    feed = {did: vals[np.isfinite(vals)] for did, vals in feed.items()}
+    # A selected post can lack a value for a particular classifier trait.
+    # Keeping an empty vector here is unsafe: ``_compute_trait_decomposition``
+    # treats its presence as a valid feed and ``np.nanmean([])`` then poisons
+    # every aggregate for that trait.  Omit those user-trait pairs instead;
+    # the evaluator will retain only users with both finite actual and feed
+    # values, and records that denominator in ``n_users``.
+    feed = {}
+    for did, indices in topk.items():
+        if did not in dids:
+            continue
+        values = pool_values[np.asarray(indices, dtype=int)]
+        values = values[np.isfinite(values)]
+        if values.size:
+            feed[did] = values
     result = synthetic._compute_trait_decomposition(pool_values, actual, feed, dids)
     if result is None:
         return None
+    if not (
+        np.isfinite(result.user_pref_std).all()
+        and np.isfinite(result.model_amp_std).all()
+        and np.isfinite(result.model_excess_std).all()
+    ):
+        raise RuntimeError(
+            "Synthetic-feed decomposition produced non-finite user statistics "
+            "after finite-value filtering."
+        )
     return {
         "mean_user_pref_std": float(np.mean(result.user_pref_std)),
         "mean_model_amp_std": float(np.mean(result.model_amp_std)),
