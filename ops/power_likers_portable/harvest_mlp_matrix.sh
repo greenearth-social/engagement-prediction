@@ -11,6 +11,10 @@ exclusions="${PL_EXCLUSIONS_DIR:-$HOME/power-likers/private/exclusions}"
 out="${PL_FULL_MATRIX_OUT:-$HOME/power-likers/full_matrix/harvest_mlp}"
 source_commit="${PL_SOURCE_COMMIT:-unknown}"
 phase="${PL_HARVEST_PHASE:-all}"
+# This harvest needs directional uncertainty for 45 cells promptly.  The
+# emitted JSON records the actual count, so selected results can later be
+# re-emitted at a higher Monte Carlo precision without changing the estimand.
+bootstrap_repetitions="${PL_BOOTSTRAP_REPETITIONS:-200}"
 
 [[ "$phase" == "all" || "$phase" == "gpu" || "$phase" == "cpu" || "$phase" == "dry-run" ]] || {
   echo "PL_HARVEST_PHASE must be all, gpu, cpu, or dry-run; got $phase" >&2
@@ -112,6 +116,7 @@ cpu_harvest_cell() {
     --remedy "$scored/holdout_unseen_users.parquet" --likes-core "$likes" \
     --out "$scored/fixed_cohort_auc.json" --condition "$condition" \
     --architecture mlp --model-seed "$seed" --summary-csv "$summary_csv" \
+    --bootstrap-repetitions "$bootstrap_repetitions" \
     ${exclusion:+--exclusion-file "$exclusions/$exclusion"}
   python3 ops/power_likers_portable/emit_cell_manifest.py \
     --cell-dir "$remedy" --predictions "$remedy/predictions/holdout_unseen_users.parquet" \
