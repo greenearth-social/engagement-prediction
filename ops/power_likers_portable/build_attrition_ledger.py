@@ -32,6 +32,11 @@ def main() -> int:
     parser.add_argument("--out-dir", required=True, type=Path)
     args = parser.parse_args()
 
+    if not args.stage1_summary.is_file():
+        parser.error(
+            f"--stage1-summary must name an existing file; got {args.stage1_summary}. "
+            "Do not emit an attrition ledger without immutable P1-P9 evidence."
+        )
     stage1 = json.loads(args.stage1_summary.read_text())
     rows: list[dict[str, object]] = [
         {

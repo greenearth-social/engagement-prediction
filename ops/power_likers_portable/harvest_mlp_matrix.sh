@@ -249,7 +249,12 @@ if [[ "$phase" == "all" || "$phase" == "cpu" ]]; then
       --architecture mlp --out "$out/reports/${condition}_typical_paired_auc.json"
   done
   stage_summary="$(find "$stage1/01_get_data" -name summary.json -print -quit)"
-  [[ -n "$stage_summary" ]] && python3 ops/power_likers_portable/build_attrition_ledger.py \
+  [[ -n "$stage_summary" ]] || {
+    echo "Missing required Stage-1 summary.json under $stage1/01_get_data; " \
+      "refusing to claim an attrition ledger was emitted." >&2
+    exit 66
+  }
+  python3 ops/power_likers_portable/build_attrition_ledger.py \
     --stage1-summary "$stage_summary" --cells-root "$stage1" --out-dir "$out/reports"
   write_matrix_scope
 fi
