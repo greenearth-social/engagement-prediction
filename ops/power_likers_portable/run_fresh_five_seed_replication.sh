@@ -60,7 +60,7 @@ PY
   basesub="$(dirname "$(dirname "$basecell")")"; r2pred="$out/pairs/r2_seed${seed}_on_baseline"
   python3 scripts/run_holdout_pred.py "$basecell" --holdout-type unseen_users --device cuda 2>&1 | tee -a "$log"
   python3 scripts/run_holdout_pred.py "$r2cell" --holdout-type unseen_users --device cuda --substrate-run-dir "$basesub" --output-dir "$r2pred" 2>&1 | tee -a "$log"
-  likes="$(rg --files "$stage1/01_get_data" | rg 'likes_core_.*\.parquet$' | awk 'NR==1')"
+  likes="$(ls "$stage1"/01_get_data/*/likes_core_*.parquet | awk 'NR==1')"
   report="$out/pairs/fixed_cohort_seed${seed}.json"
   python3 - "$basecell/predictions/holdout_unseen_users.parquet" "$r2pred/holdout_unseen_users.parquet" <<'PY'
 import sys,polars as pl
