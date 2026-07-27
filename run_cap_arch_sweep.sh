@@ -198,6 +198,21 @@ run_train_cell() {
   local RUN_LOG="$4"
   local STATUS_FILE="$5"
   local CAP_LABEL="$6"
+  local EXISTING_CELL
+
+  # A restarted sweep must not repeat a completed training/evaluation cell.
+  # The run tag includes architecture, summarization, seed, and cap; requiring
+  # both Stage-4 metadata and the holdout predictions avoids treating a
+  # checkpoint-only partial run as complete.
+  EXISTING_CELL="$(ls -dt "$CELL_DIR"/04_train/*_"${RUN_TAG}" 2>/dev/null | head -1 || true)"
+  if [[ -n "$EXISTING_CELL" \
+    && -f "$EXISTING_CELL/stage_info.txt" \
+    && -f "$EXISTING_CELL/training_config.json" \
+    && -f "$EXISTING_CELL/predictions/holdout_unseen_users.parquet" ]]; then
+    log "[$CAP_LABEL/$RUN_TAG] completed training and holdout predictions already present, skipping"
+    echo "0" > "$STATUS_FILE"
+    return 0
+  fi
 
   local MODEL_TYPE
   local USER_ENCODER
