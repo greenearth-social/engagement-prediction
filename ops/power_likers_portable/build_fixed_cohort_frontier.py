@@ -204,6 +204,57 @@ def main() -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     write_csv(args.out_dir / "fixed_cohort_bias_utility_frontier.csv", focal_rows)
     write_csv(args.out_dir / "fixed_cohort_negative_control_deltas.csv", control_rows)
+    reconciliation = [
+        "# Old-data fixed-cohort reconciliation",
+        "",
+        "All bias changes below are remedy minus baseline model excess on matched users,",
+        "with the fixed baseline pool, histories, positive examples, and Lorenz-50 split.",
+        "The utility values are the existing matched five-seed typical-user AUC reports.",
+        "",
+        "## Utility",
+        "",
+        "| Condition | Mean ΔAUC | 95% seed-pair CI | Verdict |",
+        "|---|---:|---:|---|",
+    ]
+    for condition in conditions:
+        document = utility[condition]
+        interval = document["seed_pair_bootstrap_ci_95"]
+        reconciliation.append(
+            f"| {condition} | {document['mean_delta_auc']:+.5f} | "
+            f"[{interval['low']:+.5f}, {interval['high']:+.5f}] | "
+            f"{document['verdict']} |"
+        )
+    reconciliation.extend(
+        [
+            "",
+            "## Focal-trait bias change",
+            "",
+            "| Condition | Trait | Mean Δ model excess (pp) | 95% seed-pair CI | Mean paired users |",
+            "|---|---|---:|---:|---:|",
+        ]
+    )
+    for row in focal_rows:
+        reconciliation.append(
+            f"| {row['condition']} | {row['alias']} | "
+            f"{row['mean_delta_model_excess_pp']:+.3f} | "
+            f"[{row['seed_pair_ci_95_low_pp']:+.3f}, "
+            f"{row['seed_pair_ci_95_high_pp']:+.3f}] | "
+            f"{row['mean_paired_users']:.0f} |"
+        )
+    reconciliation.extend(
+        [
+            "",
+            "## Interpretation guardrails",
+            "",
+            "- Do not describe R2-drop30 as an AUC improvement: its matched-cohort estimate is a small negative value that remains inside the 0.005 flat band.",
+            "- Do not use the old native-holdout D1 values. This document supersedes them only after all expected fixed-cohort cells are present.",
+            "- F1 and two-tower results remain outside this matrix; they cannot support a mechanism or architecture-generalization claim.",
+            "- The seed-pair intervals summarize five matched runs. Final paper inference should add a joint user-clustered resampling analysis if a result turns on a close margin.",
+        ]
+    )
+    (args.out_dir / "fixed_cohort_frontier_reconciliation.md").write_text(
+        "\n".join(reconciliation) + "\n"
+    )
     (args.out_dir / "fixed_cohort_frontier_manifest.json").write_text(
         json.dumps(
             {
