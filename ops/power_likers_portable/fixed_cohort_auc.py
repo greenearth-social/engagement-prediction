@@ -187,15 +187,21 @@ def bootstrap_delta_auc(
     if frame.height == 0 or repetitions == 0:
         return {"repetitions": repetitions, "ci_95_low": None, "ci_95_high": None}
 
-    grouped = frame.partition_by("did", maintain_order=True)
+    dids = frame["did"].to_numpy()
+    _, user_index = np.unique(dids, return_inverse=True)
+    labels = frame["y_true"].to_numpy()
+    baseline_predictions = frame["y_pred_proba"].to_numpy()
+    remedy_predictions = frame["y_pred_proba_remedy"].to_numpy()
+    n_users = int(user_index.max()) + 1
     rng = np.random.default_rng(seed)
     deltas: list[float] = []
     for _ in range(repetitions):
-        indices = rng.integers(0, len(grouped), size=len(grouped))
-        sampled = pl.concat([grouped[index] for index in indices], rechunk=False)
-        point = stratum_summary(sampled)["delta_auc"]
-        if point is not None:
-            deltas.append(float(point))
+        draws = rng.integers(0, n_users, size=n_users)
+        user_weights = np.bincount(draws, minlength=n_users)
+        row_weights = user_weights[user_index]
+        baseline_auc = roc_auc_score(labels, baseline_predictions, sample_weight=row_weights)
+        remedy_auc = roc_auc_score(labels, remedy_predictions, sample_weight=row_weights)
+        deltas.append(float(remedy_auc - baseline_auc))
     if not deltas:
         return {"repetitions": repetitions, "ci_95_low": None, "ci_95_high": None}
     return {
