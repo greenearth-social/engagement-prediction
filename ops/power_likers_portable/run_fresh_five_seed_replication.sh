@@ -60,7 +60,7 @@ PY
   basesub="$(dirname "$(dirname "$basecell")")"; r2pred="$out/pairs/r2_seed${seed}_on_baseline"
   python3 scripts/run_holdout_pred.py "$basecell" --holdout-type unseen_users --device cuda 2>&1 | tee -a "$log"
   python3 scripts/run_holdout_pred.py "$r2cell" --holdout-type unseen_users --device cuda --substrate-run-dir "$basesub" --output-dir "$r2pred" 2>&1 | tee -a "$log"
-  likes="$(rg --files "$stage1/01_get_data" | rg 'likes_core_.*\\.parquet$' | awk 'NR==1')"
+  likes="$(rg --files "$stage1/01_get_data" | rg 'likes_core_.*\.parquet$' | awk 'NR==1')"
   report="$out/pairs/fixed_cohort_seed${seed}.json"
   python3 - "$basecell/predictions/holdout_unseen_users.parquet" "$r2pred/holdout_unseen_users.parquet" <<'PY'
 import sys,polars as pl
@@ -80,12 +80,14 @@ def sha(p):
  with p.open('rb') as f:
   for b in iter(lambda:f.read(8*1024*1024),b''): h.update(b)
  return h.hexdigest()
-d={'seed':int(seed),'created_at':datetime.now(timezone.utc).isoformat(),'source_commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),'baseline_cell':str(files[0]),'r2_cell':str(files[1]),'required_files':required,'sha256':{str(p):sha(p) for p in map(Path,required)}}
+d={'seed':int(str(seed)),'created_at':datetime.now(timezone.utc).isoformat(),'source_commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),'baseline_cell':str(files[0]),'r2_cell':str(files[1]),'required_files':required,'sha256':{str(p):sha(p) for p in map(Path,required)}}
 m.write_text(json.dumps(d,indent=2)+'\n')
 PY
 }
 for seed in $seeds; do run_pair "$seed"; done
 reports=("$stage1/fresh_targeted_validation_20260726_2235/fixed_cohort_auc.json")
 for seed in $seeds; do reports+=("$out/pairs/fixed_cohort_seed${seed}.json"); done
-python3 ops/power_likers_portable/paired_auc_report.py "${reports[@]}" --stratum typical --out "$out/paired_auc_typical_5seed.json" 2>&1 | tee -a "$log"
+if [[ "${PL_SKIP_AGGREGATE:-0}" != "1" ]]; then
+  python3 ops/power_likers_portable/paired_auc_report.py "${reports[@]}" --stratum typical --out "$out/paired_auc_typical_5seed.json" 2>&1 | tee -a "$log"
+fi
 printf '[%s] completed bounded five-seed replication\n' "$(date -Is)" | tee -a "$log"
