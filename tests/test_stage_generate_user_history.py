@@ -94,7 +94,6 @@ def _make_likes(
     return pl.DataFrame(data).lazy()
 
 
-<<<<<<< HEAD
 def _default_popularity_curve(likes_lf: pl.LazyFrame) -> pl.LazyFrame:
     likes_df = likes_lf.collect()
     return (
@@ -134,8 +133,6 @@ def _make_posts(
     }).lazy()
 
 
-=======
->>>>>>> 96a6ce4 (switching to a full list of all likes per post, with their timestep - filtering will happen during dataloader step in training)
 def _history_by_bucket(df: pl.DataFrame) -> dict[datetime, list[int]]:
     return {
         row["like_hour_bucket"]: list(row["prior_emb_indices"])
