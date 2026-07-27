@@ -204,11 +204,16 @@ run_train_cell() {
   # The run tag includes architecture, summarization, seed, and cap; requiring
   # both Stage-4 metadata and the holdout predictions avoids treating a
   # checkpoint-only partial run as complete.
-  EXISTING_CELL="$(ls -dt "$CELL_DIR"/04_train/*_"${RUN_TAG}" 2>/dev/null | head -1 || true)"
-  if [[ -n "$EXISTING_CELL" \
-    && -f "$EXISTING_CELL/stage_info.txt" \
-    && -f "$EXISTING_CELL/training_config.json" \
-    && -f "$EXISTING_CELL/predictions/holdout_unseen_users.parquet" ]]; then
+  EXISTING_CELL=""
+  while IFS= read -r candidate; do
+    if [[ -f "$candidate/stage_info.txt" \
+      && -f "$candidate/training_config.json" \
+      && -f "$candidate/predictions/holdout_unseen_users.parquet" ]]; then
+      EXISTING_CELL="$candidate"
+      break
+    fi
+  done < <(ls -dt "$CELL_DIR"/04_train/*_"${RUN_TAG}" 2>/dev/null || true)
+  if [[ -n "$EXISTING_CELL" ]]; then
     log "[$CAP_LABEL/$RUN_TAG] completed training and holdout predictions already present, skipping"
     echo "0" > "$STATUS_FILE"
     return 0
