@@ -69,7 +69,8 @@ def checkpoint_for_cell(cell: Path, model_type: str) -> Path:
 
 def reconstruct_pool(
     baseline_run_dir: Path,
-    pool_at_uris: list[str],
+    pool_at_uris: list[str] | None,
+    n_pool: int,
     artifacts,
 ) -> pl.DataFrame:
     posts = pl.read_parquet(artifacts.stage_file(baseline_run_dir, "posts_core_"))
@@ -78,6 +79,12 @@ def reconstruct_pool(
         posts.filter(pl.col("in_random_sample"))
         .join(inferences.select("at_uri", "inferences"), on="at_uri", how="inner")
     )
+    if pool_at_uris is None:
+        # Historical evaluations predate the persisted pool identity. Their
+        # evaluator sampled this exact eligible frame with seed 42; reproduce
+        # it once, then persist the resolved URIs in this fixed-cohort output.
+        # The resulting URI list is the durable pool identity for every cell.
+        return eligible.sample(n=n_pool, seed=42)
     pool_order = pl.DataFrame({"at_uri": pool_at_uris, "_pool_order": range(len(pool_at_uris))})
     pool = pool_order.join(eligible, on="at_uri", how="left").sort("_pool_order")
     if pool.height != len(pool_at_uris) or pool["inferences"].null_count() > 0:
@@ -170,11 +177,14 @@ def main() -> int:
     checkpoint = json.loads(
         (args.baseline_eval_dir / "synthetic_feed" / "synthetic_feed_topk.json").read_text()
     )
-    if "pool_at_uris" not in checkpoint:
-        raise RuntimeError("Baseline eval lacks pool_at_uris; refusing an unpinned fixed-cohort pool.")
-
     predictions = pl.read_parquet(predictions_path).with_columns(pl.col("did").cast(pl.String))
-    pool = reconstruct_pool(baseline_run_dir, checkpoint["pool_at_uris"], artifacts)
+    pool_at_uris = checkpoint.get("pool_at_uris")
+    pool = reconstruct_pool(
+        baseline_run_dir,
+        pool_at_uris,
+        int(checkpoint["n_pool"]),
+        artifacts,
+    )
     posts = pl.read_parquet(artifacts.stage_file(baseline_run_dir, "posts_core_"))
     inferences = pl.read_parquet(artifacts.stage_file(baseline_run_dir, "inferences_core_"))
     liked = (
@@ -317,7 +327,11 @@ def main() -> int:
     (args.out_dir / "fixed_cohort_synthetic_feed_topk.json").write_text(
         json.dumps(
             {
-                "baseline_pool_at_uris": checkpoint["pool_at_uris"],
+                "baseline_pool_at_uris": pool["at_uri"].to_list(),
+                "pool_identity_source": (
+                    "saved_baseline_eval" if pool_at_uris is not None
+                    else "historical_seed42_reconstruction"
+                ),
                 "top_k": top_k,
                 "user_topk": topk,
             }
@@ -329,6 +343,10 @@ def main() -> int:
         "model_seed": args.model_seed,
         "baseline_run_dir": str(baseline_run_dir),
         "baseline_eval_dir": str(args.baseline_eval_dir),
+        "pool_identity_source": (
+            "saved_baseline_eval" if pool_at_uris is not None
+            else "historical_seed42_reconstruction"
+        ),
         "train_cell_dir": str(train_cell),
         "checkpoint": str(checkpoint_path),
         "checkpoint_sha256": sha256(checkpoint_path),
