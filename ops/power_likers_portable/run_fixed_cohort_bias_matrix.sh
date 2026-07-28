@@ -33,7 +33,21 @@ baseline_root="$stage1/sweep_04_longer_window/cap_inf"
 pool_baseline="$(select_completed_cell "$baseline_root" "*_mlp_*_seed1_cap_inf")" || {
   echo "Missing baseline MLP seed 1" >&2; exit 1;
 }
-pool_eval="$(ls -dt "$pool_baseline"/evals/* | head -1)"
+pool_eval="$(
+  python3 - "$pool_baseline/evals" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+for candidate in sorted(Path(sys.argv[1]).glob("*"), key=lambda p: p.stat().st_mtime, reverse=True):
+    checkpoint = candidate / "synthetic_feed" / "synthetic_feed_topk.json"
+    if not checkpoint.is_file():
+        continue
+    if "pool_at_uris" in json.loads(checkpoint.read_text()):
+        print(candidate)
+        break
+PY
+)"
 [[ -n "$pool_eval" ]] || { echo "Missing baseline synthetic-feed eval" >&2; exit 1; }
 
 run_cell() {
