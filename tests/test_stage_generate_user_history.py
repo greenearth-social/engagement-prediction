@@ -30,14 +30,27 @@ def build_history(stage_module):
     def _build_history(
         *,
         likes_lf: pl.LazyFrame,
+        history_only_likes_lf: pl.LazyFrame | None = None,
         max_prior_likes: int | None,
         logger: logging.Logger,
         liked_post_hour_cumulative_likes_lf: pl.LazyFrame | None = None,
     ) -> pl.LazyFrame:
+        if history_only_likes_lf is None:
+            history_columns = [
+                "did",
+                "record_created_at",
+                "like_hour_bucket",
+                "subject_uri",
+                "emb_idx",
+            ]
+            if "author_idx" in likes_lf.collect_schema():
+                history_columns.append("author_idx")
+            history_only_likes_lf = likes_lf.select(history_columns).head(0)
         if liked_post_hour_cumulative_likes_lf is None:
             liked_post_hour_cumulative_likes_lf = _default_popularity_curve(likes_lf)
         return stage_module._build_user_history_directory(
-            likes_lf=likes_lf,
+            target_likes_lf=likes_lf,
+            history_only_likes_lf=history_only_likes_lf,
             liked_post_hour_cumulative_likes_lf=liked_post_hour_cumulative_likes_lf,
             max_prior_likes=max_prior_likes,
             logger=logger,
@@ -127,6 +140,11 @@ def _history_popularity_by_bucket(df: pl.DataFrame) -> dict[datetime, list[int]]
         row["like_hour_bucket"]: list(row["prior_cumulative_likes"])
         for row in df.iter_rows(named=True)
     }
+
+
+def test_missing_history_only_artifact_requires_stage_one_rerun(stage_module, tmp_path):
+    with pytest.raises(FileNotFoundError, match="Rerun Stage 1"):
+        stage_module._load_required_history_only_likes(tmp_path)
 
 
 def test_user_hour_history_preserves_empty_first_bucket(build_history):
@@ -310,6 +328,88 @@ def test_user_hour_history_multiple_users(build_history):
     }
     assert histories[("u1", datetime(2024, 1, 2))] == [1]
     assert histories[("u2", datetime(2024, 1, 3))] == [11]
+
+
+def test_unseen_validation_and_holdout_targets_receive_warm_history(build_history):
+    logger = _make_test_logger()
+    target_likes_lf = _make_likes(
+        ["unseen", "unseen"],
+        [
+            datetime(2024, 1, 3, 10, 15),
+            datetime(2024, 1, 5, 12, 20),
+        ],
+        ["target:val", "target:holdout"],
+        [300, 500],
+        author_idxs=[3, 5],
+    )
+    history_only_likes_lf = _make_likes(
+        ["unseen", "unseen"],
+        [
+            datetime(2024, 1, 1, 8, 0),
+            datetime(2024, 1, 2, 9, 30),
+        ],
+        ["history:old", "history:recent"],
+        [100, 200],
+        author_idxs=[1, 2],
+    )
+    popularity_lf = _make_popularity_curve(
+        [100, 200, 300],
+        [
+            datetime(2024, 1, 1, 9),
+            datetime(2024, 1, 2, 10),
+            datetime(2024, 1, 3, 11),
+        ],
+        [10, 20, 30],
+    )
+
+    result = build_history(
+        likes_lf=target_likes_lf,
+        history_only_likes_lf=history_only_likes_lf,
+        liked_post_hour_cumulative_likes_lf=popularity_lf,
+        max_prior_likes=None,
+        logger=logger,
+    ).collect().sort("like_hour_bucket")
+
+    assert result["like_hour_bucket"].to_list() == [
+        datetime(2024, 1, 3, 10),
+        datetime(2024, 1, 5, 12),
+    ]
+    assert result["prior_emb_indices"][0].to_list() == [200, 100]
+    assert result["prior_author_indices"][0].to_list() == [2, 1]
+    assert result["prior_emb_indices"][1].to_list() == [300, 200, 100]
+    assert result["prior_author_indices"][1].to_list() == [3, 2, 1]
+
+
+def test_history_only_same_hour_and_future_likes_are_excluded(build_history):
+    logger = _make_test_logger()
+    target_likes_lf = _make_likes(
+        ["unseen"],
+        [datetime(2024, 1, 3, 10, 15)],
+        ["target"],
+        [300],
+    )
+    history_only_likes_lf = _make_likes(
+        ["unseen", "unseen", "unseen"],
+        [
+            datetime(2024, 1, 3, 9, 59),
+            datetime(2024, 1, 3, 10, 0),
+            datetime(2024, 1, 3, 11, 0),
+        ],
+        ["prior", "same-hour", "future"],
+        [100, 200, 400],
+    )
+
+    result = build_history(
+        likes_lf=target_likes_lf,
+        history_only_likes_lf=history_only_likes_lf,
+        max_prior_likes=None,
+        logger=logger,
+    ).collect()
+
+    assert result["prior_emb_indices"][0].to_list() == [100]
+    assert result["prior_like_age_hours_at_bucket_start"][0].to_list() == pytest.approx(
+        [1.0 / 60.0]
+    )
 
 
 def test_user_hour_history_output_schema(build_history):

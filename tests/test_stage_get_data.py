@@ -141,7 +141,7 @@ def test_load_likes_filters_time_and_min_likes(tmp_path, stage_get_data_module):
     )
     logger = logging.getLogger("test_stage_get_data.likes")
 
-    likes_df, stats = stage_get_data_module._load_likes_core_polars(
+    likes_df, history_only_likes_df, stats = stage_get_data_module._load_likes_core_polars(
         raw_likes_lf=raw_likes_lf,
         max_trainval_users=None,
         max_unseen_eval_users=0,
@@ -168,6 +168,13 @@ def test_load_likes_filters_time_and_min_likes(tmp_path, stage_get_data_module):
     }
     assert buckets_by_uri["post:1"].isoformat() == "2024-01-02T00:00:00+00:00"
     assert buckets_by_uri["post:2"].isoformat() == "2024-01-03T00:00:00+00:00"
+    assert history_only_likes_df.height == 0
+    assert history_only_likes_df.columns == [
+        "did",
+        "subject_uri",
+        "record_created_at",
+        "like_hour_bucket",
+    ]
 
 
 def test_load_likes_per_user_cap(tmp_path, stage_get_data_module):
@@ -186,7 +193,7 @@ def test_load_likes_per_user_cap(tmp_path, stage_get_data_module):
     )
     logger = logging.getLogger("test_stage_get_data.likes_cap")
 
-    likes_df, _ = stage_get_data_module._load_likes_core_polars(
+    likes_df, history_only_likes_df, _ = stage_get_data_module._load_likes_core_polars(
         raw_likes_lf=raw_likes_lf,
         max_trainval_users=None,
         max_unseen_eval_users=0,
@@ -199,6 +206,7 @@ def test_load_likes_per_user_cap(tmp_path, stage_get_data_module):
 
     assert likes_df.filter(pl.col("did") == "user_a").height == 2
     assert likes_df.filter(pl.col("did") == "user_b").height == 1
+    assert history_only_likes_df.height == 0
 
 
 def test_get_sampled_user_cohorts_deterministic_and_disjoint(stage_get_data_module):
@@ -231,7 +239,7 @@ def test_get_sampled_user_cohorts_deterministic_and_disjoint(stage_get_data_modu
     assert trainval.isdisjoint(unseen)
 
 
-def test_load_likes_unseen_eval_discards_train_window_and_labels_splits(tmp_path, stage_get_data_module):
+def test_load_likes_unseen_eval_preserves_train_window_as_history_only(tmp_path, stage_get_data_module):
     likes_rows = []
     for user_idx in range(8):
         for ts in [
@@ -253,7 +261,7 @@ def test_load_likes_unseen_eval_discards_train_window_and_labels_splits(tmp_path
     )
     logger = logging.getLogger("test_stage_get_data.unseen_splits")
 
-    likes_df, stats = stage_get_data_module._load_likes_core_polars(
+    likes_df, history_only_likes_df, stats = stage_get_data_module._load_likes_core_polars(
         raw_likes_lf=raw_likes_lf,
         max_trainval_users=3,
         max_unseen_eval_users=2,
@@ -288,6 +296,23 @@ def test_load_likes_unseen_eval_discards_train_window_and_labels_splits(tmp_path
         & (pl.col("split") == "train")
     )
     assert unseen_train_rows.height == 0
+    assert set(history_only_likes_df["did"].to_list()) == unseen_users
+    assert set(
+        history_only_likes_df["record_created_at"].dt.date().cast(pl.String).to_list()
+    ) == {"2024-01-02"}
+    assert set(
+        zip(
+            likes_df["did"].to_list(),
+            likes_df["subject_uri"].to_list(),
+        )
+    ).isdisjoint(
+        set(
+            zip(
+                history_only_likes_df["did"].to_list(),
+                history_only_likes_df["subject_uri"].to_list(),
+            )
+        )
+    )
 
 
 def test_load_likes_holdout_end_filters_rows(tmp_path, stage_get_data_module):
@@ -305,7 +330,7 @@ def test_load_likes_holdout_end_filters_rows(tmp_path, stage_get_data_module):
     )
     logger = logging.getLogger("test_stage_get_data.holdout_end")
 
-    likes_df, _ = stage_get_data_module._load_likes_core_polars(
+    likes_df, history_only_likes_df, _ = stage_get_data_module._load_likes_core_polars(
         raw_likes_lf=raw_likes_lf,
         max_trainval_users=None,
         max_unseen_eval_users=0,
@@ -320,6 +345,118 @@ def test_load_likes_holdout_end_filters_rows(tmp_path, stage_get_data_module):
     )
 
     assert set(likes_df["subject_uri"].to_list()) == {"post:1", "post:2"}
+    assert history_only_likes_df.height == 0
+
+
+def test_history_only_cap_is_independent_recent_and_deterministic(
+    tmp_path,
+    stage_get_data_module,
+):
+    likes_rows = [
+        {"did": "unseen", "subject_uri": "history:old", "record_created_at": "2024-01-01T01:00:00"},
+        {"did": "unseen", "subject_uri": "history:b", "record_created_at": "2024-01-02T10:00:00"},
+        {"did": "unseen", "subject_uri": "history:a", "record_created_at": "2024-01-02T10:00:00"},
+        {"did": "unseen", "subject_uri": "target:1", "record_created_at": "2024-01-03T01:00:00"},
+        {"did": "unseen", "subject_uri": "target:2", "record_created_at": "2024-01-04T01:00:00"},
+        {"did": "unseen", "subject_uri": "target:3", "record_created_at": "2024-01-05T01:00:00"},
+    ]
+    likes_path = _write_likes_parquet(tmp_path, likes_rows)
+    raw_likes_lf = _scan_likes_lf(
+        stage_get_data_module,
+        likes_path,
+        "2024-01-01T00:00:00",
+        "2024-01-06T00:00:00",
+    )
+    kwargs = dict(
+        raw_likes_lf=raw_likes_lf,
+        max_trainval_users=0,
+        max_unseen_eval_users=1,
+        max_likes_per_user=2,
+        min_likes_per_user=1,
+        random_seed=7,
+        **_split_kwargs(),
+        logger=logging.getLogger("test_stage_get_data.history_cap"),
+    )
+
+    first_targets, first_history, first_stats = (
+        stage_get_data_module._load_likes_core_polars(**kwargs)
+    )
+    second_targets, second_history, _ = (
+        stage_get_data_module._load_likes_core_polars(**kwargs)
+    )
+
+    assert first_targets.height == 2
+    assert first_history["subject_uri"].to_list() == ["history:a", "history:b"]
+    assert first_history.to_dicts() == second_history.to_dicts()
+    assert first_targets.sort("subject_uri").to_dicts() == second_targets.sort("subject_uri").to_dicts()
+    assert first_stats["n_likes_after_per_user_cap"] == 2
+    assert first_stats["n_history_only_likes_before_per_user_cap"] == 3
+    assert first_stats["n_history_only_likes_after_per_user_cap"] == 2
+
+
+def test_history_only_duplicate_pair_prefers_target_membership(
+    tmp_path,
+    stage_get_data_module,
+):
+    likes_rows = [
+        {"did": "unseen", "subject_uri": "post:same", "record_created_at": "2024-01-02T01:00:00"},
+        {"did": "unseen", "subject_uri": "post:same", "record_created_at": "2024-01-04T01:00:00"},
+    ]
+    likes_path = _write_likes_parquet(tmp_path, likes_rows)
+
+    targets, history_only, _ = stage_get_data_module._load_likes_core_polars(
+        raw_likes_lf=_scan_likes_lf(
+            stage_get_data_module,
+            likes_path,
+            "2024-01-01T00:00:00",
+            "2024-01-05T00:00:00",
+        ),
+        max_trainval_users=0,
+        max_unseen_eval_users=1,
+        max_likes_per_user=0,
+        min_likes_per_user=1,
+        random_seed=7,
+        **_split_kwargs(),
+        logger=logging.getLogger("test_stage_get_data.history_target_precedence"),
+    )
+
+    assert targets["subject_uri"].to_list() == ["post:same"]
+    assert history_only.height == 0
+
+
+def test_filter_history_only_requires_valid_post_and_final_target(stage_get_data_module):
+    history_only_likes_df = pl.DataFrame({
+        "did": ["kept", "kept", "removed_user"],
+        "subject_uri": ["post:valid", "post:missing", "post:valid"],
+        "record_created_at": [
+            datetime(2024, 1, 1),
+            datetime(2024, 1, 1),
+            datetime(2024, 1, 1),
+        ],
+        "like_hour_bucket": [
+            datetime(2024, 1, 1),
+            datetime(2024, 1, 1),
+            datetime(2024, 1, 1),
+        ],
+    })
+    target_likes_df = pl.DataFrame({
+        "did": ["kept"],
+        "subject_uri": ["post:target"],
+    })
+    posts_core_df = pl.DataFrame({
+        "at_uri": ["post:valid", "post:target"],
+    })
+
+    result, stats = stage_get_data_module._filter_history_only_likes_after_post_join(
+        history_only_likes_df,
+        target_likes_df,
+        posts_core_df,
+        logging.getLogger("test_stage_get_data.history_filter"),
+    )
+
+    assert result.select(["did", "subject_uri"]).rows() == [("kept", "post:valid")]
+    assert stats["n_history_only_likes_removed_missing_post"] == 1
+    assert stats["n_history_only_likes_removed_no_final_target"] == 1
 
 
 def test_exact_prior_cumulative_likes_excludes_same_hour_for_positives(stage_get_data_module):

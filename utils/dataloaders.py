@@ -69,6 +69,7 @@ from utils.helpers import (
     log_operation_start,
     validate_dataframe_schema,
     HISTORY_POPULARITY_SEMANTICS,
+    HISTORY_SOURCE_SEMANTICS,
 )
 from shared.input_data_helpers import (
     get_padded_embedding_history_and_mask,
@@ -929,6 +930,26 @@ def validate_history_popularity_semantics(history_dir: Path) -> None:
         )
 
 
+def validate_history_source_semantics(history_dir: Path) -> None:
+    summary_path = history_dir / "summary.json"
+    if not summary_path.exists():
+        raise RuntimeError(
+            "Training and compare-rankers require a Stage 2 summary.json with "
+            f"history_source_semantics={HISTORY_SOURCE_SEMANTICS!r}. "
+            "Rerun Stages 1 and 2 to generate warm histories for unseen evaluation users. "
+            f"Missing: {summary_path}"
+        )
+    with open(summary_path) as f:
+        summary = json.load(f)
+    actual_semantics = summary.get("history_source_semantics")
+    if actual_semantics != HISTORY_SOURCE_SEMANTICS:
+        raise RuntimeError(
+            "Training and compare-rankers require warm unseen-user history inputs. "
+            f"Expected history_source_semantics={HISTORY_SOURCE_SEMANTICS!r}, "
+            f"got {actual_semantics!r} in {summary_path}. Rerun Stages 1 and 2."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Bucketed two-tower data path
 # ---------------------------------------------------------------------------
@@ -941,6 +962,11 @@ def load_bucketed_training_data(
     """Locate and load artifacts for bucketed two-tower training."""
     if logger is None:
         logger = get_stage_logger("DATALOADERS")
+
+    history_dir = _resolve_prior(context, stage_key="user_history", folder="02_user_history")
+    validate_history_source_semantics(history_dir)
+    if require_target_hour_history_popularity:
+        validate_history_popularity_semantics(history_dir)
 
     log_operation_start("Locate embeddings memmap", "DATALOADERS", logger)
     get_data_dir = _resolve_prior(context, stage_key="get_data", folder="01_get_data")
@@ -968,9 +994,6 @@ def load_bucketed_training_data(
         logger.info("No author_idx artifact found in get_data output")
 
     log_operation_start("Locate user_history", "DATALOADERS", logger)
-    history_dir = _resolve_prior(context, stage_key="user_history", folder="02_user_history")
-    if require_target_hour_history_popularity:
-        validate_history_popularity_semantics(history_dir)
     history_df = load_parquet_from_prior(history_dir, "history_posts_").collect()
     logger.info(f"Loaded user_history: {len(history_df):,} rows")
 
