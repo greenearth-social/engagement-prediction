@@ -1094,18 +1094,25 @@ def _load_likes_core_polars(
             on=["did", "subject_uri"],
             how="anti",
         )
-    )
-    n_history_only_before_cap = (
-        history_only_likes_lf
-        .select(pl.len())
-        .collect(engine="streaming")
-        .item()
+        .with_columns(
+            pl.len().over("did").alias("_history_only_pre_cap_count")
+        )
     )
     history_only_likes_lf = _apply_per_user_recency_cap(
         history_only_likes_lf,
         max_likes_per_user,
     )
     history_only_likes_df = history_only_likes_lf.collect(engine="streaming")
+    n_history_only_before_cap = (
+        int(
+            history_only_likes_df
+            .select(["did", "_history_only_pre_cap_count"])
+            .unique(subset=["did"])
+            ["_history_only_pre_cap_count"]
+            .sum()
+        )
+        if history_only_likes_df.height > 0 else 0
+    )
     if history_only_likes_df.schema[TIMESTAMP_COL_NAME] != pl.Datetime:
         history_only_likes_df = history_only_likes_df.with_columns(
             pl.col(TIMESTAMP_COL_NAME).str.to_datetime(time_zone="UTC").alias(TIMESTAMP_COL_NAME)

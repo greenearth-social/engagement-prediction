@@ -359,6 +359,9 @@ def test_history_only_cap_is_independent_recent_and_deterministic(
         {"did": "unseen", "subject_uri": "target:1", "record_created_at": "2024-01-03T01:00:00"},
         {"did": "unseen", "subject_uri": "target:2", "record_created_at": "2024-01-04T01:00:00"},
         {"did": "unseen", "subject_uri": "target:3", "record_created_at": "2024-01-05T01:00:00"},
+        {"did": "unseen2", "subject_uri": "history2:old", "record_created_at": "2024-01-01T02:00:00"},
+        {"did": "unseen2", "subject_uri": "history2:recent", "record_created_at": "2024-01-02T11:00:00"},
+        {"did": "unseen2", "subject_uri": "target2:1", "record_created_at": "2024-01-03T02:00:00"},
     ]
     likes_path = _write_likes_parquet(tmp_path, likes_rows)
     raw_likes_lf = _scan_likes_lf(
@@ -370,7 +373,7 @@ def test_history_only_cap_is_independent_recent_and_deterministic(
     kwargs = dict(
         raw_likes_lf=raw_likes_lf,
         max_trainval_users=0,
-        max_unseen_eval_users=1,
+        max_unseen_eval_users=2,
         max_likes_per_user=2,
         min_likes_per_user=1,
         random_seed=7,
@@ -385,13 +388,18 @@ def test_history_only_cap_is_independent_recent_and_deterministic(
         stage_get_data_module._load_likes_core_polars(**kwargs)
     )
 
-    assert first_targets.height == 2
-    assert first_history["subject_uri"].to_list() == ["history:a", "history:b"]
+    assert first_targets.height == 3
+    assert first_history["subject_uri"].to_list() == [
+        "history:a",
+        "history:b",
+        "history2:recent",
+        "history2:old",
+    ]
     assert first_history.to_dicts() == second_history.to_dicts()
     assert first_targets.sort("subject_uri").to_dicts() == second_targets.sort("subject_uri").to_dicts()
-    assert first_stats["n_likes_after_per_user_cap"] == 2
-    assert first_stats["n_history_only_likes_before_per_user_cap"] == 3
-    assert first_stats["n_history_only_likes_after_per_user_cap"] == 2
+    assert first_stats["n_likes_after_per_user_cap"] == 3
+    assert first_stats["n_history_only_likes_before_per_user_cap"] == 5
+    assert first_stats["n_history_only_likes_after_per_user_cap"] == 4
 
 
 def test_history_only_duplicate_pair_prefers_target_membership(
