@@ -111,9 +111,15 @@ memory_check: "skip"
 
 Important Stage 1 behavior:
 
-- `max_likes_per_user` applies a deterministic random per-user cap.
+- `max_likes_per_user` controls two independent pools. Target likes in `likes_core`
+  use the existing deterministic hash-random per-user cap. Unseen users'
+  history-only likes use the same numeric cap separately and retain the most
+  recent rows, with post URI as the timestamp tie-breaker. A history-only row
+  never consumes a target slot.
 - `max_trainval_users` samples users eligible for train/validation/seen-holdout rows.
-- `max_unseen_eval_users` samples users used only for unseen validation and holdout.
+- `max_unseen_eval_users` samples users whose targets are limited to unseen
+  validation and holdout. Their likes in `[train_start, val_start)` are retained
+  separately in `history_only_likes`; they are not targets.
 - `initial_negative_sampling_pct` hash-samples posts before global like counts are built for negative candidates.
 - `min_likes_per_negative_post` filters negative candidates by global like count over the configured likes window.
 - `negative_samples_per_hour` controls sampled negative post-hour rows. Each candidate is eligible from its created-hour through created-hour + 23.
@@ -121,12 +127,25 @@ Important Stage 1 behavior:
 - `prior_cumulative_likes` is written to `likes_core` and `posts_core` as an exact prior-hour count from the configured likes window for selected positive and negative post-hour rows; same-hour likes are not included.
 - `liked_post_hour_cumulative_likes_*.parquet` stores sparse prior-hour popularity curves keyed by `emb_idx` for final liked/history posts only. It is used by Stage 2 history features, not sampled negatives.
 - `min_author_support` controls which authors get dedicated author embedding rows when author features are enabled.
+- History-only post URIs are loaded into post metadata and the embedding memmap
+  so they can be used as history. They are not eligible as positive targets or
+  sampled negatives unless the existing negative sampler independently selects
+  the same post.
 
-Primary artifacts include `likes_core_*.parquet`, `posts_core_*.parquet`, `liked_post_hour_cumulative_likes_*.parquet`, `embeddings_*.npy`, and, when available, `author_idx_*.parquet`.
+Primary artifacts include `likes_core_*.parquet`,
+`history_only_likes_*.parquet`, `posts_core_*.parquet`,
+`liked_post_hour_cumulative_likes_*.parquet`, `embeddings_*.npy`, and, when
+available, `author_idx_*.parquet`.
 
 ### Stage 2: User History
 
 Stage 2 creates `history_posts_*.parquet`, keyed by `(did, like_hour_bucket)`.
+Output keys come only from target rows in `likes_core`. Prior-history candidates
+come from `likes_core` plus `history_only_likes`, and a candidate is eligible
+only when its timestamp is strictly before the target hour. Thus the first
+`val_unseen_users` target can use pre-validation history, while a
+`holdout_unseen_users` target can use both pre-validation likes and earlier
+validation likes. Split names and evaluation metric names are unchanged.
 
 The history artifact includes:
 
@@ -141,6 +160,12 @@ Common config:
 ```yaml
 max_prior_likes: 64
 ```
+
+Stage 2 records
+`history_source_semantics=targets_plus_unseen_pre_validation_history`.
+Training and `compare-rankers` require this marker, so artifacts produced before
+warm unseen-user histories were introduced must be regenerated as an aligned
+Stage 1/Stage 2 pair.
 
 ### Stage 3: Training
 

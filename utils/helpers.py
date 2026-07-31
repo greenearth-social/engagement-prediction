@@ -22,6 +22,7 @@ import subprocess
 
 
 HISTORY_POPULARITY_SEMANTICS = "target_hour"
+HISTORY_SOURCE_SEMANTICS = "targets_plus_unseen_pre_validation_history"
 
 
 if TYPE_CHECKING:  # pragma: no cover

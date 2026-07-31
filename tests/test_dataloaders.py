@@ -17,6 +17,7 @@ from utils.dataloaders import (
     create_bucketed_data_loaders,
     get_author_table_num_rows,
     validate_history_popularity_semantics,
+    validate_history_source_semantics,
 )
 
 stage_train_bst_user_id_only = importlib.import_module("utils.03_train.stage_train_bst_user_id_only")
@@ -166,6 +167,32 @@ def test_validate_history_popularity_semantics_rejects_stale_summary(tmp_path):
 def test_validate_history_popularity_semantics_rejects_missing_summary(tmp_path):
     with pytest.raises(RuntimeError, match="summary.json"):
         validate_history_popularity_semantics(tmp_path)
+
+
+def test_validate_history_source_semantics_accepts_warm_history_summary(tmp_path):
+    (tmp_path / "summary.json").write_text(json.dumps({
+        "history_source_semantics": "targets_plus_unseen_pre_validation_history",
+    }))
+
+    validate_history_source_semantics(tmp_path)
+
+
+@pytest.mark.parametrize("actual_semantics", [None, "targets_only"])
+def test_validate_history_source_semantics_rejects_old_artifacts(
+    tmp_path,
+    actual_semantics,
+):
+    (tmp_path / "summary.json").write_text(json.dumps({
+        "history_source_semantics": actual_semantics,
+    }))
+
+    with pytest.raises(RuntimeError, match="Rerun Stages 1 and 2"):
+        validate_history_source_semantics(tmp_path)
+
+
+def test_validate_history_source_semantics_rejects_missing_summary(tmp_path):
+    with pytest.raises(RuntimeError, match="Rerun Stages 1 and 2"):
+        validate_history_source_semantics(tmp_path)
 
 
 def test_bucketed_dataset_groups_user_hours_and_joins_history(bucketed_dataset):
