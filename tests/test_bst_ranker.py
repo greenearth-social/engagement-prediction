@@ -1043,6 +1043,16 @@ def test_train_bst_ranker_model_uses_val_unseen_ndcg_for_listwise_primary_metric
     assert (tmp_path / "bst_ranker_best.pth").exists()
     assert calc_baseline_metrics_calls == [True, True, True, False, False, False, False, False, False]
     for series in (
+        "Train NDCG@1",
+        "Validation NDCG@1",
+        "Validation Unseen Users NDCG@1",
+        "Train Recall@1",
+        "Validation Recall@1",
+        "Validation Unseen Users Recall@1",
+    ):
+        matching_calls = [call for call in tracker.calls if call["series"] == series]
+        assert [call["iteration"] for call in matching_calls] == [0, 1, 2, 3]
+    for series in (
         "Train Baseline NDCG@1",
         "Validation Baseline NDCG@1",
         "Validation Unseen Users Baseline NDCG@1",
@@ -1051,4 +1061,4 @@ def test_train_bst_ranker_model_uses_val_unseen_ndcg_for_listwise_primary_metric
         "Validation Unseen Users Baseline Recall@1",
     ):
         matching_calls = [call for call in tracker.calls if call["series"] == series]
-        assert [call["iteration"] for call in matching_calls] == [1]
+        assert matching_calls == []

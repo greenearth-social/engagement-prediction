@@ -1106,6 +1106,19 @@ def _log_bst_listwise_epoch_metrics(
             iteration,
         )
     for k in metrics_top_ks:
+        if calc_baseline_metrics:
+            for metric_name, metric_label in ((f"ndcg@{k}", f"NDCG@{k}"), (f"recall@{k}", f"Recall@{k}")):
+                for split_label, metrics in (
+                    ("Train", train_baseline_metrics),
+                    ("Validation", val_baseline_metrics),
+                    ("Validation Unseen Users", val_unseen_baseline_metrics),
+                ):
+                    experiment_tracker.log_scalar(
+                        metric_label,
+                        f"{split_label} {metric_label}",
+                        float(metrics[metric_name]),
+                        0,
+                    )
         for metric_name, metric_label in ((f"ndcg@{k}", f"NDCG@{k}"), (f"recall@{k}", f"Recall@{k}")):
             for split_label, metrics in (
                 ("Train", train_metrics),
@@ -1116,19 +1129,6 @@ def _log_bst_listwise_epoch_metrics(
                 if metric_value is None:
                     continue
                 experiment_tracker.log_scalar(metric_label, f"{split_label} {metric_label}", float(metric_value), iteration)
-        if calc_baseline_metrics:
-            for metric_name, metric_label in ((f"ndcg@{k}", f"Baseline NDCG@{k}"), (f"recall@{k}", f"Baseline Recall@{k}")):
-                for split_label, metrics in (
-                    ("Train", train_baseline_metrics),
-                    ("Validation", val_baseline_metrics),
-                    ("Validation Unseen Users", val_unseen_baseline_metrics),
-                ):
-                    experiment_tracker.log_scalar(
-                        metric_label,
-                        f"{split_label} {metric_label}",
-                        float(metrics[metric_name]),
-                        iteration,
-                    )
     log_zero_history_rank_metrics(
         experiment_tracker,
         {

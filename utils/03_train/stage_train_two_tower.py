@@ -767,6 +767,43 @@ def train_two_tower_model(
                 iteration=iteration,
             )
             for k in metrics_top_ks:
+                if calc_baseline_metrics:
+                    experiment_tracker.log_scalar(
+                        title=f"NDCG@{k}",
+                        series=f"Train NDCG@{k}",
+                        value=float(train_baseline_metrics_dict[f"ndcg@{k}"]),
+                        iteration=0,
+                    )
+                    experiment_tracker.log_scalar(
+                        title=f"NDCG@{k}",
+                        series=f"Validation NDCG@{k}",
+                        value=float(val_baseline_metrics_dict[f"ndcg@{k}"]),
+                        iteration=0,
+                    )
+                    experiment_tracker.log_scalar(
+                        title=f"NDCG@{k}",
+                        series=f"Validation Unseen Users NDCG@{k}",
+                        value=float(val_unseen_baseline_metrics_dict[f"ndcg@{k}"]),
+                        iteration=0,
+                    )
+                    experiment_tracker.log_scalar(
+                        title=f"Recall@{k}",
+                        series=f"Train Recall@{k}",
+                        value=float(train_baseline_metrics_dict[f"recall@{k}"]),
+                        iteration=0,
+                    )
+                    experiment_tracker.log_scalar(
+                        title=f"Recall@{k}",
+                        series=f"Validation Recall@{k}",
+                        value=float(val_baseline_metrics_dict[f"recall@{k}"]),
+                        iteration=0,
+                    )
+                    experiment_tracker.log_scalar(
+                        title=f"Recall@{k}",
+                        series=f"Validation Unseen Users Recall@{k}",
+                        value=float(val_unseen_baseline_metrics_dict[f"recall@{k}"]),
+                        iteration=0,
+                    )
                 experiment_tracker.log_scalar(
                     title=f"NDCG@{k}",
                     series=f"Train NDCG@{k}",
@@ -803,43 +840,6 @@ def train_two_tower_model(
                     value=float(val_unseen_metrics_dict[f"recall@{k}"]),
                     iteration=iteration,
                 )
-                if calc_baseline_metrics:
-                    experiment_tracker.log_scalar(
-                        title=f"Baseline NDCG@{k}",
-                        series=f"Train Baseline NDCG@{k}",
-                        value=float(train_baseline_metrics_dict[f"ndcg@{k}"]),
-                        iteration=iteration,
-                    )
-                    experiment_tracker.log_scalar(
-                        title=f"Baseline NDCG@{k}",
-                        series=f"Validation Baseline NDCG@{k}",
-                        value=float(val_baseline_metrics_dict[f"ndcg@{k}"]),
-                        iteration=iteration,
-                    )
-                    experiment_tracker.log_scalar(
-                        title=f"Baseline NDCG@{k}",
-                        series=f"Validation Unseen Users Baseline NDCG@{k}",
-                        value=float(val_unseen_baseline_metrics_dict[f"ndcg@{k}"]),
-                        iteration=iteration,
-                    )
-                    experiment_tracker.log_scalar(
-                        title=f"Baseline Recall@{k}",
-                        series=f"Train Baseline Recall@{k}",
-                        value=float(train_baseline_metrics_dict[f"recall@{k}"]),
-                        iteration=iteration,
-                    )
-                    experiment_tracker.log_scalar(
-                        title=f"Baseline Recall@{k}",
-                        series=f"Validation Baseline Recall@{k}",
-                        value=float(val_baseline_metrics_dict[f"recall@{k}"]),
-                        iteration=iteration,
-                    )
-                    experiment_tracker.log_scalar(
-                        title=f"Baseline Recall@{k}",
-                        series=f"Validation Unseen Users Baseline Recall@{k}",
-                        value=float(val_unseen_baseline_metrics_dict[f"recall@{k}"]),
-                        iteration=iteration,
-                    )
             log_zero_history_rank_metrics(
                 experiment_tracker,
                 {
