@@ -347,6 +347,8 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
             bst_post_liker_projection_dim: 10
             bst_post_liker_pooling_tau_hours: 72.0
             bst_target_user_projection_dim: 11
+            bst_post_liker_user_dropout_rate: 0.25
+            bst_target_user_dropout_rate: 0.6
             bst_max_post_liker_replay_events_per_post: 25
             """
         ).strip()
@@ -374,6 +376,8 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
     assert merged.bst_post_liker_projection_dim == 10
     assert merged.bst_post_liker_pooling_tau_hours == 72.0
     assert merged.bst_target_user_projection_dim == 11
+    assert merged.bst_post_liker_user_dropout_rate == 0.25
+    assert merged.bst_target_user_dropout_rate == 0.6
     assert merged.bst_max_post_liker_replay_events_per_post == 25
     cli._validate_bst_config(merged)
 
@@ -396,6 +400,8 @@ def test_bst_ranker_training_defaults():
     assert merged.bst_post_liker_projection_dim == 16
     assert merged.bst_post_liker_pooling_tau_hours == 168.0
     assert merged.bst_target_user_projection_dim == 16
+    assert merged.bst_post_liker_user_dropout_rate == 0.2
+    assert merged.bst_target_user_dropout_rate == 0.5
     assert merged.bst_max_post_liker_replay_events_per_post == 32
     cli._validate_bst_config(merged)
 
@@ -503,6 +509,44 @@ def test_bst_ranker_validates_post_liker_replay_cap_when_configured():
 
     with pytest.raises(ValueError, match="bst-max-post-liker-replay-events-per-post"):
         cli._validate_bst_config(merged)
+
+
+@pytest.mark.parametrize(
+    ("arg_name", "error_match"),
+    [
+        ("bst_post_liker_user_dropout_rate", "bst-post-liker-user-dropout-rate"),
+        ("bst_target_user_dropout_rate", "bst-target-user-dropout-rate"),
+    ],
+)
+def test_bst_ranker_validates_user_idx_dropout_rates(arg_name, error_match):
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "bst-ranker",
+        "--use-author-embedding-table",
+        "--prediction-hidden-dims", "144", "72",
+    ])
+    merged = cli._merge_args_with_config(raw)
+    setattr(merged, arg_name, 1.1)
+
+    with pytest.raises(ValueError, match=error_match):
+        cli._validate_bst_config(merged)
+
+
+@pytest.mark.parametrize(
+    ("arg_name", "error_match"),
+    [
+        ("bst_post_liker_user_dropout_rate", "bst-post-liker-user-dropout-rate"),
+        ("bst_target_user_dropout_rate", "bst-target-user-dropout-rate"),
+    ],
+)
+def test_bst_user_id_only_validates_user_idx_dropout_rates(arg_name, error_match):
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--model-type", "bst-user-id-only"])
+    merged = cli._merge_args_with_config(raw)
+    setattr(merged, arg_name, -0.1)
+
+    with pytest.raises(ValueError, match=error_match):
+        cli._validate_bst_user_id_only_config(merged)
 
 
 def test_bst_ranker_requires_post_liker_replay_cap_when_pooling_enabled(tmp_path):

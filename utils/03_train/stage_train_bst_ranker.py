@@ -220,6 +220,8 @@ class BSTRanker(nn.Module):
         post_liker_projection_dim: int,
         post_liker_pooling_tau_hours: float,
         target_user_projection_dim: int,
+        post_liker_user_dropout_rate: float,
+        target_user_dropout_rate: float,
     ):
         super().__init__()
         if time_embedding_dim <= 0:
@@ -246,6 +248,10 @@ class BSTRanker(nn.Module):
             raise ValueError("post_liker_pooling_tau_hours must be positive when post-liker pooling is enabled")
         if use_post_liker_user_pooling and target_user_projection_dim <= 0:
             raise ValueError("target_user_projection_dim must be positive when post-liker pooling is enabled")
+        if not 0.0 <= post_liker_user_dropout_rate <= 1.0:
+            raise ValueError("post_liker_user_dropout_rate must be in [0, 1]")
+        if not 0.0 <= target_user_dropout_rate <= 1.0:
+            raise ValueError("target_user_dropout_rate must be in [0, 1]")
 
         self.post_embedding_dim = int(post_embedding_dim)
         self.content_projection_dim = int(content_projection_dim)
@@ -263,6 +269,8 @@ class BSTRanker(nn.Module):
         self.post_liker_projection_dim = int(post_liker_projection_dim) if self.use_post_liker_user_pooling else 0
         self.post_liker_pooling_tau_hours = float(post_liker_pooling_tau_hours)
         self.target_user_projection_dim = int(target_user_projection_dim) if self.use_post_liker_user_pooling else 0
+        self.post_liker_user_dropout_rate = float(post_liker_user_dropout_rate) if self.use_post_liker_user_pooling else 0.0
+        self.target_user_dropout_rate = float(target_user_dropout_rate) if self.use_post_liker_user_pooling else 0.0
         self.time_delta_bucket_boundaries_hours = _validate_time_delta_bucket_boundaries(
             time_delta_bucket_boundaries_hours
         )
@@ -358,12 +366,27 @@ class BSTRanker(nn.Module):
             device=self.post_liker_user_embedding.weight.device,
             dtype=torch.long,
         )
+        target_user_indices = self._apply_user_idx_unk_dropout(
+            target_user_indices,
+            self.target_user_dropout_rate,
+        )
         target_user_embeddings = self.post_liker_user_embedding(target_user_indices)
         return self.target_user_projection_norm(
             self.target_user_projection_activation(
                 self.target_user_projection(target_user_embeddings)
             )
         )
+
+    def _apply_user_idx_unk_dropout(
+        self,
+        user_indices: torch.Tensor,
+        dropout_rate: float,
+    ) -> torch.Tensor:
+        if not self.training or dropout_rate <= 0.0:
+            return user_indices
+        eligible = user_indices.gt(1)
+        dropout_mask = eligible & torch.rand(user_indices.size(), device=user_indices.device).lt(dropout_rate)
+        return torch.where(dropout_mask, torch.ones_like(user_indices), user_indices)
 
     def _forward_transformer(
         self,
@@ -444,6 +467,14 @@ class BSTRanker(nn.Module):
             history_post_liker_time_gap_tensor = torch.jit._unwrap_optional(history_post_liker_time_gap_hours).to(device=device, dtype=torch.float32)
             candidate_post_liker_user_indices_tensor = torch.jit._unwrap_optional(candidate_post_liker_user_indices).to(device=device, dtype=torch.long)
             candidate_post_liker_time_gap_tensor = torch.jit._unwrap_optional(candidate_post_liker_time_gap_hours).to(device=device, dtype=torch.float32)
+            history_post_liker_user_indices_tensor = self._apply_user_idx_unk_dropout(
+                history_post_liker_user_indices_tensor,
+                self.post_liker_user_dropout_rate,
+            )
+            candidate_post_liker_user_indices_tensor = self._apply_user_idx_unk_dropout(
+                candidate_post_liker_user_indices_tensor,
+                self.post_liker_user_dropout_rate,
+            )
             history_post_liker_features = self.post_liker_user_pooler(
                 history_post_liker_user_indices_tensor,
                 history_post_liker_time_gap_tensor,
@@ -724,6 +755,14 @@ class BSTRanker(nn.Module):
             target_user_indices_tensor = torch.jit._unwrap_optional(target_user_indices).to(device=device, dtype=torch.long)
             if target_user_indices_tensor.dim() != 1 or target_user_indices_tensor.size(0) != num_users:
                 raise RuntimeError("target_user_indices must have shape [U]")
+            history_post_liker_user_indices_tensor = self._apply_user_idx_unk_dropout(
+                history_post_liker_user_indices_tensor,
+                self.post_liker_user_dropout_rate,
+            )
+            candidate_post_liker_user_indices_tensor = self._apply_user_idx_unk_dropout(
+                candidate_post_liker_user_indices_tensor,
+                self.post_liker_user_dropout_rate,
+            )
             history_post_liker_features = self.post_liker_user_pooler(
                 history_post_liker_user_indices_tensor,
                 history_post_liker_time_gap_tensor,
@@ -1367,6 +1406,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     post_liker_projection_dim = int(args.bst_post_liker_projection_dim)
     post_liker_pooling_tau_hours = float(args.bst_post_liker_pooling_tau_hours)
     target_user_projection_dim = int(args.bst_target_user_projection_dim)
+    post_liker_user_dropout_rate = float(args.bst_post_liker_user_dropout_rate)
+    target_user_dropout_rate = float(args.bst_target_user_dropout_rate)
     bst_max_post_liker_replay_events_per_post = args.bst_max_post_liker_replay_events_per_post
     if bst_max_post_liker_replay_events_per_post is not None:
         bst_max_post_liker_replay_events_per_post = int(bst_max_post_liker_replay_events_per_post)
@@ -1430,6 +1471,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             f"projection_dim={post_liker_projection_dim}, "
             f"target_user_projection_dim={target_user_projection_dim}, "
             f"pooling_tau_hours={post_liker_pooling_tau_hours}, "
+            f"post_liker_user_dropout_rate={post_liker_user_dropout_rate}, "
+            f"target_user_dropout_rate={target_user_dropout_rate}, "
             f"user_table_num_rows={post_liker_user_table_num_rows}, "
             f"max_post_liker_replay_events_per_post={bst_max_post_liker_replay_events_per_post}, "
             f"post_liker_event_rows={len(post_liker_events_df):,}, "
@@ -1543,6 +1586,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "bst_post_liker_projection_dim": post_liker_projection_dim,
         "bst_post_liker_pooling_tau_hours": post_liker_pooling_tau_hours,
         "bst_target_user_projection_dim": target_user_projection_dim,
+        "bst_post_liker_user_dropout_rate": post_liker_user_dropout_rate,
+        "bst_target_user_dropout_rate": target_user_dropout_rate,
         "bst_max_post_liker_replay_events_per_post": bst_max_post_liker_replay_events_per_post,
         "requires_target_user_indices": use_post_liker_user_pooling,
     }
@@ -1613,6 +1658,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         post_liker_projection_dim=post_liker_projection_dim,
         post_liker_pooling_tau_hours=post_liker_pooling_tau_hours,
         target_user_projection_dim=target_user_projection_dim,
+        post_liker_user_dropout_rate=post_liker_user_dropout_rate,
+        target_user_dropout_rate=target_user_dropout_rate,
     )
 
     log_operation_start(f"Train BST ranker (epochs={epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)

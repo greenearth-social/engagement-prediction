@@ -30,6 +30,8 @@ def _make_model(
     popularity_projection_dim: int | None = None,
     use_post_liker_user_pooling: bool = False,
     target_user_projection_dim: int = 2,
+    post_liker_user_dropout_rate: float = 0.0,
+    target_user_dropout_rate: float = 0.0,
 ) -> BSTRanker:
     torch.manual_seed(123)
     return BSTRanker(
@@ -58,6 +60,8 @@ def _make_model(
         post_liker_projection_dim=2,
         post_liker_pooling_tau_hours=10.0,
         target_user_projection_dim=target_user_projection_dim,
+        post_liker_user_dropout_rate=post_liker_user_dropout_rate,
+        target_user_dropout_rate=target_user_dropout_rate,
     )
 
 
@@ -428,6 +432,30 @@ def test_bst_ranker_target_user_indices_change_scores():
     assert not torch.allclose(changed_output, output)
 
 
+def test_bst_ranker_user_idx_dropout_maps_supported_ids_to_unknown_only_in_training():
+    model = _make_model(
+        use_post_liker_user_pooling=True,
+        post_liker_user_dropout_rate=1.0,
+        target_user_dropout_rate=1.0,
+    )
+    user_indices = torch.tensor([[0, 1, 2, 7]], dtype=torch.long)
+
+    model.train()
+    dropped = model._apply_user_idx_unk_dropout(user_indices, model.post_liker_user_dropout_rate)
+    model.eval()
+    unchanged = model._apply_user_idx_unk_dropout(user_indices, model.post_liker_user_dropout_rate)
+
+    assert dropped.tolist() == [[0, 1, 1, 1]]
+    assert unchanged.tolist() == [[0, 1, 2, 7]]
+
+
+def test_bst_ranker_rejects_invalid_user_idx_dropout_rates():
+    with pytest.raises(ValueError, match="post_liker_user_dropout_rate"):
+        _make_model(use_post_liker_user_pooling=True, post_liker_user_dropout_rate=-0.1)
+    with pytest.raises(ValueError, match="target_user_dropout_rate"):
+        _make_model(use_post_liker_user_pooling=True, target_user_dropout_rate=1.1)
+
+
 def test_bst_ranker_post_liker_requires_tensors_when_enabled():
     model = _make_model(use_post_liker_user_pooling=True)
     batch = _batch()
@@ -527,6 +555,8 @@ def test_bst_ranker_rejects_attention_head_mismatch():
             post_liker_projection_dim=0,
             post_liker_pooling_tau_hours=10.0,
             target_user_projection_dim=0,
+            post_liker_user_dropout_rate=0.0,
+            target_user_dropout_rate=0.0,
         )
 
 
@@ -868,6 +898,8 @@ def test_bst_ranker_rejects_invalid_post_liker_dimensions():
             post_liker_projection_dim=2,
             post_liker_pooling_tau_hours=10.0,
             target_user_projection_dim=2,
+            post_liker_user_dropout_rate=0.0,
+            target_user_dropout_rate=0.0,
         )
 
 

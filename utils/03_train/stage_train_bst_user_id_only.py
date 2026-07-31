@@ -497,6 +497,8 @@ class BSTUserIdOnlyRanker(nn.Module):
         prediction_hidden_dims: List[int],
         post_liker_pooling_tau_hours: float,
         target_user_projection_dim: int,
+        post_liker_user_dropout_rate: float,
+        target_user_dropout_rate: float,
     ):
         super().__init__()
         if post_liker_user_table_num_rows < 2:
@@ -521,6 +523,10 @@ class BSTUserIdOnlyRanker(nn.Module):
             raise ValueError("post_liker_pooling_tau_hours must be positive")
         if target_user_projection_dim <= 0:
             raise ValueError("target_user_projection_dim must be positive")
+        if not 0.0 <= post_liker_user_dropout_rate <= 1.0:
+            raise ValueError("post_liker_user_dropout_rate must be in [0, 1]")
+        if not 0.0 <= target_user_dropout_rate <= 1.0:
+            raise ValueError("target_user_dropout_rate must be in [0, 1]")
 
         self.post_liker_user_table_num_rows = int(post_liker_user_table_num_rows)
         self.post_liker_user_embedding_dim = int(post_liker_user_embedding_dim)
@@ -529,6 +535,8 @@ class BSTUserIdOnlyRanker(nn.Module):
         self.time_embedding_dim = int(time_embedding_dim)
         self.dropout_rate = float(dropout_rate)
         self.target_user_projection_dim = int(target_user_projection_dim)
+        self.post_liker_user_dropout_rate = float(post_liker_user_dropout_rate)
+        self.target_user_dropout_rate = float(target_user_dropout_rate)
         self.time_delta_bucket_boundaries_hours = _validate_time_delta_bucket_boundaries(
             time_delta_bucket_boundaries_hours
         )
@@ -572,6 +580,7 @@ class BSTUserIdOnlyRanker(nn.Module):
             embedding_dim=self.time_embedding_dim,
         )
         nn.init.xavier_uniform_(self.time_delta_embedding.weight)
+        self.empty_history_token = nn.Parameter(torch.randn(self.transformer_input_dim) * 0.02)
         for layer in (self.post_liker_projection, self.post_liker_fusion, self.target_user_projection):
             nn.init.xavier_uniform_(layer.weight)
             if layer.bias is not None:
@@ -615,6 +624,10 @@ class BSTUserIdOnlyRanker(nn.Module):
         user_indices: torch.Tensor,
         time_gap_hours: torch.Tensor,
     ) -> torch.Tensor:
+        user_indices = self._apply_user_idx_unk_dropout(
+            user_indices,
+            self.post_liker_user_dropout_rate,
+        )
         pooled = self.post_liker_user_pooler(
             user_indices,
             time_gap_hours,
@@ -630,12 +643,56 @@ class BSTUserIdOnlyRanker(nn.Module):
             device=self.post_liker_user_embedding.weight.device,
             dtype=torch.long,
         )
+        target_user_indices = self._apply_user_idx_unk_dropout(
+            target_user_indices,
+            self.target_user_dropout_rate,
+        )
         target_user_embeddings = self.post_liker_user_embedding(target_user_indices)
         return self.target_user_projection_norm(
             self.target_user_projection_activation(
                 self.target_user_projection(target_user_embeddings)
             )
         )
+
+    def _apply_user_idx_unk_dropout(
+        self,
+        user_indices: torch.Tensor,
+        dropout_rate: float,
+    ) -> torch.Tensor:
+        if not self.training or dropout_rate <= 0.0:
+            return user_indices
+        eligible = user_indices.gt(1)
+        dropout_mask = eligible & torch.rand(user_indices.size(), device=user_indices.device).lt(dropout_rate)
+        return torch.where(dropout_mask, torch.ones_like(user_indices), user_indices)
+
+    def _inject_empty_history_token(
+        self,
+        history_input: torch.Tensor,
+        history_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size = int(history_input.size(0))
+        max_history_len = int(history_input.size(1))
+        token = self.empty_history_token.reshape(1, 1, self.transformer_input_dim)
+        if max_history_len == 0:
+            return (
+                token.expand(batch_size, 1, self.transformer_input_dim),
+                torch.ones((batch_size, 1), device=history_input.device, dtype=torch.bool),
+            )
+
+        has_history = history_mask.any(dim=1)
+        if bool(has_history.all().item()):
+            return history_input, history_mask
+
+        inject = ~has_history
+        inject_f = inject.to(dtype=history_input.dtype).reshape(batch_size, 1, 1)
+        history_input = history_input.clone()
+        history_input[:, 0:1, :] = (
+            history_input[:, 0:1, :] * (1.0 - inject_f)
+            + token.expand(batch_size, 1, self.transformer_input_dim) * inject_f
+        )
+        history_mask = history_mask.clone()
+        history_mask[:, 0] = history_mask[:, 0] | inject
+        return history_input, history_mask
 
     def _forward_transformer(
         self,
@@ -676,13 +733,15 @@ class BSTUserIdOnlyRanker(nn.Module):
             candidate_post_liker_user_indices,
             candidate_post_liker_time_gap_hours,
         ).unsqueeze(1)
-        post_sequence = torch.cat([history_post_vectors, candidate_post_vector], dim=1)
 
-        candidate_time_delta = torch.zeros((batch_size, 1), device=device, dtype=history_time_deltas_hours.dtype)
-        sequence_time_deltas = torch.cat([history_time_deltas_hours, candidate_time_delta], dim=1)
-        time_bucket_ids = self._bucketize_time_deltas_hours(sequence_time_deltas)
-        time_embeddings = self.time_delta_embedding(time_bucket_ids)
-        transformer_input = torch.cat([post_sequence, time_embeddings], dim=-1)
+        history_time_bucket_ids = self._bucketize_time_deltas_hours(history_time_deltas_hours)
+        history_time_embeddings = self.time_delta_embedding(history_time_bucket_ids)
+        history_input = torch.cat([history_post_vectors, history_time_embeddings], dim=-1)
+        history_input, history_mask = self._inject_empty_history_token(history_input, history_mask)
+        candidate_time_bucket_ids = torch.zeros((batch_size, 1), device=device, dtype=torch.long)
+        candidate_time_embeddings = self.time_delta_embedding(candidate_time_bucket_ids)
+        candidate_input = torch.cat([candidate_post_vector, candidate_time_embeddings], dim=-1)
+        transformer_input = torch.cat([history_input, candidate_input], dim=1)
 
         candidate_is_not_padding = torch.zeros((batch_size, 1), device=device, dtype=torch.bool)
         src_key_padding_mask = torch.cat([~history_mask, candidate_is_not_padding], dim=1)
@@ -827,6 +886,7 @@ class BSTUserIdOnlyRanker(nn.Module):
         candidate_time_bucket_ids = torch.zeros((num_candidates,), device=device, dtype=torch.long)
         candidate_time_embeddings = self.time_delta_embedding(candidate_time_bucket_ids)
         history_input = torch.cat([history_post_vectors, history_time_embeddings], dim=-1)
+        history_input, history_mask = self._inject_empty_history_token(history_input, history_mask)
         candidate_input = torch.cat([candidate_post_vectors, candidate_time_embeddings], dim=-1)
 
         if layer.norm_first:
@@ -1118,6 +1178,19 @@ def _log_bst_user_id_only_epoch_metrics(
             iteration,
         )
     for k in metrics_top_ks:
+        if calc_baseline_metrics:
+            for metric_name, metric_label in ((f"ndcg@{k}", f"NDCG@{k}"), (f"recall@{k}", f"Recall@{k}")):
+                for split_label, metrics in (
+                    ("Train", train_baseline_metrics),
+                    ("Validation", val_baseline_metrics),
+                    ("Validation Unseen Users", val_unseen_baseline_metrics),
+                ):
+                    experiment_tracker.log_scalar(
+                        metric_label,
+                        f"{split_label} {metric_label}",
+                        float(metrics[metric_name]),
+                        0,
+                    )
         for metric_name, metric_label in ((f"ndcg@{k}", f"NDCG@{k}"), (f"recall@{k}", f"Recall@{k}")):
             for split_label, metrics in (
                 ("Train", train_metrics),
@@ -1128,19 +1201,6 @@ def _log_bst_user_id_only_epoch_metrics(
                 if metric_value is None:
                     continue
                 experiment_tracker.log_scalar(metric_label, f"{split_label} {metric_label}", float(metric_value), iteration)
-        if calc_baseline_metrics:
-            for metric_name, metric_label in ((f"ndcg@{k}", f"Baseline NDCG@{k}"), (f"recall@{k}", f"Baseline Recall@{k}")):
-                for split_label, metrics in (
-                    ("Train", train_baseline_metrics),
-                    ("Validation", val_baseline_metrics),
-                    ("Validation Unseen Users", val_unseen_baseline_metrics),
-                ):
-                    experiment_tracker.log_scalar(
-                        metric_label,
-                        f"{split_label} {metric_label}",
-                        float(metrics[metric_name]),
-                        iteration,
-                    )
     log_zero_history_rank_metrics(
         experiment_tracker,
         {
@@ -1378,6 +1438,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     post_liker_projection_dim = int(args.bst_post_liker_projection_dim)
     post_liker_pooling_tau_hours = float(args.bst_post_liker_pooling_tau_hours)
     target_user_projection_dim = int(args.bst_target_user_projection_dim)
+    post_liker_user_dropout_rate = float(args.bst_post_liker_user_dropout_rate)
+    target_user_dropout_rate = float(args.bst_target_user_dropout_rate)
     bst_max_post_liker_replay_events_per_post = args.bst_max_post_liker_replay_events_per_post
     if bst_max_post_liker_replay_events_per_post is None:
         raise ValueError("bst_max_post_liker_replay_events_per_post is required for BST user-ID-only training")
@@ -1414,6 +1476,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"post_liker_projection_dim={post_liker_projection_dim}, "
         f"target_user_projection_dim={target_user_projection_dim}, "
         f"pooling_tau_hours={post_liker_pooling_tau_hours}, "
+        f"post_liker_user_dropout_rate={post_liker_user_dropout_rate}, "
+        f"target_user_dropout_rate={target_user_dropout_rate}, "
         f"user_table_num_rows={post_liker_user_table_num_rows}, "
         f"max_post_liker_replay_events_per_post={bst_max_post_liker_replay_events_per_post}, "
         f"post_liker_event_rows={len(post_liker_events_df):,}, "
@@ -1486,6 +1550,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "bst_post_liker_projection_dim": post_liker_projection_dim,
         "bst_post_liker_pooling_tau_hours": post_liker_pooling_tau_hours,
         "bst_target_user_projection_dim": target_user_projection_dim,
+        "bst_post_liker_user_dropout_rate": post_liker_user_dropout_rate,
+        "bst_target_user_dropout_rate": target_user_dropout_rate,
         "bst_max_post_liker_replay_events_per_post": bst_max_post_liker_replay_events_per_post,
         "requires_post_liker_user_pooling": True,
         "requires_target_user_indices": True,
@@ -1548,6 +1614,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         prediction_hidden_dims=prediction_hidden_dims,
         post_liker_pooling_tau_hours=post_liker_pooling_tau_hours,
         target_user_projection_dim=target_user_projection_dim,
+        post_liker_user_dropout_rate=post_liker_user_dropout_rate,
+        target_user_dropout_rate=target_user_dropout_rate,
     )
 
     log_operation_start(f"Train BST user-ID-only ranker (epochs={epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)

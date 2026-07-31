@@ -199,6 +199,8 @@ class BstPthAdapter:
                 post_liker_projection_dim=int(config.get("bst_post_liker_projection_dim") or 16),
                 post_liker_pooling_tau_hours=float(config.get("bst_post_liker_pooling_tau_hours") or 168.0),
                 target_user_projection_dim=int(config.get("bst_target_user_projection_dim") or 16),
+                post_liker_user_dropout_rate=float(config.get("bst_post_liker_user_dropout_rate") or 0.0),
+                target_user_dropout_rate=float(config.get("bst_target_user_dropout_rate") or 0.0),
             )
             model.load_state_dict(checkpoint["model_state_dict"])
             self.model = model

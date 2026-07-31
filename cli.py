@@ -130,6 +130,8 @@ DEFAULTS: Dict[str, Any] = {
     "bst_post_liker_projection_dim": 16,
     "bst_post_liker_pooling_tau_hours": 168.0,
     "bst_target_user_projection_dim": 16,
+    "bst_post_liker_user_dropout_rate": 0.2,
+    "bst_target_user_dropout_rate": 0.5,
     "bst_max_post_liker_replay_events_per_post": 32,
     "hidden_dims": [64, 32, 16],
     "dropout_rate_mlp": 0.5,
@@ -573,6 +575,8 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
     bst_post_liker_projection_dim = int(args.bst_post_liker_projection_dim)
     bst_post_liker_pooling_tau_hours = float(args.bst_post_liker_pooling_tau_hours)
     bst_target_user_projection_dim = int(args.bst_target_user_projection_dim)
+    bst_post_liker_user_dropout_rate = float(args.bst_post_liker_user_dropout_rate)
+    bst_target_user_dropout_rate = float(args.bst_target_user_dropout_rate)
     bst_max_post_liker_replay_events_per_post = args.bst_max_post_liker_replay_events_per_post
     if model_dim <= 0:
         raise ValueError("--bst-model-dim must be positive.")
@@ -604,6 +608,10 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
         raise ValueError("--bst-post-liker-pooling-tau-hours must be positive.")
     if bst_target_user_projection_dim <= 0:
         raise ValueError("--bst-target-user-projection-dim must be positive.")
+    if not 0.0 <= bst_post_liker_user_dropout_rate <= 1.0:
+        raise ValueError("--bst-post-liker-user-dropout-rate must be in [0, 1].")
+    if not 0.0 <= bst_target_user_dropout_rate <= 1.0:
+        raise ValueError("--bst-target-user-dropout-rate must be in [0, 1].")
     if bool(args.bst_use_post_liker_user_pooling) and bst_max_post_liker_replay_events_per_post is None:
         raise ValueError("--bst-max-post-liker-replay-events-per-post is required when post-liker pooling is enabled.")
     if (
@@ -637,6 +645,8 @@ def _validate_bst_user_id_only_config(args: argparse.Namespace) -> None:
     bst_post_liker_projection_dim = int(args.bst_post_liker_projection_dim)
     bst_post_liker_pooling_tau_hours = float(args.bst_post_liker_pooling_tau_hours)
     bst_target_user_projection_dim = int(args.bst_target_user_projection_dim)
+    bst_post_liker_user_dropout_rate = float(args.bst_post_liker_user_dropout_rate)
+    bst_target_user_dropout_rate = float(args.bst_target_user_dropout_rate)
     bst_max_post_liker_replay_events_per_post = args.bst_max_post_liker_replay_events_per_post
     if model_dim <= 0:
         raise ValueError("--bst-model-dim must be positive.")
@@ -662,6 +672,10 @@ def _validate_bst_user_id_only_config(args: argparse.Namespace) -> None:
         raise ValueError("--bst-post-liker-pooling-tau-hours must be positive.")
     if bst_target_user_projection_dim <= 0:
         raise ValueError("--bst-target-user-projection-dim must be positive.")
+    if not 0.0 <= bst_post_liker_user_dropout_rate <= 1.0:
+        raise ValueError("--bst-post-liker-user-dropout-rate must be in [0, 1].")
+    if not 0.0 <= bst_target_user_dropout_rate <= 1.0:
+        raise ValueError("--bst-target-user-dropout-rate must be in [0, 1].")
     if bst_max_post_liker_replay_events_per_post is None:
         raise ValueError("--bst-max-post-liker-replay-events-per-post is required for --model-type 'bst-user-id-only'.")
     if int(bst_max_post_liker_replay_events_per_post) <= 0:
@@ -1029,6 +1043,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="BST post-liker recursive EMA time constant in hours")
     _add_arg_with_default(p_all, "--bst-target-user-projection-dim", type=int, default=argparse.SUPPRESS,
                           help_text="BST target-user embedding projection dimension for post-liker user features")
+    _add_arg_with_default(p_all, "--bst-post-liker-user-dropout-rate", type=float, default=argparse.SUPPRESS,
+                          help_text="Training-time probability of replacing post-liker user IDs with the UNK row")
+    _add_arg_with_default(p_all, "--bst-target-user-dropout-rate", type=float, default=argparse.SUPPRESS,
+                          help_text="Training-time probability of replacing target user IDs with the UNK row")
     _add_arg_with_default(p_all, "--bst-max-post-liker-replay-events-per-post", type=int, default=argparse.SUPPRESS,
                           help_text="Optional tail cap on prior liker events replayed per history or candidate post for BST")
     # Stage 3 options (shared)
