@@ -257,6 +257,67 @@ def test_bst_ranker_explicit_train_stage_names_parse():
     assert merged.stop_after == "train_bst_ranker"
 
 
+def test_bst_user_id_only_model_type_maps_to_experimental_train_stage():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "bst-user-id-only",
+        "--start-from", "train",
+        "--stop-after", "train",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    train_key = cli._get_train_key(merged.model_type)
+    stage_order = cli._get_stage_order_for_model_type(train_key)
+    start_idx, stop_idx, includes_train = cli._get_stage_folder_and_start_stop_indices(
+        stage_order,
+        merged.start_from,
+        merged.stop_after,
+        train_key,
+    )
+
+    assert train_key == "train_bst_user_id_only"
+    assert stage_order == ["get_data", "user_history", "train_bst_user_id_only"]
+    assert stage_order[start_idx] == "train_bst_user_id_only"
+    assert stage_order[stop_idx] == "train_bst_user_id_only"
+    assert includes_train is True
+    cli._validate_bst_user_id_only_config(merged)
+
+
+def test_bst_user_id_only_explicit_train_stage_name_parses_without_author_table():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "bst-user-id-only",
+        "--start-from", "train_bst_user_id_only",
+        "--stop-after", "train_bst_user_id_only",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.start_from == "train_bst_user_id_only"
+    assert merged.stop_after == "train_bst_user_id_only"
+    assert merged.use_author_embedding_table is False
+    cli._validate_bst_user_id_only_config(merged)
+
+
+def test_bst_user_id_only_rejects_missing_replay_cap(tmp_path):
+    config_path = Path(tmp_path) / "bst_user_id_only_null_cap.yml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            model_type: bst-user-id-only
+            bst_max_post_liker_replay_events_per_post:
+            """
+        ).strip()
+        + "\n"
+    )
+
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--config", str(config_path)])
+    merged = cli._merge_args_with_config(raw)
+
+    with pytest.raises(ValueError, match="bst-max-post-liker-replay-events-per-post"):
+        cli._validate_bst_user_id_only_config(merged)
+
+
 def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
     config_path = Path(tmp_path) / "bst.yml"
     config_path.write_text(

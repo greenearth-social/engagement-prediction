@@ -1,4 +1,5 @@
 """Tests for bucketed two-tower dataloaders."""
+import importlib
 import json
 from datetime import datetime, timezone
 
@@ -17,6 +18,9 @@ from utils.dataloaders import (
     get_author_table_num_rows,
     validate_history_popularity_semantics,
 )
+
+stage_train_bst_user_id_only = importlib.import_module("utils.03_train.stage_train_bst_user_id_only")
+UserIdOnlyBucketedEngagementDataset = stage_train_bst_user_id_only.UserIdOnlyBucketedEngagementDataset
 
 
 def _dt(hour: int) -> datetime:
@@ -410,6 +414,78 @@ def test_bucketed_post_liker_history_uses_current_bucket_time(
         batch["history_post_liker_time_gap_hours"][0, :, :4].numpy(),
         np.zeros((3, 4), dtype=np.float32),
     )
+
+
+def test_user_id_only_bucketed_collate_omits_content_embeddings_and_keeps_post_likers(
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+    mock_post_liker_events_df,
+    mock_post_liker_user_idx_df,
+):
+    dataset = UserIdOnlyBucketedEngagementDataset(
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
+        history_df=mock_history_df,
+        split="train",
+        max_history_len=3,
+        post_liker_event_lookup=PostLikerEventLookup.from_dataframe(mock_post_liker_events_df),
+        post_liker_user_idx_df=mock_post_liker_user_idx_df,
+        max_post_liker_replay_events_per_post=4,
+    )
+
+    batch = dataset.collate_batch([dataset[0], dataset[1]])
+
+    assert batch["candidate_post_id"] == ["p1", "p3", "p2", "n1", "p4"]
+    assert "history_embeddings" not in batch
+    assert "candidate_post_embeddings" not in batch
+    assert "history_author_indices" not in batch
+    assert "candidate_post_author_idx" not in batch
+    assert batch["target_user_indices"].tolist() == [2, 1]
+    assert batch["history_mask"].tolist() == [[True, True, True], [False, False, False]]
+    assert batch["history_post_liker_user_indices"].shape == (2, 3, 4)
+    assert batch["candidate_post_liker_user_indices"].shape == (5, 4)
+    assert batch["history_post_liker_user_indices"][0, 0].tolist() == [10, 11, 0, 0]
+    assert batch["history_post_liker_user_indices"][0, 1].tolist() == [13, 0, 0, 0]
+    assert batch["candidate_post_liker_user_indices"][:, :4].tolist() == [
+        [2, 3, 0, 0],
+        [0, 0, 0, 0],
+        [4, 5, 0, 0],
+        [8, 0, 0, 0],
+        [9, 0, 0, 0],
+    ]
+    assert batch["label_matrix"].tolist() == [
+        [1.0, 1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0, 0.0],
+    ]
+
+
+def test_user_id_only_bucketed_history_uses_current_bucket_time(
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+    mock_post_liker_events_df,
+    mock_post_liker_user_idx_df,
+):
+    dataset = UserIdOnlyBucketedEngagementDataset(
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
+        history_df=mock_history_df,
+        split="train",
+        max_history_len=3,
+        post_liker_event_lookup=PostLikerEventLookup.from_dataframe(mock_post_liker_events_df),
+        post_liker_user_idx_df=mock_post_liker_user_idx_df,
+        max_post_liker_replay_events_per_post=4,
+    )
+
+    batch = dataset.collate_batch([dataset[2]])
+
+    assert batch["bucket"] == _dt(11)
+    assert batch["history_post_liker_user_indices"][0, :, :4].tolist() == [
+        [14, 0, 0, 0],
+        [0, 0, 0, 0],
+        [0, 0, 0, 0],
+    ]
 
 
 def test_bucketed_post_liker_requires_event_artifact_when_enabled(
