@@ -3,8 +3,9 @@
 """
 Stage 1: Get and filter data using streaming Polars + deterministic sampling.
 
-This stage produces four core outputs:
+This stage produces five core outputs:
 - likes_core.parquet: filtered likes with emb_idx for embedding lookup
+- history_only_likes.parquet: unseen users' pre-validation likes for history only
 - posts_core.parquet: metadata for liked posts + per-hour popularity-weighted negative sample, with emb_idx
 - author_idx.parquet: mapping of eligible post authors to author embedding table rows
 - embeddings.npy: memmap file containing post embeddings (shape: n_posts x embed_dim)
@@ -29,11 +30,14 @@ Pass 1 - Count likes per user (streaming):
 
 Pass 2 - Filter likes to sampled users (streaming):
   - Join likes to the compact sampled user cohort table.
-  - Drop unseen-eval users' train-window likes before materialization.
+  - Keep unseen-eval users' [train_start, val_start) likes in a separate
+    history-only pool.
 
-Per-user random cap (--max-likes-per-user):
+Independent per-user caps (--max-likes-per-user):
   - For each user, hash-rank subject_uri with the seed and keep top-K.
-  - This is random but deterministic and avoids recency bias.
+  - This target cap is random but deterministic and avoids recency bias.
+  - Separately retain the newest top-K unseen history-only likes, breaking
+    timestamp ties by subject_uri.
 
 Finalization:
   - Keep did, subject_uri, record_created_at (convert to UTC datetime if needed).
@@ -43,7 +47,7 @@ Finalization:
 PHASE 2: Posts Filtering (_load_posts_core_polars) - NO EMBEDDINGS
 -------------------------------------------------------------------------
 Extract liked post URIs:
-  - Get unique subject_uri values from likes_core_df.
+  - Get unique subject_uri values from target and history-only likes.
 
 Process posts (single scan, metadata only):
   - Scan all posts parquet files (no batching) and apply --posts-start/--posts-end.
@@ -63,12 +67,14 @@ PHASE 3: Post-join min-likes verification
   - Filter likes to posts that exist in posts_core (by subject_uri -> at_uri).
   - Re-apply --min-likes-per-user after the join; drop users who fall below.
   - Join emb_idx from posts_core to likes_core.
+  - Filter history-only likes to valid posts and unseen users with final targets.
   - Update stats to reflect join losses and final counts.
 
 PHASE 4: Save parquets (no embeddings)
 -------------------------------------------------------------------------
   - Write posts_core.parquet with metadata + emb_idx.
   - Write likes_core.parquet with emb_idx for fast embedding lookup.
+  - Write history_only_likes.parquet with emb_idx and author_idx.
 
 PHASE 5: Write embeddings memmap (FINAL STEP)
 -------------------------------------------------------------------------
@@ -104,6 +110,7 @@ OUTPUTS
 
 Under <run_dir>/01_get_data/<timestamp>/:
   - likes_core_*.parquet: did, subject_uri, record_created_at, like_hour_bucket, split, prior_cumulative_likes, emb_idx, author_did, author_idx
+  - history_only_likes_*.parquet: did, subject_uri, record_created_at, like_hour_bucket, emb_idx, author_idx
   - posts_core_*.parquet: at_uri, did, record_text, is_liked, in_random_sample, negative_hour_bucket, prior_cumulative_likes, split_window, emb_idx, author_idx
   - liked_post_hour_cumulative_likes_*.parquet: emb_idx, popularity_hour_bucket, prior_cumulative_likes
   - author_idx_*.parquet: author_did, author_train_count, author_idx
@@ -115,6 +122,7 @@ Under <run_dir>/01_get_data/<timestamp>/:
 Using the outputs:
   - Negative sample: filter posts_core where in_random_sample=True, grouped by negative_hour_bucket
   - Liked posts: join likes_core.subject_uri with posts_core.at_uri. is_liked is also set
+  - History-only posts: use history_only_likes for Stage 2 history; these rows are not targets
   - Embedding lookup: mmap = np.load(embeddings_path, mmap_mode="r"); emb = mmap[emb_idx]
   - Negative examples for training: sample from the negative pool, but make sure to exclude each given user's likes, since the pool can contain liked posts.
 """
@@ -611,17 +619,18 @@ def _apply_per_user_recency_cap(
     max_likes_per_user: int,
 ) -> pl.LazyFrame:
     """
-    Get the N most recent posts per user.
+    Get the N most recent posts per user, breaking timestamp ties by post URI.
     """
     if max_likes_per_user <= 0:
         return likes_lf
     return (
         likes_lf
-        .with_columns(
-            pl.col(TIMESTAMP_COL_NAME).rank('ordinal', descending=True).over('did').alias('_recency_order')
-        ).filter(
-            pl.col('_recency_order') <= max_likes_per_user
-        ).drop('_recency_order')
+        .sort(
+            ["did", TIMESTAMP_COL_NAME, "subject_uri"],
+            descending=[False, True, False],
+        )
+        .group_by("did", maintain_order=True)
+        .head(max_likes_per_user)
     )
 
 
@@ -919,7 +928,7 @@ def _load_likes_core_polars(
     holdout_start: Optional[str],
     holdout_end: Optional[str],
     logger: logging.Logger,
-) -> Tuple[pl.DataFrame, Dict[str, Any]]:
+) -> Tuple[pl.DataFrame, pl.DataFrame, Dict[str, Any]]:
     """
     Load and filter likes data using a streaming Polars pipeline.
     
@@ -927,12 +936,11 @@ def _load_likes_core_polars(
     1. Streamed pass: count likes per user
     2. Pre-filter users who don't meet min_likes_per_user
     3. Sample disjoint train/val and unseen-eval users from eligible pool
-    4. Streamed pass: keep only usable likes from sampled users
-    5. Apply per-user random caps (NOT recency-based)
-    6. Verify min-likes threshold (handles edge cases from per-user caps)
+    4. Streamed pass: build target likes and unseen pre-validation history likes
+    5. Apply independent per-user caps: hash-random for targets, recency for history
     
     Returns:
-        Tuple of (likes_lf: pl.DataFrame, stats: Dict with filtering statistics)
+        Tuple of (likes_core_df, history_only_likes_df, filtering stats)
     """
     train_start_dt = parse_one_ts(train_start)
     val_start_dt = parse_one_ts(val_start)
@@ -993,13 +1001,13 @@ def _load_likes_core_polars(
     
     # ===== PASS 2: Filter likes to sampled users (lazy) =====
     logger.info("Pass 2: Filtering likes to sampled users")
-    likes_lf = raw_likes_lf.join(
+    sampled_likes_lf = raw_likes_lf.join(
         sampled_users_df.select(["did", "_user_cohort"]).lazy(),
         on='did',
         how='inner',
     )
     before_end = (pl.col(TIMESTAMP_COL_NAME) < holdout_end) if holdout_end is not None else pl.lit(True)
-    likes_lf = likes_lf.filter(
+    likes_lf = sampled_likes_lf.filter(
         before_end
         & (
             ((pl.col("_user_cohort") == "trainval") & (pl.col(TIMESTAMP_COL_NAME) >= train_start))
@@ -1072,9 +1080,65 @@ def _load_likes_core_polars(
         pl.col(TIMESTAMP_COL_NAME).dt.truncate("1h").alias('like_hour_bucket')
     )
 
+    history_only_likes_lf = (
+        sampled_likes_lf
+        .filter(
+            (pl.col("_user_cohort") == "unseen_eval")
+            & (pl.col(TIMESTAMP_COL_NAME) >= train_start)
+            & (pl.col(TIMESTAMP_COL_NAME) < val_start)
+        )
+        .group_by(["did", "subject_uri"])
+        .agg(pl.col(TIMESTAMP_COL_NAME).max())
+        .join(
+            likes_df.select(["did", "subject_uri"]).lazy(),
+            on=["did", "subject_uri"],
+            how="anti",
+        )
+        .with_columns(
+            pl.len().over("did").alias("_history_only_pre_cap_count")
+        )
+    )
+    history_only_likes_lf = _apply_per_user_recency_cap(
+        history_only_likes_lf,
+        max_likes_per_user,
+    )
+    history_only_likes_df = history_only_likes_lf.collect(engine="streaming")
+    n_history_only_before_cap = (
+        int(
+            history_only_likes_df
+            .select(["did", "_history_only_pre_cap_count"])
+            .unique(subset=["did"])
+            ["_history_only_pre_cap_count"]
+            .sum()
+        )
+        if history_only_likes_df.height > 0 else 0
+    )
+    if history_only_likes_df.schema[TIMESTAMP_COL_NAME] != pl.Datetime:
+        history_only_likes_df = history_only_likes_df.with_columns(
+            pl.col(TIMESTAMP_COL_NAME).str.to_datetime(time_zone="UTC").alias(TIMESTAMP_COL_NAME)
+        )
+    history_only_likes_df = (
+        history_only_likes_df
+        .with_columns(
+            pl.col(TIMESTAMP_COL_NAME).dt.truncate("1h").alias("like_hour_bucket")
+        )
+        .select(["did", "subject_uri", TIMESTAMP_COL_NAME, "like_hour_bucket"])
+    )
+    stats["n_history_only_likes_before_per_user_cap"] = n_history_only_before_cap
+    stats["n_history_only_likes_after_per_user_cap"] = history_only_likes_df.height
+    stats["n_history_only_users_before_post_filter"] = (
+        history_only_likes_df["did"].n_unique() if history_only_likes_df.height > 0 else 0
+    )
+    logger.info(
+        "History-only unseen pre-validation likes: "
+        f"{n_history_only_before_cap:,} before cap, "
+        f"{history_only_likes_df.height:,} after independent recency cap "
+        f"({max_likes_per_user})"
+    )
+
     stats['n_likes_final'] = n_after_cap
 
-    return likes_df, stats # did, subject_uri, record_created_at, split, like_hour_bucket
+    return likes_df, history_only_likes_df, stats
 
 
 def _load_posts_core_polars(
@@ -1438,16 +1502,18 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     max_memory_pct = float(args.max_memory_pct)
 
     # Use Polars-based filtering pipeline for GreenEarth Ingex data
-    # Returns: (likes_core_df, posts_core_df, likes_core_path, posts_core_path, author_idx_path, embeddings_path, embed_dim, stats)
+    # Returns core tables, artifact paths, embedding metadata, and filtering stats.
     (
-        likes_core_df, 
-        posts_core_df, 
-        likes_core_path, 
-        posts_core_path, 
+        likes_core_df,
+        history_only_likes_df,
+        posts_core_df,
+        likes_core_path,
+        history_only_likes_path,
+        posts_core_path,
         author_idx_path,
         liked_post_hour_cumulative_likes_path,
-        embeddings_path, 
-        embed_dim, 
+        embeddings_path,
+        embed_dim,
         all_stats
     ) = _run_greenearth_pipeline(
         logger=logger, 
@@ -1495,6 +1561,21 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     validate_dataframe_schema(likes_core_df, likes_schema, allow_extra_columns=False)
     logger.info("✓ likes_core schema validated")
 
+    history_only_likes_schema = {
+        'did': str,
+        'subject_uri': str,
+        TIMESTAMP_COL_NAME: 'datetime',
+        'like_hour_bucket': 'datetime',
+        'emb_idx': int,
+        'author_idx': int,
+    }
+    validate_dataframe_schema(
+        history_only_likes_df,
+        history_only_likes_schema,
+        allow_extra_columns=False,
+    )
+    logger.info("✓ history_only_likes schema validated")
+
     posts_schema = {
         'at_uri': str,
         'in_random_sample': bool,
@@ -1512,6 +1593,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     logger.info("✓ posts_core schema validated")
 
     n_likes = len(likes_core_df)
+    n_history_only_likes = len(history_only_likes_df)
     n_posts = len(posts_core_df)
 
     # Summary
@@ -1519,6 +1601,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     
     # Primary outputs
     context.tracker.log_single_value(name="Output - Likes (final)", value=n_likes)
+    context.tracker.log_single_value(
+        name="Output - History-Only Likes (final)",
+        value=n_history_only_likes,
+    )
     context.tracker.log_single_value(name="Output - Posts (final)", value=n_posts)
     context.tracker.log_single_value(name="Output - Embedding Dim", value=embed_dim)
     context.tracker.log_single_value(name="Output - Embeddings Written", value=not skip_embeddings)
@@ -1558,10 +1644,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         },
         'outputs': {
             'likes_core_rows': n_likes,
+            'history_only_likes_rows': n_history_only_likes,
             'posts_core_rows': n_posts,
             'embedding_dim': embed_dim,
             'embeddings_file': str(embeddings_path.name) if embeddings_path is not None else None,
             'author_idx_file': author_idx_path.name,
+            'history_only_likes_file': history_only_likes_path.name,
             'liked_post_hour_cumulative_likes_file': liked_post_hour_cumulative_likes_path.name,
             'embeddings_written': not skip_embeddings,
         },
@@ -1584,9 +1672,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"skip_embeddings={skip_embeddings}",
         f"inputs: GCS bucket={gcs_bucket}",
         f"N_likes_core: {n_likes}",
+        f"N_history_only_likes: {n_history_only_likes}",
         f"N_posts_core: {n_posts}",
         f"embedding_dim: {embed_dim}",
         f"embeddings_file: {embeddings_path.name if embeddings_path is not None else 'SKIPPED'}",
+        f"history_only_likes_file: {history_only_likes_path.name}",
         f"liked_post_hour_cumulative_likes_file: {liked_post_hour_cumulative_likes_path.name}",
     ]
     (out_dir / 'stage_info.txt').write_text('\n'.join(info_lines) + '\n')
@@ -1597,6 +1687,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         'output_dir': out_dir,
         'artifacts': {
             'likes_core_path': str(likes_core_path),
+            'history_only_likes_path': str(history_only_likes_path),
             'posts_core_path': str(posts_core_path),
             'author_idx_path': str(author_idx_path),
             'liked_post_hour_cumulative_likes_path': str(liked_post_hour_cumulative_likes_path),
@@ -1777,13 +1868,25 @@ def _run_greenearth_pipeline(
     holdout_end: Optional[str],
     embedding_model: str,
     skip_embeddings: bool,
-) -> Tuple[pl.DataFrame, pl.DataFrame, Path, Path, Path, Path, Optional[Path], int, Dict[str, Any]]:
+) -> Tuple[
+    pl.DataFrame,
+    pl.DataFrame,
+    pl.DataFrame,
+    Path,
+    Path,
+    Path,
+    Path,
+    Path,
+    Optional[Path],
+    int,
+    Dict[str, Any],
+]:
     """
     Run the Polars-based filtering pipeline for GreenEarth Ingex data.
     
     Returns:
-        Tuple of (likes_core_df, posts_core_df, likes_core_path, posts_core_path, author_idx_path,
-                  embeddings_path (or None if skipped), embed_dim, stats_dict)
+        Target likes, history-only likes, posts, artifact paths, embedding metadata,
+        and filtering statistics.
     """
     all_stats = {}
     
@@ -1834,14 +1937,30 @@ def _run_greenearth_pipeline(
         # Smart memory check that accounts for filtering parameters
         log_operation_start('Check data load safety', '01_GET_DATA', logger)
         embedding_dim_for_estimate = 0 if skip_embeddings else get_embedding_dim_for_known_model(embedding_model)
+        has_unseen_eval_pool = (
+            max_trainval_users is not None
+            and (max_unseen_eval_users is None or max_unseen_eval_users > 0)
+        )
+        estimated_max_users = max_trainval_users
+        if has_unseen_eval_pool:
+            estimated_max_users = (
+                None
+                if max_unseen_eval_users is None
+                else max(0, max_trainval_users) + max(0, max_unseen_eval_users)
+            )
+        estimated_max_likes_per_user = (
+            max_likes_per_user * 2
+            if has_unseen_eval_pool and max_likes_per_user > 0
+            else max_likes_per_user
+        )
         memory_estimate = check_data_load_safe(
             likes_paths=likes_paths,
             posts_paths=posts_paths,
             embedding_dim=embedding_dim_for_estimate,
             max_memory_gb=max_memory_gb,
             max_memory_pct=max_memory_pct,
-            max_liking_users=max_trainval_users,
-            max_likes_per_user=max_likes_per_user,
+            max_liking_users=estimated_max_users,
+            max_likes_per_user=estimated_max_likes_per_user,
             min_likes_per_user=min_likes_per_user,
             negative_posts_sample=negative_samples_per_hour,
             skip_safety_check=(memory_check == "ignore"),
@@ -1863,7 +1982,7 @@ def _run_greenearth_pipeline(
         raise ValueError(f"No likes parquet files found for time range {likes_start} to {likes_end}")
     logger.info(f"Found {len(likes_paths)} likes parquet files")
     raw_likes_lf = apply_time_filter(pl.scan_parquet(likes_paths), likes_start, likes_end)
-    likes_core_df, likes_stats = _load_likes_core_polars(
+    likes_core_df, history_only_likes_df, likes_stats = _load_likes_core_polars(
         raw_likes_lf=raw_likes_lf,
         max_trainval_users=max_trainval_users,
         max_unseen_eval_users=max_unseen_eval_users,
@@ -1886,8 +2005,16 @@ def _run_greenearth_pipeline(
     # PHASE 2: Extract liked post URIs and load posts (metadata only, no embeddings)
     # ========================================================================
     log_operation_start('Extract liked post URIs', '01_GET_DATA', logger)
-    liked_post_uris_df: pl.DataFrame = likes_core_df.select(pl.col('subject_uri').unique())
-    logger.info(f"Extracted {len(liked_post_uris_df):,} unique liked post URIs")
+    liked_post_uris_df: pl.DataFrame = (
+        pl.concat([
+            likes_core_df.select("subject_uri"),
+            history_only_likes_df.select("subject_uri"),
+        ])
+        .unique()
+    )
+    logger.info(
+        f"Extracted {len(liked_post_uris_df):,} unique target/history liked post URIs"
+    )
     mem_tracker.checkpoint("after_uri_extraction", quiet=True)
 
     log_operation_start('Build global negative candidate like counts', '01_GET_DATA', logger)
@@ -2064,6 +2191,25 @@ def _run_greenearth_pipeline(
     # Update stats with join verification results
     if 'likes' in all_stats:
         all_stats['likes'].update(join_stats)
+
+    history_only_likes_df, history_only_join_stats = _filter_history_only_likes_after_post_join(
+        history_only_likes_df=history_only_likes_df,
+        likes_core_df=likes_core_df,
+        posts_core_df=posts_core_df,
+        logger=logger,
+    )
+    all_stats['history_only_likes'] = {
+        'n_history_only_likes_before_per_user_cap': likes_stats[
+            'n_history_only_likes_before_per_user_cap'
+        ],
+        'n_history_only_likes_after_per_user_cap': likes_stats[
+            'n_history_only_likes_after_per_user_cap'
+        ],
+        'n_history_only_users_before_post_filter': likes_stats[
+            'n_history_only_users_before_post_filter'
+        ],
+        **history_only_join_stats,
+    }
     
     mem_tracker.checkpoint("after_join_verification", quiet=True)
     
@@ -2090,12 +2236,30 @@ def _run_greenearth_pipeline(
         )
         .unique(subset=['did', 'subject_uri'])
     )
+    history_only_likes_df = (
+        history_only_likes_df
+        .join(
+            posts_uri_to_idx,
+            left_on="subject_uri",
+            right_on="at_uri",
+            how="left",
+        )
+        .unique(subset=["did", "subject_uri"])
+    )
     # Verify no nulls in emb_idx (all likes should have matching posts after join filter)
     n_null_idx = likes_core_df.filter(pl.col("emb_idx").is_null()).height
     if n_null_idx > 0:
         logger.warning(f"WARNING: {n_null_idx:,} likes have null emb_idx after join")
     else:
         logger.info(f"✓ All {len(likes_core_df):,} likes have valid emb_idx")
+    n_null_history_idx = history_only_likes_df.filter(pl.col("emb_idx").is_null()).height
+    if n_null_history_idx > 0:
+        raise ValueError(
+            f"CRITICAL: {n_null_history_idx:,} history-only likes have null emb_idx after join"
+        )
+    logger.info(
+        f"✓ All {len(history_only_likes_df):,} history-only likes have valid emb_idx"
+    )
     
     mem_tracker.checkpoint("after_emb_idx_join", quiet=True)
 
@@ -2114,6 +2278,22 @@ def _run_greenearth_pipeline(
         likes_core_df=likes_core_df,
         author_idx_df=author_idx_df,
     )
+    history_only_likes_df = (
+        history_only_likes_df
+        .join(
+            author_idx_df.select(["author_did", "author_idx"]),
+            on="author_did",
+            how="left",
+        )
+        .select([
+            "did",
+            "subject_uri",
+            TIMESTAMP_COL_NAME,
+            "like_hour_bucket",
+            "emb_idx",
+            "author_idx",
+        ])
+    )
     all_stats['authors'] = author_stats
     mem_tracker.checkpoint("after_author_idx_join", quiet=True)
     
@@ -2125,8 +2305,10 @@ def _run_greenearth_pipeline(
     log_operation_start('Build liked-post sparse popularity curve', '01_GET_DATA', logger)
     mem_tracker.checkpoint("before_liked_post_popularity_curve", quiet=True)
     liked_post_mapping_for_history_df = (
-        likes_core_df
-        .select(["subject_uri", "emb_idx"])
+        pl.concat([
+            likes_core_df.select(["subject_uri", "emb_idx"]),
+            history_only_likes_df.select(["subject_uri", "emb_idx"]),
+        ])
         .unique(subset=["subject_uri"])
     )
     liked_post_hour_cumulative_likes_df, liked_post_popularity_stats = _build_liked_post_hour_cumulative_likes_df(
@@ -2139,6 +2321,7 @@ def _run_greenearth_pipeline(
     
     posts_core_path = out_dir / f"posts_core_{ts_name}.parquet"
     likes_core_path = out_dir / f"likes_core_{ts_name}.parquet"
+    history_only_likes_path = out_dir / f"history_only_likes_{ts_name}.parquet"
     author_idx_path = out_dir / f"author_idx_{ts_name}.parquet"
     liked_post_hour_cumulative_likes_path = out_dir / f"liked_post_hour_cumulative_likes_{ts_name}.parquet"
     
@@ -2147,6 +2330,12 @@ def _run_greenearth_pipeline(
     
     likes_core_df.write_parquet(likes_core_path, compression="zstd")
     logger.info(f"Saved likes_core: {likes_core_path} ({len(likes_core_df):,} rows)")
+
+    history_only_likes_df.write_parquet(history_only_likes_path, compression="zstd")
+    logger.info(
+        f"Saved history_only_likes: {history_only_likes_path} "
+        f"({len(history_only_likes_df):,} rows)"
+    )
 
     author_idx_df.write_parquet(author_idx_path, compression="zstd")
     logger.info(f"Saved author_idx: {author_idx_path} ({len(author_idx_df):,} rows)")
@@ -2177,8 +2366,10 @@ def _run_greenearth_pipeline(
     
     return (
         likes_core_df,
+        history_only_likes_df,
         posts_core_df,
         likes_core_path,
+        history_only_likes_path,
         posts_core_path,
         author_idx_path,
         liked_post_hour_cumulative_likes_path,
@@ -2245,6 +2436,54 @@ def _filter_likes_after_post_join(
         'n_users_final_after_join': likes_core_df['did'].n_unique() if len(likes_core_df) > 0 else 0,
     }
     return likes_core_df, stats
+
+
+def _filter_history_only_likes_after_post_join(
+    history_only_likes_df: pl.DataFrame,
+    likes_core_df: pl.DataFrame,
+    posts_core_df: pl.DataFrame,
+    logger: logging.Logger,
+) -> Tuple[pl.DataFrame, Dict[str, int]]:
+    """Keep valid history rows only for users with at least one final target."""
+    n_before_filter = history_only_likes_df.height
+    valid_post_uris = posts_core_df.select("at_uri").unique()
+    final_target_users = likes_core_df.select("did").unique()
+    history_only_likes_df = (
+        history_only_likes_df
+        .join(
+            valid_post_uris,
+            left_on="subject_uri",
+            right_on="at_uri",
+            how="semi",
+        )
+    )
+    n_after_post_filter = history_only_likes_df.height
+    history_only_likes_df = history_only_likes_df.join(
+        final_target_users,
+        on="did",
+        how="semi",
+    )
+    n_after_target_user_filter = history_only_likes_df.height
+    stats = {
+        "n_history_only_likes_removed_missing_post": (
+            n_before_filter - n_after_post_filter
+        ),
+        "n_history_only_likes_removed_no_final_target": (
+            n_after_post_filter - n_after_target_user_filter
+        ),
+        "n_history_only_likes_final": n_after_target_user_filter,
+        "n_history_only_users_final": (
+            history_only_likes_df["did"].n_unique()
+            if n_after_target_user_filter > 0 else 0
+        ),
+    }
+    logger.info(
+        "Filtered history-only likes after post/target validation: "
+        f"{n_before_filter:,} -> {n_after_target_user_filter:,} "
+        f"({stats['n_history_only_likes_removed_missing_post']:,} missing posts, "
+        f"{stats['n_history_only_likes_removed_no_final_target']:,} without final targets)"
+    )
+    return history_only_likes_df, stats
 
 
 def _build_author_idx_mapping(
@@ -2351,6 +2590,7 @@ def _log_data_attrition_report(
     summary at the end of the data-getting process.
     """
     likes_stats = all_stats.get('likes', {})
+    history_only_stats = all_stats.get('history_only_likes', {})
     posts_stats = all_stats.get('posts', {})
     embeddings_stats = all_stats.get('embeddings', {})
     memory_actual = all_stats.get('memory_actual', {})
@@ -2384,6 +2624,24 @@ def _log_data_attrition_report(
     n_users_removed_join = likes_stats.get('n_users_removed_by_join_verify', 0)
     n_users_final_join = likes_stats.get('n_users_final_after_join', 0)
     n_likes_final_join = likes_stats.get('n_likes_final_after_join', 0)
+    n_history_before_cap = history_only_stats.get(
+        'n_history_only_likes_before_per_user_cap',
+        0,
+    )
+    n_history_after_cap = history_only_stats.get(
+        'n_history_only_likes_after_per_user_cap',
+        0,
+    )
+    n_history_removed_missing_post = history_only_stats.get(
+        'n_history_only_likes_removed_missing_post',
+        0,
+    )
+    n_history_removed_no_target = history_only_stats.get(
+        'n_history_only_likes_removed_no_final_target',
+        0,
+    )
+    n_history_final = history_only_stats.get('n_history_only_likes_final', 0)
+    n_history_users_final = history_only_stats.get('n_history_only_users_final', 0)
     
     # Extract posts pipeline stats
     n_posts_total = posts_stats.get('n_posts_total', 0)
@@ -2468,6 +2726,36 @@ def _log_data_attrition_report(
         logger.info(f"{'   - Removed (edge cases)':<45} {'-' + fmt(n_users_removed_verify):>12} {'-' + fmt(n_likes_removed_verify):>15} {'':>10}")
     
     logger.info(sep2)
+
+    # === HISTORY-ONLY LIKES PIPELINE ===
+    logger.info("")
+    logger.info("HISTORY-ONLY LIKES PIPELINE")
+    logger.info(sep2)
+    logger.info(f"{'Stage':<45} {'Users':>12} {'Likes':>15}")
+    logger.info(sep2)
+    logger.info(
+        f"{'1. Unseen pre-validation rows':<45} {'(n/a)':>12} "
+        f"{fmt(n_history_before_cap):>15}"
+    )
+    logger.info(
+        f"{'2. Independent recency cap (' + str(max_likes_per_user) + ')':<45} "
+        f"{'(n/a)':>12} {fmt(n_history_after_cap):>15}"
+    )
+    logger.info(
+        f"{'3. Valid posts and final target users':<45} "
+        f"{fmt(n_history_users_final):>12} {fmt(n_history_final):>15}"
+    )
+    if n_history_removed_missing_post > 0:
+        logger.info(
+            f"{'   - Removed missing/invalid posts':<45} {'':>12} "
+            f"{'-' + fmt(n_history_removed_missing_post):>15}"
+        )
+    if n_history_removed_no_target > 0:
+        logger.info(
+            f"{'   - Removed users without final targets':<45} {'':>12} "
+            f"{'-' + fmt(n_history_removed_no_target):>15}"
+        )
+    logger.info(sep2)
     
     # === POSTS PIPELINE ===
     logger.info("")
@@ -2533,6 +2821,10 @@ def _log_data_attrition_report(
     logger.info("FINAL OUTPUT")
     logger.info(sep2)
     logger.info(f"likes_core.parquet:  {fmt(n_users_final_join)} users, {fmt(n_likes_final_join)} likes")
+    logger.info(
+        f"history_only_likes.parquet: {fmt(n_history_users_final)} users, "
+        f"{fmt(n_history_final)} likes"
+    )
     logger.info(f"posts_core.parquet:  {fmt(n_posts_core)} rows, {fmt(n_posts_core_unique)} unique posts ({fmt(n_liked_only)} liked-only + {fmt(n_random_sample)} random rows)")
     logger.info(f"embeddings.npy:      {fmt(n_emb_valid)} embeddings ({memmap_size_mb:.1f} MB)")
     logger.info(sep2)
@@ -2781,6 +3073,31 @@ def _attrition_stats_to_experiment_tracker(
                 max_likes_per_user,
                 logger
             )
+
+    if 'history_only_likes' in all_stats:
+        history_only_stats = all_stats['history_only_likes']
+        context.tracker.log_single_value(
+            name="History-Only Likes - 1 Before Per-User Cap",
+            value=history_only_stats.get(
+                'n_history_only_likes_before_per_user_cap',
+                0,
+            ),
+        )
+        context.tracker.log_single_value(
+            name="History-Only Likes - 2 After Per-User Cap",
+            value=history_only_stats.get(
+                'n_history_only_likes_after_per_user_cap',
+                0,
+            ),
+        )
+        context.tracker.log_single_value(
+            name="History-Only Likes - 3 Final Likes",
+            value=history_only_stats.get('n_history_only_likes_final', 0),
+        )
+        context.tracker.log_single_value(
+            name="History-Only Likes - 3 Final Users",
+            value=history_only_stats.get('n_history_only_users_final', 0),
+        )
     
     # Posts pipeline metrics
     if 'posts' in all_stats:

@@ -78,6 +78,8 @@ DEFAULTS: Dict[str, Any] = {
     "skip_embeddings": False,
     # Stage 1 split labels / Stage 2 history
     "max_prior_likes": None,  # Stage 2: cap on prior likes per target for user history (None = no cap)
+    "generate_post_liker_history": False,  # Stage 2: optionally build post-liker event-list artifacts
+    "min_post_liker_user_support": 2,  # Stage 2: minimum train likes required for a post-liker user_idx row
     "train_start": None,
     "val_start": None,
     "holdout_start": None,
@@ -123,6 +125,15 @@ DEFAULTS: Dict[str, Any] = {
     "bst_max_train_batches_per_epoch": None,
     "bst_use_popularity_feature": True,
     "bst_popularity_projection_dim": 8,
+    "bst_use_post_liker_user_pooling": False,
+    "bst_post_liker_user_embedding_dim": 16,
+    "bst_post_liker_projection_dim": 16,
+    "bst_post_liker_pooling_tau_hours": 168.0,
+    "bst_target_user_projection_dim": 16,
+    "bst_post_liker_user_dropout_rate": 0.2,
+    "bst_target_user_dropout_rate": 0.5,
+    "bst_user_id_only_prepend_target_user_token": False,
+    "bst_max_post_liker_replay_events_per_post": 32,
     "hidden_dims": [64, 32, 16],
     "dropout_rate_mlp": 0.5,
     "dropout_rate_two_tower": 0.1,
@@ -530,6 +541,8 @@ def _get_train_key(model_type: str) -> str:
         return 'train_two_tower'
     elif model_type == 'bst-ranker':
         return 'train_bst_ranker'
+    elif model_type == 'bst-user-id-only':
+        return 'train_bst_user_id_only'
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -559,6 +572,13 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
     batch_size = int(args.batch_size)
     bst_max_train_batches_per_epoch = args.bst_max_train_batches_per_epoch
     bst_popularity_projection_dim = int(args.bst_popularity_projection_dim)
+    bst_post_liker_user_embedding_dim = int(args.bst_post_liker_user_embedding_dim)
+    bst_post_liker_projection_dim = int(args.bst_post_liker_projection_dim)
+    bst_post_liker_pooling_tau_hours = float(args.bst_post_liker_pooling_tau_hours)
+    bst_target_user_projection_dim = int(args.bst_target_user_projection_dim)
+    bst_post_liker_user_dropout_rate = float(args.bst_post_liker_user_dropout_rate)
+    bst_target_user_dropout_rate = float(args.bst_target_user_dropout_rate)
+    bst_max_post_liker_replay_events_per_post = args.bst_max_post_liker_replay_events_per_post
     if model_dim <= 0:
         raise ValueError("--bst-model-dim must be positive.")
     if content_projection_dim <= 0:
@@ -581,9 +601,91 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
         raise ValueError("--bst-max-train-batches-per-epoch must be positive when provided.")
     if bst_popularity_projection_dim <= 0:
         raise ValueError("--bst-popularity-projection-dim must be positive.")
+    if bst_post_liker_user_embedding_dim <= 0:
+        raise ValueError("--bst-post-liker-user-embedding-dim must be positive.")
+    if bst_post_liker_projection_dim <= 0:
+        raise ValueError("--bst-post-liker-projection-dim must be positive.")
+    if bst_post_liker_pooling_tau_hours <= 0.0:
+        raise ValueError("--bst-post-liker-pooling-tau-hours must be positive.")
+    if bst_target_user_projection_dim <= 0:
+        raise ValueError("--bst-target-user-projection-dim must be positive.")
+    if not 0.0 <= bst_post_liker_user_dropout_rate <= 1.0:
+        raise ValueError("--bst-post-liker-user-dropout-rate must be in [0, 1].")
+    if not 0.0 <= bst_target_user_dropout_rate <= 1.0:
+        raise ValueError("--bst-target-user-dropout-rate must be in [0, 1].")
+    if bool(args.bst_use_post_liker_user_pooling) and bst_max_post_liker_replay_events_per_post is None:
+        raise ValueError("--bst-max-post-liker-replay-events-per-post is required when post-liker pooling is enabled.")
+    if (
+        bst_max_post_liker_replay_events_per_post is not None
+        and int(bst_max_post_liker_replay_events_per_post) <= 0
+    ):
+        raise ValueError("--bst-max-post-liker-replay-events-per-post must be positive when provided.")
+
+
+def _validate_bst_user_id_only_config(args: argparse.Namespace) -> None:
+    if args.prediction_hidden_dims is None:
+        raise ValueError("--prediction-hidden-dims is required when --model-type is 'bst-user-id-only'.")
+
+    if isinstance(args.prediction_hidden_dims, (str, bytes)):
+        raise ValueError("--prediction-hidden-dims must be a list of integers.")
+    try:
+        prediction_hidden_dims = tuple(int(v) for v in args.prediction_hidden_dims)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("--prediction-hidden-dims must be a list of integers.") from exc
+    if any(dim <= 0 for dim in prediction_hidden_dims):
+        raise ValueError("--prediction-hidden-dims values must be positive integers.")
+
+    model_dim = int(args.bst_model_dim)
+    time_embedding_dim = int(args.bst_time_embedding_dim)
+    num_attention_heads = int(args.bst_num_attention_heads)
+    num_transformer_layers = int(args.bst_num_transformer_layers)
+    bst_additional_batch_negatives = int(args.bst_additional_batch_negatives)
+    batch_size = int(args.batch_size)
+    bst_max_train_batches_per_epoch = args.bst_max_train_batches_per_epoch
+    bst_post_liker_user_embedding_dim = int(args.bst_post_liker_user_embedding_dim)
+    bst_post_liker_projection_dim = int(args.bst_post_liker_projection_dim)
+    bst_post_liker_pooling_tau_hours = float(args.bst_post_liker_pooling_tau_hours)
+    bst_target_user_projection_dim = int(args.bst_target_user_projection_dim)
+    bst_post_liker_user_dropout_rate = float(args.bst_post_liker_user_dropout_rate)
+    bst_target_user_dropout_rate = float(args.bst_target_user_dropout_rate)
+    bst_max_post_liker_replay_events_per_post = args.bst_max_post_liker_replay_events_per_post
+    if model_dim <= 0:
+        raise ValueError("--bst-model-dim must be positive.")
+    if time_embedding_dim <= 0:
+        raise ValueError("--bst-time-embedding-dim must be positive.")
+    if num_attention_heads <= 0:
+        raise ValueError("--bst-num-attention-heads must be positive.")
+    if (model_dim + time_embedding_dim) % num_attention_heads != 0:
+        raise ValueError("--bst-model-dim + --bst-time-embedding-dim must be divisible by --bst-num-attention-heads.")
+    if num_transformer_layers != 1:
+        raise ValueError("BST user-ID-only experiment requires --bst-num-transformer-layers=1.")
+    if bst_additional_batch_negatives <= 0:
+        raise ValueError("--bst-additional-batch-negatives must be positive.")
+    if batch_size <= 0:
+        raise ValueError("--batch-size must be positive.")
+    if bst_max_train_batches_per_epoch is not None and int(bst_max_train_batches_per_epoch) <= 0:
+        raise ValueError("--bst-max-train-batches-per-epoch must be positive when provided.")
+    if bst_post_liker_user_embedding_dim <= 0:
+        raise ValueError("--bst-post-liker-user-embedding-dim must be positive.")
+    if bst_post_liker_projection_dim <= 0:
+        raise ValueError("--bst-post-liker-projection-dim must be positive.")
+    if bst_post_liker_pooling_tau_hours <= 0.0:
+        raise ValueError("--bst-post-liker-pooling-tau-hours must be positive.")
+    if bst_target_user_projection_dim <= 0:
+        raise ValueError("--bst-target-user-projection-dim must be positive.")
+    if not 0.0 <= bst_post_liker_user_dropout_rate <= 1.0:
+        raise ValueError("--bst-post-liker-user-dropout-rate must be in [0, 1].")
+    if not 0.0 <= bst_target_user_dropout_rate <= 1.0:
+        raise ValueError("--bst-target-user-dropout-rate must be in [0, 1].")
+    if bst_max_post_liker_replay_events_per_post is None:
+        raise ValueError("--bst-max-post-liker-replay-events-per-post is required for --model-type 'bst-user-id-only'.")
+    if int(bst_max_post_liker_replay_events_per_post) <= 0:
+        raise ValueError("--bst-max-post-liker-replay-events-per-post must be positive when provided.")
 
 
 def _get_stage_order_for_model_type(train_key: str) -> List[str]:
+    if train_key == "train_bst_user_id_only":
+        return ["get_data", "user_history", train_key]
     # replace the generic 'train_placeholder' with the actual train stage key based on train_key:
     stage_order = copy.deepcopy(STAGE_ORDER)
     return [train_key if s == TRAIN_PLACEHOLDER else s for s in stage_order]
@@ -679,6 +781,8 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
             raise ValueError("--author-unknown-dropout-rate must be in [0, 1).")
     if model_type == "bst-ranker":
         _validate_bst_config(args)
+    elif model_type == "bst-user-id-only":
+        _validate_bst_user_id_only_config(args)
 
     # Override train stage key if --model-type is specified
     train_key = _get_train_key(model_type)
@@ -832,6 +936,11 @@ def build_parser() -> argparse.ArgumentParser:
     # Stage 1 split / Stage 2 options
     _add_arg_with_default(p_all, "--max-prior-likes", type=int, default=argparse.SUPPRESS,
                           help_text="Cap on prior likes per target in Stage 2 user history (None = no cap, keeps all prior likes)")
+    _add_arg_with_default(p_all, "--generate-post-liker-history", action=argparse.BooleanOptionalAction,
+                          default=argparse.SUPPRESS,
+                          help_text="Generate Stage 2 post-liker event-list artifacts")
+    _add_arg_with_default(p_all, "--min-post-liker-user-support", type=int, default=argparse.SUPPRESS,
+                          help_text="Minimum train likes required for a user to receive a post-liker user_idx row")
     _add_arg_with_default(p_all, "--train-start", type=str, default=argparse.SUPPRESS,
                           help_text="ISO date string for start of training dataset window")
     _add_arg_with_default(p_all, "--val-start", type=str, default=argparse.SUPPRESS,
@@ -852,8 +961,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="EMA smoothing factor (0,1]. Higher = more weight on recent likes. Only used when --user-summarization=ema")
     _add_arg_with_default(p_all, "--user-encoder", type=str, choices=["summarized", "full_transformer", "cross_attention"],
                           default=argparse.SUPPRESS, help_text="User encoder type (summarized, full_transformer, or cross_attention).")
-    _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower", "bst-ranker"],
-                          default=argparse.SUPPRESS, help_text="Model architecture: mlp, two-tower, or bst-ranker")
+    _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower", "bst-ranker", "bst-user-id-only"],
+                          default=argparse.SUPPRESS, help_text="Model architecture: mlp, two-tower, bst-ranker, or bst-user-id-only")
     # Two-tower specific options
     _add_arg_with_default(p_all, "--shared-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower shared embedding dimension")
@@ -924,6 +1033,26 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Enable or disable BST prior-cumulative-like popularity features")
     _add_arg_with_default(p_all, "--bst-popularity-projection-dim", type=int, default=argparse.SUPPRESS,
                           help_text="BST popularity feature projection dimension")
+    _add_arg_with_default(p_all, "--bst-use-post-liker-user-pooling", action=argparse.BooleanOptionalAction,
+                          default=argparse.SUPPRESS,
+                          help_text="Emit BST post-liker packed replay tensors from Stage 2 post-liker events")
+    _add_arg_with_default(p_all, "--bst-post-liker-user-embedding-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="BST post-liker learned user ID embedding dimension")
+    _add_arg_with_default(p_all, "--bst-post-liker-projection-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="BST post-liker pooled-vector projection dimension")
+    _add_arg_with_default(p_all, "--bst-post-liker-pooling-tau-hours", type=float, default=argparse.SUPPRESS,
+                          help_text="BST post-liker recursive EMA time constant in hours")
+    _add_arg_with_default(p_all, "--bst-target-user-projection-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="BST target-user embedding projection dimension for post-liker user features")
+    _add_arg_with_default(p_all, "--bst-post-liker-user-dropout-rate", type=float, default=argparse.SUPPRESS,
+                          help_text="Training-time probability of replacing post-liker user IDs with the UNK row")
+    _add_arg_with_default(p_all, "--bst-target-user-dropout-rate", type=float, default=argparse.SUPPRESS,
+                          help_text="Training-time probability of replacing target user IDs with the UNK row")
+    _add_arg_with_default(p_all, "--bst-user-id-only-prepend-target-user-token", action=argparse.BooleanOptionalAction,
+                          default=argparse.SUPPRESS,
+                          help_text="BST user-ID-only experiment: prepend the target-user embedding as a transformer token")
+    _add_arg_with_default(p_all, "--bst-max-post-liker-replay-events-per-post", type=int, default=argparse.SUPPRESS,
+                          help_text="Optional tail cap on prior liker events replayed per history or candidate post for BST")
     # Stage 3 options (shared)
     _add_arg_with_default(p_all, "--epochs", type=int, default=argparse.SUPPRESS,
                           help_text="Training epochs")
@@ -989,10 +1118,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="(Deprecated) Always enabled during sequential run-all")
     # Selective reruns and prior pinning
     _add_arg_with_default(p_all, "--start-from", type=str,
-                          choices=["get_data", "user_history", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "evaluate"],
+                          choices=["get_data", "user_history", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "train_bst_user_id_only", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Begin execution at this stage")
     _add_arg_with_default(p_all, "--stop-after", type=str,
-                          choices=["get_data", "user_history", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "evaluate"],
+                          choices=["get_data", "user_history", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "train_bst_user_id_only", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Stop after this stage completes")
     _add_arg_with_default(p_all, "--pick-prior", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help_text="If multiple prior outputs exist, prompt to pick (foreground only)")

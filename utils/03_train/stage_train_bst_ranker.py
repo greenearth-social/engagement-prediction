@@ -22,9 +22,11 @@ from tqdm import tqdm
 from shared.input_data_helpers import AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
 from utils.dataloaders import (
     BucketedEngagementDataset,
+    PostLikerEventLookup,
     create_bucketed_data_loaders,
     get_author_table_num_rows,
     load_bucketed_training_data,
+    load_post_liker_event_artifacts,
 )
 from utils.helpers import (
     clear_cuda_memory,
@@ -110,10 +112,86 @@ def _compute_bst_popularity_log_stats(dataset: BucketedEngagementDataset) -> Tup
     return mean, std
 
 
+def _get_post_liker_user_table_num_rows(user_idx_df: Optional[Any]) -> int:
+    if user_idx_df is None or len(user_idx_df) == 0:
+        return 2
+    if "user_idx" not in user_idx_df.columns:
+        raise ValueError("post-liker user_idx artifact is missing user_idx column")
+    max_user_idx = user_idx_df["user_idx"].max()
+    if max_user_idx is None:
+        return 2
+    return max(2, int(max_user_idx) + 1)
+
+
+class PostLikerUserPooler(nn.Module):
+    """Replay padded post-liker user events into one EMA-pooled vector per post token."""
+
+    def __init__(
+        self,
+        user_embedding_dim: int,
+        pooling_tau_hours: float,
+    ):
+        super().__init__()
+        if user_embedding_dim <= 0:
+            raise ValueError("user_embedding_dim must be positive")
+        if pooling_tau_hours <= 0.0:
+            raise ValueError("pooling_tau_hours must be positive")
+
+        self.user_embedding_dim = int(user_embedding_dim)
+        self.pooling_tau_hours = float(pooling_tau_hours)
+
+    def forward(
+        self,
+        user_indices: torch.Tensor,
+        time_gap_hours: torch.Tensor,
+        user_embedding_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        if user_indices.dim() not in (2, 3):
+            raise ValueError("user_indices must have shape [N, K] or [B, H, K]")
+        if time_gap_hours.shape != user_indices.shape:
+            raise ValueError("time_gap_hours shape must match user_indices")
+        if user_indices.size(-1) <= 0:
+            raise ValueError("user_indices must have at least one replay slot")
+        if user_embedding_weights.dim() != 2 or user_embedding_weights.size(1) != self.user_embedding_dim:
+            raise ValueError("user_embedding_weights must have shape [num_users, user_embedding_dim]")
+
+        device = user_embedding_weights.device
+        user_indices_tensor = user_indices.to(device=device, dtype=torch.long)
+        time_gaps = time_gap_hours.to(device=device, dtype=user_embedding_weights.dtype)
+        replay_len = int(user_indices_tensor.size(-1))
+        flat_user_indices = user_indices_tensor.reshape(-1, replay_len)
+        flat_time_gaps = time_gaps.reshape(-1, replay_len)
+        event_embeddings = F.embedding(flat_user_indices, user_embedding_weights, padding_idx=0)
+        num_tokens = int(flat_user_indices.size(0))
+        pooled = torch.zeros(
+            (num_tokens, self.user_embedding_dim),
+            device=device,
+            dtype=event_embeddings.dtype,
+        )
+        has_state = torch.zeros((num_tokens, 1), device=device, dtype=torch.bool)
+
+        for event_idx in range(replay_len):
+            event_valid = flat_user_indices[:, event_idx].ne(0).unsqueeze(-1)
+            event_embedding = event_embeddings[:, event_idx, :]
+            delta_hours = torch.clamp(flat_time_gaps[:, event_idx].unsqueeze(-1), min=0.0)
+            alpha = 1.0 - torch.exp(-delta_hours / self.pooling_tau_hours)
+            updated_state = torch.where(
+                has_state,
+                alpha * event_embedding + (1.0 - alpha) * pooled,
+                event_embedding,
+            )
+            pooled = torch.where(event_valid, updated_state, pooled)
+            has_state = has_state | event_valid
+
+        if user_indices_tensor.dim() == 2:
+            return pooled.view(user_indices_tensor.size(0), self.user_embedding_dim)
+        return pooled.view(user_indices_tensor.size(0), user_indices_tensor.size(1), self.user_embedding_dim)
+
+
 class BSTRanker(nn.Module):
     """Behavior Sequence Transformer encoder for one user-history/candidate pair."""
 
-    __constants__ = ["use_popularity_feature"]
+    __constants__ = ["use_popularity_feature", "use_post_liker_user_pooling"]
 
     def __init__(
         self,
@@ -136,6 +214,14 @@ class BSTRanker(nn.Module):
         popularity_projection_dim: int,
         popularity_log_mean: float,
         popularity_log_std: float,
+        use_post_liker_user_pooling: bool,
+        post_liker_user_table_num_rows: int,
+        post_liker_user_embedding_dim: int,
+        post_liker_projection_dim: int,
+        post_liker_pooling_tau_hours: float,
+        target_user_projection_dim: int,
+        post_liker_user_dropout_rate: float,
+        target_user_dropout_rate: float,
     ):
         super().__init__()
         if time_embedding_dim <= 0:
@@ -152,6 +238,20 @@ class BSTRanker(nn.Module):
             raise ValueError("popularity_projection_dim must be positive when popularity features are enabled")
         if use_popularity_feature and popularity_log_std <= 0.0:
             raise ValueError("popularity_log_std must be positive when popularity features are enabled")
+        if use_post_liker_user_pooling and post_liker_user_table_num_rows < 2:
+            raise ValueError("post_liker_user_table_num_rows must be at least 2 when post-liker pooling is enabled")
+        if use_post_liker_user_pooling and post_liker_user_embedding_dim <= 0:
+            raise ValueError("post_liker_user_embedding_dim must be positive when post-liker pooling is enabled")
+        if use_post_liker_user_pooling and post_liker_projection_dim <= 0:
+            raise ValueError("post_liker_projection_dim must be positive when post-liker pooling is enabled")
+        if use_post_liker_user_pooling and post_liker_pooling_tau_hours <= 0.0:
+            raise ValueError("post_liker_pooling_tau_hours must be positive when post-liker pooling is enabled")
+        if use_post_liker_user_pooling and target_user_projection_dim <= 0:
+            raise ValueError("target_user_projection_dim must be positive when post-liker pooling is enabled")
+        if not 0.0 <= post_liker_user_dropout_rate <= 1.0:
+            raise ValueError("post_liker_user_dropout_rate must be in [0, 1]")
+        if not 0.0 <= target_user_dropout_rate <= 1.0:
+            raise ValueError("target_user_dropout_rate must be in [0, 1]")
 
         self.post_embedding_dim = int(post_embedding_dim)
         self.content_projection_dim = int(content_projection_dim)
@@ -163,6 +263,14 @@ class BSTRanker(nn.Module):
         self.popularity_projection_dim = int(popularity_projection_dim) if self.use_popularity_feature else 0
         self.popularity_log_mean = float(popularity_log_mean)
         self.popularity_log_std = float(popularity_log_std)
+        self.use_post_liker_user_pooling: Final[bool] = bool(use_post_liker_user_pooling)
+        self.post_liker_user_table_num_rows = int(post_liker_user_table_num_rows) if self.use_post_liker_user_pooling else 2
+        self.post_liker_user_embedding_dim = int(post_liker_user_embedding_dim) if self.use_post_liker_user_pooling else 0
+        self.post_liker_projection_dim = int(post_liker_projection_dim) if self.use_post_liker_user_pooling else 0
+        self.post_liker_pooling_tau_hours = float(post_liker_pooling_tau_hours)
+        self.target_user_projection_dim = int(target_user_projection_dim) if self.use_post_liker_user_pooling else 0
+        self.post_liker_user_dropout_rate = float(post_liker_user_dropout_rate) if self.use_post_liker_user_pooling else 0.0
+        self.target_user_dropout_rate = float(target_user_dropout_rate) if self.use_post_liker_user_pooling else 0.0
         self.time_delta_bucket_boundaries_hours = _validate_time_delta_bucket_boundaries(
             time_delta_bucket_boundaries_hours
         )
@@ -188,7 +296,32 @@ class BSTRanker(nn.Module):
             popularity_projection_dim=popularity_projection_dim,
             popularity_log_mean=popularity_log_mean,
             popularity_log_std=popularity_log_std,
+            use_post_liker_feature=use_post_liker_user_pooling,
+            post_liker_input_dim=self.post_liker_user_embedding_dim,
+            post_liker_projection_dim=self.post_liker_projection_dim,
         )
+        if self.use_post_liker_user_pooling:
+            self.post_liker_user_embedding = nn.Embedding(
+                num_embeddings=self.post_liker_user_table_num_rows,
+                embedding_dim=self.post_liker_user_embedding_dim,
+                padding_idx=0,
+            )
+            nn.init.xavier_uniform_(self.post_liker_user_embedding.weight)
+            with torch.no_grad():
+                self.post_liker_user_embedding.weight[0].zero_()
+            self.post_liker_user_pooler = PostLikerUserPooler(
+                user_embedding_dim=self.post_liker_user_embedding_dim,
+                pooling_tau_hours=self.post_liker_pooling_tau_hours,
+            )
+            self.target_user_projection = nn.Linear(
+                self.post_liker_user_embedding_dim,
+                self.target_user_projection_dim,
+            )
+            self.target_user_projection_norm = nn.LayerNorm(self.target_user_projection_dim)
+            self.target_user_projection_activation = nn.GELU()
+            nn.init.xavier_uniform_(self.target_user_projection.weight)
+            if self.target_user_projection.bias is not None:
+                nn.init.zeros_(self.target_user_projection.bias)
         self.time_delta_embedding = nn.Embedding(
             num_embeddings=self.num_time_delta_buckets,
             embedding_dim=self.time_embedding_dim,
@@ -210,7 +343,7 @@ class BSTRanker(nn.Module):
             enable_nested_tensor=False,
         )
         self.prediction_head = LinearPredictionHead(
-            input_dim=self.transformer_input_dim,
+            input_dim=self.transformer_input_dim + self.target_user_projection_dim,
             hidden_dims=prediction_hidden_dims,
             dropout_rate=dropout_rate,
         )
@@ -228,6 +361,33 @@ class BSTRanker(nn.Module):
         zero_bucket_ids = torch.zeros_like(positive_bucket_ids)
         return torch.where(deltas <= 0.0, zero_bucket_ids, positive_bucket_ids).to(dtype=torch.long)
 
+    def _target_user_features(self, target_user_indices: torch.Tensor) -> torch.Tensor:
+        target_user_indices = target_user_indices.to(
+            device=self.post_liker_user_embedding.weight.device,
+            dtype=torch.long,
+        )
+        target_user_indices = self._apply_user_idx_unk_dropout(
+            target_user_indices,
+            self.target_user_dropout_rate,
+        )
+        target_user_embeddings = self.post_liker_user_embedding(target_user_indices)
+        return self.target_user_projection_norm(
+            self.target_user_projection_activation(
+                self.target_user_projection(target_user_embeddings)
+            )
+        )
+
+    def _apply_user_idx_unk_dropout(
+        self,
+        user_indices: torch.Tensor,
+        dropout_rate: float,
+    ) -> torch.Tensor:
+        if not self.training or dropout_rate <= 0.0:
+            return user_indices
+        eligible = user_indices.gt(1)
+        dropout_mask = eligible & torch.rand(user_indices.size(), device=user_indices.device).lt(dropout_rate)
+        return torch.where(dropout_mask, torch.ones_like(user_indices), user_indices)
+
     def _forward_transformer(
         self,
         history_embeddings: torch.Tensor,
@@ -238,6 +398,10 @@ class BSTRanker(nn.Module):
         candidate_post_author_idx: torch.Tensor,
         history_prior_cumulative_likes: Optional[torch.Tensor] = None,
         candidate_prior_cumulative_likes: Optional[torch.Tensor] = None,
+        history_post_liker_user_indices: Optional[torch.Tensor] = None,
+        history_post_liker_time_gap_hours: Optional[torch.Tensor] = None,
+        candidate_post_liker_user_indices: Optional[torch.Tensor] = None,
+        candidate_post_liker_time_gap_hours: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if history_embeddings.dim() != 3:
             raise ValueError("history_embeddings must have shape [B, H, D]")
@@ -267,6 +431,23 @@ class BSTRanker(nn.Module):
                 raise ValueError("history_prior_cumulative_likes must have shape [B, H]")
             if candidate_prior_cumulative_likes.shape != (batch_size,):
                 raise ValueError("candidate_prior_cumulative_likes must have shape [B]")
+        if self.use_post_liker_user_pooling:
+            if history_post_liker_user_indices is None:
+                raise ValueError("history_post_liker_user_indices is required when post-liker pooling is enabled")
+            if history_post_liker_time_gap_hours is None:
+                raise ValueError("history_post_liker_time_gap_hours is required when post-liker pooling is enabled")
+            if candidate_post_liker_user_indices is None:
+                raise ValueError("candidate_post_liker_user_indices is required when post-liker pooling is enabled")
+            if candidate_post_liker_time_gap_hours is None:
+                raise ValueError("candidate_post_liker_time_gap_hours is required when post-liker pooling is enabled")
+            if history_post_liker_user_indices.dim() != 3 or history_post_liker_user_indices.size(0) != batch_size or history_post_liker_user_indices.size(1) != max_history_len:
+                raise ValueError("history_post_liker_user_indices must have shape [B, H, K]")
+            if history_post_liker_time_gap_hours.shape != history_post_liker_user_indices.shape:
+                raise ValueError("history_post_liker_time_gap_hours shape must match history_post_liker_user_indices")
+            if candidate_post_liker_user_indices.dim() != 2 or candidate_post_liker_user_indices.size(0) != batch_size:
+                raise ValueError("candidate_post_liker_user_indices must have shape [B, K]")
+            if candidate_post_liker_time_gap_hours.shape != candidate_post_liker_user_indices.shape:
+                raise ValueError("candidate_post_liker_time_gap_hours shape must match candidate_post_liker_user_indices")
 
         device = history_embeddings.device
         history_mask = history_mask.to(device=device, dtype=torch.bool)
@@ -279,16 +460,43 @@ class BSTRanker(nn.Module):
         if self.use_popularity_feature:
             history_prior_cumulative_likes_tensor = torch.jit._unwrap_optional(history_prior_cumulative_likes).to(device=device, dtype=torch.float32)
             candidate_prior_cumulative_likes_tensor = torch.jit._unwrap_optional(candidate_prior_cumulative_likes).to(device=device, dtype=torch.float32)
+        history_post_liker_features: Optional[torch.Tensor] = None
+        candidate_post_liker_features: Optional[torch.Tensor] = None
+        if self.use_post_liker_user_pooling:
+            history_post_liker_user_indices_tensor = torch.jit._unwrap_optional(history_post_liker_user_indices).to(device=device, dtype=torch.long)
+            history_post_liker_time_gap_tensor = torch.jit._unwrap_optional(history_post_liker_time_gap_hours).to(device=device, dtype=torch.float32)
+            candidate_post_liker_user_indices_tensor = torch.jit._unwrap_optional(candidate_post_liker_user_indices).to(device=device, dtype=torch.long)
+            candidate_post_liker_time_gap_tensor = torch.jit._unwrap_optional(candidate_post_liker_time_gap_hours).to(device=device, dtype=torch.float32)
+            history_post_liker_user_indices_tensor = self._apply_user_idx_unk_dropout(
+                history_post_liker_user_indices_tensor,
+                self.post_liker_user_dropout_rate,
+            )
+            candidate_post_liker_user_indices_tensor = self._apply_user_idx_unk_dropout(
+                candidate_post_liker_user_indices_tensor,
+                self.post_liker_user_dropout_rate,
+            )
+            history_post_liker_features = self.post_liker_user_pooler(
+                history_post_liker_user_indices_tensor,
+                history_post_liker_time_gap_tensor,
+                self.post_liker_user_embedding.weight,
+            )
+            candidate_post_liker_features = self.post_liker_user_pooler(
+                candidate_post_liker_user_indices_tensor,
+                candidate_post_liker_time_gap_tensor,
+                self.post_liker_user_embedding.weight,
+            )
 
         history_post_vectors = self.post_feature_encoder(
             history_embeddings,
             history_author_indices,
             history_prior_cumulative_likes_tensor,
+            history_post_liker_features,
         )
         candidate_post_vector = self.post_feature_encoder(
             candidate_post_embeddings,
             candidate_post_author_idx,
             candidate_prior_cumulative_likes_tensor,
+            candidate_post_liker_features,
         ).unsqueeze(1)
         post_sequence = torch.cat([history_post_vectors, candidate_post_vector], dim=1)
 
@@ -401,6 +609,11 @@ class BSTRanker(nn.Module):
         candidate_post_author_idx: torch.Tensor,
         history_prior_cumulative_likes: Optional[torch.Tensor] = None,
         candidate_prior_cumulative_likes: Optional[torch.Tensor] = None,
+        history_post_liker_user_indices: Optional[torch.Tensor] = None,
+        history_post_liker_time_gap_hours: Optional[torch.Tensor] = None,
+        candidate_post_liker_user_indices: Optional[torch.Tensor] = None,
+        candidate_post_liker_time_gap_hours: Optional[torch.Tensor] = None,
+        target_user_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         self._validate_one_layer_matrix_scorer()
         if history_embeddings.dim() != 3:
@@ -432,6 +645,27 @@ class BSTRanker(nn.Module):
                 raise ValueError("history_prior_cumulative_likes must have shape [U, H]")
             if candidate_prior_cumulative_likes.shape != (num_candidates,):
                 raise ValueError("candidate_prior_cumulative_likes must have shape [C]")
+        if self.use_post_liker_user_pooling:
+            if history_post_liker_user_indices is None:
+                raise ValueError("history_post_liker_user_indices is required when post-liker pooling is enabled")
+            if history_post_liker_time_gap_hours is None:
+                raise ValueError("history_post_liker_time_gap_hours is required when post-liker pooling is enabled")
+            if candidate_post_liker_user_indices is None:
+                raise ValueError("candidate_post_liker_user_indices is required when post-liker pooling is enabled")
+            if candidate_post_liker_time_gap_hours is None:
+                raise ValueError("candidate_post_liker_time_gap_hours is required when post-liker pooling is enabled")
+            if history_post_liker_user_indices.dim() != 3 or history_post_liker_user_indices.size(0) != num_users or history_post_liker_user_indices.size(1) != max_history_len:
+                raise ValueError("history_post_liker_user_indices must have shape [U, H, K]")
+            if history_post_liker_time_gap_hours.shape != history_post_liker_user_indices.shape:
+                raise ValueError("history_post_liker_time_gap_hours shape must match history_post_liker_user_indices")
+            if candidate_post_liker_user_indices.dim() != 2 or candidate_post_liker_user_indices.size(0) != num_candidates:
+                raise ValueError("candidate_post_liker_user_indices must have shape [C, K]")
+            if candidate_post_liker_time_gap_hours.shape != candidate_post_liker_user_indices.shape:
+                raise ValueError("candidate_post_liker_time_gap_hours shape must match candidate_post_liker_user_indices")
+            if target_user_indices is None:
+                raise ValueError("target_user_indices is required when post-liker pooling is enabled")
+            if target_user_indices.dim() != 1 or target_user_indices.size(0) != num_users:
+                raise ValueError("target_user_indices must have shape [U]")
 
         return self.score_candidate_matrix(
             history_embeddings=history_embeddings,
@@ -442,6 +676,11 @@ class BSTRanker(nn.Module):
             candidate_post_author_idx=candidate_post_author_idx,
             history_prior_cumulative_likes=history_prior_cumulative_likes,
             candidate_prior_cumulative_likes=candidate_prior_cumulative_likes,
+            history_post_liker_user_indices=history_post_liker_user_indices,
+            history_post_liker_time_gap_hours=history_post_liker_time_gap_hours,
+            candidate_post_liker_user_indices=candidate_post_liker_user_indices,
+            candidate_post_liker_time_gap_hours=candidate_post_liker_time_gap_hours,
+            target_user_indices=target_user_indices,
         )
 
     @torch.jit.export
@@ -455,12 +694,18 @@ class BSTRanker(nn.Module):
         candidate_post_author_idx: torch.Tensor,
         history_prior_cumulative_likes: Optional[torch.Tensor] = None,
         candidate_prior_cumulative_likes: Optional[torch.Tensor] = None,
+        history_post_liker_user_indices: Optional[torch.Tensor] = None,
+        history_post_liker_time_gap_hours: Optional[torch.Tensor] = None,
+        candidate_post_liker_user_indices: Optional[torch.Tensor] = None,
+        candidate_post_liker_time_gap_hours: Optional[torch.Tensor] = None,
+        target_user_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if len(self.transformer_encoder.layers) != 1:
             raise RuntimeError("score_candidate_matrix requires exactly one transformer layer")
         layer = self.transformer_encoder.layers[0]
 
         num_users = int(history_embeddings.size(0))
+        max_history_len = int(history_embeddings.size(1))
         num_candidates = int(candidate_post_embeddings.size(0))
         device = history_embeddings.device
         history_mask = history_mask.to(device=device, dtype=torch.bool)
@@ -481,16 +726,66 @@ class BSTRanker(nn.Module):
                 raise RuntimeError("candidate_prior_cumulative_likes must have shape [C]")
             history_prior_cumulative_likes_tensor = torch.jit._unwrap_optional(history_prior_cumulative_likes).to(device=device, dtype=torch.float32)
             candidate_prior_cumulative_likes_tensor = torch.jit._unwrap_optional(candidate_prior_cumulative_likes).to(device=device, dtype=torch.float32)
+        history_post_liker_features: Optional[torch.Tensor] = None
+        candidate_post_liker_features: Optional[torch.Tensor] = None
+        target_user_features: Optional[torch.Tensor] = None
+        if self.use_post_liker_user_pooling:
+            if history_post_liker_user_indices is None:
+                raise RuntimeError("history_post_liker_user_indices is required when post-liker pooling is enabled")
+            if history_post_liker_time_gap_hours is None:
+                raise RuntimeError("history_post_liker_time_gap_hours is required when post-liker pooling is enabled")
+            if candidate_post_liker_user_indices is None:
+                raise RuntimeError("candidate_post_liker_user_indices is required when post-liker pooling is enabled")
+            if candidate_post_liker_time_gap_hours is None:
+                raise RuntimeError("candidate_post_liker_time_gap_hours is required when post-liker pooling is enabled")
+            history_post_liker_user_indices_tensor = torch.jit._unwrap_optional(history_post_liker_user_indices).to(device=device, dtype=torch.long)
+            history_post_liker_time_gap_tensor = torch.jit._unwrap_optional(history_post_liker_time_gap_hours).to(device=device, dtype=torch.float32)
+            candidate_post_liker_user_indices_tensor = torch.jit._unwrap_optional(candidate_post_liker_user_indices).to(device=device, dtype=torch.long)
+            candidate_post_liker_time_gap_tensor = torch.jit._unwrap_optional(candidate_post_liker_time_gap_hours).to(device=device, dtype=torch.float32)
+            if history_post_liker_user_indices_tensor.dim() != 3 or history_post_liker_user_indices_tensor.size(0) != num_users or history_post_liker_user_indices_tensor.size(1) != max_history_len:
+                raise RuntimeError("history_post_liker_user_indices must have shape [U, H, K]")
+            if history_post_liker_time_gap_tensor.size() != history_post_liker_user_indices_tensor.size():
+                raise RuntimeError("history_post_liker_time_gap_hours shape must match history_post_liker_user_indices")
+            if candidate_post_liker_user_indices_tensor.dim() != 2 or candidate_post_liker_user_indices_tensor.size(0) != num_candidates:
+                raise RuntimeError("candidate_post_liker_user_indices must have shape [C, K]")
+            if candidate_post_liker_time_gap_tensor.size() != candidate_post_liker_user_indices_tensor.size():
+                raise RuntimeError("candidate_post_liker_time_gap_hours shape must match candidate_post_liker_user_indices")
+            if target_user_indices is None:
+                raise RuntimeError("target_user_indices is required when post-liker pooling is enabled")
+            target_user_indices_tensor = torch.jit._unwrap_optional(target_user_indices).to(device=device, dtype=torch.long)
+            if target_user_indices_tensor.dim() != 1 or target_user_indices_tensor.size(0) != num_users:
+                raise RuntimeError("target_user_indices must have shape [U]")
+            history_post_liker_user_indices_tensor = self._apply_user_idx_unk_dropout(
+                history_post_liker_user_indices_tensor,
+                self.post_liker_user_dropout_rate,
+            )
+            candidate_post_liker_user_indices_tensor = self._apply_user_idx_unk_dropout(
+                candidate_post_liker_user_indices_tensor,
+                self.post_liker_user_dropout_rate,
+            )
+            history_post_liker_features = self.post_liker_user_pooler(
+                history_post_liker_user_indices_tensor,
+                history_post_liker_time_gap_tensor,
+                self.post_liker_user_embedding.weight,
+            )
+            candidate_post_liker_features = self.post_liker_user_pooler(
+                candidate_post_liker_user_indices_tensor,
+                candidate_post_liker_time_gap_tensor,
+                self.post_liker_user_embedding.weight,
+            )
+            target_user_features = self._target_user_features(target_user_indices_tensor)
 
         history_post_vectors = self.post_feature_encoder(
             history_embeddings,
             history_author_indices,
             history_prior_cumulative_likes_tensor,
+            history_post_liker_features,
         )
         candidate_post_vectors = self.post_feature_encoder(
             candidate_post_embeddings,
             candidate_post_author_idx,
             candidate_prior_cumulative_likes_tensor,
+            candidate_post_liker_features,
         )
         history_time_bucket_ids = self._bucketize_time_deltas_hours(history_time_deltas_hours)
         history_time_embeddings = self.time_delta_embedding(history_time_bucket_ids)
@@ -557,7 +852,16 @@ class BSTRanker(nn.Module):
                 layer.norm2.eps,
             )
 
-        logits = self.prediction_head(candidate_state.reshape(num_users * num_candidates, self.transformer_input_dim))
+        prediction_input = candidate_state.reshape(num_users * num_candidates, self.transformer_input_dim)
+        if self.use_post_liker_user_pooling:
+            target_features = torch.jit._unwrap_optional(target_user_features)
+            expanded_target_features = target_features.unsqueeze(1).expand(
+                num_users,
+                num_candidates,
+                self.target_user_projection_dim,
+            ).reshape(num_users * num_candidates, self.target_user_projection_dim)
+            prediction_input = torch.cat([prediction_input, expanded_target_features], dim=-1)
+        logits = self.prediction_head(prediction_input)
         if logits.dim() == 2 and logits.shape == (num_users * num_candidates, 1):
             logits = logits.squeeze(-1)
         if logits.shape != (num_users * num_candidates,):
@@ -574,6 +878,11 @@ class BSTRanker(nn.Module):
         candidate_post_author_idx: torch.Tensor,
         history_prior_cumulative_likes: Optional[torch.Tensor] = None,
         candidate_prior_cumulative_likes: Optional[torch.Tensor] = None,
+        history_post_liker_user_indices: Optional[torch.Tensor] = None,
+        history_post_liker_time_gap_hours: Optional[torch.Tensor] = None,
+        candidate_post_liker_user_indices: Optional[torch.Tensor] = None,
+        candidate_post_liker_time_gap_hours: Optional[torch.Tensor] = None,
+        target_user_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         transformer_output = self._forward_transformer(
             history_embeddings=history_embeddings,
@@ -584,8 +893,24 @@ class BSTRanker(nn.Module):
             candidate_post_author_idx=candidate_post_author_idx,
             history_prior_cumulative_likes=history_prior_cumulative_likes,
             candidate_prior_cumulative_likes=candidate_prior_cumulative_likes,
+            history_post_liker_user_indices=history_post_liker_user_indices,
+            history_post_liker_time_gap_hours=history_post_liker_time_gap_hours,
+            candidate_post_liker_user_indices=candidate_post_liker_user_indices,
+            candidate_post_liker_time_gap_hours=candidate_post_liker_time_gap_hours,
         )
-        logits = self.prediction_head(transformer_output)
+        prediction_input = transformer_output
+        if self.use_post_liker_user_pooling:
+            if target_user_indices is None:
+                raise ValueError("target_user_indices is required when post-liker pooling is enabled")
+            target_user_indices_tensor = torch.jit._unwrap_optional(target_user_indices).to(
+                device=transformer_output.device,
+                dtype=torch.long,
+            )
+            if target_user_indices_tensor.dim() != 1 or target_user_indices_tensor.size(0) != transformer_output.size(0):
+                raise ValueError("target_user_indices must have shape [B]")
+            target_user_features = self._target_user_features(target_user_indices_tensor)
+            prediction_input = torch.cat([transformer_output, target_user_features], dim=-1)
+        logits = self.prediction_head(prediction_input)
         if logits.dim() == 2 and logits.shape == (transformer_output.size(0), 1):
             logits = logits.squeeze(-1)
         if logits.shape != (transformer_output.size(0),):
@@ -613,6 +938,30 @@ def _compute_bst_listwise_loss_and_preds(
             raise RuntimeError("BST listwise batches must include popularity tensors when popularity features are enabled")
         history_prior_cumulative_likes = batch["history_prior_cumulative_likes"].to(device, dtype=torch.float32, non_blocking=True)
         candidate_prior_cumulative_likes = batch["candidate_prior_cumulative_likes"].to(device, dtype=torch.float32, non_blocking=True)
+    history_post_liker_user_indices = None
+    history_post_liker_time_gap_hours = None
+    candidate_post_liker_user_indices = None
+    candidate_post_liker_time_gap_hours = None
+    target_user_indices = None
+    if model.use_post_liker_user_pooling:
+        required_post_liker_fields = (
+            "history_post_liker_user_indices",
+            "history_post_liker_time_gap_hours",
+            "candidate_post_liker_user_indices",
+            "candidate_post_liker_time_gap_hours",
+            "target_user_indices",
+        )
+        missing_post_liker_fields = [field for field in required_post_liker_fields if field not in batch]
+        if missing_post_liker_fields:
+            raise RuntimeError(
+                "BST listwise batches must include post-liker tensors when post-liker pooling is enabled: "
+                + ", ".join(missing_post_liker_fields)
+            )
+        history_post_liker_user_indices = batch["history_post_liker_user_indices"].to(device, dtype=torch.long, non_blocking=True)
+        history_post_liker_time_gap_hours = batch["history_post_liker_time_gap_hours"].to(device, dtype=torch.float32, non_blocking=True)
+        candidate_post_liker_user_indices = batch["candidate_post_liker_user_indices"].to(device, dtype=torch.long, non_blocking=True)
+        candidate_post_liker_time_gap_hours = batch["candidate_post_liker_time_gap_hours"].to(device, dtype=torch.float32, non_blocking=True)
+        target_user_indices = batch["target_user_indices"].to(device, dtype=torch.long, non_blocking=True)
 
     scores = model.score_candidate_matrix_one_layer(
         history_embeddings=history_embeddings,
@@ -623,6 +972,11 @@ def _compute_bst_listwise_loss_and_preds(
         candidate_post_author_idx=candidate_post_author_idx,
         history_prior_cumulative_likes=history_prior_cumulative_likes,
         candidate_prior_cumulative_likes=candidate_prior_cumulative_likes,
+        history_post_liker_user_indices=history_post_liker_user_indices,
+        history_post_liker_time_gap_hours=history_post_liker_time_gap_hours,
+        candidate_post_liker_user_indices=candidate_post_liker_user_indices,
+        candidate_post_liker_time_gap_hours=candidate_post_liker_time_gap_hours,
+        target_user_indices=target_user_indices,
     )
     if scores.shape != labels.shape:
         raise RuntimeError("Expected BST scores and label_matrix to have matching [num_users, num_candidates] shapes")
@@ -791,6 +1145,19 @@ def _log_bst_listwise_epoch_metrics(
             iteration,
         )
     for k in metrics_top_ks:
+        if calc_baseline_metrics:
+            for metric_name, metric_label in ((f"ndcg@{k}", f"NDCG@{k}"), (f"recall@{k}", f"Recall@{k}")):
+                for split_label, metrics in (
+                    ("Train", train_baseline_metrics),
+                    ("Validation", val_baseline_metrics),
+                    ("Validation Unseen Users", val_unseen_baseline_metrics),
+                ):
+                    experiment_tracker.log_scalar(
+                        metric_label,
+                        f"{split_label} {metric_label}",
+                        float(metrics[metric_name]),
+                        0,
+                    )
         for metric_name, metric_label in ((f"ndcg@{k}", f"NDCG@{k}"), (f"recall@{k}", f"Recall@{k}")):
             for split_label, metrics in (
                 ("Train", train_metrics),
@@ -801,19 +1168,6 @@ def _log_bst_listwise_epoch_metrics(
                 if metric_value is None:
                     continue
                 experiment_tracker.log_scalar(metric_label, f"{split_label} {metric_label}", float(metric_value), iteration)
-        if calc_baseline_metrics:
-            for metric_name, metric_label in ((f"ndcg@{k}", f"Baseline NDCG@{k}"), (f"recall@{k}", f"Baseline Recall@{k}")):
-                for split_label, metrics in (
-                    ("Train", train_baseline_metrics),
-                    ("Validation", val_baseline_metrics),
-                    ("Validation Unseen Users", val_unseen_baseline_metrics),
-                ):
-                    experiment_tracker.log_scalar(
-                        metric_label,
-                        f"{split_label} {metric_label}",
-                        float(metrics[metric_name]),
-                        iteration,
-                    )
     log_zero_history_rank_metrics(
         experiment_tracker,
         {
@@ -1047,9 +1401,19 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     author_embedding_dim = int(args.author_embedding_dim)
     author_unknown_dropout_rate = float(args.author_unknown_dropout_rate)
     popularity_projection_dim = int(args.bst_popularity_projection_dim)
+    use_post_liker_user_pooling = bool(args.bst_use_post_liker_user_pooling)
+    post_liker_user_embedding_dim = int(args.bst_post_liker_user_embedding_dim)
+    post_liker_projection_dim = int(args.bst_post_liker_projection_dim)
+    post_liker_pooling_tau_hours = float(args.bst_post_liker_pooling_tau_hours)
+    target_user_projection_dim = int(args.bst_target_user_projection_dim)
+    post_liker_user_dropout_rate = float(args.bst_post_liker_user_dropout_rate)
+    target_user_dropout_rate = float(args.bst_target_user_dropout_rate)
+    bst_max_post_liker_replay_events_per_post = args.bst_max_post_liker_replay_events_per_post
+    if bst_max_post_liker_replay_events_per_post is not None:
+        bst_max_post_liker_replay_events_per_post = int(bst_max_post_liker_replay_events_per_post)
     batch_size = int(args.batch_size)
     bst_additional_batch_negatives = int(args.bst_additional_batch_negatives)
-    bst_max_train_batches_per_epoch = getattr(args, "bst_max_train_batches_per_epoch", None)
+    bst_max_train_batches_per_epoch = args.bst_max_train_batches_per_epoch
     if bst_max_train_batches_per_epoch is not None:
         bst_max_train_batches_per_epoch = int(bst_max_train_batches_per_epoch)
     metrics_top_ks = list(args.metrics_top_ks)
@@ -1093,6 +1457,33 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         )
         logger.info(f"Author index mapping artifact id: {author_idx_artifact_id}")
 
+    post_liker_events_df: Optional[Any] = None
+    post_liker_user_idx_df: Optional[Any] = None
+    post_liker_event_lookup: Optional[PostLikerEventLookup] = None
+    post_liker_user_table_num_rows = 2
+    if use_post_liker_user_pooling:
+        post_liker_events_df, post_liker_user_idx_df = load_post_liker_event_artifacts(context, logger=logger)
+        post_liker_event_lookup = PostLikerEventLookup.from_dataframe(post_liker_events_df)
+        post_liker_user_table_num_rows = _get_post_liker_user_table_num_rows(post_liker_user_idx_df)
+        logger.info(
+            "BST post-liker user pooling enabled: "
+            f"user_embedding_dim={post_liker_user_embedding_dim}, "
+            f"projection_dim={post_liker_projection_dim}, "
+            f"target_user_projection_dim={target_user_projection_dim}, "
+            f"pooling_tau_hours={post_liker_pooling_tau_hours}, "
+            f"post_liker_user_dropout_rate={post_liker_user_dropout_rate}, "
+            f"target_user_dropout_rate={target_user_dropout_rate}, "
+            f"user_table_num_rows={post_liker_user_table_num_rows}, "
+            f"max_post_liker_replay_events_per_post={bst_max_post_liker_replay_events_per_post}, "
+            f"post_liker_event_rows={len(post_liker_events_df):,}, "
+            f"post_liker_user_idx_rows={len(post_liker_user_idx_df):,}"
+        )
+        logger.warning(
+            "BST post-liker user pooling checkpoints require a later serving/API slice before production deployment."
+        )
+    else:
+        logger.info("BST post-liker user pooling dataloader tensors disabled")
+
     num_workers = int(args.num_dataloader_workers)
     pin_memory = bool(args.dataloader_pin_memory)
     persistent_workers = bool(args.dataloader_persistent_workers)
@@ -1109,6 +1500,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         embed_dim=embed_dim,
         use_author_embedding_table=use_author_embedding_table,
         use_popularity_feature=use_popularity_feature,
+        use_post_liker_user_pooling=use_post_liker_user_pooling,
+        post_liker_event_lookup=post_liker_event_lookup,
+        post_liker_user_idx_df=post_liker_user_idx_df,
+        max_post_liker_replay_events_per_post=bst_max_post_liker_replay_events_per_post,
         bst_additional_batch_negatives=bst_additional_batch_negatives,
         seed=random_seed,
         logger=logger,
@@ -1123,6 +1518,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         embed_dim=embed_dim,
         use_author_embedding_table=use_author_embedding_table,
         use_popularity_feature=use_popularity_feature,
+        use_post_liker_user_pooling=use_post_liker_user_pooling,
+        post_liker_event_lookup=post_liker_event_lookup,
+        post_liker_user_idx_df=post_liker_user_idx_df,
+        max_post_liker_replay_events_per_post=bst_max_post_liker_replay_events_per_post,
         bst_additional_batch_negatives=bst_additional_batch_negatives,
         seed=random_seed,
         logger=logger,
@@ -1137,6 +1536,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         embed_dim=embed_dim,
         use_author_embedding_table=use_author_embedding_table,
         use_popularity_feature=use_popularity_feature,
+        use_post_liker_user_pooling=use_post_liker_user_pooling,
+        post_liker_event_lookup=post_liker_event_lookup,
+        post_liker_user_idx_df=post_liker_user_idx_df,
+        max_post_liker_replay_events_per_post=bst_max_post_liker_replay_events_per_post,
         bst_additional_batch_negatives=bst_additional_batch_negatives,
         seed=random_seed,
         logger=logger,
@@ -1177,6 +1580,16 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "bst_popularity_projection_dim": popularity_projection_dim,
         "bst_popularity_log_mean": popularity_log_mean,
         "bst_popularity_log_std": popularity_log_std,
+        "bst_use_post_liker_user_pooling": use_post_liker_user_pooling,
+        "bst_post_liker_user_table_num_rows": post_liker_user_table_num_rows,
+        "bst_post_liker_user_embedding_dim": post_liker_user_embedding_dim,
+        "bst_post_liker_projection_dim": post_liker_projection_dim,
+        "bst_post_liker_pooling_tau_hours": post_liker_pooling_tau_hours,
+        "bst_target_user_projection_dim": target_user_projection_dim,
+        "bst_post_liker_user_dropout_rate": post_liker_user_dropout_rate,
+        "bst_target_user_dropout_rate": target_user_dropout_rate,
+        "bst_max_post_liker_replay_events_per_post": bst_max_post_liker_replay_events_per_post,
+        "requires_target_user_indices": use_post_liker_user_pooling,
     }
     training_config = {
         **config,
@@ -1216,7 +1629,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         seed=random_seed,
         train_resample_candidates_each_epoch=True,
     )
-    del likes_core_df, posts_core_df, history_df, author_idx_mapping_df
+    del likes_core_df, posts_core_df, history_df, author_idx_mapping_df, post_liker_events_df, post_liker_user_idx_df, post_liker_event_lookup
 
     log_operation_start("Create BST ranker model", STAGE_LOG_NAME, logger)
     model = BSTRanker(
@@ -1239,6 +1652,14 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         popularity_projection_dim=popularity_projection_dim,
         popularity_log_mean=popularity_log_mean,
         popularity_log_std=popularity_log_std,
+        use_post_liker_user_pooling=use_post_liker_user_pooling,
+        post_liker_user_table_num_rows=post_liker_user_table_num_rows,
+        post_liker_user_embedding_dim=post_liker_user_embedding_dim,
+        post_liker_projection_dim=post_liker_projection_dim,
+        post_liker_pooling_tau_hours=post_liker_pooling_tau_hours,
+        target_user_projection_dim=target_user_projection_dim,
+        post_liker_user_dropout_rate=post_liker_user_dropout_rate,
+        target_user_dropout_rate=target_user_dropout_rate,
     )
 
     log_operation_start(f"Train BST ranker (epochs={epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)
@@ -1296,6 +1717,15 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "ranker_clearml_model_id": ranker_model_id,
             "ranker_uri": ranker_uri,
             "clearml_task_id": getattr(context.tracker, "id", ""),
+            "bst_use_post_liker_user_pooling": use_post_liker_user_pooling,
+            "bst_post_liker_user_table_num_rows": post_liker_user_table_num_rows,
+            "bst_post_liker_user_embedding_dim": post_liker_user_embedding_dim,
+            "bst_post_liker_projection_dim": post_liker_projection_dim,
+            "bst_post_liker_pooling_tau_hours": post_liker_pooling_tau_hours,
+            "bst_target_user_projection_dim": target_user_projection_dim,
+            "bst_max_post_liker_replay_events_per_post": bst_max_post_liker_replay_events_per_post,
+            "requires_post_liker_user_pooling": use_post_liker_user_pooling,
+            "requires_target_user_indices": use_post_liker_user_pooling,
         }
         manifest_path = checkpoints_dir / "ranker_serving_manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")

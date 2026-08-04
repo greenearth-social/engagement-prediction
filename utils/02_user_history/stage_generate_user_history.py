@@ -9,8 +9,11 @@ available, author indices. This enables efficient on-the-fly embedding retrieval
 during training and stable author-history features.
 
 Inputs:
-- likes_core_*.parquet from 01_get_data: Contains
-  {did, subject_uri, record_created_at, like_hour_bucket, emb_idx, prior_cumulative_likes, author_idx}
+- likes_core_*.parquet from 01_get_data: Contains target likes with
+  {did, subject_uri, record_created_at, like_hour_bucket, emb_idx, split, prior_cumulative_likes, author_idx}
+- history_only_likes_*.parquet from 01_get_data: Contains unseen users'
+  pre-validation likes as
+  {did, subject_uri, record_created_at, like_hour_bucket, emb_idx, author_idx}
 - liked_post_hour_cumulative_likes_*.parquet from 01_get_data: Contains
   {emb_idx, popularity_hour_bucket, prior_cumulative_likes}
 - author_idx_*.parquet from 01_get_data, when available: Author index mapping with
@@ -28,6 +31,8 @@ Outputs under <run_dir>/02_user_history/<timestamp>/:
   prior_author_indices is a List[UInt32] aligned element-wise with
   prior_emb_indices, and user-hour rows where the user has no prior likes in
   the dataset get empty lists.
+- user_idx_<timestamp>.parquet and post_liker_events_<timestamp>.parquet when
+  post-liker history generation is enabled.
 """
 
 from __future__ import annotations
@@ -47,12 +52,25 @@ from utils.helpers import (
     load_parquet_from_prior,
     TIMESTAMP_COL_NAME,
     HISTORY_POPULARITY_SEMANTICS,
+    HISTORY_SOURCE_SEMANTICS,
 )
 from utils.memory_helpers import MemoryTracker
 
 
+def _load_required_history_only_likes(prior_get_data: Path) -> pl.LazyFrame:
+    try:
+        return load_parquet_from_prior(prior_get_data, "history_only_likes_")
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            "Stage 2 requires history_only_likes_*.parquet from Stage 1 to build warm "
+            "histories for unseen evaluation users. Rerun Stage 1 before generating "
+            "user history."
+        ) from exc
+
+
 def _build_user_history_directory(
-    likes_lf: pl.LazyFrame,
+    target_likes_lf: pl.LazyFrame,
+    history_only_likes_lf: pl.LazyFrame,
     liked_post_hour_cumulative_likes_lf: pl.LazyFrame,
     max_prior_likes: Optional[int],
     logger: logging.Logger,
@@ -61,15 +79,18 @@ def _build_user_history_directory(
     Build a directory mapping each (user, like-hour bucket) to prior liked embedding indices.
 
     Uses vectorized Polars operations for efficiency:
-    1. Get distinct user-hour pairs from likes_core
-    2. Join each pair to that user's likes
+    1. Get distinct user-hour pairs from target likes_core only
+    2. Join each pair to that user's target and history-only likes
     3. Filter to likes that occurred before the hour bucket
     4. Group by (did, like_hour_bucket) and collect emb_idx values sorted by recency
     5. Join capped history posts to sparse target-hour popularity counts
     6. Left-join back to ensure every user-hour appears, including empty histories
 
     Args:
-        likes_lf: LazyFrame with columns [did, like_hour_bucket, record_created_at, emb_idx]
+        target_likes_lf: Target LazyFrame with columns
+            [did, like_hour_bucket, record_created_at, emb_idx]
+        history_only_likes_lf: Non-target LazyFrame with columns
+            [did, like_hour_bucket, record_created_at, emb_idx]
         liked_post_hour_cumulative_likes_lf: LazyFrame with columns
             [emb_idx, popularity_hour_bucket, prior_cumulative_likes]
         max_prior_likes: Optional cap on prior likes per target (None = no cap)
@@ -87,8 +108,12 @@ def _build_user_history_directory(
             "lookups will be uncapped and may use high memory. Set max_prior_likes to bound "
             "the Stage 2 rank/join/group step."
         )
-    likes_schema = likes_lf.collect_schema()
-    include_author_idx = "author_idx" in likes_schema
+    target_likes_schema = target_likes_lf.collect_schema()
+    history_only_likes_schema = history_only_likes_lf.collect_schema()
+    include_author_idx = (
+        "author_idx" in target_likes_schema
+        and "author_idx" in history_only_likes_schema
+    )
     popularity_schema = liked_post_hour_cumulative_likes_lf.collect_schema()
     missing_popularity_cols = [
         col_name
@@ -102,20 +127,28 @@ def _build_user_history_directory(
         )
 
     user_bucket_pairs_lf = (
-        likes_lf
+        target_likes_lf
         .select(['did', 'like_hour_bucket'])
         .unique()
     ) # [did, like_hour_bucket]
 
-    # Join targets with likes on user identity
-    # This creates one row per (target, like) pair for each user
-    likes_cols = ['did', TIMESTAMP_COL_NAME, 'emb_idx']
+    history_source_cols = ['did', TIMESTAMP_COL_NAME, 'emb_idx']
     if include_author_idx:
-        likes_cols.append('author_idx')
+        history_source_cols.append('author_idx')
+    history_source_lf = pl.concat(
+        [
+            target_likes_lf.select(history_source_cols),
+            history_only_likes_lf.select(history_source_cols),
+        ],
+        how="vertical_relaxed",
+    )
+
+    # Join targets with all eligible history likes on user identity
+    # This creates one row per (target, like) pair for each user
     pairs_with_prior_likes_lf = (
         user_bucket_pairs_lf
         .join(
-            likes_lf.select(likes_cols),
+            history_source_lf,
             on="did",
             how="left"
         )
@@ -221,6 +254,64 @@ def _build_user_history_directory(
         ) # [did, like_hour_bucket, prior_emb_indices, raw_prior_count, prior_like_age_hours_at_bucket_start, prior_cumulative_likes, (prior_author_indices)]
 
     return pairs_with_history_list_lf
+
+
+def _build_post_liker_user_idx(
+    likes_lf: pl.LazyFrame,
+    min_user_support: int,
+) -> pl.LazyFrame:
+    if min_user_support <= 0:
+        raise ValueError("min_user_support must be positive")
+    return (
+        likes_lf
+        .select(["did", "split"])
+        .filter(pl.col("split") == "train")
+        .group_by("did")
+        .len()
+        .rename({"len": "user_train_like_count"})
+        .filter(pl.col("user_train_like_count") >= min_user_support)
+        .sort("did")
+        .with_row_index(name="user_idx", offset=2)
+        .with_columns(
+            pl.col("user_train_like_count").cast(pl.UInt64),
+            pl.col("user_idx").cast(pl.UInt32),
+        )
+        .select(["did", "user_train_like_count", "user_idx"])
+    )
+
+
+def _build_post_liker_events(
+    likes_lf: pl.LazyFrame,
+    user_idx_lf: pl.LazyFrame,
+) -> pl.LazyFrame:
+    timestamp_dtype = likes_lf.collect_schema()[TIMESTAMP_COL_NAME]
+    indexed_events_lf = (
+        likes_lf
+        .select(["did", "emb_idx", TIMESTAMP_COL_NAME])
+        .join(user_idx_lf.select(["did", "user_idx"]), on="did", how="inner")
+        .select(
+            pl.col("emb_idx").cast(pl.UInt32),
+            pl.col(TIMESTAMP_COL_NAME),
+            pl.col("user_idx").cast(pl.UInt32),
+        )
+    )
+    sort_keys = [pl.col(TIMESTAMP_COL_NAME), pl.col("user_idx")]
+    return (
+        indexed_events_lf
+        .group_by("emb_idx")
+        .agg(
+            pl.col("user_idx").sort_by(sort_keys).alias("liker_user_indices"),
+            pl.col(TIMESTAMP_COL_NAME).sort_by(sort_keys).alias("liker_timestamps"),
+            pl.len().alias("indexed_liker_count"),
+        )
+        .select(
+            pl.col("emb_idx").cast(pl.UInt32),
+            pl.col("liker_user_indices").cast(pl.List(pl.UInt32)),
+            pl.col("liker_timestamps").cast(pl.List(timestamp_dtype)),
+            pl.col("indexed_liker_count").cast(pl.UInt64),
+        )
+        .sort("emb_idx")
+    )
 
 
 def _log_and_plot_history_distribution(
@@ -379,10 +470,16 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     max_prior_likes: Optional[int] = args.max_prior_likes
     if max_prior_likes is not None and max_prior_likes <= 0:
         max_prior_likes = None  # Treat 0 or negative as "no cap"
+    generate_post_liker_history = bool(args.generate_post_liker_history)
+    min_post_liker_user_support = int(args.min_post_liker_user_support)
+    if min_post_liker_user_support <= 0:
+        raise ValueError("min_post_liker_user_support must be positive")
 
     # === Load data ===
     log_operation_start('Load likes_core from prior stage', 'STAGE_02_USER_HISTORY', logger)
-    likes_lf: pl.LazyFrame = load_parquet_from_prior(prior_get_data, "likes_core_")
+    target_likes_lf: pl.LazyFrame = load_parquet_from_prior(prior_get_data, "likes_core_")
+    log_operation_start('Load history_only_likes from prior stage', 'STAGE_02_USER_HISTORY', logger)
+    history_only_likes_lf = _load_required_history_only_likes(prior_get_data)
     log_operation_start('Load liked-post popularity curve from prior stage', 'STAGE_02_USER_HISTORY', logger)
     try:
         liked_post_hour_cumulative_likes_lf: pl.LazyFrame = load_parquet_from_prior(
@@ -404,8 +501,22 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "emb_idx": int,
         "prior_cumulative_likes": int,
     }
-    validate_dataframe_schema(likes_lf, likes_schema)
+    if generate_post_liker_history:
+        likes_schema.update({
+            "split": str,
+        })
+    validate_dataframe_schema(target_likes_lf, likes_schema)
     logger.info("✓ likes_core schema validated")
+    history_only_likes_schema = {
+        "did": str,
+        TIMESTAMP_COL_NAME: pl.Datetime,
+        "subject_uri": str,
+        "like_hour_bucket": pl.Datetime,
+        "emb_idx": int,
+        "author_idx": int,
+    }
+    validate_dataframe_schema(history_only_likes_lf, history_only_likes_schema)
+    logger.info("✓ history_only_likes schema validated")
     liked_post_popularity_schema = {
         "emb_idx": int,
         "popularity_hour_bucket": pl.Datetime,
@@ -417,9 +528,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     mem_tracker.checkpoint("after_load_inputs", quiet=True)
 
     # Log input sizes (collect counts efficiently)
-    n_likes = likes_lf.select(pl.len()).collect().item()
+    n_likes = target_likes_lf.select(pl.len()).collect(engine="streaming").item()
+    n_history_only_likes = history_only_likes_lf.select(pl.len()).collect(engine="streaming").item()
     n_liked_post_popularity_rows = liked_post_hour_cumulative_likes_lf.select(pl.len()).collect().item()
     logger.info(f"Input: {n_likes:,} likes")
+    logger.info(f"Input: {n_history_only_likes:,} history-only likes")
     logger.info(f"Input: {n_liked_post_popularity_rows:,} liked-post popularity rows")
 
     # === Build user history directory ===
@@ -427,7 +540,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     mem_tracker.checkpoint("before_history_rank_join_group", quiet=True)
     directory_lf = _build_user_history_directory(
-        likes_lf=likes_lf,
+        target_likes_lf=target_likes_lf,
+        history_only_likes_lf=history_only_likes_lf,
         liked_post_hour_cumulative_likes_lf=liked_post_hour_cumulative_likes_lf,
         max_prior_likes=max_prior_likes,
         logger=logger,
@@ -478,6 +592,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     min_prior_value = int(prior_count_stats[2])
 
     summary = {
+        "history_source_semantics": HISTORY_SOURCE_SEMANTICS,
         "history_prior_cumulative_likes_semantics": HISTORY_POPULARITY_SEMANTICS,
         "history_prior_cumulative_likes_description": "count as of the target like_hour_bucket",
         "parameters": {
@@ -485,6 +600,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         },
         "inputs": {
             "likes_core_rows": n_likes,
+            "history_only_likes_rows": n_history_only_likes,
             "liked_post_hour_cumulative_likes_rows": n_liked_post_popularity_rows,
         },
         "outputs": {
@@ -509,6 +625,57 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     logger.info(f"  Empty history: {n_empty_history:,} ({100*n_empty_history/n_output:.1f}%)")
     logger.info(f"  Prior likes per target: mean={mean_prior_value:.1f}, min={min_prior_value}, max={max_prior_value}")
 
+    artifacts = {
+        'user_history_directory_path': str(user_history_output_path),
+    }
+    post_liker_info_lines = []
+    if generate_post_liker_history:
+        log_operation_start('Build post-liker user index', 'STAGE_02_USER_HISTORY', logger)
+        user_idx_lf = _build_post_liker_user_idx(
+            likes_lf=target_likes_lf,
+            min_user_support=min_post_liker_user_support,
+        )
+        user_idx_df = user_idx_lf.collect(engine="streaming")
+        user_idx_output_path = out_dir / f"user_idx_{out_dir.name}.parquet"
+        user_idx_df.write_parquet(user_idx_output_path, compression="zstd")
+        logger.info(f"✓ Wrote {len(user_idx_df):,} post-liker user index rows to {user_idx_output_path.name}")
+        mem_tracker.checkpoint("after_post_liker_user_idx", quiet=True)
+
+        log_operation_start('Build post-liker event lists', 'STAGE_02_USER_HISTORY', logger)
+        logger.info("Building event lists from indexed likes using did, emb_idx, and record_created_at only")
+        post_liker_events_lf = _build_post_liker_events(
+            likes_lf=target_likes_lf,
+            user_idx_lf=user_idx_df.lazy(),
+        )
+        mem_tracker.checkpoint("after_post_liker_events_plan", quiet=True)
+        post_liker_events_df = post_liker_events_lf.collect(engine="streaming")
+        mem_tracker.checkpoint("after_post_liker_events_collect", quiet=True)
+        post_liker_events_output_path = out_dir / f"post_liker_events_{out_dir.name}.parquet"
+        post_liker_events_df.write_parquet(post_liker_events_output_path, compression="zstd")
+        n_post_liker_rows = len(post_liker_events_df)
+        n_indexed_liker_events = int(post_liker_events_df["indexed_liker_count"].sum() or 0)
+        max_indexed_likers_per_post = (
+            int(post_liker_events_df["indexed_liker_count"].max())
+            if n_post_liker_rows > 0 else 0
+        )
+        logger.info(f"✓ Wrote {n_post_liker_rows:,} post-liker event-list rows to {post_liker_events_output_path.name}")
+        logger.info(f"  Indexed liker events: {n_indexed_liker_events:,}")
+        logger.info(f"  Max indexed liker events per post: {max_indexed_likers_per_post:,}")
+        mem_tracker.checkpoint("after_post_liker_events_write", quiet=True)
+
+        artifacts.update({
+            'post_liker_user_idx_path': str(user_idx_output_path),
+            'post_liker_events_path': str(post_liker_events_output_path),
+        })
+        post_liker_info_lines = [
+            f"settings: generate_post_liker_history={generate_post_liker_history}",
+            f"settings: min_post_liker_user_support={min_post_liker_user_support}",
+            f"outputs: post_liker_user_idx ({len(user_idx_df):,} rows)",
+            f"outputs: post_liker_events ({n_post_liker_rows:,} rows)",
+            f"stats: post_liker_indexed_events={n_indexed_liker_events:,}",
+            f"stats: post_liker_max_events_per_post={max_indexed_likers_per_post}",
+        ]
+
     # Memory summary
     mem_tracker.summary()
 
@@ -520,11 +687,14 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"runtime_seconds: {runtime:.2f}",
         f"settings: max_prior_likes={max_prior_likes}",
         f"inputs: likes_core ({n_likes:,})",
+        f"inputs: history_only_likes ({n_history_only_likes:,})",
         f"inputs: liked_post_hour_cumulative_likes ({n_liked_post_popularity_rows:,})",
         f"outputs: user_history_directory ({n_output:,} entries)",
         f"history_prior_cumulative_likes_semantics: {HISTORY_POPULARITY_SEMANTICS}",
+        f"history_source_semantics: {HISTORY_SOURCE_SEMANTICS}",
         f"stats: with_history={n_with_history:,}, empty_history={n_empty_history:,}",
         f"stats: mean_prior={mean_prior_value:.1f}, max_prior={max_prior_value}",
+        *post_liker_info_lines,
     ]
     (out_dir / 'stage_info.txt').write_text('\n'.join(info_lines) + '\n')
 
@@ -532,7 +702,5 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     return {
         'output_dir': out_dir,
-        'artifacts': {
-            'user_history_directory_path': str(user_history_output_path),
-        }
+        'artifacts': artifacts,
     }

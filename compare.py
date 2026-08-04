@@ -123,6 +123,67 @@ def _resolve_compare_max_history_len(
     return max_history_len
 
 
+def _resolve_compare_max_post_liker_replay_events_per_post(
+    args: argparse.Namespace,
+    *,
+    model_specs: List[Dict[str, str]],
+    model_configs: Dict[str, Dict[str, Any]],
+) -> Optional[int]:
+    enabled_specs = [
+        model_spec
+        for model_spec in model_specs
+        if (
+            model_spec["model_type"] == "bst-ranker"
+            and bool(
+                model_configs[model_spec["name"]].get(
+                    "bst_use_post_liker_user_pooling",
+                    False,
+                )
+            )
+        )
+    ]
+    if not enabled_specs:
+        return None
+
+    cli_value = getattr(args, "bst_max_post_liker_replay_events_per_post", None)
+    if cli_value is not None:
+        resolved_value = int(cli_value)
+        if resolved_value <= 0:
+            raise ValueError(
+                "compare-rankers --bst-max-post-liker-replay-events-per-post must be positive"
+            )
+        return resolved_value
+
+    values_by_model: Dict[str, int] = {}
+    for model_spec in enabled_specs:
+        value = _require_compare_model_config(
+            model_spec,
+            model_configs[model_spec["name"]],
+            "bst_max_post_liker_replay_events_per_post",
+        )
+        if value is None or int(value) <= 0:
+            raise ValueError(
+                "compare-rankers model "
+                f"'{model_spec['name']}' must have a positive "
+                "bst_max_post_liker_replay_events_per_post"
+            )
+        values_by_model[model_spec["name"]] = int(value)
+
+    distinct_values = sorted(set(values_by_model.values()))
+    if len(distinct_values) > 1:
+        details = ", ".join(
+            f"{name}={value}"
+            for name, value in sorted(values_by_model.items())
+        )
+        raise ValueError(
+            "compare-rankers requires matching "
+            "bst_max_post_liker_replay_events_per_post across post-liker-enabled "
+            "models unless --bst-max-post-liker-replay-events-per-post is passed "
+            f"explicitly: {details}"
+        )
+    return distinct_values[0]
+
+
 def _metric_value_for_csv(value: Any) -> str:
     if value is None:
         return ""
@@ -246,6 +307,16 @@ def cmd_compare_rankers(
         and bool(model_configs[spec["name"]].get("bst_use_popularity_feature", False))
         for spec in parsed_specs
     )
+    max_post_liker_replay_events_per_post = (
+        _resolve_compare_max_post_liker_replay_events_per_post(
+            args,
+            model_specs=parsed_specs,
+            model_configs=model_configs,
+        )
+    )
+    use_post_liker_user_pooling_for_compare = (
+        max_post_liker_replay_events_per_post is not None
+    )
 
     print(f"Batch Size: {batch_size}")
     print(f"Candidate Chunk Size: {bst_candidate_chunk_size}")
@@ -253,13 +324,21 @@ def cmd_compare_rankers(
     print(f"Pin memory: {pin_memory}")
     print(f"Prefetch Factor: {prefetch_factor}")
     print(f"Persistent Workers: {persistent_workers}")
+    print(f"Post-liker user pooling: {use_post_liker_user_pooling_for_compare}")
+    if max_post_liker_replay_events_per_post is not None:
+        print(
+            "Max post-liker replay events per post: "
+            f"{max_post_liker_replay_events_per_post}"
+        )
 
     import torch
     from torch.utils.data import DataLoader
     from utils.dataloaders import (
         BucketedBatchSampler,
         BucketedEngagementDataset,
+        PostLikerEventLookup,
         load_bucketed_training_data,
+        load_post_liker_event_artifacts,
     )
     from utils.matrix_ranking import evaluate_matrix_scorer
 
@@ -305,6 +384,16 @@ def cmd_compare_rankers(
         logger=logger,
         require_target_hour_history_popularity=use_popularity_feature_for_compare,
     )
+    post_liker_event_lookup = None
+    post_liker_user_idx_df = None
+    if use_post_liker_user_pooling_for_compare:
+        post_liker_events_df, post_liker_user_idx_df = load_post_liker_event_artifacts(
+            ctx,
+            logger=logger,
+        )
+        post_liker_event_lookup = PostLikerEventLookup.from_dataframe(
+            post_liker_events_df
+        )
 
     worker_kw: Dict[str, Any] = {
         "num_workers": num_workers,
@@ -330,6 +419,10 @@ def cmd_compare_rankers(
             embed_dim=embed_dim,
             use_author_embedding_table=True,
             use_popularity_feature=use_popularity_feature_for_compare,
+            use_post_liker_user_pooling=use_post_liker_user_pooling_for_compare,
+            post_liker_event_lookup=post_liker_event_lookup,
+            post_liker_user_idx_df=post_liker_user_idx_df,
+            max_post_liker_replay_events_per_post=max_post_liker_replay_events_per_post,
             logger=logger,
         )
         split_row_counts[split_name] = len(dataset)
@@ -390,6 +483,8 @@ def cmd_compare_rankers(
         "batch_size": batch_size,
         "bst_candidate_chunk_size": bst_candidate_chunk_size,
         "max_history_len": eval_max_history_len,
+        "bst_use_post_liker_user_pooling": use_post_liker_user_pooling_for_compare,
+        "bst_max_post_liker_replay_events_per_post": max_post_liker_replay_events_per_post,
         "model_specs": parsed_specs,
         "metrics": metrics_by_model,
         "prior_inputs": {k: str(v) for k, v in ctx.get_active_stage_inputs().items()},
@@ -414,6 +509,11 @@ def cmd_compare_rankers(
         f"metrics_top_ks: {', '.join(str(k) for k in metrics_top_ks)}",
         f"batch_size: {batch_size}",
         f"max_history_len: {eval_max_history_len}",
+        f"bst_use_post_liker_user_pooling: {use_post_liker_user_pooling_for_compare}",
+        (
+            "bst_max_post_liker_replay_events_per_post: "
+            f"{max_post_liker_replay_events_per_post}"
+        ),
     ]
     for folder, path in sorted(ctx.get_active_stage_inputs().items()):
         info_lines.append(f"prior_input_{folder}: {path}")

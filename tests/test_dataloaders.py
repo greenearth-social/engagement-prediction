@@ -1,4 +1,5 @@
 """Tests for bucketed two-tower dataloaders."""
+import importlib
 import json
 from datetime import datetime, timezone
 
@@ -11,10 +12,16 @@ from shared.input_data_helpers import AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
 from utils.dataloaders import (
     BucketedBatchSampler,
     BucketedEngagementDataset,
+    PostLikerEventLookup,
+    _timestamp_to_epoch_us,
     create_bucketed_data_loaders,
     get_author_table_num_rows,
     validate_history_popularity_semantics,
+    validate_history_source_semantics,
 )
+
+stage_train_bst_user_id_only = importlib.import_module("utils.03_train.stage_train_bst_user_id_only")
+UserIdOnlyBucketedEngagementDataset = stage_train_bst_user_id_only.UserIdOnlyBucketedEngagementDataset
 
 
 def _dt(hour: int) -> datetime:
@@ -75,6 +82,41 @@ def mock_history_df():
 
 
 @pytest.fixture
+def mock_post_liker_events_df():
+    return pl.DataFrame({
+        "emb_idx": pl.Series([0, 1, 3, 5, 6, 8, 20], dtype=pl.UInt32),
+        "liker_user_indices": [
+            [2, 3, 4],
+            [4, 5],
+            [9],
+            [10, 11, 12],
+            [13],
+            [14],
+            [8],
+        ],
+        "liker_timestamps": [
+            [_dt(8), _dt(9), _dt(10)],
+            [_dt(9), _dt(9)],
+            [_dt(9)],
+            [_dt(8), _dt(9), _dt(10)],
+            [_dt(9)],
+            [_dt(10)],
+            [_dt(7)],
+        ],
+        "indexed_liker_count": pl.Series([3, 2, 1, 3, 1, 1, 1], dtype=pl.UInt64),
+    })
+
+
+@pytest.fixture
+def mock_post_liker_user_idx_df():
+    return pl.DataFrame({
+        "did": ["u1", "u3"],
+        "user_train_like_count": pl.Series([3, 2], dtype=pl.UInt32),
+        "user_idx": pl.Series([2, 3], dtype=pl.UInt32),
+    })
+
+
+@pytest.fixture
 def bucketed_dataset(mock_embeddings_mmap, mock_likes_core_df, mock_posts_core_df, mock_history_df):
     return BucketedEngagementDataset(
         embeddings_mmap=mock_embeddings_mmap,
@@ -125,6 +167,32 @@ def test_validate_history_popularity_semantics_rejects_stale_summary(tmp_path):
 def test_validate_history_popularity_semantics_rejects_missing_summary(tmp_path):
     with pytest.raises(RuntimeError, match="summary.json"):
         validate_history_popularity_semantics(tmp_path)
+
+
+def test_validate_history_source_semantics_accepts_warm_history_summary(tmp_path):
+    (tmp_path / "summary.json").write_text(json.dumps({
+        "history_source_semantics": "targets_plus_unseen_pre_validation_history",
+    }))
+
+    validate_history_source_semantics(tmp_path)
+
+
+@pytest.mark.parametrize("actual_semantics", [None, "targets_only"])
+def test_validate_history_source_semantics_rejects_old_artifacts(
+    tmp_path,
+    actual_semantics,
+):
+    (tmp_path / "summary.json").write_text(json.dumps({
+        "history_source_semantics": actual_semantics,
+    }))
+
+    with pytest.raises(RuntimeError, match="Rerun Stages 1 and 2"):
+        validate_history_source_semantics(tmp_path)
+
+
+def test_validate_history_source_semantics_rejects_missing_summary(tmp_path):
+    with pytest.raises(RuntimeError, match="Rerun Stages 1 and 2"):
+        validate_history_source_semantics(tmp_path)
 
 
 def test_bucketed_dataset_groups_user_hours_and_joins_history(bucketed_dataset):
@@ -178,6 +246,9 @@ def test_bucketed_collate_builds_candidates_and_same_hour_labels(bucketed_datase
     assert batch["candidate_post_embeddings"].shape == (5, 4)
     assert "history_prior_cumulative_likes" not in batch
     assert "candidate_prior_cumulative_likes" not in batch
+    assert "history_post_liker_user_indices" not in batch
+    assert "candidate_post_liker_user_indices" not in batch
+    assert "target_user_indices" not in batch
 
     labels_by_user = {
         user_id: batch["label_matrix"][idx].tolist()
@@ -185,6 +256,326 @@ def test_bucketed_collate_builds_candidates_and_same_hour_labels(bucketed_datase
     }
     assert labels_by_user["u1"] == [1.0, 1.0, 0.0, 0.0, 0.0]
     assert labels_by_user["u2"] == [0.0, 0.0, 1.0, 0.0, 0.0]
+
+
+def test_post_liker_event_lookup_slices_prior_events_as_variable_length_replay(mock_post_liker_events_df):
+    lookup = PostLikerEventLookup.from_dataframe(mock_post_liker_events_df)
+
+    user_indices, time_gap_hours = lookup.liker_events_before(
+        emb_idx=0,
+        target_time_us=_timestamp_to_epoch_us(_dt(10)),
+    )
+
+    assert user_indices.tolist() == [2, 3]
+    np.testing.assert_allclose(time_gap_hours, np.array([0.0, 1.0], dtype=np.float32))
+
+    duplicate_indices, duplicate_time_gap_hours = lookup.liker_events_before(
+        emb_idx=1,
+        target_time_us=_timestamp_to_epoch_us(_dt(10)),
+    )
+    assert duplicate_indices.tolist() == [4, 5]
+    np.testing.assert_allclose(duplicate_time_gap_hours, np.array([0.0, 0.0], dtype=np.float32))
+
+    capped_indices, capped_time_gap_hours = lookup.liker_events_before(
+        emb_idx=0,
+        target_time_us=_timestamp_to_epoch_us(_dt(11)),
+        max_replay_events=2,
+    )
+    assert capped_indices.tolist() == [3, 4]
+    np.testing.assert_allclose(capped_time_gap_hours, np.array([0.0, 1.0], dtype=np.float32))
+
+    missing_indices, missing_time_gap_hours = lookup.liker_events_before(
+        emb_idx=999,
+        target_time_us=_timestamp_to_epoch_us(_dt(10)),
+    )
+    assert missing_indices.tolist() == []
+    np.testing.assert_allclose(missing_time_gap_hours, np.array([], dtype=np.float32))
+
+
+def test_bucketed_collate_returns_post_liker_tensors_when_enabled(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+    mock_post_liker_events_df,
+    mock_post_liker_user_idx_df,
+):
+    max_replay_events = 4
+    dataset = BucketedEngagementDataset(
+        embeddings_mmap=mock_embeddings_mmap,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
+        history_df=mock_history_df,
+        split="train",
+        max_history_len=3,
+        embed_dim=4,
+        use_post_liker_user_pooling=True,
+        post_liker_event_lookup=PostLikerEventLookup.from_dataframe(mock_post_liker_events_df),
+        post_liker_user_idx_df=mock_post_liker_user_idx_df,
+        max_post_liker_replay_events_per_post=max_replay_events,
+    )
+
+    batch = dataset.collate_batch([dataset[0], dataset[1]])
+
+    assert batch["candidate_post_id"] == ["p1", "p3", "p2", "n1", "p4"]
+    assert batch["target_user_indices"].tolist() == [2, 1]
+    assert batch["history_post_liker_user_indices"].shape == (
+        2,
+        3,
+        max_replay_events,
+    )
+    assert batch["candidate_post_liker_user_indices"].shape == (
+        5,
+        max_replay_events,
+    )
+    assert batch["history_post_liker_user_indices"][0, 0, :4].tolist() == [10, 11, 0, 0]
+    assert batch["history_post_liker_user_indices"][0, 1, :4].tolist() == [13, 0, 0, 0]
+    assert batch["history_post_liker_user_indices"][0, 2, :4].tolist() == [0, 0, 0, 0]
+    assert batch["history_post_liker_user_indices"][1, :, :4].tolist() == [
+        [0, 0, 0, 0],
+        [0, 0, 0, 0],
+        [0, 0, 0, 0],
+    ]
+    np.testing.assert_allclose(
+        batch["history_post_liker_time_gap_hours"][0, :3, :4].numpy(),
+        np.array(
+            [
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+    )
+    assert batch["candidate_post_liker_user_indices"][:, :4].tolist() == [
+        [2, 3, 0, 0],
+        [0, 0, 0, 0],
+        [4, 5, 0, 0],
+        [8, 0, 0, 0],
+        [9, 0, 0, 0],
+    ]
+    np.testing.assert_allclose(
+        batch["candidate_post_liker_time_gap_hours"][:, :4].numpy(),
+        np.array(
+            [
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+    )
+    assert batch["post_liker_replay_event_count"] == 9
+    assert batch["post_liker_replay_max_events_per_post"] == 2
+
+
+def test_bucketed_post_liker_replay_cap_keeps_most_recent_prior_events(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+    mock_post_liker_events_df,
+    mock_post_liker_user_idx_df,
+):
+    dataset = BucketedEngagementDataset(
+        embeddings_mmap=mock_embeddings_mmap,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
+        history_df=mock_history_df,
+        split="train",
+        max_history_len=3,
+        embed_dim=4,
+        use_post_liker_user_pooling=True,
+        post_liker_event_lookup=PostLikerEventLookup.from_dataframe(mock_post_liker_events_df),
+        post_liker_user_idx_df=mock_post_liker_user_idx_df,
+        max_post_liker_replay_events_per_post=1,
+    )
+
+    batch = dataset.collate_batch([dataset[0], dataset[1]])
+
+    assert batch["history_post_liker_user_indices"].shape == (2, 3, 1)
+    assert batch["history_post_liker_user_indices"].squeeze(-1).tolist() == [
+        [11, 13, 0],
+        [0, 0, 0],
+    ]
+    np.testing.assert_allclose(
+        batch["history_post_liker_time_gap_hours"].squeeze(-1).numpy(),
+        np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=np.float32),
+    )
+    assert batch["candidate_post_liker_user_indices"].squeeze(-1).tolist() == [3, 0, 5, 8, 9]
+
+
+def test_bucketed_post_liker_history_uses_current_bucket_time(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+    mock_post_liker_events_df,
+    mock_post_liker_user_idx_df,
+):
+    dataset = BucketedEngagementDataset(
+        embeddings_mmap=mock_embeddings_mmap,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
+        history_df=mock_history_df,
+        split="train",
+        max_history_len=3,
+        embed_dim=4,
+        use_post_liker_user_pooling=True,
+        post_liker_event_lookup=PostLikerEventLookup.from_dataframe(mock_post_liker_events_df),
+        post_liker_user_idx_df=mock_post_liker_user_idx_df,
+        max_post_liker_replay_events_per_post=4,
+    )
+
+    batch = dataset.collate_batch([dataset[2]])
+
+    assert batch["bucket"] == _dt(11)
+    assert batch["history_post_liker_user_indices"][0, :, :4].tolist() == [
+        [14, 0, 0, 0],
+        [0, 0, 0, 0],
+        [0, 0, 0, 0],
+    ]
+    np.testing.assert_allclose(
+        batch["history_post_liker_time_gap_hours"][0, :, :4].numpy(),
+        np.zeros((3, 4), dtype=np.float32),
+    )
+
+
+def test_user_id_only_bucketed_collate_omits_content_embeddings_and_keeps_post_likers(
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+    mock_post_liker_events_df,
+    mock_post_liker_user_idx_df,
+):
+    dataset = UserIdOnlyBucketedEngagementDataset(
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
+        history_df=mock_history_df,
+        split="train",
+        max_history_len=3,
+        post_liker_event_lookup=PostLikerEventLookup.from_dataframe(mock_post_liker_events_df),
+        post_liker_user_idx_df=mock_post_liker_user_idx_df,
+        max_post_liker_replay_events_per_post=4,
+    )
+
+    batch = dataset.collate_batch([dataset[0], dataset[1]])
+
+    assert batch["candidate_post_id"] == ["p1", "p3", "p2", "n1", "p4"]
+    assert "history_embeddings" not in batch
+    assert "candidate_post_embeddings" not in batch
+    assert "history_author_indices" not in batch
+    assert "candidate_post_author_idx" not in batch
+    assert batch["target_user_indices"].tolist() == [2, 1]
+    assert batch["history_mask"].tolist() == [[True, True, True], [False, False, False]]
+    assert batch["history_post_liker_user_indices"].shape == (2, 3, 4)
+    assert batch["candidate_post_liker_user_indices"].shape == (5, 4)
+    assert batch["history_post_liker_user_indices"][0, 0].tolist() == [10, 11, 0, 0]
+    assert batch["history_post_liker_user_indices"][0, 1].tolist() == [13, 0, 0, 0]
+    assert batch["candidate_post_liker_user_indices"][:, :4].tolist() == [
+        [2, 3, 0, 0],
+        [0, 0, 0, 0],
+        [4, 5, 0, 0],
+        [8, 0, 0, 0],
+        [9, 0, 0, 0],
+    ]
+    assert batch["label_matrix"].tolist() == [
+        [1.0, 1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0, 0.0],
+    ]
+
+
+def test_user_id_only_bucketed_history_uses_current_bucket_time(
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+    mock_post_liker_events_df,
+    mock_post_liker_user_idx_df,
+):
+    dataset = UserIdOnlyBucketedEngagementDataset(
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=mock_posts_core_df,
+        history_df=mock_history_df,
+        split="train",
+        max_history_len=3,
+        post_liker_event_lookup=PostLikerEventLookup.from_dataframe(mock_post_liker_events_df),
+        post_liker_user_idx_df=mock_post_liker_user_idx_df,
+        max_post_liker_replay_events_per_post=4,
+    )
+
+    batch = dataset.collate_batch([dataset[2]])
+
+    assert batch["bucket"] == _dt(11)
+    assert batch["history_post_liker_user_indices"][0, :, :4].tolist() == [
+        [14, 0, 0, 0],
+        [0, 0, 0, 0],
+        [0, 0, 0, 0],
+    ]
+
+
+def test_bucketed_post_liker_requires_event_artifact_when_enabled(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+):
+    with pytest.raises(ValueError, match="post_liker_event_lookup"):
+        BucketedEngagementDataset(
+            embeddings_mmap=mock_embeddings_mmap,
+            likes_core_df=mock_likes_core_df,
+            posts_core_df=mock_posts_core_df,
+            history_df=mock_history_df,
+            split="train",
+            max_history_len=3,
+            embed_dim=4,
+            use_post_liker_user_pooling=True,
+        )
+
+
+def test_bucketed_post_liker_requires_user_idx_artifact_when_enabled(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+    mock_post_liker_events_df,
+):
+    with pytest.raises(ValueError, match="post_liker_user_idx_df"):
+        BucketedEngagementDataset(
+            embeddings_mmap=mock_embeddings_mmap,
+            likes_core_df=mock_likes_core_df,
+            posts_core_df=mock_posts_core_df,
+            history_df=mock_history_df,
+            split="train",
+            max_history_len=3,
+            embed_dim=4,
+            use_post_liker_user_pooling=True,
+            post_liker_event_lookup=PostLikerEventLookup.from_dataframe(mock_post_liker_events_df),
+        )
+
+
+def test_bucketed_post_liker_requires_replay_cap_when_enabled(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+    mock_post_liker_events_df,
+    mock_post_liker_user_idx_df,
+):
+    with pytest.raises(ValueError, match="max_post_liker_replay_events_per_post"):
+        BucketedEngagementDataset(
+            embeddings_mmap=mock_embeddings_mmap,
+            likes_core_df=mock_likes_core_df,
+            posts_core_df=mock_posts_core_df,
+            history_df=mock_history_df,
+            split="train",
+            max_history_len=3,
+            embed_dim=4,
+            use_post_liker_user_pooling=True,
+            post_liker_event_lookup=PostLikerEventLookup.from_dataframe(mock_post_liker_events_df),
+            post_liker_user_idx_df=mock_post_liker_user_idx_df,
+        )
 
 
 def test_bucketed_collate_dedupes_candidates(bucketed_dataset):

@@ -52,6 +52,7 @@ from __future__ import annotations
 import json
 import logging
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -69,6 +70,7 @@ from utils.helpers import (
     log_operation_start,
     validate_dataframe_schema,
     HISTORY_POPULARITY_SEMANTICS,
+    HISTORY_SOURCE_SEMANTICS,
 )
 from shared.input_data_helpers import (
     get_padded_embedding_history_and_mask,
@@ -76,6 +78,9 @@ from shared.input_data_helpers import (
     get_padded_history_time_deltas,
     AUTHOR_UNK_IDX,
 )
+
+POST_LIKER_USER_PAD_IDX = 0
+POST_LIKER_USER_UNK_IDX = 1
 
 
 def _author_idx_or_unk(author_idx: Any) -> int:
@@ -929,6 +934,26 @@ def validate_history_popularity_semantics(history_dir: Path) -> None:
         )
 
 
+def validate_history_source_semantics(history_dir: Path) -> None:
+    summary_path = history_dir / "summary.json"
+    if not summary_path.exists():
+        raise RuntimeError(
+            "Training and compare-rankers require a Stage 2 summary.json with "
+            f"history_source_semantics={HISTORY_SOURCE_SEMANTICS!r}. "
+            "Rerun Stages 1 and 2 to generate warm histories for unseen evaluation users. "
+            f"Missing: {summary_path}"
+        )
+    with open(summary_path) as f:
+        summary = json.load(f)
+    actual_semantics = summary.get("history_source_semantics")
+    if actual_semantics != HISTORY_SOURCE_SEMANTICS:
+        raise RuntimeError(
+            "Training and compare-rankers require warm unseen-user history inputs. "
+            f"Expected history_source_semantics={HISTORY_SOURCE_SEMANTICS!r}, "
+            f"got {actual_semantics!r} in {summary_path}. Rerun Stages 1 and 2."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Bucketed two-tower data path
 # ---------------------------------------------------------------------------
@@ -941,6 +966,11 @@ def load_bucketed_training_data(
     """Locate and load artifacts for bucketed two-tower training."""
     if logger is None:
         logger = get_stage_logger("DATALOADERS")
+
+    history_dir = _resolve_prior(context, stage_key="user_history", folder="02_user_history")
+    validate_history_source_semantics(history_dir)
+    if require_target_hour_history_popularity:
+        validate_history_popularity_semantics(history_dir)
 
     log_operation_start("Locate embeddings memmap", "DATALOADERS", logger)
     get_data_dir = _resolve_prior(context, stage_key="get_data", folder="01_get_data")
@@ -968,13 +998,34 @@ def load_bucketed_training_data(
         logger.info("No author_idx artifact found in get_data output")
 
     log_operation_start("Locate user_history", "DATALOADERS", logger)
-    history_dir = _resolve_prior(context, stage_key="user_history", folder="02_user_history")
-    if require_target_hour_history_popularity:
-        validate_history_popularity_semantics(history_dir)
     history_df = load_parquet_from_prior(history_dir, "history_posts_").collect()
     logger.info(f"Loaded user_history: {len(history_df):,} rows")
 
     return embeddings_mmap, likes_core_df, posts_core_df, history_df, author_idx_mapping_df, embed_dim
+
+
+def load_post_liker_event_artifacts(
+    context: Context,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[pl.DataFrame, pl.DataFrame]:
+    """Load optional Stage 2 post-liker artifacts for BST post featurization."""
+    if logger is None:
+        logger = get_stage_logger("DATALOADERS")
+
+    log_operation_start("Locate post-liker event artifacts", "DATALOADERS", logger)
+    history_dir = _resolve_prior(context, stage_key="user_history", folder="02_user_history")
+    try:
+        post_liker_events_df = load_parquet_from_prior(history_dir, "post_liker_events_").collect()
+        user_idx_df = load_parquet_from_prior(history_dir, "user_idx_").collect()
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            "BST post-liker user pooling requires Stage 2 post_liker_events_*.parquet "
+            "and user_idx_*.parquet artifacts. Rerun Stage 2 with "
+            "generate_post_liker_history enabled."
+        ) from exc
+    logger.info(f"Loaded post_liker_events: {len(post_liker_events_df):,} rows")
+    logger.info(f"Loaded post-liker user_idx: {len(user_idx_df):,} rows")
+    return post_liker_events_df, user_idx_df
 
 
 def _post_split_window_for_like_split(split: str) -> str:
@@ -1028,6 +1079,99 @@ def _author_idx_list_to_table_rows(
     ], dtype=np.uint32)
 
 
+def _timestamp_to_epoch_us(value: Any) -> int:
+    if isinstance(value, np.datetime64):
+        return int(value.astype("datetime64[us]").astype(np.int64))
+    if isinstance(value, datetime):
+        dt = value
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return int(np.datetime64(dt, "us").astype(np.int64))
+    if hasattr(value, "to_pydatetime"):
+        return _timestamp_to_epoch_us(value.to_pydatetime())
+    return int(np.datetime64(value, "us").astype(np.int64))
+
+
+class PostLikerEventLookup:
+    """In-memory lookup for indexed liker events keyed by post emb_idx."""
+
+    def __init__(self, events_by_emb_idx: Dict[int, Tuple[np.ndarray, np.ndarray]]):
+        self.events_by_emb_idx = events_by_emb_idx
+
+    @classmethod
+    def from_dataframe(cls, post_liker_events_df: pl.DataFrame) -> "PostLikerEventLookup":
+        required_cols = {"emb_idx", "liker_user_indices", "liker_timestamps", "indexed_liker_count"}
+        missing_cols = required_cols.difference(post_liker_events_df.columns)
+        if missing_cols:
+            missing = ", ".join(sorted(missing_cols))
+            raise ValueError(f"post_liker_events_df is missing required columns: {missing}")
+
+        events_by_emb_idx: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+        converted_df = post_liker_events_df.select(
+            pl.col("emb_idx").cast(pl.Int64),
+            pl.col("liker_user_indices"),
+            pl.col("liker_timestamps")
+            .list.eval(pl.element().dt.epoch("us"))
+            .alias("_liker_timestamp_us"),
+        )
+        for row in converted_df.iter_rows(named=True):
+            user_indices = _list_to_int_array(row["liker_user_indices"]).astype(np.int64, copy=False)
+            timestamp_us = _list_to_int_array(row["_liker_timestamp_us"]).astype(np.int64, copy=False)
+            if len(user_indices) != len(timestamp_us):
+                raise ValueError("post_liker_events_df has misaligned liker_user_indices and liker_timestamps lists")
+            events_by_emb_idx[int(row["emb_idx"])] = (user_indices, timestamp_us)
+        return cls(events_by_emb_idx)
+
+    def liker_events_before(
+        self,
+        emb_idx: int,
+        target_time_us: int,
+        max_replay_events: Optional[int] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        events = self.events_by_emb_idx.get(int(emb_idx))
+        if events is None:
+            return np.array([], dtype=np.int64), np.array([], dtype=np.float32)
+
+        user_indices, timestamp_us = events
+        end = int(np.searchsorted(timestamp_us, int(target_time_us), side="left"))
+        if end <= 0:
+            return np.array([], dtype=np.int64), np.array([], dtype=np.float32)
+        start = 0
+        if max_replay_events is not None:
+            start = max(0, end - int(max_replay_events))
+        selected_user_indices = user_indices[start:end].astype(np.int64, copy=False)
+        selected_timestamp_us = timestamp_us[start:end].astype(np.int64, copy=False)
+        time_gap_hours = np.zeros(len(selected_timestamp_us), dtype=np.float32)
+        if len(selected_timestamp_us) > 1:
+            time_gap_hours[1:] = (
+                np.diff(selected_timestamp_us).astype(np.float64) / 3_600_000_000.0
+            ).astype(np.float32)
+        return selected_user_indices, time_gap_hours
+
+
+def _fill_post_liker_event_slice(
+    user_indices: np.ndarray,
+    time_gap_hours: np.ndarray,
+    user_indices_out: np.ndarray,
+    time_gap_hours_out: np.ndarray,
+) -> int:
+    if len(user_indices) != len(time_gap_hours):
+        raise ValueError("post-liker user index and time-gap arrays must be aligned")
+    n_events = min(len(user_indices), user_indices_out.shape[-1])
+    if n_events > 0:
+        user_indices_out[:n_events] = user_indices[:n_events].astype(np.int64, copy=False)
+        time_gap_hours_out[:n_events] = time_gap_hours[:n_events].astype(np.float32, copy=False)
+    return n_events
+
+
+def _build_post_liker_user_idx_by_did(user_idx_df: pl.DataFrame) -> Dict[str, int]:
+    validate_dataframe_schema(user_idx_df, {"did": None, "user_idx": None})
+    return {
+        str(row["did"]): int(row["user_idx"])
+        for row in user_idx_df.select(["did", "user_idx"]).iter_rows(named=True)
+    }
+
+
 class BucketedEngagementDataset(Dataset):
     """User-hour positives grouped by hour bucket with same-hour candidate posts."""
 
@@ -1042,6 +1186,10 @@ class BucketedEngagementDataset(Dataset):
         embed_dim: int,
         use_author_embedding_table: bool = False,
         use_popularity_feature: bool = False,
+        use_post_liker_user_pooling: bool = False,
+        post_liker_event_lookup: Optional[PostLikerEventLookup] = None,
+        post_liker_user_idx_df: Optional[pl.DataFrame] = None,
+        max_post_liker_replay_events_per_post: Optional[int] = None,
         bst_additional_batch_negatives: Optional[int] = None,
         seed: int = 0,
         logger: Optional[logging.Logger] = None,
@@ -1050,12 +1198,40 @@ class BucketedEngagementDataset(Dataset):
             raise ValueError("max_history_len must be positive")
         if bst_additional_batch_negatives is not None and bst_additional_batch_negatives <= 0:
             raise ValueError("bst_additional_batch_negatives must be positive when provided")
+        if use_post_liker_user_pooling:
+            if post_liker_event_lookup is None:
+                raise ValueError("post_liker_event_lookup is required when post-liker user pooling is enabled")
+            if post_liker_user_idx_df is None:
+                raise ValueError("post_liker_user_idx_df is required when post-liker user pooling is enabled")
+            if max_post_liker_replay_events_per_post is None:
+                raise ValueError("max_post_liker_replay_events_per_post is required when post-liker user pooling is enabled")
+        if (
+            max_post_liker_replay_events_per_post is not None
+            and int(max_post_liker_replay_events_per_post) <= 0
+        ):
+            raise ValueError("max_post_liker_replay_events_per_post must be positive when provided")
         self.embeddings = embeddings_mmap
         self.split = str(split)
         self.max_history_len = int(max_history_len)
         self.embed_dim = int(embed_dim)
         self.use_author_embedding_table = bool(use_author_embedding_table)
         self.use_popularity_feature = bool(use_popularity_feature)
+        self.use_post_liker_user_pooling = bool(use_post_liker_user_pooling)
+        self.max_post_liker_replay_events_per_post = (
+            int(max_post_liker_replay_events_per_post)
+            if max_post_liker_replay_events_per_post
+            else 0
+        )
+        self.post_liker_event_lookup: Optional[PostLikerEventLookup] = (
+            post_liker_event_lookup
+            if self.use_post_liker_user_pooling
+            else None
+        )
+        self.post_liker_user_idx_by_did = (
+            _build_post_liker_user_idx_by_did(post_liker_user_idx_df)
+            if self.use_post_liker_user_pooling and post_liker_user_idx_df is not None
+            else {}
+        )
         self.bst_additional_batch_negatives = int(bst_additional_batch_negatives) if bst_additional_batch_negatives is not None else None
         self.seed = int(seed)
 
@@ -1132,6 +1308,12 @@ class BucketedEngagementDataset(Dataset):
             logger.info(f"  BucketedEngagementDataset('{self.split}'): {len(joined):,} user-hour rows")
 
         self.user_ids = joined["did"].to_list()
+        self.target_user_indices: Optional[List[int]] = None
+        if self.use_post_liker_user_pooling:
+            self.target_user_indices = [
+                self.post_liker_user_idx_by_did.get(str(user_id), POST_LIKER_USER_UNK_IDX)
+                for user_id in self.user_ids
+            ]
         self.like_hour_buckets = joined["like_hour_bucket"].to_list()
         self.liked_post_ids = joined["liked_post_ids"].to_list()
         self.liked_post_emb_indices = [
@@ -1240,6 +1422,23 @@ class BucketedEngagementDataset(Dataset):
         padded = get_padded_history_time_deltas(counts, self.max_history_len)
         return torch.from_numpy(padded)
 
+    def _post_liker_features_for_emb_idx(
+        self,
+        emb_idx: int,
+        target_time_us: int,
+        cache: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        if self.post_liker_event_lookup is None:
+            raise ValueError("post_liker_event_lookup must be available when post-liker user pooling is enabled")
+        key = (int(emb_idx), int(target_time_us))
+        if key not in cache:
+            cache[key] = self.post_liker_event_lookup.liker_events_before(
+                emb_idx=int(emb_idx),
+                target_time_us=int(target_time_us),
+                max_replay_events=self.max_post_liker_replay_events_per_post,
+            )
+        return cache[key]
+
     def _sample_candidate_posts_for_batch(
         self,
         row_indices: List[int],
@@ -1275,6 +1474,7 @@ class BucketedEngagementDataset(Dataset):
         bucket = self.like_hour_buckets[row_indices[0]]
         if any(self.like_hour_buckets[row_idx] != bucket for row_idx in row_indices):
             raise ValueError("Bucketed batches must contain rows from exactly one hour bucket")
+        target_time_us = _timestamp_to_epoch_us(bucket)
 
         user_ids = [self.user_ids[row_idx] for row_idx in row_indices]
         user_to_batch_idx = {
@@ -1285,11 +1485,52 @@ class BucketedEngagementDataset(Dataset):
         history_tensors = []
         mask_tensors = []
         time_delta_tensors = []
-        for row_idx in row_indices:
+        history_user_indices_padded: Optional[np.ndarray] = None
+        history_time_gap_hours_padded: Optional[np.ndarray] = None
+        history_max_events = 0
+        if self.use_post_liker_user_pooling:
+            history_user_indices_padded = np.zeros(
+                (
+                    len(row_indices),
+                    self.max_history_len,
+                    self.max_post_liker_replay_events_per_post,
+                ),
+                dtype=np.int64,
+            )
+            history_time_gap_hours_padded = np.zeros(
+                (
+                    len(row_indices),
+                    self.max_history_len,
+                    self.max_post_liker_replay_events_per_post,
+                ),
+                dtype=np.float32,
+            )
+        post_liker_cache: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]] = {}
+        for batch_row_idx, row_idx in enumerate(row_indices):
             history, mask = self._padded_history_for_row(row_idx)
             history_tensors.append(history)
             mask_tensors.append(mask)
             time_delta_tensors.append(self._padded_time_deltas_for_row(row_idx))
+            if self.use_post_liker_user_pooling:
+                if history_user_indices_padded is None or history_time_gap_hours_padded is None:
+                    raise RuntimeError("history post-liker tensors were not initialized")
+                hist_indices = self.prior_emb_indices[row_idx]
+                seq_len = min(len(hist_indices), self.max_history_len)
+                for hist_pos in range(seq_len):
+                    user_indices, time_gap_hours = self._post_liker_features_for_emb_idx(
+                        int(hist_indices[hist_pos]),
+                        target_time_us,
+                        post_liker_cache,
+                    )
+                    history_max_events = max(
+                        history_max_events,
+                        _fill_post_liker_event_slice(
+                            user_indices,
+                            time_gap_hours,
+                            history_user_indices_padded[batch_row_idx, hist_pos],
+                            history_time_gap_hours_padded[batch_row_idx, hist_pos],
+                        ),
+                    )
 
         candidate_post_ids: List[str] = []
         candidate_emb_indices: List[int] = []
@@ -1345,6 +1586,33 @@ class BucketedEngagementDataset(Dataset):
         candidate_post_embeddings = torch.from_numpy(
             np.array(self.embeddings[np.array(candidate_emb_indices, dtype=np.int64)], dtype=np.float32)
         )
+        candidate_user_indices_padded: Optional[np.ndarray] = None
+        candidate_time_gap_hours_padded: Optional[np.ndarray] = None
+        candidate_max_events = 0
+        if self.use_post_liker_user_pooling:
+            candidate_user_indices_padded = np.zeros(
+                (len(candidate_emb_indices), self.max_post_liker_replay_events_per_post),
+                dtype=np.int64,
+            )
+            candidate_time_gap_hours_padded = np.zeros(
+                (len(candidate_emb_indices), self.max_post_liker_replay_events_per_post),
+                dtype=np.float32,
+            )
+            for candidate_idx, emb_idx in enumerate(candidate_emb_indices):
+                user_indices, time_gap_hours = self._post_liker_features_for_emb_idx(
+                    int(emb_idx),
+                    target_time_us,
+                    post_liker_cache,
+                )
+                candidate_max_events = max(
+                    candidate_max_events,
+                    _fill_post_liker_event_slice(
+                        user_indices,
+                        time_gap_hours,
+                        candidate_user_indices_padded[candidate_idx],
+                        candidate_time_gap_hours_padded[candidate_idx],
+                    ),
+                )
         label_matrix = torch.zeros((len(user_ids), len(candidate_post_ids)), dtype=torch.float32)
         for row_idx in row_indices:
             user_idx = user_to_batch_idx[self.user_ids[row_idx]]
@@ -1375,6 +1643,29 @@ class BucketedEngagementDataset(Dataset):
                 dim=0,
             )
             output["candidate_prior_cumulative_likes"] = torch.tensor(candidate_prior_cumulative_likes, dtype=torch.float32)
+        if self.use_post_liker_user_pooling:
+            if (
+                history_user_indices_padded is None
+                or history_time_gap_hours_padded is None
+                or candidate_user_indices_padded is None
+                or candidate_time_gap_hours_padded is None
+            ):
+                raise RuntimeError("post-liker tensors were not initialized")
+            output["history_post_liker_user_indices"] = torch.from_numpy(history_user_indices_padded)
+            output["history_post_liker_time_gap_hours"] = torch.from_numpy(history_time_gap_hours_padded)
+            output["candidate_post_liker_user_indices"] = torch.from_numpy(candidate_user_indices_padded)
+            output["candidate_post_liker_time_gap_hours"] = torch.from_numpy(candidate_time_gap_hours_padded)
+            if self.target_user_indices is None:
+                raise RuntimeError("target_user_indices were not initialized")
+            output["target_user_indices"] = torch.tensor(
+                [self.target_user_indices[row_idx] for row_idx in row_indices],
+                dtype=torch.long,
+            )
+            output["post_liker_replay_event_count"] = int(
+                (history_user_indices_padded != 0).sum().item()
+                + (candidate_user_indices_padded != 0).sum().item()
+            )
+            output["post_liker_replay_max_events_per_post"] = int(max(history_max_events, candidate_max_events))
         return output
 
 

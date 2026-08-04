@@ -104,6 +104,31 @@ def test_negative_sampling_popularity_args_merge_from_cli_and_config(tmp_path):
     assert merged.initial_negative_sampling_pct == 0.05
 
 
+def test_post_liker_history_args_merge_from_cli_and_config(tmp_path):
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--generate-post-liker-history",
+        "--min-post-liker-user-support", "7",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.generate_post_liker_history is True
+    assert merged.min_post_liker_user_support == 7
+    assert cli.DEFAULTS["generate_post_liker_history"] is False
+    assert cli.DEFAULTS["min_post_liker_user_support"] == 2
+
+    config_path = Path(tmp_path) / "post_liker_history.yml"
+    config_path.write_text(
+        "generate_post_liker_history: true\n"
+        "min_post_liker_user_support: 5\n"
+    )
+    raw = parser.parse_args(["--config", str(config_path), "--no-generate-post-liker-history"])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.generate_post_liker_history is False
+    assert merged.min_post_liker_user_support == 5
+
+
 def test_user_sampling_args_replace_old_names(tmp_path):
     parser = cli.build_parser()
     raw = parser.parse_args(["--max-trainval-users", "123", "--max-unseen-eval-users", "45"])
@@ -232,6 +257,81 @@ def test_bst_ranker_explicit_train_stage_names_parse():
     assert merged.stop_after == "train_bst_ranker"
 
 
+def test_bst_user_id_only_model_type_maps_to_experimental_train_stage():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "bst-user-id-only",
+        "--start-from", "train",
+        "--stop-after", "train",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    train_key = cli._get_train_key(merged.model_type)
+    stage_order = cli._get_stage_order_for_model_type(train_key)
+    start_idx, stop_idx, includes_train = cli._get_stage_folder_and_start_stop_indices(
+        stage_order,
+        merged.start_from,
+        merged.stop_after,
+        train_key,
+    )
+
+    assert train_key == "train_bst_user_id_only"
+    assert stage_order == ["get_data", "user_history", "train_bst_user_id_only"]
+    assert stage_order[start_idx] == "train_bst_user_id_only"
+    assert stage_order[stop_idx] == "train_bst_user_id_only"
+    assert includes_train is True
+    assert merged.bst_user_id_only_prepend_target_user_token is False
+    cli._validate_bst_user_id_only_config(merged)
+
+
+def test_bst_user_id_only_target_user_token_flag_parses():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "bst-user-id-only",
+        "--bst-user-id-only-prepend-target-user-token",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    assert cli.DEFAULTS["bst_user_id_only_prepend_target_user_token"] is False
+    assert merged.bst_user_id_only_prepend_target_user_token is True
+    cli._validate_bst_user_id_only_config(merged)
+
+
+def test_bst_user_id_only_explicit_train_stage_name_parses_without_author_table():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "bst-user-id-only",
+        "--start-from", "train_bst_user_id_only",
+        "--stop-after", "train_bst_user_id_only",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.start_from == "train_bst_user_id_only"
+    assert merged.stop_after == "train_bst_user_id_only"
+    assert merged.use_author_embedding_table is False
+    cli._validate_bst_user_id_only_config(merged)
+
+
+def test_bst_user_id_only_rejects_missing_replay_cap(tmp_path):
+    config_path = Path(tmp_path) / "bst_user_id_only_null_cap.yml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            model_type: bst-user-id-only
+            bst_max_post_liker_replay_events_per_post:
+            """
+        ).strip()
+        + "\n"
+    )
+
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--config", str(config_path)])
+    merged = cli._merge_args_with_config(raw)
+
+    with pytest.raises(ValueError, match="bst-max-post-liker-replay-events-per-post"):
+        cli._validate_bst_user_id_only_config(merged)
+
+
 def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
     config_path = Path(tmp_path) / "bst.yml"
     config_path.write_text(
@@ -256,6 +356,14 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
             bst_max_train_batches_per_epoch: 5
             bst_use_popularity_feature: false
             bst_popularity_projection_dim: 12
+            bst_use_post_liker_user_pooling: true
+            bst_post_liker_user_embedding_dim: 24
+            bst_post_liker_projection_dim: 10
+            bst_post_liker_pooling_tau_hours: 72.0
+            bst_target_user_projection_dim: 11
+            bst_post_liker_user_dropout_rate: 0.25
+            bst_target_user_dropout_rate: 0.6
+            bst_max_post_liker_replay_events_per_post: 25
             """
         ).strip()
         + "\n"
@@ -277,6 +385,14 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
     assert merged.bst_max_train_batches_per_epoch == 5
     assert merged.bst_use_popularity_feature is False
     assert merged.bst_popularity_projection_dim == 12
+    assert merged.bst_use_post_liker_user_pooling is True
+    assert merged.bst_post_liker_user_embedding_dim == 24
+    assert merged.bst_post_liker_projection_dim == 10
+    assert merged.bst_post_liker_pooling_tau_hours == 72.0
+    assert merged.bst_target_user_projection_dim == 11
+    assert merged.bst_post_liker_user_dropout_rate == 0.25
+    assert merged.bst_target_user_dropout_rate == 0.6
+    assert merged.bst_max_post_liker_replay_events_per_post == 25
     cli._validate_bst_config(merged)
 
 
@@ -293,6 +409,14 @@ def test_bst_ranker_training_defaults():
     assert merged.bst_max_train_batches_per_epoch is None
     assert merged.bst_use_popularity_feature is True
     assert merged.bst_popularity_projection_dim == 8
+    assert merged.bst_use_post_liker_user_pooling is False
+    assert merged.bst_post_liker_user_embedding_dim == 16
+    assert merged.bst_post_liker_projection_dim == 16
+    assert merged.bst_post_liker_pooling_tau_hours == 168.0
+    assert merged.bst_target_user_projection_dim == 16
+    assert merged.bst_post_liker_user_dropout_rate == 0.2
+    assert merged.bst_target_user_dropout_rate == 0.5
+    assert merged.bst_max_post_liker_replay_events_per_post == 32
     cli._validate_bst_config(merged)
 
 
@@ -316,6 +440,9 @@ def test_bst_ranker_requires_one_transformer_layer():
         ("--batch-size", "batch-size"),
         ("--bst-max-train-batches-per-epoch", "bst-max-train-batches-per-epoch"),
         ("--bst-popularity-projection-dim", "bst-popularity-projection-dim"),
+        ("--bst-post-liker-user-embedding-dim", "bst-post-liker-user-embedding-dim"),
+        ("--bst-post-liker-projection-dim", "bst-post-liker-projection-dim"),
+        ("--bst-post-liker-pooling-tau-hours", "bst-post-liker-pooling-tau-hours"),
     ],
 )
 def test_bst_ranker_rejects_non_positive_listwise_training_controls(flag, message):
@@ -368,6 +495,7 @@ def test_bst_ranker_accepts_explicit_empty_prediction_hidden_dims():
     [
         ("content_projection_dim", "content-projection-dim"),
         ("author_projection_dim", "author-projection-dim"),
+        ("bst_target_user_projection_dim", "bst-target-user-projection-dim"),
     ],
 )
 def test_bst_ranker_validates_projection_dims(arg_name, error_match):
@@ -382,6 +510,94 @@ def test_bst_ranker_validates_projection_dims(arg_name, error_match):
 
     with pytest.raises(ValueError, match=error_match):
         cli._validate_bst_config(merged)
+
+
+def test_bst_ranker_validates_post_liker_replay_cap_when_configured():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "bst-ranker",
+        "--use-author-embedding-table",
+        "--bst-max-post-liker-replay-events-per-post", "0",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    with pytest.raises(ValueError, match="bst-max-post-liker-replay-events-per-post"):
+        cli._validate_bst_config(merged)
+
+
+@pytest.mark.parametrize(
+    ("arg_name", "error_match"),
+    [
+        ("bst_post_liker_user_dropout_rate", "bst-post-liker-user-dropout-rate"),
+        ("bst_target_user_dropout_rate", "bst-target-user-dropout-rate"),
+    ],
+)
+def test_bst_ranker_validates_user_idx_dropout_rates(arg_name, error_match):
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "bst-ranker",
+        "--use-author-embedding-table",
+        "--prediction-hidden-dims", "144", "72",
+    ])
+    merged = cli._merge_args_with_config(raw)
+    setattr(merged, arg_name, 1.1)
+
+    with pytest.raises(ValueError, match=error_match):
+        cli._validate_bst_config(merged)
+
+
+@pytest.mark.parametrize(
+    ("arg_name", "error_match"),
+    [
+        ("bst_post_liker_user_dropout_rate", "bst-post-liker-user-dropout-rate"),
+        ("bst_target_user_dropout_rate", "bst-target-user-dropout-rate"),
+    ],
+)
+def test_bst_user_id_only_validates_user_idx_dropout_rates(arg_name, error_match):
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--model-type", "bst-user-id-only"])
+    merged = cli._merge_args_with_config(raw)
+    setattr(merged, arg_name, -0.1)
+
+    with pytest.raises(ValueError, match=error_match):
+        cli._validate_bst_user_id_only_config(merged)
+
+
+def test_bst_ranker_requires_post_liker_replay_cap_when_pooling_enabled(tmp_path):
+    config_path = Path(tmp_path) / "bst_post_liker_null_cap.yml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            model_type: bst-ranker
+            use_author_embedding_table: true
+            prediction_hidden_dims: [128, 64]
+            bst_use_post_liker_user_pooling: true
+            bst_max_post_liker_replay_events_per_post:
+            """
+        ).strip()
+        + "\n"
+    )
+
+    parser = cli.build_parser()
+    raw = parser.parse_args(["--config", str(config_path)])
+    merged = cli._merge_args_with_config(raw)
+
+    with pytest.raises(ValueError, match="bst-max-post-liker-replay-events-per-post"):
+        cli._validate_bst_config(merged)
+
+
+def test_bst_ranker_rejects_removed_post_liker_recent_cap(tmp_path):
+    parser = cli.build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--bst-max-recent-likers-per-post", "25"])
+
+    config_path = Path(tmp_path) / "old_post_liker_cap.yml"
+    config_path.write_text("bst_max_recent_likers_per_post: 25\n")
+    raw = parser.parse_args(["--config", str(config_path)])
+
+    with pytest.raises(ValueError, match="bst_max_recent_likers_per_post"):
+        cli._merge_args_with_config(raw)
 
 
 def test_bst_ranker_validates_transformer_head_divisibility():
