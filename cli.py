@@ -132,6 +132,7 @@ DEFAULTS: Dict[str, Any] = {
     "bst_target_user_projection_dim": 16,
     "bst_post_liker_user_dropout_rate": 0.2,
     "bst_target_user_dropout_rate": 0.5,
+    "bst_user_id_only_prepend_target_user_token": False,
     "bst_max_post_liker_replay_events_per_post": 32,
     "hidden_dims": [64, 32, 16],
     "dropout_rate_mlp": 0.5,
@@ -1047,6 +1048,9 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Training-time probability of replacing post-liker user IDs with the UNK row")
     _add_arg_with_default(p_all, "--bst-target-user-dropout-rate", type=float, default=argparse.SUPPRESS,
                           help_text="Training-time probability of replacing target user IDs with the UNK row")
+    _add_arg_with_default(p_all, "--bst-user-id-only-prepend-target-user-token", action=argparse.BooleanOptionalAction,
+                          default=argparse.SUPPRESS,
+                          help_text="BST user-ID-only experiment: prepend the target-user embedding as a transformer token")
     _add_arg_with_default(p_all, "--bst-max-post-liker-replay-events-per-post", type=int, default=argparse.SUPPRESS,
                           help_text="Optional tail cap on prior liker events replayed per history or candidate post for BST")
     # Stage 3 options (shared)

@@ -479,7 +479,7 @@ def create_user_id_only_bucketed_data_loaders(
 class BSTUserIdOnlyRanker(nn.Module):
     """Behavior Sequence Transformer using only user-ID-derived post features."""
 
-    __constants__ = ["post_liker_user_embedding_dim", "target_user_projection_dim"]
+    __constants__ = ["post_liker_user_embedding_dim", "target_user_projection_dim", "prepend_target_user_token"]
 
     def __init__(
         self,
@@ -499,6 +499,7 @@ class BSTUserIdOnlyRanker(nn.Module):
         target_user_projection_dim: int,
         post_liker_user_dropout_rate: float,
         target_user_dropout_rate: float,
+        prepend_target_user_token: bool,
     ):
         super().__init__()
         if post_liker_user_table_num_rows < 2:
@@ -537,6 +538,7 @@ class BSTUserIdOnlyRanker(nn.Module):
         self.target_user_projection_dim = int(target_user_projection_dim)
         self.post_liker_user_dropout_rate = float(post_liker_user_dropout_rate)
         self.target_user_dropout_rate = float(target_user_dropout_rate)
+        self.prepend_target_user_token = bool(prepend_target_user_token)
         self.time_delta_bucket_boundaries_hours = _validate_time_delta_bucket_boundaries(
             time_delta_bucket_boundaries_hours
         )
@@ -575,13 +577,19 @@ class BSTUserIdOnlyRanker(nn.Module):
         )
         self.target_user_projection_norm = nn.LayerNorm(self.target_user_projection_dim)
         self.target_user_projection_activation = nn.GELU()
+        self.target_user_token_fusion = nn.Linear(self.target_user_projection_dim, self.model_dim)
         self.time_delta_embedding = nn.Embedding(
             num_embeddings=self.num_time_delta_buckets,
             embedding_dim=self.time_embedding_dim,
         )
         nn.init.xavier_uniform_(self.time_delta_embedding.weight)
         self.empty_history_token = nn.Parameter(torch.randn(self.transformer_input_dim) * 0.02)
-        for layer in (self.post_liker_projection, self.post_liker_fusion, self.target_user_projection):
+        for layer in (
+            self.post_liker_projection,
+            self.post_liker_fusion,
+            self.target_user_projection,
+            self.target_user_token_fusion,
+        ):
             nn.init.xavier_uniform_(layer.weight)
             if layer.bias is not None:
                 nn.init.zeros_(layer.bias)
@@ -638,21 +646,49 @@ class BSTUserIdOnlyRanker(nn.Module):
         )
         return self.post_liker_fusion(projected)
 
-    def _target_user_features(self, target_user_indices: torch.Tensor) -> torch.Tensor:
-        target_user_indices = target_user_indices.to(
+    def _target_user_indices_for_features(self, target_user_indices: torch.Tensor) -> torch.Tensor:
+        prepared_indices = target_user_indices.to(
             device=self.post_liker_user_embedding.weight.device,
             dtype=torch.long,
         )
-        target_user_indices = self._apply_user_idx_unk_dropout(
-            target_user_indices,
+        return self._apply_user_idx_unk_dropout(
+            prepared_indices,
             self.target_user_dropout_rate,
         )
+
+    def _target_user_features_from_prepared_indices(self, target_user_indices: torch.Tensor) -> torch.Tensor:
         target_user_embeddings = self.post_liker_user_embedding(target_user_indices)
         return self.target_user_projection_norm(
             self.target_user_projection_activation(
                 self.target_user_projection(target_user_embeddings)
             )
         )
+
+    def _target_user_features(self, target_user_indices: torch.Tensor) -> torch.Tensor:
+        return self._target_user_features_from_prepared_indices(
+            self._target_user_indices_for_features(target_user_indices)
+        )
+
+    def _target_user_token_input(self, target_user_features: torch.Tensor) -> torch.Tensor:
+        batch_size = int(target_user_features.size(0))
+        device = target_user_features.device
+        target_user_post_vector = self.target_user_token_fusion(target_user_features).unsqueeze(1)
+        target_user_time_bucket_ids = torch.zeros((batch_size, 1), device=device, dtype=torch.long)
+        target_user_time_embeddings = self.time_delta_embedding(target_user_time_bucket_ids)
+        return torch.cat([target_user_post_vector, target_user_time_embeddings], dim=-1)
+
+    def _maybe_prepend_target_user_token(
+        self,
+        history_input: torch.Tensor,
+        history_mask: torch.Tensor,
+        target_user_features: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.prepend_target_user_token:
+            return history_input, history_mask
+        batch_size = int(history_input.size(0))
+        target_user_token = self._target_user_token_input(target_user_features)
+        target_user_mask = torch.ones((batch_size, 1), device=history_mask.device, dtype=torch.bool)
+        return torch.cat([target_user_token, history_input], dim=1), torch.cat([target_user_mask, history_mask], dim=1)
 
     def _apply_user_idx_unk_dropout(
         self,
@@ -702,6 +738,7 @@ class BSTUserIdOnlyRanker(nn.Module):
         history_post_liker_time_gap_hours: torch.Tensor,
         candidate_post_liker_user_indices: torch.Tensor,
         candidate_post_liker_time_gap_hours: torch.Tensor,
+        target_user_features: torch.Tensor,
     ) -> torch.Tensor:
         if history_mask.dim() != 2:
             raise ValueError("history_mask must have shape [B, H]")
@@ -716,6 +753,8 @@ class BSTUserIdOnlyRanker(nn.Module):
             raise ValueError("candidate_post_liker_user_indices must have shape [B, K]")
         if candidate_post_liker_time_gap_hours.shape != candidate_post_liker_user_indices.shape:
             raise ValueError("candidate_post_liker_time_gap_hours shape must match candidate_post_liker_user_indices")
+        if target_user_features.shape != (batch_size, self.target_user_projection_dim):
+            raise ValueError("target_user_features must have shape [B, target_user_projection_dim]")
 
         device = self.post_liker_user_embedding.weight.device
         history_mask = history_mask.to(device=device, dtype=torch.bool)
@@ -738,6 +777,11 @@ class BSTUserIdOnlyRanker(nn.Module):
         history_time_embeddings = self.time_delta_embedding(history_time_bucket_ids)
         history_input = torch.cat([history_post_vectors, history_time_embeddings], dim=-1)
         history_input, history_mask = self._inject_empty_history_token(history_input, history_mask)
+        history_input, history_mask = self._maybe_prepend_target_user_token(
+            history_input,
+            history_mask,
+            target_user_features,
+        )
         candidate_time_bucket_ids = torch.zeros((batch_size, 1), device=device, dtype=torch.long)
         candidate_time_embeddings = self.time_delta_embedding(candidate_time_bucket_ids)
         candidate_input = torch.cat([candidate_post_vector, candidate_time_embeddings], dim=-1)
@@ -871,7 +915,8 @@ class BSTUserIdOnlyRanker(nn.Module):
         history_post_liker_time_gap_hours = history_post_liker_time_gap_hours.to(device=device, dtype=torch.float32)
         candidate_post_liker_user_indices = candidate_post_liker_user_indices.to(device=device, dtype=torch.long)
         candidate_post_liker_time_gap_hours = candidate_post_liker_time_gap_hours.to(device=device, dtype=torch.float32)
-        target_user_indices = target_user_indices.to(device=device, dtype=torch.long)
+        target_user_indices = self._target_user_indices_for_features(target_user_indices)
+        target_user_features = self._target_user_features_from_prepared_indices(target_user_indices)
 
         history_post_vectors = self._post_vectors_from_liker_tensors(
             history_post_liker_user_indices,
@@ -887,6 +932,11 @@ class BSTUserIdOnlyRanker(nn.Module):
         candidate_time_embeddings = self.time_delta_embedding(candidate_time_bucket_ids)
         history_input = torch.cat([history_post_vectors, history_time_embeddings], dim=-1)
         history_input, history_mask = self._inject_empty_history_token(history_input, history_mask)
+        history_input, history_mask = self._maybe_prepend_target_user_token(
+            history_input,
+            history_mask,
+            target_user_features,
+        )
         candidate_input = torch.cat([candidate_post_vectors, candidate_time_embeddings], dim=-1)
 
         if layer.norm_first:
@@ -948,7 +998,6 @@ class BSTUserIdOnlyRanker(nn.Module):
             )
 
         prediction_input = candidate_state.reshape(num_users * num_candidates, self.transformer_input_dim)
-        target_user_features = self._target_user_features(target_user_indices)
         expanded_target_features = target_user_features.unsqueeze(1).expand(
             num_users,
             num_candidates,
@@ -972,6 +1021,8 @@ class BSTUserIdOnlyRanker(nn.Module):
         candidate_post_liker_time_gap_hours: torch.Tensor,
         target_user_indices: torch.Tensor,
     ) -> torch.Tensor:
+        target_user_indices = self._target_user_indices_for_features(target_user_indices)
+        target_user_features = self._target_user_features_from_prepared_indices(target_user_indices)
         transformer_output = self._forward_transformer(
             history_mask=history_mask,
             history_time_deltas_hours=history_time_deltas_hours,
@@ -979,8 +1030,8 @@ class BSTUserIdOnlyRanker(nn.Module):
             history_post_liker_time_gap_hours=history_post_liker_time_gap_hours,
             candidate_post_liker_user_indices=candidate_post_liker_user_indices,
             candidate_post_liker_time_gap_hours=candidate_post_liker_time_gap_hours,
+            target_user_features=target_user_features,
         )
-        target_user_features = self._target_user_features(target_user_indices)
         prediction_input = torch.cat([transformer_output, target_user_features], dim=-1)
         logits = self.prediction_head(prediction_input)
         if logits.dim() == 2 and logits.shape == (transformer_output.size(0), 1):
@@ -1440,6 +1491,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     target_user_projection_dim = int(args.bst_target_user_projection_dim)
     post_liker_user_dropout_rate = float(args.bst_post_liker_user_dropout_rate)
     target_user_dropout_rate = float(args.bst_target_user_dropout_rate)
+    prepend_target_user_token = bool(args.bst_user_id_only_prepend_target_user_token)
     bst_max_post_liker_replay_events_per_post = args.bst_max_post_liker_replay_events_per_post
     if bst_max_post_liker_replay_events_per_post is None:
         raise ValueError("bst_max_post_liker_replay_events_per_post is required for BST user-ID-only training")
@@ -1478,6 +1530,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"pooling_tau_hours={post_liker_pooling_tau_hours}, "
         f"post_liker_user_dropout_rate={post_liker_user_dropout_rate}, "
         f"target_user_dropout_rate={target_user_dropout_rate}, "
+        f"prepend_target_user_token={prepend_target_user_token}, "
         f"user_table_num_rows={post_liker_user_table_num_rows}, "
         f"max_post_liker_replay_events_per_post={bst_max_post_liker_replay_events_per_post}, "
         f"post_liker_event_rows={len(post_liker_events_df):,}, "
@@ -1552,6 +1605,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "bst_target_user_projection_dim": target_user_projection_dim,
         "bst_post_liker_user_dropout_rate": post_liker_user_dropout_rate,
         "bst_target_user_dropout_rate": target_user_dropout_rate,
+        "bst_user_id_only_prepend_target_user_token": prepend_target_user_token,
         "bst_max_post_liker_replay_events_per_post": bst_max_post_liker_replay_events_per_post,
         "requires_post_liker_user_pooling": True,
         "requires_target_user_indices": True,
@@ -1616,6 +1670,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         target_user_projection_dim=target_user_projection_dim,
         post_liker_user_dropout_rate=post_liker_user_dropout_rate,
         target_user_dropout_rate=target_user_dropout_rate,
+        prepend_target_user_token=prepend_target_user_token,
     )
 
     log_operation_start(f"Train BST user-ID-only ranker (epochs={epochs}, batch_size={batch_size})", STAGE_LOG_NAME, logger)

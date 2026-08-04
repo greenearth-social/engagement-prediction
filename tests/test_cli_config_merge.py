@@ -280,6 +280,20 @@ def test_bst_user_id_only_model_type_maps_to_experimental_train_stage():
     assert stage_order[start_idx] == "train_bst_user_id_only"
     assert stage_order[stop_idx] == "train_bst_user_id_only"
     assert includes_train is True
+    assert merged.bst_user_id_only_prepend_target_user_token is False
+    cli._validate_bst_user_id_only_config(merged)
+
+
+def test_bst_user_id_only_target_user_token_flag_parses():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "bst-user-id-only",
+        "--bst-user-id-only-prepend-target-user-token",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    assert cli.DEFAULTS["bst_user_id_only_prepend_target_user_token"] is False
+    assert merged.bst_user_id_only_prepend_target_user_token is True
     cli._validate_bst_user_id_only_config(merged)
 
 

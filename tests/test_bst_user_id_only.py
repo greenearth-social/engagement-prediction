@@ -34,7 +34,7 @@ def _scalar_calls_by_series(calls, series: str):
     return [call for call in calls if call["series"] == series]
 
 
-def _make_model(*, dropout_rate: float = 0.0) -> BSTUserIdOnlyRanker:
+def _make_model(*, dropout_rate: float = 0.0, prepend_target_user_token: bool = False) -> BSTUserIdOnlyRanker:
     torch.manual_seed(123)
     return BSTUserIdOnlyRanker(
         post_liker_user_table_num_rows=8,
@@ -53,6 +53,7 @@ def _make_model(*, dropout_rate: float = 0.0) -> BSTUserIdOnlyRanker:
         target_user_projection_dim=2,
         post_liker_user_dropout_rate=0.0,
         target_user_dropout_rate=0.0,
+        prepend_target_user_token=prepend_target_user_token,
     )
 
 
@@ -142,6 +143,17 @@ def test_bst_user_id_only_matrix_scorer_matches_repeated_forward_path():
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 
+def test_bst_user_id_only_target_user_token_matrix_scorer_matches_repeated_forward_path():
+    model = _make_model(prepend_target_user_token=True).eval()
+    batch = _batch()
+
+    with torch.no_grad():
+        expected = _expected_matrix_scores(model, batch)
+        actual = model.score_candidate_matrix(**batch)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
 def test_bst_user_id_only_zero_history_rows_use_empty_history_token():
     model = _make_model()
     batch = _batch()
@@ -167,6 +179,17 @@ def test_bst_user_id_only_zero_history_matrix_scorer_matches_repeated_forward_pa
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 
+def test_bst_user_id_only_target_user_token_zero_history_matches_repeated_forward_path():
+    model = _make_model(prepend_target_user_token=True).eval()
+    batch = _mixed_zero_history_batch()
+
+    with torch.no_grad():
+        expected = _expected_matrix_scores(model, batch)
+        actual = model.score_candidate_matrix(**batch)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
 def test_bst_user_id_only_target_user_indices_change_scores():
     model = _make_model().eval()
     batch = _batch()
@@ -178,6 +201,21 @@ def test_bst_user_id_only_target_user_indices_change_scores():
         changed = model.score_candidate_matrix(**changed_batch)
 
     assert not torch.allclose(baseline, changed)
+
+
+def test_bst_user_id_only_target_user_token_changes_scores_beyond_post_head_feature():
+    without_token = _make_model(prepend_target_user_token=False).eval()
+    with_token = _make_model(prepend_target_user_token=True).eval()
+    with_token.load_state_dict(without_token.state_dict())
+    batch = _batch()
+
+    with torch.no_grad():
+        without_token_scores = without_token.score_candidate_matrix(**batch)
+        with_token_scores = with_token.score_candidate_matrix(**batch)
+
+    assert not torch.allclose(without_token_scores, with_token_scores)
+    first_head_layer = with_token.prediction_head.network[0]
+    assert first_head_layer.in_features == with_token.transformer_input_dim + with_token.target_user_projection_dim
 
 
 def test_bst_user_id_only_user_idx_dropout_maps_supported_ids_to_unknown_only_in_training():
@@ -198,6 +236,7 @@ def test_bst_user_id_only_user_idx_dropout_maps_supported_ids_to_unknown_only_in
         target_user_projection_dim=2,
         post_liker_user_dropout_rate=1.0,
         target_user_dropout_rate=1.0,
+        prepend_target_user_token=False,
     )
     user_indices = torch.tensor([[0, 1, 2, 7]], dtype=torch.long)
 
@@ -235,6 +274,21 @@ def test_bst_user_id_only_listwise_loss_trains_user_embedding_and_target_project
     assert model.post_liker_user_embedding.weight.grad.abs().sum() > 0
     assert model.target_user_projection.weight.grad is not None
     assert model.target_user_projection.weight.grad.abs().sum() > 0
+
+
+def test_bst_user_id_only_target_user_token_path_trains_token_fusion():
+    model = _make_model(prepend_target_user_token=True)
+    batch = {
+        **_batch(),
+        "label_matrix": torch.tensor([[1.0, 0.0], [1.0, 1.0]], dtype=torch.float32),
+    }
+
+    loss, _scores, _labels = _compute_bst_user_id_only_listwise_loss_and_preds(model, batch, "cpu")
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert model.target_user_token_fusion.weight.grad is not None
+    assert model.target_user_token_fusion.weight.grad.abs().sum() > 0
 
 
 def test_bst_user_id_only_baseline_metrics_log_on_normal_series_at_iteration_zero():
@@ -297,6 +351,7 @@ def test_bst_user_id_only_rejects_invalid_dimensions():
             target_user_projection_dim=2,
             post_liker_user_dropout_rate=0.0,
             target_user_dropout_rate=0.0,
+            prepend_target_user_token=False,
         )
 
 
@@ -319,6 +374,7 @@ def test_bst_user_id_only_rejects_invalid_user_idx_dropout_rates():
             target_user_projection_dim=2,
             post_liker_user_dropout_rate=-0.1,
             target_user_dropout_rate=0.0,
+            prepend_target_user_token=False,
         )
     with pytest.raises(ValueError, match="target_user_dropout_rate"):
         BSTUserIdOnlyRanker(
@@ -338,4 +394,5 @@ def test_bst_user_id_only_rejects_invalid_user_idx_dropout_rates():
             target_user_projection_dim=2,
             post_liker_user_dropout_rate=0.0,
             target_user_dropout_rate=1.1,
+            prepend_target_user_token=False,
         )
