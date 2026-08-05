@@ -698,7 +698,6 @@ def _build_global_like_counts_df(
 
 def _build_political_uris_df(
     inference_paths: List[str],
-    global_like_counts_df: pl.DataFrame,
     political_score_threshold: float,
 ) -> pl.DataFrame:
     parsed_record_expr = (
@@ -735,9 +734,6 @@ def _build_political_uris_df(
         .select(["at_uri", "indexed_at", "is_political"])
         .collect(engine="streaming")
     )
-    eligible_uris_df = global_like_counts_df.select(
-        pl.col("subject_uri").alias("at_uri")
-    )
     return (
         inference_labels_df
         .group_by("at_uri")
@@ -747,7 +743,6 @@ def _build_political_uris_df(
             .last()
         )
         .filter(pl.col("is_political"))
-        .join(eligible_uris_df, on="at_uri", how="semi")
     )
 
 
@@ -1183,7 +1178,8 @@ def _load_posts_core_polars(
 
     Processing flow:
     1. Scan all parquet files and apply the time filter.
-    2. Sample post-hour negatives by global popularity within fixed 24-hour eligibility windows.
+    2. Sample ordinary post-hour negatives by global popularity and political supplements uniformly
+       within fixed 24-hour eligibility windows.
     3. Left-join liked_post_uris.
     4. Keep posts that are either in the negative sample or liked.
     5. Collect metadata-only DataFrame (no embeddings).
@@ -1236,11 +1232,10 @@ def _load_posts_core_polars(
             raise ValueError("No bsky_inferences parquet files found for political negative sampling")
         political_uris_df = _build_political_uris_df(
             inference_paths=inference_paths,
-            global_like_counts_df=global_like_counts_df,
             political_score_threshold=political_score_threshold,
         )
         logger.info(
-            "Collected %s eligible political candidate URIs from inference data",
+            "Collected %s political candidate URIs from inference data before post eligibility",
             f"{political_uris_df.height:,}",
         )
 
@@ -1491,26 +1486,21 @@ def _get_negative_sample_posts(
         and political_uris_df is not None
         and political_uris_df.height > 0
     ):
-        ordinary_political_counts_df = (
-            ordinary_posts_df
-            .group_by("negative_hour_bucket")
-            .agg(
-                pl.col("is_political")
-                .fill_null(False)
-                .sum()
-                .cast(pl.Int64)
-                .alias("_ordinary_political_count")
-            )
-        )
         ordinary_pairs_lf = (
             ordinary_posts_df
             .select(["at_uri", "negative_hour_bucket"])
             .lazy()
         )
-        political_candidate_posts_lf = candidate_posts_lf.join(
-            political_uris_df.lazy(),
-            on="at_uri",
-            how="inner",
+        political_candidate_posts_lf = (
+            metadata_lf
+            .join(
+                political_uris_df.lazy(),
+                on="at_uri",
+                how="inner",
+            )
+            .with_columns(
+                pl.lit(1, dtype=pl.UInt64).alias("global_like_count")
+            )
         )
         supplemental_posts_df = (
             _expand_negative_candidate_post_hours_lf(
@@ -1522,25 +1512,13 @@ def _get_negative_sample_posts(
                 holdout_end=holdout_end,
             )
             .join(ordinary_pairs_lf, on=["at_uri", "negative_hour_bucket"], how="anti")
-            .join(
-                ordinary_political_counts_df.lazy(),
-                on="negative_hour_bucket",
-                how="left",
-            )
             .with_columns(
-                pl.col("_ordinary_political_count").fill_null(0),
-            )
-            .with_columns(
-                pl.when(pl.col("_ordinary_political_count") < political_negative_samples_per_hour)
-                .then(political_negative_samples_per_hour - pl.col("_ordinary_political_count"))
-                .otherwise(0)
-                .alias("_political_shortfall"),
                 pl.col("_sample_score")
                 .rank("ordinal")
                 .over("negative_hour_bucket")
                 .alias("_political_sample_rank"),
             )
-            .filter(pl.col("_political_sample_rank") <= pl.col("_political_shortfall"))
+            .filter(pl.col("_political_sample_rank") <= political_negative_samples_per_hour)
             .with_columns(
                 pl.lit(False).alias("_in_ordinary_negative_sample"),
                 pl.lit(True).alias("_in_political_negative_sample"),
@@ -1601,6 +1579,7 @@ def _calculate_negative_sampling_stats(
         .agg(
             pl.len().alias("total_samples"),
             pl.col("is_political").fill_null(False).sum().alias("political_samples"),
+            pl.col("_in_political_negative_sample").sum().alias("supplemental_political_samples"),
         )
     )
     n_buckets = hourly_df.height
@@ -1611,6 +1590,9 @@ def _calculate_negative_sampling_stats(
         political_min = int(hourly_df["political_samples"].min())
         political_median = float(hourly_df["political_samples"].median())
         political_max = int(hourly_df["political_samples"].max())
+        supplemental_political_min = int(hourly_df["supplemental_political_samples"].min())
+        supplemental_political_median = float(hourly_df["supplemental_political_samples"].median())
+        supplemental_political_max = int(hourly_df["supplemental_political_samples"].max())
     else:
         total_min = 0
         total_median = 0.0
@@ -1618,17 +1600,20 @@ def _calculate_negative_sampling_stats(
         political_min = 0
         political_median = 0.0
         political_max = 0
+        supplemental_political_min = 0
+        supplemental_political_median = 0.0
+        supplemental_political_max = 0
 
     if political_negative_samples_per_hour > 0 and n_buckets > 0:
-        quota_met = hourly_df.filter(
-            pl.col("political_samples") >= political_negative_samples_per_hour
+        supplement_target_met = hourly_df.filter(
+            pl.col("supplemental_political_samples") >= political_negative_samples_per_hour
         ).height
-        quota_short = n_buckets - quota_met
-        quota_met_pct = 100.0 * quota_met / n_buckets
+        supplement_target_short = n_buckets - supplement_target_met
+        supplement_target_met_pct = 100.0 * supplement_target_met / n_buckets
     else:
-        quota_met = 0
-        quota_short = 0
-        quota_met_pct = 0.0
+        supplement_target_met = 0
+        supplement_target_short = 0
+        supplement_target_met_pct = 0.0
 
     labeled_rows = political_rows + nonpolitical_rows
     return {
@@ -1657,9 +1642,12 @@ def _calculate_negative_sampling_stats(
         "political_samples_per_hour_min": political_min,
         "political_samples_per_hour_median": political_median,
         "political_samples_per_hour_max": political_max,
-        "n_political_quota_hours_met": quota_met,
-        "n_political_quota_hours_short": quota_short,
-        "political_quota_hours_met_pct": quota_met_pct,
+        "supplemental_political_samples_per_hour_min": supplemental_political_min,
+        "supplemental_political_samples_per_hour_median": supplemental_political_median,
+        "supplemental_political_samples_per_hour_max": supplemental_political_max,
+        "n_political_supplement_target_hours_met": supplement_target_met,
+        "n_political_supplement_target_hours_short": supplement_target_short,
+        "political_supplement_target_hours_met_pct": supplement_target_met_pct,
     }
 
 
@@ -1700,13 +1688,19 @@ def _log_negative_sampling_summary(logger: logging.Logger, stats: Dict[str, Any]
         f"{stats['negative_samples_per_hour_max']:,}",
     )
     logger.info(
-        "  Hourly political counts: min=%s, median=%.1f, max=%s; quota met=%s (%.1f%%), short=%s",
+        "  Hourly political totals: min=%s, median=%.1f, max=%s",
         f"{stats['political_samples_per_hour_min']:,}",
         stats["political_samples_per_hour_median"],
         f"{stats['political_samples_per_hour_max']:,}",
-        f"{stats['n_political_quota_hours_met']:,}",
-        stats["political_quota_hours_met_pct"],
-        f"{stats['n_political_quota_hours_short']:,}",
+    )
+    logger.info(
+        "  Hourly political supplements: min=%s, median=%.1f, max=%s; target met=%s (%.1f%%), short=%s",
+        f"{stats['supplemental_political_samples_per_hour_min']:,}",
+        stats["supplemental_political_samples_per_hour_median"],
+        f"{stats['supplemental_political_samples_per_hour_max']:,}",
+        f"{stats['n_political_supplement_target_hours_met']:,}",
+        stats["political_supplement_target_hours_met_pct"],
+        f"{stats['n_political_supplement_target_hours_short']:,}",
     )
 
 

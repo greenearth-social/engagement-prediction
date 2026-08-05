@@ -492,7 +492,7 @@ def test_global_negative_counts_respect_hash_seed_and_min_likes(stage_get_data_m
     assert stats["n_global_negative_candidate_posts"] == 2
 
 
-def test_build_political_uris_filters_candidates_and_uses_latest_inference(tmp_path, stage_get_data_module):
+def test_build_political_uris_uses_latest_inference_without_candidate_filtering(tmp_path, stage_get_data_module):
     inference_path = _write_inferences_parquet(tmp_path, [
         {
             "at_uri": "post:high_both",
@@ -530,29 +530,18 @@ def test_build_political_uris_filters_candidates_and_uses_latest_inference(tmp_p
             "inferences": _inference_payload(0.99, 0.99),
         },
     ])
-    eligible_df = pl.DataFrame({
-        "subject_uri": [
-            "post:high_both",
-            "post:politics_only",
-            "post:news_only",
-            "post:missing_text",
-            "post:updated",
-        ],
-        "global_like_count": [100, 100, 100, 100, 100],
-    }).with_columns(pl.col("global_like_count").cast(pl.UInt64))
-
     political_uris_df = stage_get_data_module._build_political_uris_df(
         inference_paths=[str(inference_path)],
-        global_like_counts_df=eligible_df,
         political_score_threshold=0.8,
-    )
+    ).sort("at_uri")
 
     assert political_uris_df.to_dicts() == [
         {"at_uri": "post:high_both", "is_political": True},
+        {"at_uri": "post:ineligible", "is_political": True},
     ]
 
 
-def test_political_sampling_adds_only_the_ordinary_pool_shortfall(tmp_path, stage_get_data_module, caplog):
+def test_political_sampling_adds_fixed_supplement_beyond_ordinary_politics(tmp_path, stage_get_data_module, caplog):
     posts_rows = [
         {
             "at_uri": f"post:{idx}",
@@ -583,8 +572,8 @@ def test_political_sampling_adds_only_the_ordinary_pool_shortfall(tmp_path, stag
     )
     ordinary_ids = set(ordinary_df["at_uri"].to_list())
     inside_ordinary = next(iter(ordinary_ids))
-    outside_ordinary = next(row["at_uri"] for row in posts_rows if row["at_uri"] not in ordinary_ids)
-    political_ids = {inside_ordinary, outside_ordinary}
+    outside_ordinary = {row["at_uri"] for row in posts_rows if row["at_uri"] not in ordinary_ids}
+    political_ids = {inside_ordinary} | outside_ordinary
     political_uris_df = pl.DataFrame({
         "at_uri": list(political_ids),
         "is_political": [True] * len(political_ids),
@@ -606,8 +595,8 @@ def test_political_sampling_adds_only_the_ordinary_pool_shortfall(tmp_path, stag
             stats,
         )
 
-    assert sampled_df.height == 3
-    assert sampled_df["at_uri"].n_unique() == 3
+    assert sampled_df.height == 4
+    assert sampled_df["at_uri"].n_unique() == 4
     assert stats == {
         "political_sampling_enabled": True,
         "n_political_inference_files": 1,
@@ -615,32 +604,43 @@ def test_political_sampling_adds_only_the_ordinary_pool_shortfall(tmp_path, stag
         "n_ordinary_negative_sample_unique_posts": 2,
         "n_ordinary_political_sample_rows": 1,
         "n_ordinary_political_sample_unique_posts": 1,
-        "n_supplemental_political_sample_rows": 1,
-        "n_supplemental_political_sample_unique_posts": 1,
-        "n_final_negative_sample_rows": 3,
-        "n_final_negative_sample_unique_posts": 3,
-        "n_final_political_sample_rows": 2,
-        "n_final_political_sample_unique_posts": 2,
+        "n_supplemental_political_sample_rows": 2,
+        "n_supplemental_political_sample_unique_posts": 2,
+        "n_final_negative_sample_rows": 4,
+        "n_final_negative_sample_unique_posts": 4,
+        "n_final_political_sample_rows": 3,
+        "n_final_political_sample_unique_posts": 3,
         "n_final_nonpolitical_sample_rows": 0,
         "n_final_nonpolitical_sample_unique_posts": 0,
         "n_final_unknown_political_sample_rows": 1,
         "n_final_unknown_political_sample_unique_posts": 1,
-        "n_labeled_negative_sample_rows": 2,
-        "political_label_coverage_pct": 100.0 * 2 / 3,
+        "n_labeled_negative_sample_rows": 3,
+        "political_label_coverage_pct": 75.0,
         "n_negative_sample_buckets": 1,
-        "negative_samples_per_hour_min": 3,
-        "negative_samples_per_hour_median": 3.0,
-        "negative_samples_per_hour_max": 3,
-        "political_samples_per_hour_min": 2,
-        "political_samples_per_hour_median": 2.0,
-        "political_samples_per_hour_max": 2,
-        "n_political_quota_hours_met": 1,
-        "n_political_quota_hours_short": 0,
-        "political_quota_hours_met_pct": 100.0,
+        "negative_samples_per_hour_min": 4,
+        "negative_samples_per_hour_median": 4.0,
+        "negative_samples_per_hour_max": 4,
+        "political_samples_per_hour_min": 3,
+        "political_samples_per_hour_median": 3.0,
+        "political_samples_per_hour_max": 3,
+        "supplemental_political_samples_per_hour_min": 2,
+        "supplemental_political_samples_per_hour_median": 2.0,
+        "supplemental_political_samples_per_hour_max": 2,
+        "n_political_supplement_target_hours_met": 1,
+        "n_political_supplement_target_hours_short": 0,
+        "political_supplement_target_hours_met_pct": 100.0,
     }
     assert "Ordinary sample: 2 post-hour rows, 2 unique posts" in caplog.text
-    assert "Supplemental political sample: 1 post-hour rows, 1 unique posts" in caplog.text
-    assert "Final labels: political=2, non-political=0, unknown=1" in caplog.text
+    assert "Supplemental political sample: 2 post-hour rows, 2 unique posts" in caplog.text
+    assert "Final labels: political=3, non-political=0, unknown=1" in caplog.text
+    assert "Hourly political supplements: min=2, median=2.0, max=2; target met=1 (100.0%), short=0" in caplog.text
+    shortage_stats = stage_get_data_module._calculate_negative_sampling_stats(
+        sampled_df,
+        political_negative_samples_per_hour=3,
+        inference_file_count=1,
+    )
+    assert shortage_stats["n_political_supplement_target_hours_met"] == 0
+    assert shortage_stats["n_political_supplement_target_hours_short"] == 1
 
 
 def test_force_included_positive_post_is_not_sampled_as_negative(stage_get_data_module):
@@ -708,8 +708,8 @@ def test_load_posts_random_sample_all_metadata_only(tmp_path, stage_get_data_mod
     assert stats["n_final_negative_sample_rows"] == posts_df.height
     assert stats["n_final_unknown_political_sample_rows"] == posts_df.height
     assert stats["political_sampling_enabled"] is False
-    assert stats["n_political_quota_hours_met"] == 0
-    assert stats["n_political_quota_hours_short"] == 0
+    assert stats["n_political_supplement_target_hours_met"] == 0
+    assert stats["n_political_supplement_target_hours_short"] == 0
     assert stats["n_liked_posts"] == 2
     assert embed_dim == 3
 
@@ -734,7 +734,7 @@ def test_load_posts_random_sample_all_metadata_only(tmp_path, stage_get_data_mod
     assert posts_df.filter(pl.col("at_uri") == "post:1").height == 24
 
 
-def test_load_posts_adds_political_pool_and_nullable_labels(tmp_path, stage_get_data_module, caplog):
+def test_load_posts_political_pool_bypasses_global_candidate_filters(tmp_path, stage_get_data_module, caplog):
     embedding_model = "test-model"
     posts_rows = [
         {
@@ -774,12 +774,12 @@ def test_load_posts_adds_political_pool_and_nullable_labels(tmp_path, stage_get_
         {
             "at_uri": "post:liked_only",
             "indexed_at": "2024-01-01T12:30:00Z",
-            "inferences": _inference_payload(0.9, 0.9),
+            "inferences": _inference_payload(0.9, 0.2),
         },
     ])
     global_counts_df = pl.DataFrame({
-        "subject_uri": ["post:political", "post:nonpolitical"],
-        "global_like_count": [1, 1_000_000],
+        "subject_uri": ["post:nonpolitical"],
+        "global_like_count": [1_000_000],
     }).with_columns(pl.col("global_like_count").cast(pl.UInt64))
 
     with caplog.at_level(logging.INFO):
@@ -815,7 +815,7 @@ def test_load_posts_adds_political_pool_and_nullable_labels(tmp_path, stage_get_
     assert stats["n_final_political_sample_rows"] == 1
     assert stats["n_final_nonpolitical_sample_rows"] == 0
     assert stats["n_final_unknown_political_sample_rows"] == 1
-    assert stats["n_political_quota_hours_met"] == 1
+    assert stats["n_political_supplement_target_hours_met"] == 1
     assert "Final sample: 2 post-hour rows, 2 unique posts" in caplog.text
 
 

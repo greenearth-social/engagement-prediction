@@ -119,7 +119,7 @@ Important Stage 1 behavior:
 - `initial_negative_sampling_pct` hash-samples posts before global like counts are built for negative candidates.
 - `min_likes_per_negative_post` filters negative candidates by global like count over the configured likes window.
 - `negative_samples_per_hour` controls sampled negative post-hour rows. Each candidate is eligible from its created-hour through created-hour + 23.
-- `political_negative_samples_per_hour` supplements each hourly negative pool until it contains this many politics-labeled candidates, when enough are available. `0` disables inference loading.
+- `political_negative_samples_per_hour` adds up to this many political candidates to each hourly negative pool, in addition to any political posts already present in the ordinary sample. Political candidates bypass `initial_negative_sampling_pct` and `min_likes_per_negative_post` and are sampled uniformly with the deterministic post-hour score. `0` disables inference loading.
 - `political_score_threshold` is applied to both `text_arbitrary.Politics` and `topic.News & Social Concern`; both scores must meet the threshold.
 - `negative_sampling_alpha` weights negative sampling by `global_like_count ** alpha`.
 - `prior_cumulative_likes` is written to `likes_core` and `posts_core` as an exact prior-hour count from the configured likes window for selected positive and negative post-hour rows; same-hour likes are not included.
