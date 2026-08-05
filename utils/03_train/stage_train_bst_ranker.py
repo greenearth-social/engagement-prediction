@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import logging
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -54,6 +55,20 @@ from utils.ranker_utilities import LinearPredictionHead
 
 
 STAGE_LOG_NAME = "STAGE_03_TRAIN_BST_RANKER"
+
+POLITICAL_NEGATIVE_SAMPLING_METRIC_NAMES = [
+    "sampled_negative_count",
+    "sampled_political_negative_count",
+    "sampled_negatives_per_batch_min",
+    "sampled_negatives_per_batch_median",
+    "sampled_negatives_per_batch_max",
+    "sampled_political_negatives_per_batch_min",
+    "sampled_political_negatives_per_batch_median",
+    "sampled_political_negatives_per_batch_max",
+    "political_negative_quota_batches_met",
+    "political_negative_quota_batches_short",
+    "political_negative_quota_batches_met_pct",
+]
 
 
 def _validate_time_delta_bucket_boundaries(boundaries_hours: Sequence[float]) -> tuple[float, ...]:
@@ -664,6 +679,18 @@ def run_bst_listwise_epoch(
     metric_user_count = 0
     zero_history_metric_sums = empty_rank_metric_sums(metrics_top_ks)
     zero_history_metric_user_count = 0
+    sampled_negative_counts: List[int] = []
+    sampled_political_negative_counts: List[int] = []
+    dataset_political_negative_quota = getattr(
+        dataloader.dataset,
+        "bst_political_batch_negatives",
+        None,
+    )
+    political_negative_quotas: set[int] = (
+        {int(dataset_political_negative_quota)}
+        if dataset_political_negative_quota is not None
+        else set()
+    )
 
     with nullcontext() if train else torch.inference_mode():
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=split_name, leave=False, disable=disable_progress)):
@@ -673,6 +700,11 @@ def run_bst_listwise_epoch(
                 optimizer.zero_grad()
 
             loss, scores, labels = _compute_bst_listwise_loss_and_preds(model, batch, device)
+            sampled_negative_counts.append(int(batch.get("sampled_negative_count", 0)))
+            sampled_political_negative_counts.append(
+                int(batch.get("sampled_political_negative_count", 0))
+            )
+            political_negative_quotas.add(int(batch.get("political_negative_quota", 0)))
             if calc_baseline_metrics:
                 baseline_batch_metric_sums, baseline_batch_metric_user_count = calc_baseline_rank_metrics_for_batch(
                     labels,
@@ -714,6 +746,52 @@ def run_bst_listwise_epoch(
     metrics.update(finalize_zero_history_rank_metrics(zero_history_metric_sums, zero_history_metric_user_count))
     metrics["loss"] = loss
     metrics["rank_metric_user_count"] = metric_user_count
+    if len(political_negative_quotas) > 1:
+        raise RuntimeError("BST batches within one split must use one political negative quota")
+    political_negative_quota = next(iter(political_negative_quotas), 0)
+    if sampled_negative_counts:
+        sampled_negative_min = min(sampled_negative_counts)
+        sampled_negative_median = float(np.median(sampled_negative_counts))
+        sampled_negative_max = max(sampled_negative_counts)
+        sampled_political_min = min(sampled_political_negative_counts)
+        sampled_political_median = float(np.median(sampled_political_negative_counts))
+        sampled_political_max = max(sampled_political_negative_counts)
+    else:
+        sampled_negative_min = 0
+        sampled_negative_median = 0.0
+        sampled_negative_max = 0
+        sampled_political_min = 0
+        sampled_political_median = 0.0
+        sampled_political_max = 0
+    if political_negative_quota > 0:
+        quota_batches_met = sum(
+            count >= political_negative_quota
+            for count in sampled_political_negative_counts
+        )
+        quota_batches_short = len(sampled_political_negative_counts) - quota_batches_met
+        quota_batches_met_pct = (
+            100.0 * quota_batches_met / len(sampled_political_negative_counts)
+            if sampled_political_negative_counts
+            else 0.0
+        )
+    else:
+        quota_batches_met = 0
+        quota_batches_short = 0
+        quota_batches_met_pct = 0.0
+    metrics.update({
+        "political_negative_quota": political_negative_quota,
+        "sampled_negative_count": sum(sampled_negative_counts),
+        "sampled_political_negative_count": sum(sampled_political_negative_counts),
+        "sampled_negatives_per_batch_min": sampled_negative_min,
+        "sampled_negatives_per_batch_median": sampled_negative_median,
+        "sampled_negatives_per_batch_max": sampled_negative_max,
+        "sampled_political_negatives_per_batch_min": sampled_political_min,
+        "sampled_political_negatives_per_batch_median": sampled_political_median,
+        "sampled_political_negatives_per_batch_max": sampled_political_max,
+        "political_negative_quota_batches_met": quota_batches_met,
+        "political_negative_quota_batches_short": quota_batches_short,
+        "political_negative_quota_batches_met_pct": quota_batches_met_pct,
+    })
     return loss, metrics, baseline_metrics
 
 
@@ -824,6 +902,49 @@ def _log_bst_listwise_epoch_metrics(
         metrics_top_ks,
         iteration,
     )
+    for split_label, metrics in (
+        ("Train", train_metrics),
+        ("Validation", val_metrics),
+        ("Validation Unseen Users", val_unseen_metrics),
+    ):
+        for metric_name in POLITICAL_NEGATIVE_SAMPLING_METRIC_NAMES:
+            metric_value = metrics.get(metric_name)
+            if metric_value is None:
+                continue
+            experiment_tracker.log_scalar(
+                "BST Political Negative Sampling",
+                f"{split_label} {metric_name}",
+                float(metric_value),
+                iteration,
+            )
+
+
+def _log_bst_political_negative_sampling_summary(
+    logger: logging.Logger,
+    split_name: str,
+    epoch: int,
+    metrics: Dict[str, Any],
+) -> None:
+    quota = int(metrics.get("political_negative_quota", 0))
+    logger.info(
+        "BST political negative sampling (%s, epoch %s): total negatives=%s, political=%s; "
+        "negatives/batch min=%.0f median=%.1f max=%.0f; political/batch min=%.0f "
+        "median=%.1f max=%.0f; quota=%s, met=%s (%.1f%%), short=%s",
+        split_name,
+        epoch,
+        f"{int(metrics.get('sampled_negative_count', 0)):,}",
+        f"{int(metrics.get('sampled_political_negative_count', 0)):,}",
+        float(metrics.get("sampled_negatives_per_batch_min", 0)),
+        float(metrics.get("sampled_negatives_per_batch_median", 0.0)),
+        float(metrics.get("sampled_negatives_per_batch_max", 0)),
+        float(metrics.get("sampled_political_negatives_per_batch_min", 0)),
+        float(metrics.get("sampled_political_negatives_per_batch_median", 0.0)),
+        float(metrics.get("sampled_political_negatives_per_batch_max", 0)),
+        f"{quota:,}" if quota > 0 else "disabled",
+        f"{int(metrics.get('political_negative_quota_batches_met', 0)):,}",
+        float(metrics.get("political_negative_quota_batches_met_pct", 0.0)),
+        f"{int(metrics.get('political_negative_quota_batches_short', 0)):,}",
+    )
 
 
 def train_bst_ranker_model(
@@ -842,6 +963,7 @@ def train_bst_ranker_model(
     lr_scheduler_factor: float,
     lr_scheduler_patience: int,
     gradient_clip_max_norm: float,
+    logger: logging.Logger,
     metrics_top_ks: Optional[List[int]] = None,
     bst_max_train_batches_per_epoch: Optional[int] = None,
     experiment_tracker: Optional[Any] = None,
@@ -867,6 +989,8 @@ def train_bst_ranker_model(
     listwise_metric_names = _listwise_history_metric_names(metrics_top_ks)
     for split_name in ("train", "val", "val_unseen"):
         for metric_name in listwise_metric_names:
+            history[f"{split_name}_{metric_name}"] = []
+        for metric_name in POLITICAL_NEGATIVE_SAMPLING_METRIC_NAMES:
             history[f"{split_name}_{metric_name}"] = []
     best_val_metric = float("-inf")
     best_reset_val_metric = float("-inf")
@@ -920,6 +1044,32 @@ def train_bst_ranker_model(
         _append_split_metrics_to_history(history, "train", train_metrics, listwise_metric_names)
         _append_split_metrics_to_history(history, "val", val_metrics, listwise_metric_names)
         _append_split_metrics_to_history(history, "val_unseen", val_unseen_metrics, listwise_metric_names)
+        _append_split_metrics_to_history(
+            history,
+            "train",
+            train_metrics,
+            POLITICAL_NEGATIVE_SAMPLING_METRIC_NAMES,
+        )
+        _append_split_metrics_to_history(
+            history,
+            "val",
+            val_metrics,
+            POLITICAL_NEGATIVE_SAMPLING_METRIC_NAMES,
+        )
+        _append_split_metrics_to_history(
+            history,
+            "val_unseen",
+            val_unseen_metrics,
+            POLITICAL_NEGATIVE_SAMPLING_METRIC_NAMES,
+        )
+        _log_bst_political_negative_sampling_summary(logger, "Train", epoch + 1, train_metrics)
+        _log_bst_political_negative_sampling_summary(logger, "Validation", epoch + 1, val_metrics)
+        _log_bst_political_negative_sampling_summary(
+            logger,
+            "Validation Unseen Users",
+            epoch + 1,
+            val_unseen_metrics,
+        )
 
         _log_bst_epoch_metrics(
             experiment_tracker,
@@ -1049,6 +1199,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     popularity_projection_dim = int(args.bst_popularity_projection_dim)
     batch_size = int(args.batch_size)
     bst_additional_batch_negatives = int(args.bst_additional_batch_negatives)
+    bst_political_batch_negatives = int(args.bst_political_batch_negatives)
     bst_max_train_batches_per_epoch = getattr(args, "bst_max_train_batches_per_epoch", None)
     if bst_max_train_batches_per_epoch is not None:
         bst_max_train_batches_per_epoch = int(bst_max_train_batches_per_epoch)
@@ -1110,6 +1261,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         use_author_embedding_table=use_author_embedding_table,
         use_popularity_feature=use_popularity_feature,
         bst_additional_batch_negatives=bst_additional_batch_negatives,
+        bst_political_batch_negatives=bst_political_batch_negatives,
         seed=random_seed,
         logger=logger,
     )
@@ -1124,6 +1276,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         use_author_embedding_table=use_author_embedding_table,
         use_popularity_feature=use_popularity_feature,
         bst_additional_batch_negatives=bst_additional_batch_negatives,
+        bst_political_batch_negatives=bst_political_batch_negatives,
         seed=random_seed,
         logger=logger,
     )
@@ -1138,6 +1291,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         use_author_embedding_table=use_author_embedding_table,
         use_popularity_feature=use_popularity_feature,
         bst_additional_batch_negatives=bst_additional_batch_negatives,
+        bst_political_batch_negatives=bst_political_batch_negatives,
         seed=random_seed,
         logger=logger,
     )
@@ -1173,6 +1327,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "author_pad_idx": AUTHOR_PAD_IDX,
         "author_unk_idx": AUTHOR_UNK_IDX,
         "bst_additional_batch_negatives": bst_additional_batch_negatives,
+        "bst_political_batch_negatives": bst_political_batch_negatives,
         "bst_use_popularity_feature": use_popularity_feature,
         "bst_popularity_projection_dim": popularity_projection_dim,
         "bst_popularity_log_mean": popularity_log_mean,
@@ -1258,6 +1413,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         lr_scheduler_factor=lr_scheduler_factor,
         lr_scheduler_patience=lr_scheduler_patience,
         gradient_clip_max_norm=gradient_clip_max_norm,
+        logger=logger,
         metrics_top_ks=metrics_top_ks,
         bst_max_train_batches_per_epoch=bst_max_train_batches_per_epoch,
         experiment_tracker=context.tracker,
@@ -1392,7 +1548,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "stage: train_bst_ranker",
         f"timestamp: {timestamp}",
         f"runtime_seconds: {runtime:.2f}",
-        f"settings: batch_size={batch_size}, bst_additional_batch_negatives={bst_additional_batch_negatives}, lr={learning_rate}, epochs={epochs}, max_history_len={max_history_len}, early_stopping_min_delta={early_stopping_min_delta}",
+        f"settings: batch_size={batch_size}, bst_additional_batch_negatives={bst_additional_batch_negatives}, bst_political_batch_negatives={bst_political_batch_negatives}, lr={learning_rate}, epochs={epochs}, max_history_len={max_history_len}, early_stopping_min_delta={early_stopping_min_delta}",
         f"train_samples: {len(train_dataset)}",
         f"val_samples: {len(val_dataset)}",
         f"val_unseen_samples: {len(val_unseen_dataset)}",

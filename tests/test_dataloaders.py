@@ -1,5 +1,6 @@
 """Tests for bucketed two-tower dataloaders."""
 import json
+import logging
 from datetime import datetime, timezone
 
 import numpy as np
@@ -74,6 +75,43 @@ def mock_history_df():
     })
 
 
+def _political_pool_posts_df(post_ids, political_labels):
+    return pl.DataFrame({
+        "at_uri": post_ids,
+        "in_random_sample": [True] * len(post_ids),
+        "negative_hour_bucket": [_dt(10)] * len(post_ids),
+        "split_window": ["train"] * len(post_ids),
+        "emb_idx": list(range(20, 20 + len(post_ids))),
+        "is_political": pl.Series(political_labels, dtype=pl.Boolean),
+    })
+
+
+def _political_sampling_dataset(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_history_df,
+    posts_core_df,
+    *,
+    total_negatives,
+    political_negatives,
+    seed=0,
+    logger=None,
+):
+    return BucketedEngagementDataset(
+        embeddings_mmap=mock_embeddings_mmap,
+        likes_core_df=mock_likes_core_df,
+        posts_core_df=posts_core_df,
+        history_df=mock_history_df,
+        split="train",
+        max_history_len=3,
+        embed_dim=4,
+        bst_political_batch_negatives=political_negatives,
+        bst_additional_batch_negatives=total_negatives,
+        seed=seed,
+        logger=logger,
+    )
+
+
 @pytest.fixture
 def bucketed_dataset(mock_embeddings_mmap, mock_likes_core_df, mock_posts_core_df, mock_history_df):
     return BucketedEngagementDataset(
@@ -84,6 +122,7 @@ def bucketed_dataset(mock_embeddings_mmap, mock_likes_core_df, mock_posts_core_d
         split="train",
         max_history_len=3,
         embed_dim=4,
+        bst_political_batch_negatives=0,
     )
 
 
@@ -210,6 +249,7 @@ def test_bucketed_collate_additional_negatives_are_added_after_positives(
         split="train",
         max_history_len=3,
         embed_dim=4,
+        bst_political_batch_negatives=0,
         bst_additional_batch_negatives=1,
         seed=0,
     )
@@ -243,6 +283,7 @@ def test_bucketed_collate_additional_negatives_do_not_cap_positives(
         split="train",
         max_history_len=3,
         embed_dim=4,
+        bst_political_batch_negatives=0,
         bst_additional_batch_negatives=2,
         seed=0,
     )
@@ -267,6 +308,7 @@ def test_bucketed_collate_returns_popularity_tensors_when_enabled(
         split="train",
         max_history_len=4,
         embed_dim=4,
+        bst_political_batch_negatives=0,
         use_popularity_feature=True,
     )
 
@@ -305,6 +347,7 @@ def test_bucketed_candidate_sampling_changes_by_epoch(
         split="train",
         max_history_len=3,
         embed_dim=4,
+        bst_political_batch_negatives=0,
         bst_additional_batch_negatives=1,
         seed=0,
     )
@@ -335,6 +378,7 @@ def test_bucketed_validation_candidate_sampling_is_deterministic(
         split="train",
         max_history_len=3,
         embed_dim=4,
+        bst_political_batch_negatives=0,
         bst_additional_batch_negatives=1,
         seed=0,
     )
@@ -343,6 +387,205 @@ def test_bucketed_validation_candidate_sampling_is_deterministic(
     second = dataset.collate_batch([dataset[0], dataset[1]])
 
     assert first["candidate_post_id"] == second["candidate_post_id"]
+
+
+def test_bucketed_political_sampling_replaces_only_the_ordinary_shortfall_and_excludes_positives(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_history_df,
+):
+    pool_ids = ["n1", "n2", "n3", "n4", "n5", "n6", "p2"]
+    ordinary_posts_df = _political_pool_posts_df(pool_ids, [False] * len(pool_ids))
+    ordinary_dataset = _political_sampling_dataset(
+        mock_embeddings_mmap,
+        mock_likes_core_df,
+        mock_history_df,
+        ordinary_posts_df,
+        total_negatives=3,
+        political_negatives=0,
+        seed=17,
+    )
+    positive_ids = {"p1", "p2", "p3"}
+    ordinary_batch = ordinary_dataset.collate_batch([ordinary_dataset[0], ordinary_dataset[1]])
+    ordinary_negative_ids = set(ordinary_batch["candidate_post_id"]) - positive_ids
+    political_in_ordinary = next(iter(ordinary_negative_ids))
+    political_outside_ordinary = next(
+        post_id
+        for post_id in pool_ids
+        if post_id not in ordinary_negative_ids and post_id not in positive_ids
+    )
+    political_ids = {political_in_ordinary, political_outside_ordinary, "p2"}
+    labeled_posts_df = _political_pool_posts_df(
+        pool_ids,
+        [post_id in political_ids for post_id in pool_ids],
+    )
+    dataset = _political_sampling_dataset(
+        mock_embeddings_mmap,
+        mock_likes_core_df,
+        mock_history_df,
+        labeled_posts_df,
+        total_negatives=3,
+        political_negatives=2,
+        seed=17,
+    )
+
+    batch = dataset.collate_batch([dataset[0], dataset[1]])
+    sampled_negative_ids = set(batch["candidate_post_id"]) - positive_ids
+
+    assert len(sampled_negative_ids) == 3
+    assert political_in_ordinary in sampled_negative_ids
+    assert political_outside_ordinary in sampled_negative_ids
+    assert len(sampled_negative_ids & ordinary_negative_ids) == 2
+    assert batch["candidate_post_id"].count("p2") == 1
+    assert batch["sampled_negative_count"] == 3
+    assert batch["sampled_political_negative_count"] == 2
+    assert batch["political_negative_quota"] == 2
+    assert batch["political_negative_quota_met"] is True
+
+
+def test_bucketed_political_sampling_uses_available_posts_and_logs_shortage(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_history_df,
+    caplog,
+):
+    posts_df = _political_pool_posts_df(
+        ["political", "nonpolitical", "unknown"],
+        [True, False, None],
+    )
+    logger = logging.getLogger("test_dataloaders.political_shortage")
+
+    with caplog.at_level(logging.INFO):
+        dataset = _political_sampling_dataset(
+            mock_embeddings_mmap,
+            mock_likes_core_df,
+            mock_history_df,
+            posts_df,
+            total_negatives=5,
+            political_negatives=2,
+            logger=logger,
+        )
+        batch = dataset.collate_batch([dataset[0], dataset[1]])
+
+    assert batch["sampled_negative_count"] == 3
+    assert batch["sampled_political_negative_count"] == 1
+    assert batch["political_negative_quota_met"] is False
+    assert "total=3, political=1, non-political=1, unknown=1" in caplog.text
+    assert "1 hourly buckets below quota 2" in caplog.text
+
+
+def test_bucketed_political_sampling_keeps_ordinary_sample_when_quota_is_already_met(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_history_df,
+):
+    posts_df = _political_pool_posts_df(
+        [f"n{idx}" for idx in range(6)],
+        [True] * 6,
+    )
+    ordinary_dataset = _political_sampling_dataset(
+        mock_embeddings_mmap,
+        mock_likes_core_df,
+        mock_history_df,
+        posts_df,
+        total_negatives=3,
+        political_negatives=0,
+        seed=31,
+    )
+    political_dataset = _political_sampling_dataset(
+        mock_embeddings_mmap,
+        mock_likes_core_df,
+        mock_history_df,
+        posts_df,
+        total_negatives=3,
+        political_negatives=2,
+        seed=31,
+    )
+
+    ordinary_batch = ordinary_dataset.collate_batch([ordinary_dataset[0], ordinary_dataset[1]])
+    political_batch = political_dataset.collate_batch([political_dataset[0], political_dataset[1]])
+
+    assert political_batch["candidate_post_id"] == ordinary_batch["candidate_post_id"]
+    assert political_batch["sampled_political_negative_count"] == 3
+    assert political_batch["political_negative_quota_met"] is True
+
+
+def test_bucketed_political_sampling_is_deterministic_and_resamples_by_epoch(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_history_df,
+):
+    posts_df = _political_pool_posts_df(
+        [f"n{idx}" for idx in range(8)],
+        [True, True, True, False, False, False, None, None],
+    )
+    dataset = _political_sampling_dataset(
+        mock_embeddings_mmap,
+        mock_likes_core_df,
+        mock_history_df,
+        posts_df,
+        total_negatives=4,
+        political_negatives=2,
+        seed=23,
+    )
+
+    sampled_candidates = [
+        tuple(dataset.collate_batch([dataset[(0, epoch)], dataset[(1, epoch)]])["candidate_post_id"])
+        for epoch in range(8)
+    ]
+
+    assert len(set(sampled_candidates)) > 1
+    assert sampled_candidates == [
+        tuple(dataset.collate_batch([dataset[(0, epoch)], dataset[(1, epoch)]])["candidate_post_id"])
+        for epoch in range(8)
+    ]
+    for epoch in range(8):
+        batch = dataset.collate_batch([dataset[(0, epoch)], dataset[(1, epoch)]])
+        assert batch["sampled_negative_count"] == 4
+        assert batch["sampled_political_negative_count"] >= 2
+        assert batch["political_negative_quota_met"] is True
+
+
+def test_bucketed_political_sampling_requires_boolean_label_only_when_enabled(
+    mock_embeddings_mmap,
+    mock_likes_core_df,
+    mock_posts_core_df,
+    mock_history_df,
+):
+    disabled_dataset = _political_sampling_dataset(
+        mock_embeddings_mmap,
+        mock_likes_core_df,
+        mock_history_df,
+        mock_posts_core_df,
+        total_negatives=2,
+        political_negatives=0,
+    )
+    assert disabled_dataset.collate_batch(
+        [disabled_dataset[0], disabled_dataset[1]]
+    )["sampled_negative_count"] == 2
+
+    with pytest.raises(ValueError, match="posts_core.is_political"):
+        _political_sampling_dataset(
+            mock_embeddings_mmap,
+            mock_likes_core_df,
+            mock_history_df,
+            mock_posts_core_df,
+            total_negatives=2,
+            political_negatives=1,
+        )
+
+    invalid_posts_df = mock_posts_core_df.with_columns(
+        pl.lit("false").alias("is_political")
+    )
+    with pytest.raises(ValueError, match="nullable Boolean"):
+        _political_sampling_dataset(
+            mock_embeddings_mmap,
+            mock_likes_core_df,
+            mock_history_df,
+            invalid_posts_df,
+            total_negatives=2,
+            political_negatives=1,
+        )
 
 
 def test_bucketed_collate_handles_empty_sampled_negative_bucket(bucketed_dataset):
@@ -368,6 +611,7 @@ def test_bucketed_collate_returns_author_tensors_when_enabled(
         split="train",
         max_history_len=4,
         embed_dim=4,
+        bst_political_batch_negatives=0,
         use_author_embedding_table=True,
     )
 
@@ -400,6 +644,7 @@ def test_create_bucketed_data_loaders_returns_iterable_loaders(
         split="val",
         max_history_len=3,
         embed_dim=4,
+        bst_political_batch_negatives=0,
     )
     val_unseen_dataset = BucketedEngagementDataset(
         embeddings_mmap=mock_embeddings_mmap,
@@ -409,6 +654,7 @@ def test_create_bucketed_data_loaders_returns_iterable_loaders(
         split="val_unseen_users",
         max_history_len=3,
         embed_dim=4,
+        bst_political_batch_negatives=0,
     )
 
     train_loader, val_loader, val_unseen_loader, holdout_loader = create_bucketed_data_loaders(

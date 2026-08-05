@@ -113,6 +113,7 @@ DEFAULTS: Dict[str, Any] = {
     "author_projection_dim": 32,
     "prediction_hidden_dims": [64, 32, 16],
     "bst_additional_batch_negatives": 64,
+    "bst_political_batch_negatives": 0,
     "bst_model_dim": 128,
     "bst_time_embedding_dim": 16,
     "bst_num_attention_heads": 4,
@@ -558,6 +559,7 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
     num_attention_heads = int(args.bst_num_attention_heads)
     num_transformer_layers = int(args.bst_num_transformer_layers)
     bst_additional_batch_negatives = int(args.bst_additional_batch_negatives)
+    bst_political_batch_negatives = int(args.bst_political_batch_negatives)
     batch_size = int(args.batch_size)
     bst_max_train_batches_per_epoch = args.bst_max_train_batches_per_epoch
     bst_popularity_projection_dim = int(args.bst_popularity_projection_dim)
@@ -577,6 +579,12 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
         raise ValueError("BST ranker requires --bst-num-transformer-layers=1.")
     if bst_additional_batch_negatives <= 0:
         raise ValueError("--bst-additional-batch-negatives must be positive.")
+    if bst_political_batch_negatives < 0:
+        raise ValueError("--bst-political-batch-negatives must be non-negative.")
+    if bst_political_batch_negatives > bst_additional_batch_negatives:
+        raise ValueError(
+            "--bst-political-batch-negatives must not exceed --bst-additional-batch-negatives."
+        )
     if batch_size <= 0:
         raise ValueError("--batch-size must be positive.")
     if bst_max_train_batches_per_epoch is not None and int(bst_max_train_batches_per_epoch) <= 0:
@@ -903,6 +911,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Ranker prediction-head hidden dimensions. Use no values for a direct linear head")
     _add_arg_with_default(p_all, "--bst-additional-batch-negatives", type=int, default=argparse.SUPPRESS,
                           help_text="Additional same-hour negative-pool posts to sample per BST training batch")
+    _add_arg_with_default(p_all, "--bst-political-batch-negatives", type=int, default=argparse.SUPPRESS,
+                          help_text="Minimum political posts within each BST additional-negative sample")
     # BST ranker specific options
     _add_arg_with_default(p_all, "--bst-model-dim", type=int, default=argparse.SUPPRESS,
                           help_text="BST ranker fused post/author model dimension")

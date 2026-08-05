@@ -600,18 +600,21 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     train_dataset = BucketedEngagementDataset(
         embeddings_mmap, likes_core_df, posts_core_df, history_df, split="train",
         max_history_len=max_history_len, embed_dim=embed_dim,
+        bst_political_batch_negatives=0,
         use_author_embedding_table=use_author_embedding_table,
         logger=logger,
     )
     val_dataset = BucketedEngagementDataset(
         embeddings_mmap, likes_core_df, posts_core_df, history_df, split="val",
         max_history_len=max_history_len, embed_dim=embed_dim,
+        bst_political_batch_negatives=0,
         use_author_embedding_table=use_author_embedding_table,
         logger=logger,
     )
     val_unseen_dataset = BucketedEngagementDataset(
         embeddings_mmap, likes_core_df, posts_core_df, history_df, split="val_unseen_users",
         max_history_len=max_history_len, embed_dim=embed_dim,
+        bst_political_batch_negatives=0,
         use_author_embedding_table=use_author_embedding_table,
         logger=logger,
     )
@@ -752,6 +755,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             holdout_dataset = BucketedEngagementDataset(
                 embeddings_mmap, likes_core_df, posts_core_df, history_df, split=split_name,
                 max_history_len=max_history_len, embed_dim=embed_dim,
+                bst_political_batch_negatives=0,
                 use_author_embedding_table=use_author_embedding_table,
                 logger=logger,
             )

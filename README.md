@@ -218,9 +218,12 @@ python cli.py --model-type bst-ranker \
 
 BST training uses matrix ranking over same-hour candidate sets with additional sampled negatives. It requires `bst_num_transformer_layers: 1` because it uses the optimized one-layer matrix scorer.
 
+`--bst-political-batch-negatives` sets the minimum number of politics-labeled posts within the existing `--bst-additional-batch-negatives` cap. It defaults to `0`; when enabled, sparse hourly pools use all available political negatives and report quota shortfalls without failing training.
+
 Useful options:
 
 - `--bst-additional-batch-negatives`
+- `--bst-political-batch-negatives`
 - `--content-projection-dim`
 - `--author-projection-dim`
 - `--bst-model-dim`

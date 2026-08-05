@@ -1,5 +1,6 @@
 """Tests for the BST heavy ranker model components."""
 import importlib
+import logging
 
 import pytest
 import torch
@@ -130,6 +131,10 @@ def _listwise_batch() -> dict[str, torch.Tensor]:
     return {
         **batch,
         "label_matrix": torch.tensor([[1.0, 0.0], [1.0, 1.0]], dtype=torch.float32),
+        "sampled_negative_count": 1,
+        "sampled_political_negative_count": 1,
+        "political_negative_quota": 1,
+        "political_negative_quota_met": True,
     }
 
 
@@ -142,6 +147,16 @@ class _SingleBatchDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         return self.batch
+
+
+class _EmptyPoliticalDataset(Dataset):
+    bst_political_batch_negatives = 2
+
+    def __len__(self) -> int:
+        return 0
+
+    def __getitem__(self, idx: int):
+        raise IndexError(idx)
 
 
 class _RecordingTracker:
@@ -563,6 +578,17 @@ def test_run_bst_listwise_epoch_computes_rank_metrics():
     assert loss >= 0.0
     assert metrics["loss"] == loss
     assert metrics["rank_metric_user_count"] == 2
+    assert metrics["sampled_negative_count"] == 1
+    assert metrics["sampled_political_negative_count"] == 1
+    assert metrics["sampled_negatives_per_batch_min"] == 1
+    assert metrics["sampled_negatives_per_batch_median"] == 1.0
+    assert metrics["sampled_negatives_per_batch_max"] == 1
+    assert metrics["sampled_political_negatives_per_batch_min"] == 1
+    assert metrics["sampled_political_negatives_per_batch_median"] == 1.0
+    assert metrics["sampled_political_negatives_per_batch_max"] == 1
+    assert metrics["political_negative_quota_batches_met"] == 1
+    assert metrics["political_negative_quota_batches_short"] == 0
+    assert metrics["political_negative_quota_batches_met_pct"] == 100.0
     for metric_name in ("ndcg@1", "recall@1", "ndcg@2", "recall@2", "mean_average_precision"):
         assert metric_name in metrics
         assert 0.0 <= metrics[metric_name] <= 1.0
@@ -575,7 +601,10 @@ def test_run_bst_listwise_epoch_computes_rank_metrics():
 def test_run_bst_listwise_epoch_reports_zero_history_metrics():
     model = _make_model()
     model.eval()
-    batch = {key: value.clone() for key, value in _listwise_batch().items()}
+    batch = {
+        key: value.clone() if isinstance(value, torch.Tensor) else value
+        for key, value in _listwise_batch().items()
+    }
     batch["history_mask"][1] = False
     loader = DataLoader(_SingleBatchDataset(batch), batch_size=None, shuffle=False)
 
@@ -600,6 +629,66 @@ def test_run_bst_listwise_epoch_reports_zero_history_metrics():
     assert metrics["zero_history_mean_average_precision"] == pytest.approx(1.0)
 
 
+def test_run_bst_listwise_epoch_reports_political_quota_shortage():
+    model = _make_model()
+    model.eval()
+    batch = _listwise_batch()
+    batch["sampled_negative_count"] = 3
+    batch["sampled_political_negative_count"] = 1
+    batch["political_negative_quota"] = 2
+    batch["political_negative_quota_met"] = False
+    loader = DataLoader(_SingleBatchDataset(batch), batch_size=None, shuffle=False)
+
+    _, metrics, _ = run_bst_listwise_epoch(
+        train=False,
+        split_name="Validation",
+        model=model,
+        device="cpu",
+        dataloader=loader,
+        optimizer=None,
+        disable_progress=True,
+        gradient_clip_max_norm=1.0,
+        metrics_top_ks=[1],
+        calc_baseline_metrics=False,
+    )
+
+    assert metrics["sampled_negative_count"] == 3
+    assert metrics["sampled_political_negative_count"] == 1
+    assert metrics["political_negative_quota"] == 2
+    assert metrics["political_negative_quota_batches_met"] == 0
+    assert metrics["political_negative_quota_batches_short"] == 1
+    assert metrics["political_negative_quota_batches_met_pct"] == 0.0
+
+
+def test_run_bst_listwise_epoch_handles_empty_loader_sampling_stats():
+    model = _make_model()
+    model.eval()
+    loader = DataLoader(_EmptyPoliticalDataset(), batch_size=None, shuffle=False)
+
+    loss, metrics, _ = run_bst_listwise_epoch(
+        train=False,
+        split_name="Validation",
+        model=model,
+        device="cpu",
+        dataloader=loader,
+        optimizer=None,
+        disable_progress=True,
+        gradient_clip_max_norm=1.0,
+        metrics_top_ks=[1],
+        calc_baseline_metrics=False,
+    )
+
+    assert loss == 0.0
+    assert metrics["political_negative_quota"] == 2
+    assert metrics["sampled_negative_count"] == 0
+    assert metrics["sampled_political_negative_count"] == 0
+    assert metrics["sampled_negatives_per_batch_min"] == 0
+    assert metrics["sampled_political_negatives_per_batch_median"] == 0.0
+    assert metrics["political_negative_quota_batches_met"] == 0
+    assert metrics["political_negative_quota_batches_short"] == 0
+    assert metrics["political_negative_quota_batches_met_pct"] == 0.0
+
+
 def test_train_bst_ranker_model_uses_val_unseen_ndcg_for_listwise_primary_metric_and_checkpoint(
     tmp_path,
     monkeypatch,
@@ -611,6 +700,20 @@ def test_train_bst_ranker_model_uses_val_unseen_ndcg_for_listwise_primary_metric
     val_unseen_call_count = 0
     calc_baseline_metrics_calls = []
     tracker = _RecordingTracker()
+    sampling_metrics = {
+        "political_negative_quota": 2,
+        "sampled_negative_count": 8,
+        "sampled_political_negative_count": 4,
+        "sampled_negatives_per_batch_min": 4,
+        "sampled_negatives_per_batch_median": 4.0,
+        "sampled_negatives_per_batch_max": 4,
+        "sampled_political_negatives_per_batch_min": 2,
+        "sampled_political_negatives_per_batch_median": 2.0,
+        "sampled_political_negatives_per_batch_max": 2,
+        "political_negative_quota_batches_met": 2,
+        "political_negative_quota_batches_short": 0,
+        "political_negative_quota_batches_met_pct": 100.0,
+    }
 
     def fake_run_bst_listwise_epoch(**kwargs):
         nonlocal val_unseen_call_count
@@ -631,6 +734,7 @@ def test_train_bst_ranker_model_uses_val_unseen_ndcg_for_listwise_primary_metric
                 "recall@1": ndcg,
                 "mean_average_precision": ndcg,
                 "rank_metric_user_count": 2,
+                **sampling_metrics,
             },
             {
                 "ndcg@1": 0.4,
@@ -656,12 +760,14 @@ def test_train_bst_ranker_model_uses_val_unseen_ndcg_for_listwise_primary_metric
         lr_scheduler_factor=0.5,
         lr_scheduler_patience=2,
         gradient_clip_max_norm=1.0,
+        logger=logging.getLogger("test_bst_ranker.training"),
         metrics_top_ks=[1],
         experiment_tracker=tracker,
     )
 
     assert results["primary_metric_name"] == "val_unseen_ndcg@1"
     assert results["history"]["val_unseen_ndcg@1"] == val_unseen_ndcg_values
+    assert results["history"]["train_sampled_political_negative_count"] == [4.0, 4.0, 4.0]
     assert results["best_val_metric"] == 0.75
     assert (tmp_path / "bst_ranker_best.pth").exists()
     assert calc_baseline_metrics_calls == [True, True, True, False, False, False, False, False, False]
@@ -675,3 +781,10 @@ def test_train_bst_ranker_model_uses_val_unseen_ndcg_for_listwise_primary_metric
     ):
         matching_calls = [call for call in tracker.calls if call["series"] == series]
         assert [call["iteration"] for call in matching_calls] == [1]
+    political_calls = [
+        call
+        for call in tracker.calls
+        if call["series"] == "Train sampled_political_negative_count"
+    ]
+    assert [call["iteration"] for call in political_calls] == [1, 2, 3]
+    assert [call["value"] for call in political_calls] == [4.0, 4.0, 4.0]
