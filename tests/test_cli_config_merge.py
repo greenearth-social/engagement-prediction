@@ -104,6 +104,34 @@ def test_negative_sampling_popularity_args_merge_from_cli_and_config(tmp_path):
     assert merged.initial_negative_sampling_pct == 0.05
 
 
+def test_political_negative_sampling_args_merge_from_cli_and_config(tmp_path):
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--political-negative-samples-per-hour", "100",
+        "--political-score-threshold", "0.9",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.political_negative_samples_per_hour == 100
+    assert merged.political_score_threshold == 0.9
+    assert cli.DEFAULTS["political_negative_samples_per_hour"] == 0
+    assert cli.DEFAULTS["political_score_threshold"] == 0.8
+
+    config_path = Path(tmp_path) / "political_sampling.yml"
+    config_path.write_text(
+        "political_negative_samples_per_hour: 25\n"
+        "political_score_threshold: 0.75\n"
+    )
+    raw = parser.parse_args([
+        "--config", str(config_path),
+        "--political-negative-samples-per-hour", "50",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.political_negative_samples_per_hour == 50
+    assert merged.political_score_threshold == 0.75
+
+
 def test_user_sampling_args_replace_old_names(tmp_path):
     parser = cli.build_parser()
     raw = parser.parse_args(["--max-trainval-users", "123", "--max-unseen-eval-users", "45"])

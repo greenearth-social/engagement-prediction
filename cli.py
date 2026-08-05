@@ -64,6 +64,8 @@ DEFAULTS: Dict[str, Any] = {
     "max_likes_per_user": 100,  # Stage 1: random cap on likes per user (NOT recency-based)
     "min_likes_per_user": 2,  # Stage 1: minimum likes for user inclusion
     "negative_samples_per_hour": 1000,  # Stage 1: sampled negative post-hour rows per bucket
+    "political_negative_samples_per_hour": 0,  # Stage 1: minimum political negative post-hour rows per bucket; 0 disables inference loading
+    "political_score_threshold": 0.8,  # Stage 1: minimum required score for both politics inference signals
     "negative_sampling_alpha": 0.15,  # Stage 1: popularity weighting exponent for negative sampling
     "min_likes_per_negative_post": 50,  # Stage 1: minimum global likes for negative-sampling candidates
     "initial_negative_sampling_pct": 0.1,  # Stage 1: hash-sampled post rate before global like counts for negatives
@@ -804,6 +806,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Random cap on likes per user in Stage 1 (NOT recency-based)")
     _add_arg_with_default(p_all, "--negative-samples-per-hour", type=int, default=argparse.SUPPRESS,
                           help_text="Number of negative post-hour rows to sample per hour in Stage 1")
+    _add_arg_with_default(p_all, "--political-negative-samples-per-hour", type=int, default=argparse.SUPPRESS,
+                          help_text="Minimum political negative post-hour rows per hour in Stage 1; 0 disables inference loading")
+    _add_arg_with_default(p_all, "--political-score-threshold", type=float, default=argparse.SUPPRESS,
+                          help_text="Minimum required score for both politics inference signals in Stage 1")
     _add_arg_with_default(p_all, "--negative-sampling-alpha", type=float, default=argparse.SUPPRESS,
                           help_text="Popularity weighting exponent for negative sampling in Stage 1")
     _add_arg_with_default(p_all, "--min-likes-per-negative-post", type=int, default=argparse.SUPPRESS,

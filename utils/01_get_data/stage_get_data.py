@@ -104,7 +104,7 @@ OUTPUTS
 
 Under <run_dir>/01_get_data/<timestamp>/:
   - likes_core_*.parquet: did, subject_uri, record_created_at, like_hour_bucket, split, prior_cumulative_likes, emb_idx, author_did, author_idx
-  - posts_core_*.parquet: at_uri, did, record_text, is_liked, in_random_sample, negative_hour_bucket, prior_cumulative_likes, split_window, emb_idx, author_idx
+  - posts_core_*.parquet: at_uri, did, record_text, is_liked, in_random_sample, is_political, negative_hour_bucket, prior_cumulative_likes, split_window, emb_idx, author_idx
   - liked_post_hour_cumulative_likes_*.parquet: emb_idx, popularity_hour_bucket, prior_cumulative_likes
   - author_idx_*.parquet: author_did, author_train_count, author_idx
   - embeddings_*.npy: memmap file, shape (n_posts, embed_dim), dtype float32
@@ -190,6 +190,29 @@ def _infer_embed_dim_from_first_row_polars(lf: pl.LazyFrame, embedding_model: st
 # ----------------------------------------
 # For parsing GCS Ingex filenames
 TIMESTAMP_SUFFIX_GCS = "_(\\d{8})_(\\d{6})\\.parquet$"
+
+POLITICAL_INFERENCE_DTYPE = pl.Struct({
+    "text": pl.Struct({
+        "message.commit.record.text": pl.Struct({
+            "text_arbitrary": pl.Struct({
+                "Politics": pl.Float64,
+            }),
+            "topic": pl.Struct({
+                "News & Social Concern": pl.Float64,
+            }),
+        }),
+    }),
+})
+
+
+def _validate_political_sampling_parameters(
+    political_negative_samples_per_hour: int,
+    political_score_threshold: float,
+) -> None:
+    if political_negative_samples_per_hour < 0:
+        raise ValueError("political_negative_samples_per_hour must be non-negative")
+    if not 0 <= political_score_threshold <= 1:
+        raise ValueError("political_score_threshold must be between 0 and 1")
 
 
 def _parse_ts_from_name_ingex_gcs(
@@ -673,6 +696,57 @@ def _build_global_like_counts_df(
     return counts_df, stats
 
 
+def _build_political_labels_lf(
+    inference_paths: List[str],
+    global_like_counts_df: pl.DataFrame,
+    political_score_threshold: float,
+) -> pl.LazyFrame:
+    eligible_uris_lf = (
+        global_like_counts_df
+        .select(pl.col("subject_uri").alias("at_uri"))
+        .lazy()
+    )
+    parsed_record_expr = (
+        pl.col("_parsed_inferences")
+        .struct.field("text")
+        .struct.field("message.commit.record.text")
+    )
+    return (
+        pl.scan_parquet(inference_paths)
+        .select(["at_uri", "indexed_at", "inferences"])
+        .join(eligible_uris_lf, on="at_uri", how="semi")
+        .with_columns(
+            pl.col("inferences")
+            .str.json_decode(dtype=POLITICAL_INFERENCE_DTYPE)
+            .alias("_parsed_inferences"),
+        )
+        .with_columns(
+            parsed_record_expr
+            .struct.field("text_arbitrary")
+            .struct.field("Politics")
+            .fill_null(0.0)
+            .alias("_politics_score"),
+            parsed_record_expr
+            .struct.field("topic")
+            .struct.field("News & Social Concern")
+            .fill_null(0.0)
+            .alias("_news_social_concern_score"),
+        )
+        .with_columns(
+            (
+                (pl.col("_politics_score") >= political_score_threshold)
+                & (pl.col("_news_social_concern_score") >= political_score_threshold)
+            ).alias("is_political")
+        )
+        .group_by("at_uri")
+        .agg(
+            pl.col("is_political")
+            .sort_by("indexed_at")
+            .last()
+        )
+    )
+
+
 def _build_needed_post_hours_df(
     likes_core_df: pl.DataFrame,
     posts_core_df: pl.DataFrame,
@@ -1085,6 +1159,9 @@ def _load_posts_core_polars(
     *,
     global_like_counts_df: pl.DataFrame,
     negative_samples_per_hour: int,
+    political_negative_samples_per_hour: int,
+    political_score_threshold: float,
+    inference_paths: List[str],
     negative_sampling_alpha: float,
     embedding_model: str,
     random_seed: int,
@@ -1120,6 +1197,7 @@ def _load_posts_core_polars(
     - in_random_sample: True if post was selected by hash-sampling,
                         False if included only because it was liked
     - is_liked: True if post is in likes core dataset, False otherwise
+    - is_political: Politics label for sampled negatives with inference coverage; null otherwise
     - negative_hour_bucket: Hour bucket for sampled negatives; null for liked-only rows
     - prior_cumulative_likes: Exact prior-hour like count; null for liked-only rows
 
@@ -1148,18 +1226,40 @@ def _load_posts_core_polars(
 
     # get posts: sampled via hash, or in liked_post_uris:
     logger.info(f"Finding popular posts to sample as negatives...")
-    negative_posts_df = _get_negative_sample_posts(
+    political_labels_lf: Optional[pl.LazyFrame] = None
+    if political_negative_samples_per_hour > 0:
+        if not inference_paths:
+            raise ValueError("No bsky_inferences parquet files found for political negative sampling")
+        political_labels_lf = _build_political_labels_lf(
+            inference_paths=inference_paths,
+            global_like_counts_df=global_like_counts_df,
+            political_score_threshold=political_score_threshold,
+        )
+
+    negative_posts_with_flags_df = _get_negative_sample_posts(
         posts_lf,
         global_like_counts_df,
+        political_labels_lf,
         liked_post_uris_df,
         cols_metadata,
         negative_samples_per_hour,
+        political_negative_samples_per_hour,
         random_seed,
         negative_sampling_alpha,
         train_start,
         end_str,
         holdout_end,
     )
+    negative_sampling_stats = _calculate_negative_sampling_stats(
+        negative_posts_with_flags_df,
+        political_negative_samples_per_hour=political_negative_samples_per_hour,
+        inference_file_count=len(inference_paths),
+    )
+    _log_negative_sampling_summary(logger, negative_sampling_stats)
+    negative_posts_df = negative_posts_with_flags_df.drop([
+        "_in_ordinary_negative_sample",
+        "_in_political_negative_sample",
+    ])
     logger.info(f"Done finding popular posts to sample as negatives.")
     logger.info(f"Getting post info for liked posts...")
     liked_posts_df = _get_liked_posts_metadata_df(posts_lf, liked_post_uris_df, negative_posts_df, cols_metadata)
@@ -1195,6 +1295,7 @@ def _load_posts_core_polars(
         TIMESTAMP_COL_NAME: 'datetime',
         'record_text': str,
         'is_liked': bool,
+        'is_political': bool,
         'negative_hour_bucket': 'datetime',
         'split_window': str,
     }
@@ -1232,10 +1333,13 @@ def _load_posts_core_polars(
         'n_random_sample_unique_posts': n_random_sample_unique_posts,
         'n_random_sample_buckets': n_random_sample_buckets,
         'negative_samples_per_hour': negative_samples_per_hour,
+        'political_negative_samples_per_hour': political_negative_samples_per_hour,
+        'political_score_threshold': political_score_threshold,
         'negative_sampling_alpha': negative_sampling_alpha,
         'n_posts_core': n_posts_core,
         'n_posts_core_unique': n_posts_core_unique,
         'embedding_dim': embed_dim,
+        **negative_sampling_stats,
     }
     
     logger.info(f"posts_core: {n_posts_core:,} rows ({n_liked_only:,} liked-only + {n_random_sample:,} random sample)")
@@ -1263,9 +1367,11 @@ def _hour_bucket_key_expr(col_name: str) -> pl.Expr:
 def _get_negative_sample_posts(
     posts_lf: pl.LazyFrame,
     global_like_counts_df: pl.DataFrame,
+    political_labels_lf: Optional[pl.LazyFrame],
     liked_post_uris_df: pl.DataFrame,
     cols_metadata: List[str],
     negative_samples_per_hour: int,
+    political_negative_samples_per_hour: int,
     random_seed: int,
     negative_sampling_alpha: float,
     train_start: str,
@@ -1280,6 +1386,16 @@ def _get_negative_sample_posts(
         })
         .lazy()
     )
+    if political_labels_lf is None:
+        global_counts_lf = global_counts_lf.with_columns(
+            pl.lit(None, dtype=pl.Boolean).alias("is_political")
+        )
+    else:
+        global_counts_lf = global_counts_lf.join(
+            political_labels_lf,
+            on="at_uri",
+            how="left",
+        )
     liked_marker_lf = (
         liked_post_uris_df
         .rename({
@@ -1316,10 +1432,22 @@ def _get_negative_sample_posts(
             (-pl.col("_rand_val").log() / pl.col("_weight")).alias("_sample_score"),
         ) # at_uri, record_created_at, did, record_text, global_like_count, negative_hour_bucket, _weight, _rand_val, _sample_score
         .with_columns(
-            pl.col("_sample_score").rank("ordinal").over("negative_hour_bucket").alias("_sample_rank")
-        ) # at_uri, record_created_at, did, record_text, global_like_count, negative_hour_bucket, _weight, _rand_val, _sample_score, _sample_rank
+            pl.col("_sample_score").rank("ordinal").over("negative_hour_bucket").alias("_sample_rank"),
+            pl.col("_sample_score")
+            .rank("ordinal")
+            .over(["negative_hour_bucket", "is_political"])
+            .alias("_political_sample_rank"),
+        )
+        .with_columns(
+            (pl.col("_sample_rank") <= negative_samples_per_hour).alias("_in_ordinary_negative_sample"),
+            (
+                pl.col("is_political").fill_null(False)
+                & (pl.col("_political_sample_rank") <= political_negative_samples_per_hour)
+            ).alias("_in_political_negative_sample"),
+        )
         .filter(
-            pl.col("_sample_rank") <= negative_samples_per_hour
+            pl.col("_in_ordinary_negative_sample")
+            | pl.col("_in_political_negative_sample")
         )
         .join(liked_marker_lf, on="at_uri", how="left")
         .with_columns(
@@ -1338,7 +1466,151 @@ def _get_negative_sample_posts(
         )
     return (
         posts_with_weights_df
-        .select(cols_metadata + ["is_liked", "in_random_sample", "negative_hour_bucket"])
+        .select(cols_metadata + [
+            "is_liked",
+            "in_random_sample",
+            "is_political",
+            "negative_hour_bucket",
+            "_in_ordinary_negative_sample",
+            "_in_political_negative_sample",
+        ])
+    )
+
+
+def _calculate_negative_sampling_stats(
+    negative_posts_df: pl.DataFrame,
+    political_negative_samples_per_hour: int,
+    inference_file_count: int,
+) -> Dict[str, Any]:
+    def filtered_counts(mask: pl.Expr) -> Tuple[int, int]:
+        filtered = negative_posts_df.filter(mask)
+        return filtered.height, filtered["at_uri"].n_unique() if filtered.height > 0 else 0
+
+    ordinary_mask = pl.col("_in_ordinary_negative_sample")
+    political_mask = pl.col("is_political").fill_null(False)
+    nonpolitical_mask = pl.col("is_political").eq(False).fill_null(False)
+    unknown_mask = pl.col("is_political").is_null()
+    supplemental_mask = pl.col("_in_political_negative_sample") & ~ordinary_mask
+
+    ordinary_rows, ordinary_posts = filtered_counts(ordinary_mask)
+    ordinary_political_rows, ordinary_political_posts = filtered_counts(ordinary_mask & political_mask)
+    supplemental_rows, supplemental_posts = filtered_counts(supplemental_mask)
+    political_rows, political_posts = filtered_counts(political_mask)
+    nonpolitical_rows, nonpolitical_posts = filtered_counts(nonpolitical_mask)
+    unknown_rows, unknown_posts = filtered_counts(unknown_mask)
+
+    hourly_df = (
+        negative_posts_df
+        .group_by("negative_hour_bucket")
+        .agg(
+            pl.len().alias("total_samples"),
+            pl.col("is_political").fill_null(False).sum().alias("political_samples"),
+        )
+    )
+    n_buckets = hourly_df.height
+    if n_buckets > 0:
+        total_min = int(hourly_df["total_samples"].min())
+        total_median = float(hourly_df["total_samples"].median())
+        total_max = int(hourly_df["total_samples"].max())
+        political_min = int(hourly_df["political_samples"].min())
+        political_median = float(hourly_df["political_samples"].median())
+        political_max = int(hourly_df["political_samples"].max())
+    else:
+        total_min = 0
+        total_median = 0.0
+        total_max = 0
+        political_min = 0
+        political_median = 0.0
+        political_max = 0
+
+    if political_negative_samples_per_hour > 0 and n_buckets > 0:
+        quota_met = hourly_df.filter(
+            pl.col("political_samples") >= political_negative_samples_per_hour
+        ).height
+        quota_short = n_buckets - quota_met
+        quota_met_pct = 100.0 * quota_met / n_buckets
+    else:
+        quota_met = 0
+        quota_short = 0
+        quota_met_pct = 0.0
+
+    labeled_rows = political_rows + nonpolitical_rows
+    return {
+        "political_sampling_enabled": political_negative_samples_per_hour > 0,
+        "n_political_inference_files": inference_file_count,
+        "n_ordinary_negative_sample_rows": ordinary_rows,
+        "n_ordinary_negative_sample_unique_posts": ordinary_posts,
+        "n_ordinary_political_sample_rows": ordinary_political_rows,
+        "n_ordinary_political_sample_unique_posts": ordinary_political_posts,
+        "n_supplemental_political_sample_rows": supplemental_rows,
+        "n_supplemental_political_sample_unique_posts": supplemental_posts,
+        "n_final_negative_sample_rows": negative_posts_df.height,
+        "n_final_negative_sample_unique_posts": negative_posts_df["at_uri"].n_unique() if negative_posts_df.height > 0 else 0,
+        "n_final_political_sample_rows": political_rows,
+        "n_final_political_sample_unique_posts": political_posts,
+        "n_final_nonpolitical_sample_rows": nonpolitical_rows,
+        "n_final_nonpolitical_sample_unique_posts": nonpolitical_posts,
+        "n_final_unknown_political_sample_rows": unknown_rows,
+        "n_final_unknown_political_sample_unique_posts": unknown_posts,
+        "n_labeled_negative_sample_rows": labeled_rows,
+        "political_label_coverage_pct": 100.0 * labeled_rows / negative_posts_df.height if negative_posts_df.height > 0 else 0.0,
+        "n_negative_sample_buckets": n_buckets,
+        "negative_samples_per_hour_min": total_min,
+        "negative_samples_per_hour_median": total_median,
+        "negative_samples_per_hour_max": total_max,
+        "political_samples_per_hour_min": political_min,
+        "political_samples_per_hour_median": political_median,
+        "political_samples_per_hour_max": political_max,
+        "n_political_quota_hours_met": quota_met,
+        "n_political_quota_hours_short": quota_short,
+        "political_quota_hours_met_pct": quota_met_pct,
+    }
+
+
+def _log_negative_sampling_summary(logger: logging.Logger, stats: Dict[str, Any]) -> None:
+    logger.info("Negative sampling summary:")
+    logger.info(
+        "  Ordinary sample: %s post-hour rows, %s unique posts",
+        f"{stats['n_ordinary_negative_sample_rows']:,}",
+        f"{stats['n_ordinary_negative_sample_unique_posts']:,}",
+    )
+    logger.info(
+        "  Political posts already in ordinary sample: %s post-hour rows, %s unique posts",
+        f"{stats['n_ordinary_political_sample_rows']:,}",
+        f"{stats['n_ordinary_political_sample_unique_posts']:,}",
+    )
+    logger.info(
+        "  Supplemental political sample: %s post-hour rows, %s unique posts",
+        f"{stats['n_supplemental_political_sample_rows']:,}",
+        f"{stats['n_supplemental_political_sample_unique_posts']:,}",
+    )
+    logger.info(
+        "  Final sample: %s post-hour rows, %s unique posts",
+        f"{stats['n_final_negative_sample_rows']:,}",
+        f"{stats['n_final_negative_sample_unique_posts']:,}",
+    )
+    logger.info(
+        "  Final labels: political=%s, non-political=%s, unknown=%s post-hour rows (coverage %.1f%%)",
+        f"{stats['n_final_political_sample_rows']:,}",
+        f"{stats['n_final_nonpolitical_sample_rows']:,}",
+        f"{stats['n_final_unknown_political_sample_rows']:,}",
+        stats["political_label_coverage_pct"],
+    )
+    logger.info(
+        "  Hourly totals across %s buckets: min=%s, median=%.1f, max=%s",
+        f"{stats['n_negative_sample_buckets']:,}",
+        f"{stats['negative_samples_per_hour_min']:,}",
+        stats["negative_samples_per_hour_median"],
+        f"{stats['negative_samples_per_hour_max']:,}",
+    )
+    logger.info(
+        "  Hourly political counts: min=%s, median=%.1f, max=%s; quota met=%s (%.1f%%), short=%s",
+        f"{stats['political_samples_per_hour_min']:,}",
+        stats["political_samples_per_hour_median"],
+        f"{stats['political_samples_per_hour_max']:,}",
+        f"{stats['n_political_quota_hours_met']:,}",
+        stats["political_quota_hours_met_pct"],
+        f"{stats['n_political_quota_hours_short']:,}",
     )
 
 
@@ -1370,8 +1642,9 @@ def _get_liked_posts_metadata_df(
         .join(negative_post_uris_lf, on="at_uri", how="anti")
         .with_columns(
             pl.lit(False).alias("in_random_sample"),
+            pl.lit(None, dtype=pl.Boolean).alias("is_political"),
             pl.lit(None).alias("negative_hour_bucket"),
-        ) # at_uri, record_created_at, did, record_text, is_liked, in_random_sample, negative_hour_bucket
+        ) # at_uri, record_created_at, did, record_text, is_liked, in_random_sample, is_political, negative_hour_bucket
         .collect(engine="streaming")
     )
 
@@ -1384,8 +1657,8 @@ def _combine_posts_dfs(
     return (
         pl
         .concat([
-            negative_posts_df.select(cols_metadata + ["is_liked", "in_random_sample", "negative_hour_bucket"]),
-            liked_posts_df.select(cols_metadata + ["is_liked", "in_random_sample", "negative_hour_bucket"]),
+            negative_posts_df.select(cols_metadata + ["is_liked", "in_random_sample", "is_political", "negative_hour_bucket"]),
+            liked_posts_df.select(cols_metadata + ["is_liked", "in_random_sample", "is_political", "negative_hour_bucket"]),
         ], how="vertical_relaxed")
         .unique(subset=cols_metadata + ["negative_hour_bucket"])
     )
@@ -1415,6 +1688,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     min_likes_per_user = int(args.min_likes_per_user)
     min_author_support = int(args.min_author_support)
     negative_samples_per_hour = int(args.negative_samples_per_hour)
+    political_negative_samples_per_hour = int(args.political_negative_samples_per_hour)
+    political_score_threshold = float(args.political_score_threshold)
+    _validate_political_sampling_parameters(
+        political_negative_samples_per_hour,
+        political_score_threshold,
+    )
     negative_sampling_alpha = float(args.negative_sampling_alpha)
     if negative_sampling_alpha < 0:
         raise ValueError("negative_sampling_alpha must be non-negative")
@@ -1466,6 +1745,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         min_likes_per_user=min_likes_per_user,
         min_author_support=min_author_support,
         negative_samples_per_hour=negative_samples_per_hour,
+        political_negative_samples_per_hour=political_negative_samples_per_hour,
+        political_score_threshold=political_score_threshold,
         negative_sampling_alpha=negative_sampling_alpha,
         min_likes_per_negative_post=min_likes_per_negative_post,
         initial_negative_sampling_pct=initial_negative_sampling_pct,
@@ -1502,6 +1783,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         TIMESTAMP_COL_NAME: 'datetime',
         'record_text': str,
         'is_liked': bool,
+        'is_political': bool,
         'negative_hour_bucket': 'datetime',
         'prior_cumulative_likes': 'int',
         'split_window': str,
@@ -1545,6 +1827,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             'min_likes_per_user': min_likes_per_user,
             'min_author_support': min_author_support,
             'negative_samples_per_hour': negative_samples_per_hour,
+            'political_negative_samples_per_hour': political_negative_samples_per_hour,
+            'political_score_threshold': political_score_threshold,
             'negative_sampling_alpha': negative_sampling_alpha,
             'min_likes_per_negative_post': min_likes_per_negative_post,
             'initial_negative_sampling_pct': initial_negative_sampling_pct,
@@ -1579,6 +1863,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"settings: max_trainval_users={max_trainval_users}, max_unseen_eval_users={max_unseen_eval_users}, "
         f"max_likes_per_user={max_likes_per_user}, min_likes_per_user={min_likes_per_user}, "
         f"min_author_support={min_author_support}, negative_samples_per_hour={negative_samples_per_hour}, "
+        f"political_negative_samples_per_hour={political_negative_samples_per_hour}, "
+        f"political_score_threshold={political_score_threshold}, "
         f"negative_sampling_alpha={negative_sampling_alpha}, min_likes_per_negative_post={min_likes_per_negative_post}, "
         f"initial_negative_sampling_pct={initial_negative_sampling_pct}, "
         f"skip_embeddings={skip_embeddings}",
@@ -1767,6 +2053,8 @@ def _run_greenearth_pipeline(
     min_likes_per_user: int,
     min_author_support: int,
     negative_samples_per_hour: int,
+    political_negative_samples_per_hour: int,
+    political_score_threshold: float,
     negative_sampling_alpha: float,
     min_likes_per_negative_post: int,
     initial_negative_sampling_pct: float,
@@ -1813,6 +2101,19 @@ def _run_greenearth_pipeline(
         start=posts_start_dt,
         end=posts_end_dt,
     )
+    inference_paths: List[str] = []
+    if political_negative_samples_per_hour > 0:
+        inference_paths, _ = _list_files_with_timestamps_ingex_gcs(
+            gcs_bucket=gcs_bucket,
+            blob_prefix='bsky_inferences',
+            start=posts_start_dt,
+            end=posts_end_dt,
+        )
+        if not inference_paths:
+            raise ValueError(
+                f"No bsky_inferences parquet files found for time range {posts_start} to {posts_end}"
+            )
+        logger.info(f"Found {len(inference_paths)} inference parquet files for political negative sampling")
     
     # Generate data density histogram for observability
     density_stats = _plot_data_density_histogram(
@@ -1915,6 +2216,9 @@ def _run_greenearth_pipeline(
         paths=posts_paths,
         global_like_counts_df=global_like_counts_df,
         negative_samples_per_hour=negative_samples_per_hour,
+        political_negative_samples_per_hour=political_negative_samples_per_hour,
+        political_score_threshold=political_score_threshold,
+        inference_paths=inference_paths,
         negative_sampling_alpha=negative_sampling_alpha,
         embedding_model=embedding_model,
         random_seed=cap_random_seed,
