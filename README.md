@@ -126,7 +126,7 @@ Important Stage 1 behavior:
 - `liked_post_hour_cumulative_likes_*.parquet` stores sparse prior-hour popularity curves keyed by `emb_idx` for final liked/history posts only. It is used by Stage 2 history features, not sampled negatives.
 - `min_author_support` controls which authors get dedicated author embedding rows when author features are enabled.
 
-`posts_core_*.parquet` includes nullable `is_political`: sampled negative rows are labeled when inference data is available, while liked-only and uncovered rows are null.
+`posts_core_*.parquet` includes nullable `is_political`: sampled negatives meeting both politics thresholds are `true`; all other sampled negatives and liked-only rows are null.
 
 Primary artifacts include `likes_core_*.parquet`, `posts_core_*.parquet`, `liked_post_hour_cumulative_likes_*.parquet`, `embeddings_*.npy`, and, when available, `author_idx_*.parquet`.
 

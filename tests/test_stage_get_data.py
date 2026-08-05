@@ -492,7 +492,7 @@ def test_global_negative_counts_respect_hash_seed_and_min_likes(stage_get_data_m
     assert stats["n_global_negative_candidate_posts"] == 2
 
 
-def test_build_political_labels_filters_candidates_and_uses_latest_inference(tmp_path, stage_get_data_module):
+def test_build_political_uris_filters_candidates_and_uses_latest_inference(tmp_path, stage_get_data_module):
     inference_path = _write_inferences_parquet(tmp_path, [
         {
             "at_uri": "post:high_both",
@@ -541,22 +541,14 @@ def test_build_political_labels_filters_candidates_and_uses_latest_inference(tmp
         "global_like_count": [100, 100, 100, 100, 100],
     }).with_columns(pl.col("global_like_count").cast(pl.UInt64))
 
-    labels_df = (
-        stage_get_data_module._build_political_labels_lf(
-            inference_paths=[str(inference_path)],
-            global_like_counts_df=eligible_df,
-            political_score_threshold=0.8,
-        )
-        .collect(engine="streaming")
-        .sort("at_uri")
+    political_uris_df = stage_get_data_module._build_political_uris_df(
+        inference_paths=[str(inference_path)],
+        global_like_counts_df=eligible_df,
+        political_score_threshold=0.8,
     )
 
-    assert labels_df.to_dicts() == [
+    assert political_uris_df.to_dicts() == [
         {"at_uri": "post:high_both", "is_political": True},
-        {"at_uri": "post:missing_text", "is_political": False},
-        {"at_uri": "post:news_only", "is_political": False},
-        {"at_uri": "post:politics_only", "is_political": False},
-        {"at_uri": "post:updated", "is_political": False},
     ]
 
 
@@ -572,10 +564,6 @@ def test_political_sampling_adds_only_the_ordinary_pool_shortfall(tmp_path, stag
     ]
     posts_path = _write_posts_parquet(tmp_path, posts_rows)
     global_counts_df = _global_likes_for_posts(posts_rows)
-    false_labels_lf = pl.DataFrame({
-        "at_uri": [row["at_uri"] for row in posts_rows],
-        "is_political": [False] * len(posts_rows),
-    }).lazy()
     common_kwargs = {
         "posts_lf": pl.scan_parquet(str(posts_path)),
         "global_like_counts_df": global_counts_df,
@@ -589,7 +577,7 @@ def test_political_sampling_adds_only_the_ordinary_pool_shortfall(tmp_path, stag
         "holdout_end": None,
     }
     ordinary_df = stage_get_data_module._get_negative_sample_posts(
-        political_labels_lf=false_labels_lf,
+        political_uris_df=None,
         political_negative_samples_per_hour=0,
         **common_kwargs,
     )
@@ -597,13 +585,13 @@ def test_political_sampling_adds_only_the_ordinary_pool_shortfall(tmp_path, stag
     inside_ordinary = next(iter(ordinary_ids))
     outside_ordinary = next(row["at_uri"] for row in posts_rows if row["at_uri"] not in ordinary_ids)
     political_ids = {inside_ordinary, outside_ordinary}
-    labels_lf = pl.DataFrame({
-        "at_uri": [row["at_uri"] for row in posts_rows],
-        "is_political": [row["at_uri"] in political_ids for row in posts_rows],
-    }).lazy()
+    political_uris_df = pl.DataFrame({
+        "at_uri": list(political_ids),
+        "is_political": [True] * len(political_ids),
+    })
 
     sampled_df = stage_get_data_module._get_negative_sample_posts(
-        political_labels_lf=labels_lf,
+        political_uris_df=political_uris_df,
         political_negative_samples_per_hour=2,
         **common_kwargs,
     )
@@ -633,12 +621,12 @@ def test_political_sampling_adds_only_the_ordinary_pool_shortfall(tmp_path, stag
         "n_final_negative_sample_unique_posts": 3,
         "n_final_political_sample_rows": 2,
         "n_final_political_sample_unique_posts": 2,
-        "n_final_nonpolitical_sample_rows": 1,
-        "n_final_nonpolitical_sample_unique_posts": 1,
-        "n_final_unknown_political_sample_rows": 0,
-        "n_final_unknown_political_sample_unique_posts": 0,
-        "n_labeled_negative_sample_rows": 3,
-        "political_label_coverage_pct": 100.0,
+        "n_final_nonpolitical_sample_rows": 0,
+        "n_final_nonpolitical_sample_unique_posts": 0,
+        "n_final_unknown_political_sample_rows": 1,
+        "n_final_unknown_political_sample_unique_posts": 1,
+        "n_labeled_negative_sample_rows": 2,
+        "political_label_coverage_pct": 100.0 * 2 / 3,
         "n_negative_sample_buckets": 1,
         "negative_samples_per_hour_min": 3,
         "negative_samples_per_hour_median": 3.0,
@@ -652,7 +640,7 @@ def test_political_sampling_adds_only_the_ordinary_pool_shortfall(tmp_path, stag
     }
     assert "Ordinary sample: 2 post-hour rows, 2 unique posts" in caplog.text
     assert "Supplemental political sample: 1 post-hour rows, 1 unique posts" in caplog.text
-    assert "Final labels: political=2, non-political=1, unknown=0" in caplog.text
+    assert "Final labels: political=2, non-political=0, unknown=1" in caplog.text
 
 
 def test_force_included_positive_post_is_not_sampled_as_negative(stage_get_data_module):
@@ -668,7 +656,7 @@ def test_force_included_positive_post_is_not_sampled_as_negative(stage_get_data_
             "subject_uri": pl.Series([], dtype=pl.String),
             "global_like_count": pl.Series([], dtype=pl.UInt64),
         }),
-        political_labels_lf=None,
+        political_uris_df=None,
         liked_post_uris_df=pl.DataFrame({"subject_uri": ["post:forced"]}),
         cols_metadata=["at_uri", "record_created_at", "did", "record_text"],
         negative_samples_per_hour=10,
@@ -818,15 +806,15 @@ def test_load_posts_adds_political_pool_and_nullable_labels(tmp_path, stage_get_
     }
     assert labels_by_uri == {
         "post:political": True,
-        "post:nonpolitical": False,
+        "post:nonpolitical": None,
         "post:liked_only": None,
     }
     assert stats["n_ordinary_negative_sample_rows"] == 1
     assert stats["n_supplemental_political_sample_rows"] == 1
     assert stats["n_final_negative_sample_rows"] == 2
     assert stats["n_final_political_sample_rows"] == 1
-    assert stats["n_final_nonpolitical_sample_rows"] == 1
-    assert stats["n_final_unknown_political_sample_rows"] == 0
+    assert stats["n_final_nonpolitical_sample_rows"] == 0
+    assert stats["n_final_unknown_political_sample_rows"] == 1
     assert stats["n_political_quota_hours_met"] == 1
     assert "Final sample: 2 post-hour rows, 2 unique posts" in caplog.text
 
@@ -871,7 +859,7 @@ def test_negative_sampling_weights_by_global_like_counts(tmp_path, stage_get_dat
     posts_df = stage_get_data_module._get_negative_sample_posts(
         posts_lf=pl.scan_parquet(str(posts_path)),
         global_like_counts_df=global_negative_like_counts_df,
-        political_labels_lf=None,
+        political_uris_df=None,
         liked_post_uris_df=pl.DataFrame({"subject_uri": []}, schema={"subject_uri": pl.String}),
         cols_metadata=["at_uri", "record_created_at", "did", "record_text"],
         negative_samples_per_hour=1,
@@ -905,7 +893,7 @@ def test_negative_sampling_hashes_post_and_hour(tmp_path, stage_get_data_module)
     posts_df = stage_get_data_module._get_negative_sample_posts(
         posts_lf=pl.scan_parquet(str(posts_path)),
         global_like_counts_df=global_negative_like_counts_df,
-        political_labels_lf=None,
+        political_uris_df=None,
         liked_post_uris_df=pl.DataFrame({"subject_uri": []}, schema={"subject_uri": pl.String}),
         cols_metadata=["at_uri", "record_created_at", "did", "record_text"],
         negative_samples_per_hour=1,

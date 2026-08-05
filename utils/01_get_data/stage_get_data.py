@@ -104,7 +104,7 @@ OUTPUTS
 
 Under <run_dir>/01_get_data/<timestamp>/:
   - likes_core_*.parquet: did, subject_uri, record_created_at, like_hour_bucket, split, prior_cumulative_likes, emb_idx, author_did, author_idx
-  - posts_core_*.parquet: at_uri, did, record_text, is_liked, in_random_sample, is_political, negative_hour_bucket, prior_cumulative_likes, split_window, emb_idx, author_idx
+  - posts_core_*.parquet: at_uri, did, record_text, is_liked, in_random_sample, is_political (true or null), negative_hour_bucket, prior_cumulative_likes, split_window, emb_idx, author_idx
   - liked_post_hour_cumulative_likes_*.parquet: emb_idx, popularity_hour_bucket, prior_cumulative_likes
   - author_idx_*.parquet: author_did, author_train_count, author_idx
   - embeddings_*.npy: memmap file, shape (n_posts, embed_dim), dtype float32
@@ -696,25 +696,19 @@ def _build_global_like_counts_df(
     return counts_df, stats
 
 
-def _build_political_labels_lf(
+def _build_political_uris_df(
     inference_paths: List[str],
     global_like_counts_df: pl.DataFrame,
     political_score_threshold: float,
-) -> pl.LazyFrame:
-    eligible_uris_lf = (
-        global_like_counts_df
-        .select(pl.col("subject_uri").alias("at_uri"))
-        .lazy()
-    )
+) -> pl.DataFrame:
     parsed_record_expr = (
         pl.col("_parsed_inferences")
         .struct.field("text")
         .struct.field("message.commit.record.text")
     )
-    return (
+    inference_labels_df = (
         pl.scan_parquet(inference_paths)
         .select(["at_uri", "indexed_at", "inferences"])
-        .join(eligible_uris_lf, on="at_uri", how="semi")
         .with_columns(
             pl.col("inferences")
             .str.json_decode(dtype=POLITICAL_INFERENCE_DTYPE)
@@ -734,16 +728,26 @@ def _build_political_labels_lf(
         )
         .with_columns(
             (
-                (pl.col("_politics_score") >= political_score_threshold)
-                & (pl.col("_news_social_concern_score") >= political_score_threshold)
+                pl.min_horizontal("_politics_score", "_news_social_concern_score")
+                >= political_score_threshold
             ).alias("is_political")
         )
+        .select(["at_uri", "indexed_at", "is_political"])
+        .collect(engine="streaming")
+    )
+    eligible_uris_df = global_like_counts_df.select(
+        pl.col("subject_uri").alias("at_uri")
+    )
+    return (
+        inference_labels_df
         .group_by("at_uri")
         .agg(
             pl.col("is_political")
             .sort_by("indexed_at")
             .last()
         )
+        .filter(pl.col("is_political"))
+        .join(eligible_uris_df, on="at_uri", how="semi")
     )
 
 
@@ -1197,7 +1201,7 @@ def _load_posts_core_polars(
     - in_random_sample: True if post was selected by hash-sampling,
                         False if included only because it was liked
     - is_liked: True if post is in likes core dataset, False otherwise
-    - is_political: Politics label for sampled negatives with inference coverage; null otherwise
+    - is_political: True for sampled negatives meeting the politics thresholds; null otherwise
     - negative_hour_bucket: Hour bucket for sampled negatives; null for liked-only rows
     - prior_cumulative_likes: Exact prior-hour like count; null for liked-only rows
 
@@ -1226,20 +1230,24 @@ def _load_posts_core_polars(
 
     # get posts: sampled via hash, or in liked_post_uris:
     logger.info(f"Finding popular posts to sample as negatives...")
-    political_labels_lf: Optional[pl.LazyFrame] = None
+    political_uris_df: Optional[pl.DataFrame] = None
     if political_negative_samples_per_hour > 0:
         if not inference_paths:
             raise ValueError("No bsky_inferences parquet files found for political negative sampling")
-        political_labels_lf = _build_political_labels_lf(
+        political_uris_df = _build_political_uris_df(
             inference_paths=inference_paths,
             global_like_counts_df=global_like_counts_df,
             political_score_threshold=political_score_threshold,
+        )
+        logger.info(
+            "Collected %s eligible political candidate URIs from inference data",
+            f"{political_uris_df.height:,}",
         )
 
     negative_posts_with_flags_df = _get_negative_sample_posts(
         posts_lf,
         global_like_counts_df,
-        political_labels_lf,
+        political_uris_df,
         liked_post_uris_df,
         cols_metadata,
         negative_samples_per_hour,
@@ -1364,10 +1372,58 @@ def _hour_bucket_key_expr(col_name: str) -> pl.Expr:
     ])
 
 
+def _expand_negative_candidate_post_hours_lf(
+    candidate_posts_lf: pl.LazyFrame,
+    random_seed: int,
+    negative_sampling_alpha: float,
+    train_start: str,
+    posts_end: Optional[str],
+    holdout_end: Optional[str],
+) -> pl.LazyFrame:
+    post_hours_lf = (
+        candidate_posts_lf
+        .with_columns(
+            _hour_bucket_key_expr(TIMESTAMP_COL_NAME).str.to_datetime(time_zone="UTC").alias("_created_hour_bucket"),
+            pl.int_ranges(0, 24).alias("_eligibility_hour_offset"),
+        )
+        .explode("_eligibility_hour_offset")
+        .with_columns(
+            (pl.col("_created_hour_bucket") + pl.duration(hours=pl.col("_eligibility_hour_offset"))).alias("negative_hour_bucket")
+        )
+        .drop(["_created_hour_bucket", "_eligibility_hour_offset"])
+        .filter(
+            pl.col("negative_hour_bucket") >= pl.lit(train_start).str.to_datetime(time_zone="UTC")
+        )
+    )
+    if posts_end is not None:
+        post_hours_lf = post_hours_lf.filter(
+            pl.col("negative_hour_bucket") < pl.lit(posts_end).str.to_datetime(time_zone="UTC")
+        )
+    if holdout_end is not None:
+        post_hours_lf = post_hours_lf.filter(
+            pl.col("negative_hour_bucket") < pl.lit(holdout_end).str.to_datetime(time_zone="UTC")
+        )
+    return (
+        post_hours_lf
+        .with_columns(
+            (pl.col("global_like_count") ** negative_sampling_alpha).alias("_weight"),
+            (
+                pl.concat_str([
+                    pl.col("at_uri"),
+                    pl.col("negative_hour_bucket").cast(pl.Utf8),
+                ]).hash(seed=random_seed).cast(pl.Float64) / float(2**64 - 1)
+            ).alias("_rand_val"),
+        )
+        .with_columns(
+            (-pl.col("_rand_val").log() / pl.col("_weight")).alias("_sample_score"),
+        )
+    )
+
+
 def _get_negative_sample_posts(
     posts_lf: pl.LazyFrame,
     global_like_counts_df: pl.DataFrame,
-    political_labels_lf: Optional[pl.LazyFrame],
+    political_uris_df: Optional[pl.DataFrame],
     liked_post_uris_df: pl.DataFrame,
     cols_metadata: List[str],
     negative_samples_per_hour: int,
@@ -1386,86 +1442,126 @@ def _get_negative_sample_posts(
         })
         .lazy()
     )
-    if political_labels_lf is None:
-        global_counts_lf = global_counts_lf.with_columns(
+    candidate_posts_lf = metadata_lf.join(global_counts_lf, on="at_uri", how="inner")
+    ordinary_posts_df = (
+        _expand_negative_candidate_post_hours_lf(
+            candidate_posts_lf=candidate_posts_lf,
+            random_seed=random_seed,
+            negative_sampling_alpha=negative_sampling_alpha,
+            train_start=train_start,
+            posts_end=posts_end,
+            holdout_end=holdout_end,
+        )
+        .with_columns(
+            pl.col("_sample_score").rank("ordinal").over("negative_hour_bucket").alias("_sample_rank"),
+        )
+        .filter(pl.col("_sample_rank") <= negative_samples_per_hour)
+        .with_columns(
+            pl.lit(True).alias("_in_ordinary_negative_sample"),
+            pl.lit(False).alias("_in_political_negative_sample"),
+        )
+        .select(cols_metadata + [
+            "negative_hour_bucket",
+            "_in_ordinary_negative_sample",
+            "_in_political_negative_sample",
+        ])
+        .collect(engine="streaming")
+    )
+    if political_uris_df is None:
+        ordinary_posts_df = ordinary_posts_df.with_columns(
             pl.lit(None, dtype=pl.Boolean).alias("is_political")
         )
     else:
-        global_counts_lf = global_counts_lf.join(
-            political_labels_lf,
+        ordinary_posts_df = ordinary_posts_df.join(
+            political_uris_df,
             on="at_uri",
             how="left",
         )
-    liked_marker_lf = (
+    sampled_cols = cols_metadata + [
+        "is_political",
+        "negative_hour_bucket",
+        "_in_ordinary_negative_sample",
+        "_in_political_negative_sample",
+    ]
+    ordinary_posts_df = ordinary_posts_df.select(sampled_cols)
+
+    supplemental_posts_df = ordinary_posts_df.head(0)
+    if (
+        political_negative_samples_per_hour > 0
+        and political_uris_df is not None
+        and political_uris_df.height > 0
+    ):
+        ordinary_political_counts_df = (
+            ordinary_posts_df
+            .group_by("negative_hour_bucket")
+            .agg(
+                pl.col("is_political")
+                .fill_null(False)
+                .sum()
+                .cast(pl.Int64)
+                .alias("_ordinary_political_count")
+            )
+        )
+        ordinary_pairs_lf = (
+            ordinary_posts_df
+            .select(["at_uri", "negative_hour_bucket"])
+            .lazy()
+        )
+        political_candidate_posts_lf = candidate_posts_lf.join(
+            political_uris_df.lazy(),
+            on="at_uri",
+            how="inner",
+        )
+        supplemental_posts_df = (
+            _expand_negative_candidate_post_hours_lf(
+                candidate_posts_lf=political_candidate_posts_lf,
+                random_seed=random_seed,
+                negative_sampling_alpha=negative_sampling_alpha,
+                train_start=train_start,
+                posts_end=posts_end,
+                holdout_end=holdout_end,
+            )
+            .join(ordinary_pairs_lf, on=["at_uri", "negative_hour_bucket"], how="anti")
+            .join(
+                ordinary_political_counts_df.lazy(),
+                on="negative_hour_bucket",
+                how="left",
+            )
+            .with_columns(
+                pl.col("_ordinary_political_count").fill_null(0),
+            )
+            .with_columns(
+                pl.when(pl.col("_ordinary_political_count") < political_negative_samples_per_hour)
+                .then(political_negative_samples_per_hour - pl.col("_ordinary_political_count"))
+                .otherwise(0)
+                .alias("_political_shortfall"),
+                pl.col("_sample_score")
+                .rank("ordinal")
+                .over("negative_hour_bucket")
+                .alias("_political_sample_rank"),
+            )
+            .filter(pl.col("_political_sample_rank") <= pl.col("_political_shortfall"))
+            .with_columns(
+                pl.lit(False).alias("_in_ordinary_negative_sample"),
+                pl.lit(True).alias("_in_political_negative_sample"),
+            )
+            .select(sampled_cols)
+            .collect(engine="streaming")
+        )
+
+    liked_marker_df = (
         liked_post_uris_df
-        .rename({
-            "subject_uri": "at_uri",
-        })
+        .rename({"subject_uri": "at_uri"})
         .with_columns(pl.lit(True).alias("is_liked"))
-        .lazy()
     )
-    posts_with_weights_df = (
-        metadata_lf
-        .join(global_counts_lf, on="at_uri", how="inner")
-        .with_columns(
-            _hour_bucket_key_expr(TIMESTAMP_COL_NAME).str.to_datetime(time_zone="UTC").alias("_created_hour_bucket"),
-            pl.int_ranges(0, 24).alias("_eligibility_hour_offset"),
-        ) # at_uri, record_created_at, did, record_text, global_like_count, _created_hour_bucket, _eligibility_hour_offset
-        .explode("_eligibility_hour_offset")
-        .with_columns(
-            (pl.col("_created_hour_bucket") + pl.duration(hours=pl.col("_eligibility_hour_offset"))).alias("negative_hour_bucket")
-        ) # at_uri, record_created_at, did, record_text, global_like_count, _created_hour_bucket, _eligibility_hour_offset, negative_hour_bucket
-        .drop(["_created_hour_bucket", "_eligibility_hour_offset"])
-        .filter(
-            pl.col("negative_hour_bucket") >= pl.lit(train_start).str.to_datetime(time_zone="UTC")
-        )
-        .with_columns(
-            (pl.col("global_like_count") ** negative_sampling_alpha).alias("_weight"),
-            (
-                pl.concat_str([
-                    pl.col("at_uri"),
-                    pl.col("negative_hour_bucket").cast(pl.Utf8),
-                ]).hash(seed=random_seed).cast(pl.Float64) / float(2**64 - 1)
-            ).alias("_rand_val"),
-        ) # at_uri, record_created_at, did, record_text, global_like_count, negative_hour_bucket, _weight, _rand_val
-        .with_columns(
-            (-pl.col("_rand_val").log() / pl.col("_weight")).alias("_sample_score"),
-        ) # at_uri, record_created_at, did, record_text, global_like_count, negative_hour_bucket, _weight, _rand_val, _sample_score
-        .with_columns(
-            pl.col("_sample_score").rank("ordinal").over("negative_hour_bucket").alias("_sample_rank"),
-            pl.col("_sample_score")
-            .rank("ordinal")
-            .over(["negative_hour_bucket", "is_political"])
-            .alias("_political_sample_rank"),
-        )
-        .with_columns(
-            (pl.col("_sample_rank") <= negative_samples_per_hour).alias("_in_ordinary_negative_sample"),
-            (
-                pl.col("is_political").fill_null(False)
-                & (pl.col("_political_sample_rank") <= political_negative_samples_per_hour)
-            ).alias("_in_political_negative_sample"),
-        )
-        .filter(
-            pl.col("_in_ordinary_negative_sample")
-            | pl.col("_in_political_negative_sample")
-        )
-        .join(liked_marker_lf, on="at_uri", how="left")
+    return (
+        pl.concat([ordinary_posts_df, supplemental_posts_df], how="vertical")
+        .unique(subset=["at_uri", "negative_hour_bucket"], maintain_order=True)
+        .join(liked_marker_df, on="at_uri", how="left")
         .with_columns(
             pl.col("is_liked").fill_null(False),
             pl.lit(True).alias("in_random_sample"),
         )
-        .collect(engine="streaming")
-    )
-    if posts_end is not None:
-        posts_with_weights_df = posts_with_weights_df.filter(
-            pl.col("negative_hour_bucket") < pl.lit(posts_end).str.to_datetime(time_zone="UTC")
-        )
-    if holdout_end is not None:
-        posts_with_weights_df = posts_with_weights_df.filter(
-            pl.col("negative_hour_bucket") < pl.lit(holdout_end).str.to_datetime(time_zone="UTC")
-        )
-    return (
-        posts_with_weights_df
         .select(cols_metadata + [
             "is_liked",
             "in_random_sample",
