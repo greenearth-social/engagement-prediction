@@ -902,21 +902,6 @@ def _log_bst_listwise_epoch_metrics(
         metrics_top_ks,
         iteration,
     )
-    for split_label, metrics in (
-        ("Train", train_metrics),
-        ("Validation", val_metrics),
-        ("Validation Unseen Users", val_unseen_metrics),
-    ):
-        for metric_name in POLITICAL_NEGATIVE_SAMPLING_METRIC_NAMES:
-            metric_value = metrics.get(metric_name)
-            if metric_value is None:
-                continue
-            experiment_tracker.log_scalar(
-                "BST Political Negative Sampling",
-                f"{split_label} {metric_name}",
-                float(metric_value),
-                iteration,
-            )
 
 
 def _log_bst_political_negative_sampling_summary(
