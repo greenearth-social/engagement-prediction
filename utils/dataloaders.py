@@ -1219,45 +1219,6 @@ class BucketedEngagementDataset(Dataset):
                 post["prior_cumulative_likes"] = _prior_count_or_zero(row.get("prior_cumulative_likes"))
             self.sampled_posts_by_bucket.setdefault(row["negative_hour_bucket"], []).append(post)
 
-        if logger:
-            if self.bst_political_batch_negatives > 0:
-                political_rows = sampled_posts_df.filter(
-                    pl.col("is_political").fill_null(False)
-                ).height
-                nonpolitical_rows = sampled_posts_df.filter(
-                    pl.col("is_political").eq(False).fill_null(False)
-                ).height
-                unknown_rows = sampled_posts_df.filter(pl.col("is_political").is_null()).height
-                bucket_counts_df = sampled_posts_df.group_by("negative_hour_bucket").agg(
-                    pl.col("is_political").fill_null(False).sum().alias("political_count")
-                )
-                quota_capable_buckets = bucket_counts_df.filter(
-                    pl.col("political_count") >= self.bst_political_batch_negatives
-                ).height
-                quota_short_buckets = bucket_counts_df.height - quota_capable_buckets
-                logger.info(
-                    "  BST political negative pool('%s'): total=%s, political=%s, "
-                    "non-political=%s, unknown=%s, buckets=%s, quota-capable=%s, quota-short=%s",
-                    self.split,
-                    f"{sampled_posts_df.height:,}",
-                    f"{political_rows:,}",
-                    f"{nonpolitical_rows:,}",
-                    f"{unknown_rows:,}",
-                    f"{bucket_counts_df.height:,}",
-                    f"{quota_capable_buckets:,}",
-                    f"{quota_short_buckets:,}",
-                )
-                if quota_short_buckets > 0:
-                    logger.warning(
-                        "  BST political negative pool('%s') has %s hourly buckets below quota %s; "
-                        "batches will use all available political negatives",
-                        self.split,
-                        f"{quota_short_buckets:,}",
-                        f"{self.bst_political_batch_negatives:,}",
-                    )
-            else:
-                logger.info(f"  BST political negative sampling disabled for '{self.split}'")
-
     def __len__(self) -> int:
         return len(self.user_ids)
 
@@ -1440,14 +1401,8 @@ class BucketedEngagementDataset(Dataset):
                     float(prior_count) if prior_count is not None else None,
                 )
 
-        sampled_negative_count = 0
-        sampled_political_negative_count = 0
         for post in self._sample_candidate_posts_for_batch(row_indices, bucket, epoch, candidate_to_idx):
-            candidate_count_before = len(candidate_post_ids)
             add_candidate(post["post_id"], int(post["emb_idx"]), post.get("author_idx"), post.get("prior_cumulative_likes"))
-            if len(candidate_post_ids) > candidate_count_before:
-                sampled_negative_count += 1
-                sampled_political_negative_count += int(bool(post["is_political"]))
 
         candidate_post_embeddings = torch.from_numpy(
             np.array(self.embeddings[np.array(candidate_emb_indices, dtype=np.int64)], dtype=np.float32)
@@ -1469,13 +1424,6 @@ class BucketedEngagementDataset(Dataset):
             "user_id": user_ids,
             "candidate_post_id": candidate_post_ids,
             "bucket": bucket,
-            "sampled_negative_count": sampled_negative_count,
-            "sampled_political_negative_count": sampled_political_negative_count,
-            "political_negative_quota": self.bst_political_batch_negatives,
-            "political_negative_quota_met": (
-                self.bst_political_batch_negatives > 0
-                and sampled_political_negative_count >= self.bst_political_batch_negatives
-            ),
         }
         if self.use_author_embedding_table:
             output["history_author_indices"] = torch.stack(

@@ -1,6 +1,5 @@
 """Tests for bucketed two-tower dataloaders."""
 import json
-import logging
 from datetime import datetime, timezone
 
 import numpy as np
@@ -95,7 +94,6 @@ def _political_sampling_dataset(
     total_negatives,
     political_negatives,
     seed=0,
-    logger=None,
 ):
     return BucketedEngagementDataset(
         embeddings_mmap=mock_embeddings_mmap,
@@ -108,7 +106,6 @@ def _political_sampling_dataset(
         bst_political_batch_negatives=political_negatives,
         bst_additional_batch_negatives=total_negatives,
         seed=seed,
-        logger=logger,
     )
 
 
@@ -437,41 +434,29 @@ def test_bucketed_political_sampling_replaces_only_the_ordinary_shortfall_and_ex
     assert political_outside_ordinary in sampled_negative_ids
     assert len(sampled_negative_ids & ordinary_negative_ids) == 2
     assert batch["candidate_post_id"].count("p2") == 1
-    assert batch["sampled_negative_count"] == 3
-    assert batch["sampled_political_negative_count"] == 2
-    assert batch["political_negative_quota"] == 2
-    assert batch["political_negative_quota_met"] is True
 
 
-def test_bucketed_political_sampling_uses_available_posts_and_logs_shortage(
+def test_bucketed_political_sampling_uses_all_available_political_posts_when_pool_is_scarce(
     mock_embeddings_mmap,
     mock_likes_core_df,
     mock_history_df,
-    caplog,
 ):
     posts_df = _political_pool_posts_df(
         ["political", "nonpolitical", "unknown"],
         [True, False, None],
     )
-    logger = logging.getLogger("test_dataloaders.political_shortage")
+    dataset = _political_sampling_dataset(
+        mock_embeddings_mmap,
+        mock_likes_core_df,
+        mock_history_df,
+        posts_df,
+        total_negatives=5,
+        political_negatives=2,
+    )
+    batch = dataset.collate_batch([dataset[0], dataset[1]])
 
-    with caplog.at_level(logging.INFO):
-        dataset = _political_sampling_dataset(
-            mock_embeddings_mmap,
-            mock_likes_core_df,
-            mock_history_df,
-            posts_df,
-            total_negatives=5,
-            political_negatives=2,
-            logger=logger,
-        )
-        batch = dataset.collate_batch([dataset[0], dataset[1]])
-
-    assert batch["sampled_negative_count"] == 3
-    assert batch["sampled_political_negative_count"] == 1
-    assert batch["political_negative_quota_met"] is False
-    assert "total=3, political=1, non-political=1, unknown=1" in caplog.text
-    assert "1 hourly buckets below quota 2" in caplog.text
+    sampled_negative_ids = set(batch["candidate_post_id"]) - {"p1", "p2", "p3"}
+    assert sampled_negative_ids == {"political", "nonpolitical", "unknown"}
 
 
 def test_bucketed_political_sampling_keeps_ordinary_sample_when_quota_is_already_met(
@@ -506,8 +491,6 @@ def test_bucketed_political_sampling_keeps_ordinary_sample_when_quota_is_already
     political_batch = political_dataset.collate_batch([political_dataset[0], political_dataset[1]])
 
     assert political_batch["candidate_post_id"] == ordinary_batch["candidate_post_id"]
-    assert political_batch["sampled_political_negative_count"] == 3
-    assert political_batch["political_negative_quota_met"] is True
 
 
 def test_bucketed_political_sampling_is_deterministic_and_resamples_by_epoch(
@@ -541,9 +524,9 @@ def test_bucketed_political_sampling_is_deterministic_and_resamples_by_epoch(
     ]
     for epoch in range(8):
         batch = dataset.collate_batch([dataset[(0, epoch)], dataset[(1, epoch)]])
-        assert batch["sampled_negative_count"] == 4
-        assert batch["sampled_political_negative_count"] >= 2
-        assert batch["political_negative_quota_met"] is True
+        sampled_negative_ids = set(batch["candidate_post_id"]) - {"p1", "p2", "p3"}
+        assert len(sampled_negative_ids) == 4
+        assert len(sampled_negative_ids & {"n0", "n1", "n2"}) >= 2
 
 
 def test_bucketed_political_sampling_requires_boolean_label_only_when_enabled(
@@ -560,9 +543,11 @@ def test_bucketed_political_sampling_requires_boolean_label_only_when_enabled(
         total_negatives=2,
         political_negatives=0,
     )
-    assert disabled_dataset.collate_batch(
+    disabled_batch = disabled_dataset.collate_batch(
         [disabled_dataset[0], disabled_dataset[1]]
-    )["sampled_negative_count"] == 2
+    )
+    sampled_negative_ids = set(disabled_batch["candidate_post_id"]) - {"p1", "p2", "p3"}
+    assert len(sampled_negative_ids) == 2
 
     with pytest.raises(ValueError, match="posts_core.is_political"):
         _political_sampling_dataset(
