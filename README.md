@@ -42,7 +42,7 @@ To keep pytest temporary files inside the repo:
 TMPDIR=$PWD conda run -n eng-pred pytest -q
 ```
 
-Tests live under `tests/` and use the `test_*.py` naming convention.
+Tests use the `*_test.py` naming convention and live next to the code they cover as modules are migrated into `engagement_prediction/`. Legacy tests remain under `tests/` during the transition.
 
 ## Repository Layout
 

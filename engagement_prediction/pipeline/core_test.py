@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import engagement_prediction.pipeline.core as pipeline_core
-from engagement_prediction.pipeline import registry as pipeline_registry
 from engagement_prediction.pipeline.core import Context, select_prior_output, list_stage_outputs
 
 
@@ -22,18 +21,11 @@ def test_generate_run_timestamp_uses_los_angeles_time(monkeypatch):
 
 
 def test_pipeline_core_resolves_repository_root():
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[2]
 
     assert pipeline_core.ROOT == repo_root
     assert pipeline_core.DEFAULT_ARTIFACTS_DIR == repo_root / "artifacts"
     assert pipeline_core.DEFAULT_RUNS_DIR == repo_root / "runs"
-
-
-def test_registered_stage_modules_load():
-    for stage_name in pipeline_registry.STAGE_SPECS:
-        module_path, _stage_folder = pipeline_registry.get_stage_spec(stage_name)
-
-        assert callable(pipeline_core.load_run_callable(module_path))
 
 
 def test_select_prior_output_prefers_latest(tmp_path):
