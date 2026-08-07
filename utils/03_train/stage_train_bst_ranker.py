@@ -48,7 +48,7 @@ from utils.matrix_ranking import (
     stage_info_metric_lines,
     zero_history_rank_metric_sums_for_batch,
 )
-from utils.pipeline.core import Context
+from engagement_prediction.pipeline.core import Context
 from utils.author_features import ProjectedPostFeatureEncoder
 from utils.ranker_utilities import LinearPredictionHead
 

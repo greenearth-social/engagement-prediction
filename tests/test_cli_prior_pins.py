@@ -4,8 +4,8 @@ from pathlib import Path
 import pytest
 
 import cli
-from utils.pipeline.core import Context
-from utils.pipeline.dependencies import (
+from engagement_prediction.pipeline.core import Context
+from engagement_prediction.pipeline.dependencies import (
     get_stage_folder_to_keys,
     get_stage_input_folders,
     resolve_stage_dependencies_for_run,

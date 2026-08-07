@@ -28,7 +28,7 @@ if TYPE_CHECKING:  # pragma: no cover
     import numpy as np  # type: ignore
     import pandas as pd  # type: ignore
     import polars as pl  # type: ignore
-    from utils.pipeline.core import Context
+    from engagement_prediction.pipeline.core import Context
 
 
 # Avoid HF tokenizers fork warnings/deadlocks in multiprocessing contexts

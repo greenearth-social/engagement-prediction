@@ -29,7 +29,7 @@ from typing import Any, Dict, Optional
 
 import pandas as pd
 
-from utils.pipeline.core import Context, generate_run_timestamp
+from engagement_prediction.pipeline.core import Context, generate_run_timestamp
 from utils.helpers import get_stage_logger, log_operation_start
 
 # ---------------------------------------------------------------------------

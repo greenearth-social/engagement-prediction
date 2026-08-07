@@ -39,7 +39,7 @@ import logging
 import polars as pl
 import time
 
-from utils.pipeline.core import Context
+from engagement_prediction.pipeline.core import Context
 from utils.helpers import (
     get_stage_logger,
     log_operation_start,

@@ -1,4 +1,4 @@
-from utils.experiment_tracking import ClearMLExperimentTracker
+from engagement_prediction.experiment_tracking import ClearMLExperimentTracker
 
 
 class _FakeArtifact:

@@ -9,11 +9,11 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from utils.pipeline.dependencies import (
+from engagement_prediction.pipeline.dependencies import (
     resolve_stage_dependencies_for_run,
     validate_explicit_prior_pin_consistency,
 )
-from utils.pipeline.core import (
+from engagement_prediction.pipeline.core import (
     Context,
     generate_run_timestamp,
     new_stage_artifact_dir,

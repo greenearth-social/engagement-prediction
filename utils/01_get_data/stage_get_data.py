@@ -135,7 +135,7 @@ import numpy as np
 from tqdm import tqdm
 import gc
 
-from utils.pipeline.core import (
+from engagement_prediction.pipeline.core import (
     Context,
 )
 from utils.helpers import (

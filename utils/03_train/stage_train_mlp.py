@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from utils.pipeline.core import Context
+from engagement_prediction.pipeline.core import Context
 from utils.helpers import (
     get_stage_logger,
     log_operation_start,

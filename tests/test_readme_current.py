@@ -8,6 +8,8 @@ def test_readme_describes_current_pipeline_and_new_ranker_surface():
     assert "utils/02_user_history/stage_generate_user_history.py" in readme
     assert "utils/03_train/stage_train_bst_ranker.py" in readme
     assert "utils/04_evaluate/stage_evaluate.py" in readme
+    assert "engagement_prediction/pipeline/{core.py,dependencies.py,registry.py}" in readme
+    assert "utils/pipeline/registry.py" not in readme
     assert "compare-rankers" in readme
     assert "--model-type bst-ranker" in readme
     assert "prior_like_age_hours_at_bucket_start" in readme

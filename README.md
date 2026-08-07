@@ -57,7 +57,7 @@ Tests live under `tests/` and use the `test_*.py` naming convention.
 - `utils/dataloaders.py`: bucketed listwise datasets, samplers, and shared user encoders.
 - `utils/matrix_ranking.py`: shared matrix ranking metrics, final metric logging, and ranking-row writers.
 - `utils/ranking_adapters.py`: `.pth` checkpoint adapters for compare-rankers.
-- `utils/pipeline/{core.py,dependencies.py,registry.py}`: artifact directories, lineage, dependency resolution, and stage registry.
+- `engagement_prediction/pipeline/{core.py,dependencies.py,registry.py}`: artifact directories, lineage, dependency resolution, and stage registry.
 
 ## Running The Pipeline
 
@@ -335,7 +335,7 @@ python cli.py --config config.yml --background false
 - Keep Stage 1/2 artifact schemas stable when possible; all model types share them.
 - Use `utils/matrix_ranking.py` for matrix ranking metrics and ranking-row writes.
 - Use `utils/ranking_adapters.py` when adding checkpoint-backed comparison support.
-- Avoid adding new training paths without registering them in `utils/pipeline/registry.py` and documenting their artifact contract here.
+- Avoid adding new training paths without registering them in `engagement_prediction/pipeline/registry.py` and documenting their artifact contract here.
 
 ## Contributing
 

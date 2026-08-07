@@ -62,7 +62,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, Sampler
 
-from utils.pipeline.core import Context
+from engagement_prediction.pipeline.core import Context
 from utils.helpers import (
     get_stage_logger,
     load_parquet_from_prior,

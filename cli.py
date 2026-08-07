@@ -24,13 +24,13 @@ import json
 import copy
 
 import compare as compare_rankers
-from utils.pipeline import registry as reg
-from utils.pipeline.dependencies import (
+from engagement_prediction.pipeline import registry as reg
+from engagement_prediction.pipeline.dependencies import (
     pin_lineage_aligned_inputs,
     validate_explicit_prior_pin_consistency,
 )
-from utils.experiment_tracking import build_experiment_tracker
-from utils.pipeline.core import (
+from engagement_prediction.experiment_tracking import build_experiment_tracker
+from engagement_prediction.pipeline.core import (
     Context,
     generate_run_timestamp,
     LINEAGE_FILENAME,

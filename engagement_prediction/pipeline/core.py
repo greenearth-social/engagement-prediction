@@ -26,10 +26,10 @@ from zoneinfo import ZoneInfo
 
 from ..experiment_tracking import ExperimentTracker, NoOpExperimentTracker
 
-# Resolve repo root as two levels up from this file: utils/pipeline/core.py → repo/
+# Resolve repo root as two levels up from this file: engagement_prediction/pipeline/core.py → repo/
 CURR = Path(__file__).resolve()
-UTILS_DIR = CURR.parent.parent
-ROOT = UTILS_DIR.parent
+PACKAGE_DIR = CURR.parent.parent
+ROOT = PACKAGE_DIR.parent
 
 
 RUN_TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"

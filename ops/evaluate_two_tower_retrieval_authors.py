@@ -39,7 +39,7 @@ from shared.input_data_helpers import (
     get_padded_embedding_history_and_mask,
 )
 from utils.helpers import apply_time_filter, parse_one_ts
-from utils.pipeline.core import generate_run_timestamp
+from engagement_prediction.pipeline.core import generate_run_timestamp
 
 
 DEFAULT_TRAIN_ARTIFACTS_DIR = Path("/mnt/data/dave/outputs/artifacts/03_train")
