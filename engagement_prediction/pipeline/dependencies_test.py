@@ -32,7 +32,7 @@ def _make_stage_output(
 
 def test_get_stage_folder_to_keys_is_derived_from_registry():
     assert get_stage_folder_to_keys() == {
-        "01_get_data": ("get_data",),
+        "01_query_selection": ("query_selection",),
         "02_user_history": ("user_history",),
         "03_train": ("train_mlp", "train_two_tower", "train_bst_ranker"),
         "04_evaluate": ("evaluate",),
@@ -41,7 +41,7 @@ def test_get_stage_folder_to_keys_is_derived_from_registry():
 
 def test_get_stage_input_folders_is_derived_from_stage_order():
     assert get_stage_input_folders() == {
-        "01_get_data": [],
+        "01_query_selection": [],
         "02_user_history": ["01_get_data"],
         "03_train": ["01_get_data", "02_user_history"],
         "04_evaluate": ["01_get_data", "02_user_history", "03_train"],

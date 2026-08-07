@@ -132,26 +132,64 @@ def test_political_negative_sampling_args_merge_from_cli_and_config(tmp_path):
     assert merged.political_score_threshold == 0.75
 
 
-def test_user_sampling_args_replace_old_names(tmp_path):
+def test_query_sampling_args_replace_user_sampling_args(tmp_path):
     parser = cli.build_parser()
-    raw = parser.parse_args(["--max-trainval-users", "123", "--max-unseen-eval-users", "45"])
+    raw = parser.parse_args([
+        "--unseen-user-fraction", "0.2",
+        "--max-hours-per-user-per-split", "48",
+        "--max-train-query-hours", "123",
+        "--max-eval-query-hours-per-split", "45",
+        "--max-positives-per-user-hour", "24",
+    ])
     merged = cli._merge_args_with_config(raw)
 
-    assert merged.max_trainval_users == 123
-    assert merged.max_unseen_eval_users == 45
-    assert "max_liking_users" not in cli.DEFAULTS
-    assert "holdout_user_fraction" not in cli.DEFAULTS
+    assert merged.unseen_user_fraction == 0.2
+    assert merged.max_hours_per_user_per_split == 48
+    assert merged.max_train_query_hours == 123
+    assert merged.max_eval_query_hours_per_split == 45
+    assert merged.max_positives_per_user_hour == 24
+    assert cli.DEFAULTS["max_hours_per_user_per_split"] == 64
+    assert cli.DEFAULTS["max_positives_per_user_hour"] == 32
 
     with pytest.raises(SystemExit):
-        parser.parse_args(["--max-liking-users", "123"])
+        parser.parse_args(["--max-trainval-users", "123"])
     with pytest.raises(SystemExit):
-        parser.parse_args(["--holdout-user-fraction", "0.2"])
+        parser.parse_args(["--max-unseen-eval-users", "45"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--max-likes-per-user", "16"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--min-likes-per-user", "2"])
 
     config_path = Path(tmp_path) / "old_sampling.yml"
-    config_path.write_text("max_liking_users: 123\nholdout_user_fraction: 0.2\n")
+    config_path.write_text("max_trainval_users: 123\nmax_unseen_eval_users: 45\n")
     raw = parser.parse_args(["--config", str(config_path)])
     with pytest.raises(ValueError):
         cli._merge_args_with_config(raw)
+
+
+def test_query_sampling_defaults():
+    merged = cli._merge_args_with_config(cli.build_parser().parse_args([]))
+
+    assert merged.unseen_user_fraction == 0.10
+    assert merged.max_hours_per_user_per_split == 64
+    assert merged.max_train_query_hours is None
+    assert merged.max_eval_query_hours_per_split is None
+    assert merged.max_positives_per_user_hour == 32
+
+
+def test_query_selection_cannot_continue_into_legacy_stage_two(tmp_path):
+    parser = cli.build_parser()
+    merged = cli._merge_args_with_config(parser.parse_args([]))
+    merged.output_dir = str(tmp_path)
+    ctx = cli.Context(
+        run_dir=Path(tmp_path) / "runs" / "run",
+        artifacts_dir=Path(tmp_path) / "artifacts",
+        runs_dir=Path(tmp_path) / "runs",
+        pipeline_run_id="run",
+    )
+
+    with pytest.raises(ValueError, match="--stop-after query_selection"):
+        cli.cmd__run_all_exec(merged, ctx)
 
 
 def test_background_effective_config_preserves_no_post_encoder(tmp_path):
@@ -476,7 +514,7 @@ def test_bst_ranker_validates_transformer_head_divisibility():
 
 def test_min_author_support_must_be_positive_even_without_author_table(tmp_path):
     parser = cli.build_parser()
-    raw = parser.parse_args(["--min-author-support", "0", "--stop-after", "get_data"])
+    raw = parser.parse_args(["--min-author-support", "0", "--stop-after", "query_selection"])
     merged = cli._merge_args_with_config(raw)
     merged.output_dir = str(tmp_path)
     ctx = cli.Context(

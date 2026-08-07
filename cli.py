@@ -4,13 +4,13 @@
 Unified CLI for Engagement Prediction Pipeline
 =============================================
 
-Runs the 4-stage pipeline end-to-end (get_data → user_history → train → evaluate).
+Runs the engagement prediction artifact pipeline.
 
 Note: The historical `run-all` subcommand is now optional (kept for backwards compatibility).
 
 Usage examples:
-    python cli.py --user-encoder summarized --epochs 150 --embedding-model all_MiniLM_L12_v2
-    python cli.py --user-encoder cross_attention --model-type mlp --config config.yml
+    python cli.py --config config.yml --stop-after query_selection
+    python cli.py run-all --config config.yml --stop-after query_selection
 """
 
 import argparse
@@ -45,7 +45,7 @@ from engagement_prediction.pipeline.core import (
 CLI_FILE_DIR = Path(__file__).parent
 
 TRAIN_PLACEHOLDER = 'train_placeholder'
-STAGE_ORDER = ['get_data', 'user_history', TRAIN_PLACEHOLDER, 'evaluate']
+STAGE_ORDER = ['query_selection', 'user_history', TRAIN_PLACEHOLDER, 'evaluate']
 VALID_USER_ENCODERS_BY_MODEL_TYPE: Dict[str, Tuple[str, ...]] = {
     "mlp": ("summarized", "full_transformer", "cross_attention"),
     "two-tower": ("full_transformer", "cross_attention"),
@@ -53,16 +53,17 @@ VALID_USER_ENCODERS_BY_MODEL_TYPE: Dict[str, Tuple[str, ...]] = {
 
 # Central default map for all run-all parameters
 DEFAULTS: Dict[str, Any] = {
-    # Stage 1: Data filtering
+    # Stage 1: Query selection
     "gcs_bucket": 'greenearth-471522-ingex-extract-stage',
     "posts_start": None,
     "posts_end": None,
     "likes_start": None,
     "likes_end": None,
-    "max_trainval_users": None,  # None = no limit; sample this many unique train/val users
-    "max_unseen_eval_users": 0,  # Evaluation-only unseen users to sample from eligible users outside train/val
-    "max_likes_per_user": 100,  # Stage 1: random cap on likes per user (NOT recency-based)
-    "min_likes_per_user": 2,  # Stage 1: minimum likes for user inclusion
+    "unseen_user_fraction": 0.10,
+    "max_hours_per_user_per_split": 64,
+    "max_train_query_hours": None,
+    "max_eval_query_hours_per_split": None,
+    "max_positives_per_user_hour": 32,
     "negative_samples_per_hour": 1000,  # Stage 1: sampled negative post-hour rows per bucket
     "political_negative_samples_per_hour": 0,  # Stage 1: additional political negative post-hour rows per bucket; 0 disables inference loading
     "political_score_threshold": 0.8,  # Stage 1: minimum required score for both politics inference signals
@@ -378,10 +379,20 @@ def cmd_compare_rankers(args: argparse.Namespace) -> int:
 
 
 def cmd_run_all(args: argparse.Namespace) -> int:
-    """Run the 4-stage pipeline.
+    """Run the selected pipeline stages.
 
     Creates a run directory up front and backgrounds itself with nohup if --background.
     """
+    train_key = _get_train_key(args.model_type)
+    stage_order = _get_stage_order_for_model_type(train_key)
+    start_idx, stop_idx, _ = _get_stage_folder_and_start_stop_indices(
+        stage_order,
+        args.start_from,
+        args.stop_after,
+        train_key,
+    )
+    _validate_query_selection_boundary(stage_order, start_idx, stop_idx)
+
     # Store the single timestamp in Context; for background runs we pass it via env.
     run_timestamp = (os.environ.get("ENGAGEMENT_RUN_TIMESTAMP") or "").strip() or generate_run_timestamp()
 
@@ -634,6 +645,19 @@ def _get_stage_folder_and_start_stop_indices(
     return start_idx, stop_idx, includes_train
 
 
+def _validate_query_selection_boundary(
+    stage_order: List[str],
+    start_idx: int,
+    stop_idx: int,
+) -> None:
+    query_selection_idx = stage_order.index("query_selection")
+    if start_idx <= query_selection_idx < stop_idx:
+        raise ValueError(
+            "query_selection cannot yet continue into user_history: the unchanged legacy Stage 2 "
+            "requires 01_get_data artifacts. Run with --stop-after query_selection."
+        )
+
+
 def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     """Execute the modular pipeline stages in the foreground sequentially."""
     run_dir = Path(ctx.run_dir).resolve()
@@ -700,6 +724,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
         args.stop_after,
         train_key
     )
+    _validate_query_selection_boundary(stage_order, start_idx, stop_idx)
 
     # Optional interactive chooser (foreground only)
     def _maybe_choose_prior(stage_key: str):
@@ -734,12 +759,12 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
             if idx < start_idx or idx > stop_idx:
                 continue
             # Before running, offer prior selection for this stage's dependency (if any)
-            if key != 'get_data':
+            if key != 'query_selection':
                 prev_key = stage_order[idx - 1]
                 if stage_folder[prev_key] not in ctx.prior_outputs:
                     _maybe_choose_prior(prev_key)
             label_map = {
-                'get_data': "Stage 1: Get data…",
+                'query_selection': "Stage 1: Select user-hour queries…",
                 'user_history': "Stage 2: Generate user history…",
                 'train_mlp': "Stage 3: Train model (MLP)…",
                 'train_two_tower': "Stage 3: Train model (Two-Tower)…",
@@ -806,12 +831,16 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="ISO date string for ingex GCS likes start (inclusive)")
     _add_arg_with_default(p_all, "--likes-end", type=str, default=argparse.SUPPRESS,
                           help_text="ISO date string for ingex GCS likes end (exclusive)")
-    _add_arg_with_default(p_all, "--max-trainval-users", type=int, default=argparse.SUPPRESS,
-                          help_text="Cap on train/val users to sample (None = no limit)")
-    _add_arg_with_default(p_all, "--max-unseen-eval-users", type=int, default=argparse.SUPPRESS,
-                          help_text="Cap on evaluation-only unseen users to sample")
-    _add_arg_with_default(p_all, "--max-likes-per-user", type=int, default=argparse.SUPPRESS,
-                          help_text="Random cap on likes per user in Stage 1 (NOT recency-based)")
+    _add_arg_with_default(p_all, "--unseen-user-fraction", type=float, default=argparse.SUPPRESS,
+                          help_text="Stable fraction of users reserved for unseen-user evaluation")
+    _add_arg_with_default(p_all, "--max-hours-per-user-per-split", type=int, default=argparse.SUPPRESS,
+                          help_text="Maximum query-hours retained per user within each split")
+    _add_arg_with_default(p_all, "--max-train-query-hours", type=int, default=argparse.SUPPRESS,
+                          help_text="Optional cap on selected training query-hours")
+    _add_arg_with_default(p_all, "--max-eval-query-hours-per-split", type=int, default=argparse.SUPPRESS,
+                          help_text="Optional independent query-hour cap for each evaluation split")
+    _add_arg_with_default(p_all, "--max-positives-per-user-hour", type=int, default=argparse.SUPPRESS,
+                          help_text="Discard selected user-hours with more than this many positives")
     _add_arg_with_default(p_all, "--negative-samples-per-hour", type=int, default=argparse.SUPPRESS,
                           help_text="Number of negative post-hour rows to sample per hour in Stage 1")
     _add_arg_with_default(p_all, "--political-negative-samples-per-hour", type=int, default=argparse.SUPPRESS,
@@ -856,8 +885,6 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="ISO date string for end of holdout window. Applies to both holdout_seen_users and holdout_unseen_users. Rows at/after this date get split=None. Default: no upper bound.")
     _add_arg_with_default(p_all, "--global-topic-k", type=int, default=argparse.SUPPRESS,
                           help_text="Number of global topics")
-    _add_arg_with_default(p_all, "--min-likes-per-user", type=int, default=argparse.SUPPRESS,
-                          help_text="Minimum likes per user for inclusion (used in Stage 1 filtering and later stages)")
     # Stage 3 (train) user summarization + model selection
     _add_arg_with_default(p_all, "--user-summarization", type=str, choices=["mean", "ema", "linear_recency"],
                           default=argparse.SUPPRESS,
@@ -1005,10 +1032,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="(Deprecated) Always enabled during sequential run-all")
     # Selective reruns and prior pinning
     _add_arg_with_default(p_all, "--start-from", type=str,
-                          choices=["get_data", "user_history", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "evaluate"],
+                          choices=["query_selection", "user_history", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Begin execution at this stage")
     _add_arg_with_default(p_all, "--stop-after", type=str,
-                          choices=["get_data", "user_history", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "evaluate"],
+                          choices=["query_selection", "user_history", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Stop after this stage completes")
     _add_arg_with_default(p_all, "--pick-prior", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help_text="If multiple prior outputs exist, prompt to pick (foreground only)")

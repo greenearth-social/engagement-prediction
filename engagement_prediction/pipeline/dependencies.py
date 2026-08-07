@@ -6,13 +6,13 @@ Helpers for resolving lineage-aligned stage artifacts.
 This module keeps the provenance logic out of ``cli.py`` so the CLI stays
 focused on argument handling and stage orchestration.
 
-The current pipeline is linear at the artifact-folder level:
+The legacy downstream pipeline is linear at the artifact-folder level:
 
 01_get_data -> 02_user_history -> 03_train -> 04_evaluate
 
-Later stages depend on all earlier stage folders. We derive that folder order
- from the registry's canonical folder names rather than maintaining a second
- hand-written dependency map in the CLI.
+The active query-selection Stage 1 intentionally does not feed the unchanged
+legacy Stage 2 yet. Direct downstream reruns continue to resolve the legacy
+01_get_data lineage until Stage 2 is rewritten.
 """
 
 from __future__ import annotations
@@ -23,20 +23,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import registry as reg
 from .core import Context, STAGE_MANIFEST_FILENAME, list_stage_outputs
-
-
-def _stage_folder_sort_key(folder: str) -> Tuple[int, str]:
-    """Sort stage folders by their numeric prefix, falling back to name.
-
-    Folder names currently follow the convention ``NN_name``. Sorting by the
-    prefix keeps dependency inference aligned with the pipeline's stage order
-    without requiring another manually-maintained list.
-    """
-    prefix, _, remainder = str(folder).partition("_")
-    try:
-        return (int(prefix), remainder)
-    except ValueError:
-        return (10**9, str(folder))
 
 
 def get_stage_folder_to_keys() -> Dict[str, Tuple[str, ...]]:
@@ -53,18 +39,23 @@ def get_stage_folder_to_keys() -> Dict[str, Tuple[str, ...]]:
 
 
 def get_stage_input_folders() -> Dict[str, List[str]]:
-    """Return cumulative artifact-folder dependencies for the linear pipeline.
+    """Return artifact-folder dependencies across the temporary Stage 1 boundary.
 
-    For example, ``03_train`` depends on ``01_get_data`` and
-    ``02_user_history``. The result is derived from
-    the registered stage folders sorted by their numeric prefixes, so there is
-    no separate hand-maintained dependency table to update.
+    Query selection has no inputs. The unchanged downstream stages retain their
+    legacy ``01_get_data`` lineage so they can still be rerun directly from
+    existing artifacts. This compatibility branch should be removed when Stage
+    2 is rewritten to consume ``01_query_selection``.
     """
-    folder_order = sorted(get_stage_folder_to_keys().keys(), key=_stage_folder_sort_key)
-    return {
-        folder: folder_order[:idx]
-        for idx, folder in enumerate(folder_order)
-    }
+    registered_folders = set(get_stage_folder_to_keys().keys())
+    dependencies: Dict[str, List[str]] = {}
+    if "01_query_selection" in registered_folders:
+        dependencies["01_query_selection"] = []
+
+    legacy_order = ["01_get_data", "02_user_history", "03_train", "04_evaluate"]
+    for idx, folder in enumerate(legacy_order[1:], start=1):
+        if folder in registered_folders:
+            dependencies[folder] = legacy_order[:idx]
+    return dependencies
 
 
 def load_stage_manifest(stage_dir: Path) -> Dict[str, Any]:

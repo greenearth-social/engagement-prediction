@@ -1,13 +1,13 @@
 # Engagement Prediction
 
-This repo trains and evaluates engagement rankers for Bluesky posts. The active workflow is a four-stage artifact pipeline:
+This repo trains and evaluates engagement rankers for Bluesky posts. The artifact pipeline is being migrated to production-shaped user-hour queries:
 
-1. `01_get_data`: load Ingex parquet data, split likes into train/validation/holdout windows, write post embeddings and compact core tables.
-2. `02_user_history`: build per-user, per-hour history lists for model training.
+1. `01_query_selection`: load Ingex likes and select bounded `(user, hour)` queries with their positive posts.
+2. `02_user_history`: legacy Stage 2, pending a rewrite to consume query-selection artifacts.
 3. `03_train`: train an MLP, two-tower, or BST ranker.
 4. `04_evaluate`: run holdout evaluation modules from ranking-row artifacts written by Stage 3.
 
-The historical featurize/relevel/split workflow is not part of the active branch.
+Query selection is currently an explicit pipeline boundary. Run it with `--stop-after query_selection`; it cannot yet continue into the unchanged Stage 2. Direct downstream reruns can still use existing `01_get_data` artifacts and prior pins.
 
 ## Setup
 
@@ -46,9 +46,11 @@ Tests use the `*_test.py` naming convention and live next to the code they cover
 
 ## Repository Layout
 
-- `cli.py`: unified pipeline CLI. `run-all` is implicit, so `python cli.py --config config.yml` and `python cli.py run-all --config config.yml` are both accepted.
+- `cli.py`: unified pipeline CLI. `run-all` is implicit, so both invocation forms are accepted; the active Stage 1 currently requires `--stop-after query_selection`.
 - `compare.py`: checkpoint-backed ranker comparison CLI.
-- `utils/01_get_data/stage_get_data.py`: Stage 1 data ingestion, time-window splits, negative sampling pools, embeddings memmap, author index mapping.
+- `engagement_prediction/stages/query_selection.py`: active Stage 1 user-hour query selection.
+- `engagement_prediction/data/ingex.py`: reusable Ingex GCS listing and lazy Parquet scanning.
+- `utils/01_get_data/stage_get_data.py`: unregistered legacy Stage 1 retained while downstream stages still consume its artifacts.
 - `utils/02_user_history/stage_generate_user_history.py`: Stage 2 user-hour history directory with prior embedding ids, author ids, and time-delta features.
 - `utils/03_train/stage_train_mlp.py`: Stage 3 MLP matrix ranker.
 - `utils/03_train/stage_train_two_tower.py`: Stage 3 two-tower matrix ranker.
@@ -64,13 +66,13 @@ Tests use the `*_test.py` naming convention and live next to the code they cover
 The CLI merges defaults, an optional YAML/JSON config, and explicit command-line flags. CLI flags win over config values.
 
 ```bash
-python cli.py --config config.yml
+python cli.py --config config.yml --stop-after query_selection
 ```
 
 For foreground local iteration:
 
 ```bash
-python cli.py --config config.yml --background false --experiment-tracker none
+python cli.py --config config.yml --stop-after query_selection --background false --experiment-tracker none
 ```
 
 ### Output Layout
@@ -82,53 +84,38 @@ By default, outputs are written under `outputs/` in two coordinated views:
 
 Each stage writes `manifest.json`, `resolved_config.json`, `stage.log`, and `stage_info.txt` when it completes.
 
-### Stage 1: Get Data
+### Stage 1: Query Selection
 
-Stage 1 reads Ingex parquet data from GCS, applies date filters, splits users and likes, and writes compact artifacts used by all downstream stages.
+Stage 1 reads Ingex likes from GCS and writes production-shaped user-hour queries plus their positive posts.
 
 Common config keys:
 
 ```yaml
 gcs_bucket: "greenearth-471522-ingex-extract-prod"
-posts_start: "2026-06-20"
-posts_end: "2026-06-24"
 likes_start: "2026-06-20"
 likes_end: "2026-06-24"
 train_start: "2026-06-20"
 val_start: "2026-06-22"
 holdout_start: "2026-06-23"
 holdout_end: null
-max_trainval_users: 1000
-max_unseen_eval_users: 100
-max_likes_per_user: 16
-negative_samples_per_hour: 10
-political_negative_samples_per_hour: 0
-political_score_threshold: 0.8
-negative_sampling_alpha: 0.5
-min_likes_per_negative_post: 50
-initial_negative_sampling_pct: 0.1
-min_likes_per_user: 0
-memory_check: "skip"
+unseen_user_fraction: 0.10
+max_hours_per_user_per_split: 64
+max_train_query_hours: null
+max_eval_query_hours_per_split: null
+max_positives_per_user_hour: 32
+random_seed: 42
 ```
 
 Important Stage 1 behavior:
 
-- `max_likes_per_user` applies a deterministic random per-user cap.
-- `max_trainval_users` samples users eligible for train/validation/seen-holdout rows.
-- `max_unseen_eval_users` samples users used only for unseen validation and holdout.
-- `initial_negative_sampling_pct` hash-samples posts before global like counts are built for negative candidates.
-- `min_likes_per_negative_post` filters negative candidates by global like count over the configured likes window.
-- `negative_samples_per_hour` controls sampled negative post-hour rows. Each candidate is eligible from its created-hour through created-hour + 23.
-- `political_negative_samples_per_hour` targets this many supplemental political candidates in each hourly negative pool, in addition to any political posts already present in the ordinary sample. If fewer are available, it adds all available candidates. Political candidates bypass `initial_negative_sampling_pct` and `min_likes_per_negative_post` and are sampled uniformly with the deterministic post-hour score. `0` disables inference loading.
-- `political_score_threshold` is applied to both `text_arbitrary.Politics` and `topic.News & Social Concern`; both scores must meet the threshold.
-- `negative_sampling_alpha` weights negative sampling by `global_like_count ** alpha`.
-- `prior_cumulative_likes` is written to `likes_core` and `posts_core` as an exact prior-hour count from the configured likes window for selected positive and negative post-hour rows; same-hour likes are not included.
-- `liked_post_hour_cumulative_likes_*.parquet` stores sparse prior-hour popularity curves keyed by `emb_idx` for final liked/history posts only. It is used by Stage 2 history features, not sampled negatives.
-- `min_author_support` controls which authors get dedicated author embedding rows when author features are enabled.
+- Users are assigned deterministically to a 90% `trainval` cohort and a 10% `unseen_eval` cohort.
+- Seen users produce `train`, `val`, and `holdout_seen_users` queries. Unseen users produce only `val_unseen_users` and `holdout_unseen_users` queries.
+- Query-hours are hash-sampled independently of their positive counts. Each user contributes at most 64 query-hours per split by default.
+- Training and each evaluation split can be capped directly with query-hour budgets. The global caps default to no limit for the first slice.
+- Selected hours with more than 32 unique positives are discarded without backfill.
+- There is no minimum-likes eligibility filter.
 
-`posts_core_*.parquet` includes nullable `is_political`: sampled negatives meeting both politics thresholds are `true`; all other sampled negatives and liked-only rows are null.
-
-Primary artifacts include `likes_core_*.parquet`, `posts_core_*.parquet`, `liked_post_hour_cumulative_likes_*.parquet`, `embeddings_*.npy`, and, when available, `author_idx_*.parquet`.
+Primary artifacts are `queries_*.parquet`, keyed by `(did, query_hour)`, and `query_positives_*.parquet`, keyed by `(did, query_hour, subject_uri)`.
 
 ### Stage 2: User History
 
@@ -313,7 +300,7 @@ python cli.py --config config.yml \
 
 Accepted stage aliases:
 
-- `get_data`
+- `query_selection`
 - `user_history`
 - `train`, `train_mlp`, `train_two_tower`, `train_bst_ranker`
 - `evaluate`
@@ -327,12 +314,12 @@ By default, `config.yml` may set `background: true`. In background mode, the CLI
 Run in the foreground while iterating:
 
 ```bash
-python cli.py --config config.yml --background false
+python cli.py --config config.yml --stop-after query_selection --background false
 ```
 
 ## Development Notes
 
-- Keep Stage 1/2 artifact schemas stable when possible; all model types share them.
+- Treat `01_query_selection` as an explicit boundary until Stage 2 is rewritten for its artifact contract.
 - Use `utils/matrix_ranking.py` for matrix ranking metrics and ranking-row writes.
 - Use `utils/ranking_adapters.py` when adding checkpoint-backed comparison support.
 - Avoid adding new training paths without registering them in `engagement_prediction/pipeline/registry.py` and documenting their artifact contract here.

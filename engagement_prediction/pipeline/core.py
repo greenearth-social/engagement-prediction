@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Callable, List, Iterable
 import json
 import subprocess
+import sys
 import uuid
 from zoneinfo import ZoneInfo
 
@@ -445,7 +446,12 @@ def load_run_callable(module_path: Path) -> Callable[[Context, Any], Dict[str, A
     if spec is None or spec.loader is None:
         raise ImportError(f"Failed to load module at {module_path}")
     mod = module_from_spec(spec)
-    spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+    sys.modules[spec.name] = mod
+    try:
+        spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+    except Exception:
+        sys.modules.pop(spec.name, None)
+        raise
     if not hasattr(mod, 'run'):
         raise AttributeError(f"Stage module {module_path} has no run(context, args) function")
     return getattr(mod, 'run')
