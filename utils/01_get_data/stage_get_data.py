@@ -128,7 +128,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Callable, Iterable
 import polars as pl
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import re
 from google.cloud import storage
 import numpy as np
@@ -213,6 +213,17 @@ def _validate_political_sampling_parameters(
         raise ValueError("political_negative_samples_per_hour must be non-negative")
     if not 0 <= political_score_threshold <= 1:
         raise ValueError("political_score_threshold must be between 0 and 1")
+
+
+def _get_political_inference_file_range(
+    posts_start: Optional[datetime],
+    posts_end: Optional[datetime],
+) -> Tuple[Optional[datetime], Optional[datetime]]:
+    padding = timedelta(days=5)
+    return (
+        posts_start - padding if posts_start is not None else None,
+        posts_end + padding if posts_end is not None else None,
+    )
 
 
 def _parse_ts_from_name_ingex_gcs(
@@ -2193,11 +2204,15 @@ def _run_greenearth_pipeline(
     )
     inference_paths: List[str] = []
     if political_negative_samples_per_hour > 0:
+        inference_start_dt, inference_end_dt = _get_political_inference_file_range(
+            posts_start_dt,
+            posts_end_dt,
+        )
         inference_paths, _ = _list_files_with_timestamps_ingex_gcs(
             gcs_bucket=gcs_bucket,
             blob_prefix='bsky_inferences',
-            start=posts_start_dt,
-            end=posts_end_dt,
+            start=inference_start_dt,
+            end=inference_end_dt,
         )
         if not inference_paths:
             raise ValueError(

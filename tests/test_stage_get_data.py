@@ -5,7 +5,7 @@ import struct
 import sys
 import zlib
 import base64
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -109,6 +109,16 @@ def _disabled_political_sampling_kwargs():
         "political_score_threshold": 0.8,
         "inference_paths": [],
     }
+
+
+def test_political_inference_file_range_has_five_day_padding(stage_get_data_module):
+    start, end = stage_get_data_module._get_political_inference_file_range(
+        datetime(2024, 1, 10, tzinfo=timezone.utc),
+        datetime(2024, 1, 20, tzinfo=timezone.utc),
+    )
+
+    assert start == datetime(2024, 1, 5, tzinfo=timezone.utc)
+    assert end == datetime(2024, 1, 25, tzinfo=timezone.utc)
 
 
 def _make_posts_rows(embedding_model):
