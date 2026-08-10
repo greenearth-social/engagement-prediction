@@ -102,6 +102,8 @@ max_trainval_users: 1000
 max_unseen_eval_users: 100
 max_likes_per_user: 16
 negative_samples_per_hour: 10
+political_negative_samples_per_hour: 0
+political_score_threshold: 0.8
 negative_sampling_alpha: 0.5
 min_likes_per_negative_post: 50
 initial_negative_sampling_pct: 0.1
@@ -117,10 +119,14 @@ Important Stage 1 behavior:
 - `initial_negative_sampling_pct` hash-samples posts before global like counts are built for negative candidates.
 - `min_likes_per_negative_post` filters negative candidates by global like count over the configured likes window.
 - `negative_samples_per_hour` controls sampled negative post-hour rows. Each candidate is eligible from its created-hour through created-hour + 23.
+- `political_negative_samples_per_hour` targets this many supplemental political candidates in each hourly negative pool, in addition to any political posts already present in the ordinary sample. If fewer are available, it adds all available candidates. Political candidates bypass `initial_negative_sampling_pct` and `min_likes_per_negative_post` and are sampled uniformly with the deterministic post-hour score. `0` disables inference loading.
+- `political_score_threshold` is applied to both `text_arbitrary.Politics` and `topic.News & Social Concern`; both scores must meet the threshold.
 - `negative_sampling_alpha` weights negative sampling by `global_like_count ** alpha`.
 - `prior_cumulative_likes` is written to `likes_core` and `posts_core` as an exact prior-hour count from the configured likes window for selected positive and negative post-hour rows; same-hour likes are not included.
 - `liked_post_hour_cumulative_likes_*.parquet` stores sparse prior-hour popularity curves keyed by `emb_idx` for final liked/history posts only. It is used by Stage 2 history features, not sampled negatives.
 - `min_author_support` controls which authors get dedicated author embedding rows when author features are enabled.
+
+`posts_core_*.parquet` includes nullable `is_political`: sampled negatives meeting both politics thresholds are `true`; all other sampled negatives and liked-only rows are null.
 
 Primary artifacts include `likes_core_*.parquet`, `posts_core_*.parquet`, `liked_post_hour_cumulative_likes_*.parquet`, `embeddings_*.npy`, and, when available, `author_idx_*.parquet`.
 
@@ -212,9 +218,12 @@ python cli.py --model-type bst-ranker \
 
 BST training uses matrix ranking over same-hour candidate sets with additional sampled negatives. It requires `bst_num_transformer_layers: 1` because it uses the optimized one-layer matrix scorer.
 
+`--bst-political-batch-negatives` sets the minimum number of politics-labeled posts within the existing `--bst-additional-batch-negatives` cap. It defaults to `0`; if a batch's hourly pool contains fewer political negatives than requested, training uses all available political negatives without failing.
+
 Useful options:
 
 - `--bst-additional-batch-negatives`
+- `--bst-political-batch-negatives`
 - `--content-projection-dim`
 - `--author-projection-dim`
 - `--bst-model-dim`

@@ -575,7 +575,10 @@ def test_run_bst_listwise_epoch_computes_rank_metrics():
 def test_run_bst_listwise_epoch_reports_zero_history_metrics():
     model = _make_model()
     model.eval()
-    batch = {key: value.clone() for key, value in _listwise_batch().items()}
+    batch = {
+        key: value.clone() if isinstance(value, torch.Tensor) else value
+        for key, value in _listwise_batch().items()
+    }
     batch["history_mask"][1] = False
     loader = DataLoader(_SingleBatchDataset(batch), batch_size=None, shuffle=False)
 

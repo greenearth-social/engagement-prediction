@@ -104,6 +104,34 @@ def test_negative_sampling_popularity_args_merge_from_cli_and_config(tmp_path):
     assert merged.initial_negative_sampling_pct == 0.05
 
 
+def test_political_negative_sampling_args_merge_from_cli_and_config(tmp_path):
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--political-negative-samples-per-hour", "100",
+        "--political-score-threshold", "0.9",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.political_negative_samples_per_hour == 100
+    assert merged.political_score_threshold == 0.9
+    assert cli.DEFAULTS["political_negative_samples_per_hour"] == 0
+    assert cli.DEFAULTS["political_score_threshold"] == 0.8
+
+    config_path = Path(tmp_path) / "political_sampling.yml"
+    config_path.write_text(
+        "political_negative_samples_per_hour: 25\n"
+        "political_score_threshold: 0.75\n"
+    )
+    raw = parser.parse_args([
+        "--config", str(config_path),
+        "--political-negative-samples-per-hour", "50",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.political_negative_samples_per_hour == 50
+    assert merged.political_score_threshold == 0.75
+
+
 def test_user_sampling_args_replace_old_names(tmp_path):
     parser = cli.build_parser()
     raw = parser.parse_args(["--max-trainval-users", "123", "--max-unseen-eval-users", "45"])
@@ -252,6 +280,7 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
             prediction_hidden_dims: [128, 64]
             bst_weight_decay: 0.02
             bst_additional_batch_negatives: 32
+            bst_political_batch_negatives: 8
             batch_size: 16
             bst_max_train_batches_per_epoch: 5
             bst_use_popularity_feature: false
@@ -273,6 +302,7 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
     assert merged.bst_num_attention_heads == 8
     assert merged.prediction_hidden_dims == [128, 64]
     assert merged.bst_additional_batch_negatives == 32
+    assert merged.bst_political_batch_negatives == 8
     assert merged.batch_size == 16
     assert merged.bst_max_train_batches_per_epoch == 5
     assert merged.bst_use_popularity_feature is False
@@ -289,10 +319,29 @@ def test_bst_ranker_training_defaults():
     merged = cli._merge_args_with_config(raw)
 
     assert merged.bst_additional_batch_negatives == 64
+    assert merged.bst_political_batch_negatives == 0
     assert merged.batch_size == cli.DEFAULTS["batch_size"]
     assert merged.bst_max_train_batches_per_epoch is None
     assert merged.bst_use_popularity_feature is True
     assert merged.bst_popularity_projection_dim == 8
+    cli._validate_bst_config(merged)
+
+
+def test_bst_political_batch_negatives_cli_overrides_config(tmp_path):
+    config_path = Path(tmp_path) / "bst.yml"
+    config_path.write_text(
+        "model_type: bst-ranker\n"
+        "use_author_embedding_table: true\n"
+        "bst_political_batch_negatives: 4\n"
+    )
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--config", str(config_path),
+        "--bst-political-batch-negatives", "7",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.bst_political_batch_negatives == 7
     cli._validate_bst_config(merged)
 
 
@@ -328,6 +377,33 @@ def test_bst_ranker_rejects_non_positive_listwise_training_controls(flag, messag
     merged = cli._merge_args_with_config(raw)
 
     with pytest.raises(ValueError, match=message):
+        cli._validate_bst_config(merged)
+
+
+def test_bst_ranker_rejects_negative_political_batch_negatives():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "bst-ranker",
+        "--use-author-embedding-table",
+        "--bst-political-batch-negatives", "-1",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    with pytest.raises(ValueError, match="bst-political-batch-negatives"):
+        cli._validate_bst_config(merged)
+
+
+def test_bst_ranker_rejects_political_batch_negatives_above_total():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "bst-ranker",
+        "--use-author-embedding-table",
+        "--bst-additional-batch-negatives", "4",
+        "--bst-political-batch-negatives", "5",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    with pytest.raises(ValueError, match="must not exceed"):
         cli._validate_bst_config(merged)
 
 

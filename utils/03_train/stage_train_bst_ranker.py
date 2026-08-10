@@ -664,7 +664,6 @@ def run_bst_listwise_epoch(
     metric_user_count = 0
     zero_history_metric_sums = empty_rank_metric_sums(metrics_top_ks)
     zero_history_metric_user_count = 0
-
     with nullcontext() if train else torch.inference_mode():
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=split_name, leave=False, disable=disable_progress)):
             if max_batches is not None and batch_idx >= max_batches:
@@ -1049,6 +1048,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     popularity_projection_dim = int(args.bst_popularity_projection_dim)
     batch_size = int(args.batch_size)
     bst_additional_batch_negatives = int(args.bst_additional_batch_negatives)
+    bst_political_batch_negatives = int(args.bst_political_batch_negatives)
     bst_max_train_batches_per_epoch = getattr(args, "bst_max_train_batches_per_epoch", None)
     if bst_max_train_batches_per_epoch is not None:
         bst_max_train_batches_per_epoch = int(bst_max_train_batches_per_epoch)
@@ -1110,6 +1110,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         use_author_embedding_table=use_author_embedding_table,
         use_popularity_feature=use_popularity_feature,
         bst_additional_batch_negatives=bst_additional_batch_negatives,
+        bst_political_batch_negatives=bst_political_batch_negatives,
         seed=random_seed,
         logger=logger,
     )
@@ -1124,6 +1125,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         use_author_embedding_table=use_author_embedding_table,
         use_popularity_feature=use_popularity_feature,
         bst_additional_batch_negatives=bst_additional_batch_negatives,
+        bst_political_batch_negatives=bst_political_batch_negatives,
         seed=random_seed,
         logger=logger,
     )
@@ -1138,6 +1140,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         use_author_embedding_table=use_author_embedding_table,
         use_popularity_feature=use_popularity_feature,
         bst_additional_batch_negatives=bst_additional_batch_negatives,
+        bst_political_batch_negatives=bst_political_batch_negatives,
         seed=random_seed,
         logger=logger,
     )
@@ -1173,6 +1176,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "author_pad_idx": AUTHOR_PAD_IDX,
         "author_unk_idx": AUTHOR_UNK_IDX,
         "bst_additional_batch_negatives": bst_additional_batch_negatives,
+        "bst_political_batch_negatives": bst_political_batch_negatives,
         "bst_use_popularity_feature": use_popularity_feature,
         "bst_popularity_projection_dim": popularity_projection_dim,
         "bst_popularity_log_mean": popularity_log_mean,
@@ -1392,7 +1396,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "stage: train_bst_ranker",
         f"timestamp: {timestamp}",
         f"runtime_seconds: {runtime:.2f}",
-        f"settings: batch_size={batch_size}, bst_additional_batch_negatives={bst_additional_batch_negatives}, lr={learning_rate}, epochs={epochs}, max_history_len={max_history_len}, early_stopping_min_delta={early_stopping_min_delta}",
+        f"settings: batch_size={batch_size}, bst_additional_batch_negatives={bst_additional_batch_negatives}, bst_political_batch_negatives={bst_political_batch_negatives}, lr={learning_rate}, epochs={epochs}, max_history_len={max_history_len}, early_stopping_min_delta={early_stopping_min_delta}",
         f"train_samples: {len(train_dataset)}",
         f"val_samples: {len(val_dataset)}",
         f"val_unseen_samples: {len(val_unseen_dataset)}",
