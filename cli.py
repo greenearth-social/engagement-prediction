@@ -815,7 +815,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--negative-samples-per-hour", type=int, default=argparse.SUPPRESS,
                           help_text="Number of negative post-hour rows to sample per hour in Stage 1")
     _add_arg_with_default(p_all, "--political-negative-samples-per-hour", type=int, default=argparse.SUPPRESS,
-                          help_text="Minimum political negative post-hour rows per hour in Stage 1; 0 disables inference loading")
+                          help_text="Target number of supplemental political negative post-hour rows per hour in Stage 1; 0 disables inference loading")
     _add_arg_with_default(p_all, "--political-score-threshold", type=float, default=argparse.SUPPRESS,
                           help_text="Minimum required score for both politics inference signals in Stage 1")
     _add_arg_with_default(p_all, "--negative-sampling-alpha", type=float, default=argparse.SUPPRESS,

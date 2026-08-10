@@ -7,7 +7,6 @@ from __future__ import annotations
 import argparse
 import copy
 import json
-import logging
 import time
 from contextlib import nullcontext
 from pathlib import Path
