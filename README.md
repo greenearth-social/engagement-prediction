@@ -3,11 +3,11 @@
 This repo trains and evaluates engagement rankers for Bluesky posts. The artifact pipeline is being migrated to production-shaped user-hour queries:
 
 1. `01_query_selection`: load Ingex likes and select bounded `(user, hour)` queries with their positive posts.
-2. `02_user_history`: legacy Stage 2, pending a rewrite to consume query-selection artifacts.
-3. `03_train`: train an MLP, two-tower, or BST ranker.
+2. `02_user_history`: select the bounded as-of like history for every query.
+3. `03_train`: unchanged legacy training, pending a rewrite for the new data artifacts.
 4. `04_evaluate`: run holdout evaluation modules from ranking-row artifacts written by Stage 3.
 
-Query selection is currently an explicit pipeline boundary. Run it with `--stop-after query_selection`; it cannot yet continue into the unchanged Stage 2. Direct downstream reruns can still use existing `01_get_data` artifacts and prior pins.
+User history is currently an explicit pipeline boundary. Run the new data path with `--stop-after user_history`; it cannot yet continue into unchanged training. Direct legacy training reruns require explicit aligned `01_get_data` and legacy `02_user_history` pins.
 
 ## Setup
 
@@ -46,12 +46,14 @@ Tests use the `*_test.py` naming convention and live next to the code they cover
 
 ## Repository Layout
 
-- `cli.py`: unified pipeline CLI. `run-all` is implicit, so both invocation forms are accepted; the active Stage 1 currently requires `--stop-after query_selection`.
+- `cli.py`: unified pipeline CLI. `run-all` is implicit, so both invocation forms are accepted; the new data path currently requires `--stop-after user_history`.
 - `compare.py`: checkpoint-backed ranker comparison CLI.
 - `engagement_prediction/stages/query_selection.py`: active Stage 1 user-hour query selection.
-- `engagement_prediction/data/ingex.py`: reusable Ingex GCS listing and lazy Parquet scanning.
+- `engagement_prediction/stages/user_history.py`: active Stage 2 orchestration.
+- `engagement_prediction/data/ingex.py`: reusable Ingex access and exact source-file manifests.
+- `engagement_prediction/data/`: Parquet artifact loading, like normalization, and query-history transformations.
 - `utils/01_get_data/stage_get_data.py`: unregistered legacy Stage 1 retained while downstream stages still consume its artifacts.
-- `utils/02_user_history/stage_generate_user_history.py`: Stage 2 user-hour history directory with prior embedding ids, author ids, and time-delta features.
+- `utils/02_user_history/stage_generate_user_history.py`: unregistered legacy Stage 2 retained for pinned legacy training artifacts.
 - `utils/03_train/stage_train_mlp.py`: Stage 3 MLP matrix ranker.
 - `utils/03_train/stage_train_two_tower.py`: Stage 3 two-tower matrix ranker.
 - `utils/03_train/stage_train_bst_ranker.py`: Stage 3 BST heavy ranker.
@@ -66,13 +68,13 @@ Tests use the `*_test.py` naming convention and live next to the code they cover
 The CLI merges defaults, an optional YAML/JSON config, and explicit command-line flags. CLI flags win over config values.
 
 ```bash
-python cli.py --config config.yml --stop-after query_selection
+python cli.py --config config.yml --stop-after user_history
 ```
 
 For foreground local iteration:
 
 ```bash
-python cli.py --config config.yml --stop-after query_selection --background false --experiment-tracker none
+python cli.py --config config.yml --stop-after user_history --background false --experiment-tracker none
 ```
 
 ### Output Layout
@@ -115,29 +117,32 @@ Important Stage 1 behavior:
 - Selected hours with more than 32 unique positives are discarded without backfill.
 - There is no minimum-likes eligibility filter.
 
-Primary artifacts are `queries_*.parquet`, keyed by `(did, query_hour)`, and `query_positives_*.parquet`, keyed by `(did, query_hour, subject_uri)`.
+Primary artifacts are `queries_*.parquet`, keyed by `(did, query_hour)`, and `query_positives_*.parquet`, keyed by `(did, query_hour, subject_uri)`. Stage 1 also records the exact Ingex like-file snapshot in `like_sources_*.json` for Stage 2.
 
 ### Stage 2: User History
 
-Stage 2 creates `history_posts_*.parquet`, keyed by `(did, like_hour_bucket)`.
+Stage 2 rescans the exact Stage 1 like-file snapshot and creates the partitioned `query_histories_*` dataset, keyed by `(did, query_hour)`.
 
 The history artifact includes:
 
-- `prior_emb_indices`: prior liked post embedding ids, sorted most-recent first.
-- `prior_like_age_hours_at_bucket_start`: age of each prior like relative to the target hour bucket, aligned with `prior_emb_indices`.
-- `prior_cumulative_likes`: prior-hour popularity count for each prior liked post as of the target `like_hour_bucket`, aligned with `prior_emb_indices`.
-- `prior_author_indices`: aligned author ids when Stage 1 wrote author metadata.
-- `raw_prior_count`: uncapped count before `max_prior_likes`.
+- `history_subject_uris`: prior liked post URIs, sorted most-recent first.
+- `history_like_created_ats`: aligned UTC like timestamps.
+
+Every Stage 1 query has exactly one row, including explicit empty histories. Only likes strictly before the start of `query_hour` are eligible. Histories use all valid source likes from queried users, not only selected target likes, and preserve duplicate source events.
 
 Common config:
 
 ```yaml
-max_prior_likes: 64
+max_history_posts_per_query: 64
+user_history_partition_count: 256
 ```
+
+The source history window begins at `likes_start`. Set `likes_start` earlier than `train_start` when training queries need a warm-up period.
 
 ### Stage 3: Training
 
-All active model types use the same Stage 1/2 artifact contract and bucketed same-hour candidates.
+The unchanged training stages still use legacy `01_get_data` and legacy `02_user_history` artifacts. They do not yet consume `queries_*` or `query_histories_*`.
+The legacy ranker history contract includes `prior_like_age_hours_at_bucket_start`, embedding indices, author indices, and target-hour popularity lists.
 
 Shared training options:
 
@@ -292,6 +297,15 @@ Use `--start-from`, `--stop-after`, and prior pins to reuse artifacts:
 
 ```bash
 python cli.py --config config.yml \
+  --start-from user_history \
+  --stop-after user_history \
+  --prior-01-query-selection 20260811_120000_a1b2c3d4
+```
+
+Direct legacy training requires both aligned legacy pins:
+
+```bash
+python cli.py --config config.yml \
   --start-from train \
   --stop-after train \
   --prior-01-get-data 20260617_205310_fec862c8 \
@@ -314,12 +328,12 @@ By default, `config.yml` may set `background: true`. In background mode, the CLI
 Run in the foreground while iterating:
 
 ```bash
-python cli.py --config config.yml --stop-after query_selection --background false
+python cli.py --config config.yml --stop-after user_history --background false
 ```
 
 ## Development Notes
 
-- Treat `01_query_selection` as an explicit boundary until Stage 2 is rewritten for its artifact contract.
+- Treat `02_user_history` as the explicit new-pipeline boundary until training is rewritten for its artifact contract.
 - Use `utils/matrix_ranking.py` for matrix ranking metrics and ranking-row writes.
 - Use `utils/ranking_adapters.py` when adding checkpoint-backed comparison support.
 - Avoid adding new training paths without registering them in `engagement_prediction/pipeline/registry.py` and documenting their artifact contract here.

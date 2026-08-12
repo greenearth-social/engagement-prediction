@@ -40,11 +40,11 @@ import polars as pl
 import time
 
 from engagement_prediction.pipeline.core import Context
+from engagement_prediction.data.parquet import load_parquet_from_prior
 from utils.helpers import (
     get_stage_logger,
     log_operation_start,
     validate_dataframe_schema,
-    load_parquet_from_prior,
     TIMESTAMP_COL_NAME,
     HISTORY_POPULARITY_SEMANTICS,
 )

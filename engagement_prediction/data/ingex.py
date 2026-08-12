@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
+from pathlib import Path
 import re
 from typing import Any, Optional, Sequence, Tuple
 
@@ -10,6 +12,7 @@ import polars as pl
 
 
 TIMESTAMP_SUFFIX_PATTERN = r"_(\d{8})_(\d{6})\.parquet$"
+SOURCE_MANIFEST_VERSION = 1
 
 
 def parse_utc_datetime(value: Optional[str], *, field_name: str) -> Optional[datetime]:
@@ -84,3 +87,54 @@ def scan_parquet_files(paths: Sequence[str]) -> pl.LazyFrame:
     if not paths:
         raise ValueError("Cannot scan an empty collection of Parquet files")
     return pl.scan_parquet(list(paths))
+
+
+def build_source_manifest(
+    *,
+    gcs_bucket: str,
+    blob_prefix: str,
+    start: Optional[datetime],
+    end: Optional[datetime],
+    paths: Sequence[str],
+    timestamps: Sequence[datetime],
+) -> dict[str, Any]:
+    """Describe the exact Ingex files used by a stage."""
+    if len(paths) != len(timestamps):
+        raise ValueError("Ingex source paths and timestamps must have the same length")
+    return {
+        "version": SOURCE_MANIFEST_VERSION,
+        "gcs_bucket": str(gcs_bucket),
+        "blob_prefix": str(blob_prefix),
+        "start": start.isoformat() if start is not None else None,
+        "end": end.isoformat() if end is not None else None,
+        "files": [
+            {"uri": str(uri), "export_timestamp": timestamp.isoformat()}
+            for uri, timestamp in zip(paths, timestamps)
+        ],
+    }
+
+
+def write_source_manifest(path: Path, manifest: dict[str, Any]) -> None:
+    Path(path).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+
+def load_source_manifest(path: Path) -> dict[str, Any]:
+    """Load and validate an Ingex source manifest."""
+    path = Path(path)
+    try:
+        manifest = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Failed to parse Ingex source manifest {path}: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Ingex source manifest {path} must contain a JSON object")
+    if manifest.get("version") != SOURCE_MANIFEST_VERSION:
+        raise ValueError(
+            f"Unsupported Ingex source manifest version in {path}: {manifest.get('version')!r}"
+        )
+    files = manifest.get("files")
+    if not isinstance(files, list) or not files:
+        raise ValueError(f"Ingex source manifest {path} must contain a non-empty files list")
+    for entry in files:
+        if not isinstance(entry, dict) or not entry.get("uri") or not entry.get("export_timestamp"):
+            raise ValueError(f"Ingex source manifest {path} contains an invalid file entry")
+    return manifest

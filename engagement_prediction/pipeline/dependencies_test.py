@@ -9,6 +9,7 @@ from engagement_prediction.pipeline.dependencies import (
     get_stage_input_folders,
     resolve_stage_dependencies_for_run,
     validate_explicit_prior_pin_consistency,
+    validate_legacy_training_inputs,
 )
 
 
@@ -42,130 +43,108 @@ def test_get_stage_folder_to_keys_is_derived_from_registry():
 def test_get_stage_input_folders_is_derived_from_stage_order():
     assert get_stage_input_folders() == {
         "01_query_selection": [],
-        "02_user_history": ["01_get_data"],
-        "03_train": ["01_get_data", "02_user_history"],
-        "04_evaluate": ["01_get_data", "02_user_history", "03_train"],
+        "02_user_history": ["01_query_selection"],
+        "03_train": [],
+        "04_evaluate": [],
     }
 
 
-def test_resolve_stage_dependencies_for_train_follows_latest_downstream_lineage(tmp_path):
+def test_resolve_stage_dependencies_for_user_history_selects_latest_query_artifact(tmp_path):
     artifacts_dir = Path(tmp_path) / "artifacts"
     run_dir = Path(tmp_path) / "runs" / "run1"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    get_data_old = _make_stage_output(artifacts_dir, "01_get_data", "20260101_000000_oldget")
-    get_data_new = _make_stage_output(artifacts_dir, "01_get_data", "20260105_000000_newget")
-    _make_stage_output(
-        artifacts_dir,
-        "02_user_history",
-        "20260103_000000_oldhistory",
-        inputs={"01_get_data": str(get_data_old)},
-    )
-    user_history_new = _make_stage_output(
-        artifacts_dir,
-        "02_user_history",
-        "20260106_000000_newhistory",
-        inputs={"01_get_data": str(get_data_new)},
-    )
+    _make_stage_output(artifacts_dir, "01_query_selection", "20260101_000000_old")
+    query_new = _make_stage_output(artifacts_dir, "01_query_selection", "20260105_000000_new")
 
     ctx = Context(run_dir=run_dir, artifacts_dir=artifacts_dir, runs_dir=Path(tmp_path) / "runs", use_latest=True)
 
     resolved = resolve_stage_dependencies_for_run(
         ctx=ctx,
-        consumer_stage_folder="03_train",
+        consumer_stage_folder="02_user_history",
     )
 
-    assert resolved == {
-        "01_get_data": get_data_new.resolve(),
-        "02_user_history": user_history_new.resolve(),
-    }
+    assert resolved == {"01_query_selection": query_new.resolve()}
 
 
-def test_resolve_stage_dependencies_raises_on_misaligned_explicit_pins(tmp_path):
+def test_validate_explicit_prior_pin_consistency_rejects_misaligned_query_history(tmp_path):
     artifacts_dir = Path(tmp_path) / "artifacts"
     run_dir = Path(tmp_path) / "runs" / "run1"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    get_data_old = _make_stage_output(artifacts_dir, "01_get_data", "20260101_000000_oldget")
-    get_data_new = _make_stage_output(artifacts_dir, "01_get_data", "20260104_000000_newget")
-    _make_stage_output(
+    query_old = _make_stage_output(artifacts_dir, "01_query_selection", "20260101_000000_old")
+    query_new = _make_stage_output(artifacts_dir, "01_query_selection", "20260104_000000_new")
+    user_history = _make_stage_output(
         artifacts_dir,
         "02_user_history",
-        "20260102_000000_oldhistory",
-        inputs={"01_get_data": str(get_data_old)},
-    )
-    user_history_new = _make_stage_output(
-        artifacts_dir,
-        "02_user_history",
-        "20260106_000000_newhistory",
-        inputs={"01_get_data": str(get_data_new)},
+        "20260105_000000_history",
+        inputs={"01_query_selection": str(query_new)},
     )
 
     ctx = Context(run_dir=run_dir, artifacts_dir=artifacts_dir, runs_dir=Path(tmp_path) / "runs", use_latest=True)
-    ctx.prior_outputs["01_get_data"] = get_data_old
-    ctx.prior_outputs["02_user_history"] = user_history_new
-
-    with pytest.raises(ValueError, match="Misaligned inputs for stage '03_train'"):
-        resolve_stage_dependencies_for_run(
-            ctx=ctx,
-            consumer_stage_folder="03_train",
-        )
-
-
-def test_resolve_stage_dependencies_for_evaluate_infers_inputs_from_train_manifest(tmp_path):
-    artifacts_dir = Path(tmp_path) / "artifacts"
-    run_dir = Path(tmp_path) / "runs" / "run1"
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    get_data_old = _make_stage_output(artifacts_dir, "01_get_data", "20260101_000000_oldget")
-    _make_stage_output(artifacts_dir, "01_get_data", "20260109_000000_newget")
-    user_history_old = _make_stage_output(
-        artifacts_dir,
-        "02_user_history",
-        "20260103_000000_oldhistory",
-        inputs={"01_get_data": str(get_data_old)},
-    )
-    train_old = _make_stage_output(
-        artifacts_dir,
-        "03_train",
-        "20260104_000000_oldtrain",
-        inputs={
-            "01_get_data": str(get_data_old),
-            "02_user_history": str(user_history_old),
-        },
-    )
-
-    ctx = Context(run_dir=run_dir, artifacts_dir=artifacts_dir, runs_dir=Path(tmp_path) / "runs", use_latest=True)
-
-    resolved = resolve_stage_dependencies_for_run(
-        ctx=ctx,
-        consumer_stage_folder="04_evaluate",
-    )
-
-    assert resolved == {
-        "01_get_data": get_data_old.resolve(),
-        "02_user_history": user_history_old.resolve(),
-        "03_train": train_old.resolve(),
-    }
-
-
-def test_validate_explicit_prior_pin_consistency_raises_on_misaligned_stage1_history_pins(tmp_path):
-    artifacts_dir = Path(tmp_path) / "artifacts"
-    run_dir = Path(tmp_path) / "runs" / "run1"
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    get_data_old = _make_stage_output(artifacts_dir, "01_get_data", "20260101_000000_oldget")
-    get_data_new = _make_stage_output(artifacts_dir, "01_get_data", "20260104_000000_newget")
-    user_history_new = _make_stage_output(
-        artifacts_dir,
-        "02_user_history",
-        "20260105_000000_newhistory",
-        inputs={"01_get_data": str(get_data_new)},
-    )
-
-    ctx = Context(run_dir=run_dir, artifacts_dir=artifacts_dir, runs_dir=Path(tmp_path) / "runs", use_latest=True)
-    ctx.prior_outputs["01_get_data"] = get_data_old
-    ctx.prior_outputs["02_user_history"] = user_history_new
+    ctx.prior_outputs["01_query_selection"] = query_old
+    ctx.prior_outputs["02_user_history"] = user_history
 
     with pytest.raises(ValueError, match="Explicit prior pins are inconsistent"):
         validate_explicit_prior_pin_consistency(ctx)
+
+
+def test_validate_legacy_training_inputs_accepts_aligned_explicit_artifacts(tmp_path):
+    artifacts_dir = Path(tmp_path) / "artifacts"
+    run_dir = Path(tmp_path) / "runs" / "run1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    get_data = _make_stage_output(artifacts_dir, "01_get_data", "20260101_000000_get")
+    user_history = _make_stage_output(
+        artifacts_dir,
+        "02_user_history",
+        "20260102_000000_history",
+        inputs={"01_get_data": str(get_data)},
+    )
+    (user_history / "history_posts_test.parquet").touch()
+
+    ctx = Context(run_dir=run_dir, artifacts_dir=artifacts_dir, runs_dir=Path(tmp_path) / "runs", use_latest=True)
+    ctx.prior_outputs["01_get_data"] = get_data
+    ctx.prior_outputs["02_user_history"] = user_history
+
+    assert validate_legacy_training_inputs(ctx) == {
+        "01_get_data": get_data.resolve(),
+        "02_user_history": user_history.resolve(),
+    }
+
+
+def test_validate_legacy_training_inputs_rejects_new_or_misaligned_history(tmp_path):
+    artifacts_dir = Path(tmp_path) / "artifacts"
+    run_dir = Path(tmp_path) / "runs" / "run1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    get_data = _make_stage_output(artifacts_dir, "01_get_data", "20260101_000000_get")
+    other_get_data = _make_stage_output(artifacts_dir, "01_get_data", "20260102_000000_other")
+    user_history = _make_stage_output(
+        artifacts_dir,
+        "02_user_history",
+        "20260103_000000_history",
+        inputs={"01_get_data": str(other_get_data)},
+    )
+    (user_history / "history_posts_test.parquet").touch()
+
+    ctx = Context(run_dir=run_dir, artifacts_dir=artifacts_dir, runs_dir=Path(tmp_path) / "runs", use_latest=True)
+    ctx.prior_outputs["01_get_data"] = get_data
+    ctx.prior_outputs["02_user_history"] = user_history
+    with pytest.raises(ValueError, match="was built from"):
+        validate_legacy_training_inputs(ctx)
+
+    query_selection = _make_stage_output(
+        artifacts_dir,
+        "01_query_selection",
+        "20260104_000000_query",
+    )
+    new_history = _make_stage_output(
+        artifacts_dir,
+        "02_user_history",
+        "20260105_000000_newhistory",
+        inputs={"01_query_selection": str(query_selection)},
+    )
+    ctx.prior_outputs["02_user_history"] = new_history
+    with pytest.raises(ValueError, match="New query-history artifacts"):
+        validate_legacy_training_inputs(ctx)

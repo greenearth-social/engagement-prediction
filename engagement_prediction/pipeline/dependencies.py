@@ -6,13 +6,12 @@ Helpers for resolving lineage-aligned stage artifacts.
 This module keeps the provenance logic out of ``cli.py`` so the CLI stays
 focused on argument handling and stage orchestration.
 
-The legacy downstream pipeline is linear at the artifact-folder level:
+The active data pipeline currently ends at query-conditioned user history:
 
-01_get_data -> 02_user_history -> 03_train -> 04_evaluate
+01_query_selection -> 02_user_history
 
-The active query-selection Stage 1 intentionally does not feed the unchanged
-legacy Stage 2 yet. Direct downstream reruns continue to resolve the legacy
-01_get_data lineage until Stage 2 is rewritten.
+The unchanged training and evaluation stages remain available only through an
+explicitly pinned legacy compatibility path.
 """
 
 from __future__ import annotations
@@ -39,23 +38,52 @@ def get_stage_folder_to_keys() -> Dict[str, Tuple[str, ...]]:
 
 
 def get_stage_input_folders() -> Dict[str, List[str]]:
-    """Return artifact-folder dependencies across the temporary Stage 1 boundary.
-
-    Query selection has no inputs. The unchanged downstream stages retain their
-    legacy ``01_get_data`` lineage so they can still be rerun directly from
-    existing artifacts. This compatibility branch should be removed when Stage
-    2 is rewritten to consume ``01_query_selection``.
-    """
+    """Return dependencies for the active, production-shaped pipeline."""
     registered_folders = set(get_stage_folder_to_keys().keys())
     dependencies: Dict[str, List[str]] = {}
     if "01_query_selection" in registered_folders:
         dependencies["01_query_selection"] = []
-
-    legacy_order = ["01_get_data", "02_user_history", "03_train", "04_evaluate"]
-    for idx, folder in enumerate(legacy_order[1:], start=1):
-        if folder in registered_folders:
-            dependencies[folder] = legacy_order[:idx]
+    if "02_user_history" in registered_folders:
+        dependencies["02_user_history"] = ["01_query_selection"]
+    if "03_train" in registered_folders:
+        dependencies["03_train"] = []
+    if "04_evaluate" in registered_folders:
+        dependencies["04_evaluate"] = []
     return dependencies
+
+
+def validate_legacy_training_inputs(ctx: Context) -> Dict[str, Path]:
+    """Validate the explicitly pinned legacy Stage 1/2 training contract."""
+    get_data_raw = ctx.prior_outputs.get("01_get_data")
+    user_history_raw = ctx.prior_outputs.get("02_user_history")
+    if get_data_raw is None or user_history_raw is None:
+        raise ValueError(
+            "Direct legacy training requires explicit --prior-01-get-data and "
+            "--prior-02-user-history pins."
+        )
+    get_data_dir = Path(get_data_raw).resolve()
+    user_history_dir = Path(user_history_raw).resolve()
+    manifest = load_stage_manifest(user_history_dir)
+    recorded_get_data = manifest.get("inputs", {}).get("01_get_data")
+    if not recorded_get_data:
+        raise ValueError(
+            f"Pinned legacy user-history artifact '{user_history_dir}' does not record an "
+            "01_get_data input. New query-history artifacts cannot feed legacy training."
+        )
+    if Path(recorded_get_data).resolve() != get_data_dir:
+        raise ValueError(
+            f"Pinned legacy user-history artifact '{user_history_dir}' was built from "
+            f"'{Path(recorded_get_data).resolve()}', not pinned 01_get_data '{get_data_dir}'."
+        )
+    if not list(user_history_dir.glob("history_posts_*.parquet")):
+        raise ValueError(
+            f"Pinned user-history artifact '{user_history_dir}' is missing the legacy "
+            "history_posts_*.parquet required by unchanged training."
+        )
+    return {
+        "01_get_data": get_data_dir,
+        "02_user_history": user_history_dir,
+    }
 
 
 def load_stage_manifest(stage_dir: Path) -> Dict[str, Any]:
@@ -346,6 +374,14 @@ def pin_lineage_aligned_inputs(ctx: Context, stage_key: str, stage_folder_map: D
     implementation and any downstream helpers read the same lineage-aligned
     artifact set.
     """
+    if stage_key.startswith("train_"):
+        resolved = validate_legacy_training_inputs(ctx)
+        for folder, path in resolved.items():
+            ctx.prior_outputs[folder] = path
+        return
+    if stage_key == "evaluate":
+        return
+
     consumer_stage_folder = stage_folder_map[stage_key]
     resolved = resolve_stage_dependencies_for_run(
         ctx=ctx,

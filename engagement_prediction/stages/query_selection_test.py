@@ -404,6 +404,7 @@ def test_registry_run_writes_query_artifacts_and_manifest(tmp_path, monkeypatch)
     output_dir = Path(result["output_dir"])
     queries = pl.read_parquet(result["artifacts"]["queries_path"])
     positives = pl.read_parquet(result["artifacts"]["query_positives_path"])
+    like_sources = json.loads(Path(result["artifacts"]["like_sources_path"]).read_text())
     candidate_query_counts_paths = list(output_dir.glob("_candidate_query_counts_*.parquet"))
 
     assert output_dir.parent.name == "01_query_selection"
@@ -421,6 +422,7 @@ def test_registry_run_writes_query_artifacts_and_manifest(tmp_path, monkeypatch)
     assert positives.columns == ["did", "query_hour", "subject_uri", "like_created_at"]
     assert queries.height == 1
     assert positives.height == 2
+    assert [entry["uri"] for entry in like_sources["files"]] == [str(likes_path)]
     assert json.loads((output_dir / "manifest.json").read_text())["stage_key"] == "query_selection"
     assert (output_dir / "summary.json").exists()
     assert (output_dir / "stage.log").exists()

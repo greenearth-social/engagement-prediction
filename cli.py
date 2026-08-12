@@ -9,8 +9,8 @@ Runs the engagement prediction artifact pipeline.
 Note: The historical `run-all` subcommand is now optional (kept for backwards compatibility).
 
 Usage examples:
-    python cli.py --config config.yml --stop-after query_selection
-    python cli.py run-all --config config.yml --stop-after query_selection
+    python cli.py --config config.yml --stop-after user_history
+    python cli.py run-all --config config.yml --stop-after user_history
 """
 
 import argparse
@@ -64,6 +64,8 @@ DEFAULTS: Dict[str, Any] = {
     "max_train_query_hours": None,
     "max_eval_query_hours_per_split": None,
     "max_positives_per_user_hour": 32,
+    "max_history_posts_per_query": 64,
+    "user_history_partition_count": 256,
     "negative_samples_per_hour": 1000,  # Stage 1: sampled negative post-hour rows per bucket
     "political_negative_samples_per_hour": 0,  # Stage 1: additional political negative post-hour rows per bucket; 0 disables inference loading
     "political_score_threshold": 0.8,  # Stage 1: minimum required score for both politics inference signals
@@ -80,7 +82,6 @@ DEFAULTS: Dict[str, Any] = {
     "embedding_model": "all_MiniLM_L12_v2",
     "skip_embeddings": False,
     # Stage 1 split labels / Stage 2 history
-    "max_prior_likes": None,  # Stage 2: cap on prior likes per target for user history (None = no cap)
     "train_start": None,
     "val_start": None,
     "holdout_start": None,
@@ -160,6 +161,7 @@ DEFAULTS: Dict[str, Any] = {
     "pick_prior": False,
     # Prior pins (optional): may be a stage_run_id (dir name under artifacts/<stage>/)
     # or a path (absolute, or relative to --output-dir).
+    "prior_01_query_selection": None,
     "prior_01_get_data": None,
     "prior_02_user_history": None,
     "prior_03_train": None,
@@ -391,7 +393,7 @@ def cmd_run_all(args: argparse.Namespace) -> int:
         args.stop_after,
         train_key,
     )
-    _validate_query_selection_boundary(stage_order, start_idx, stop_idx)
+    _validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
 
     # Store the single timestamp in Context; for background runs we pass it via env.
     run_timestamp = (os.environ.get("ENGAGEMENT_RUN_TIMESTAMP") or "").strip() or generate_run_timestamp()
@@ -645,17 +647,29 @@ def _get_stage_folder_and_start_stop_indices(
     return start_idx, stop_idx, includes_train
 
 
-def _validate_query_selection_boundary(
+def _validate_data_pipeline_boundary(
+    args: argparse.Namespace,
     stage_order: List[str],
     start_idx: int,
     stop_idx: int,
 ) -> None:
-    query_selection_idx = stage_order.index("query_selection")
-    if start_idx <= query_selection_idx < stop_idx:
+    user_history_idx = stage_order.index("user_history")
+    if start_idx <= user_history_idx < stop_idx:
         raise ValueError(
-            "query_selection cannot yet continue into user_history: the unchanged legacy Stage 2 "
-            "requires 01_get_data artifacts. Run with --stop-after query_selection."
+            "user_history cannot yet continue into unchanged training stages. "
+            "Run the new data pipeline with --stop-after user_history."
         )
+    train_idx = next(idx for idx, key in enumerate(stage_order) if key.startswith("train_"))
+    evaluate_idx = stage_order.index("evaluate")
+    if start_idx == train_idx and (
+        args.prior_01_get_data is None or args.prior_02_user_history is None
+    ):
+        raise ValueError(
+            "Direct legacy training requires explicit --prior-01-get-data and "
+            "--prior-02-user-history pins."
+        )
+    if start_idx == evaluate_idx and args.prior_03_train is None:
+        raise ValueError("Direct legacy evaluation requires an explicit --prior-03-train pin.")
 
 
 def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
@@ -665,6 +679,12 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     output_root = Path(args.output_dir).resolve()
 
     # Apply non-interactive prior pins (paths or stage_run_ids).
+    prior_01_query_selection = _resolve_prior_spec(
+        args.prior_01_query_selection,
+        output_root=output_root,
+        artifacts_dir=artifacts_dir,
+        stage_folder="01_query_selection",
+    )
     prior_01_get_data = _resolve_prior_spec(
         args.prior_01_get_data,
         output_root=output_root,
@@ -683,6 +703,8 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
         artifacts_dir=artifacts_dir,
         stage_folder="03_train",
     )
+    if prior_01_query_selection is not None:
+        ctx.prior_outputs["01_query_selection"] = prior_01_query_selection
     if prior_01_get_data is not None:
         ctx.prior_outputs["01_get_data"] = prior_01_get_data
     if prior_02_user_history is not None:
@@ -724,7 +746,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
         args.stop_after,
         train_key
     )
-    _validate_query_selection_boundary(stage_order, start_idx, stop_idx)
+    _validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
 
     # Optional interactive chooser (foreground only)
     def _maybe_choose_prior(stage_key: str):
@@ -873,8 +895,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--skip-embeddings", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help_text="Skip embedding validation/memmap write in Stage 1 (faster iteration; later stages that need embeddings will fail)")
     # Stage 1 split / Stage 2 options
-    _add_arg_with_default(p_all, "--max-prior-likes", type=int, default=argparse.SUPPRESS,
-                          help_text="Cap on prior likes per target in Stage 2 user history (None = no cap, keeps all prior likes)")
+    _add_arg_with_default(p_all, "--max-history-posts-per-query", type=int, default=argparse.SUPPRESS,
+                          help_text="Maximum recent like events retained in each Stage 2 query history")
+    _add_arg_with_default(p_all, "--user-history-partition-count", type=int, default=argparse.SUPPRESS,
+                          help_text="Stable DID-hash partition count used to bound Stage 2 memory")
     _add_arg_with_default(p_all, "--train-start", type=str, default=argparse.SUPPRESS,
                           help_text="ISO date string for start of training dataset window")
     _add_arg_with_default(p_all, "--val-start", type=str, default=argparse.SUPPRESS,
@@ -1039,10 +1063,12 @@ def build_parser() -> argparse.ArgumentParser:
                           default=argparse.SUPPRESS, help_text="Stop after this stage completes")
     _add_arg_with_default(p_all, "--pick-prior", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help_text="If multiple prior outputs exist, prompt to pick (foreground only)")
+    _add_arg_with_default(p_all, "--prior-01-query-selection", type=str, default=argparse.SUPPRESS,
+                          help_text="Pin prior Stage 1 (01_query_selection) artifact dir by stage_run_id or path")
     _add_arg_with_default(p_all, "--prior-01-get-data", type=str, default=argparse.SUPPRESS,
-                          help_text="Pin prior Stage 1 (01_get_data) artifact dir by stage_run_id or path")
+                          help_text="Pin legacy Stage 1 (01_get_data) artifact dir by stage_run_id or path")
     _add_arg_with_default(p_all, "--prior-02-user-history", type=str, default=argparse.SUPPRESS,
-                          help_text="Pin prior Stage 2 (02_user_history) artifact dir by stage_run_id or path")
+                          help_text="Pin legacy Stage 2 (02_user_history) artifact dir for direct training")
     _add_arg_with_default(p_all, "--prior-03-train", type=str, default=argparse.SUPPRESS,
                           help_text="Pin prior Stage 3 (03_train) artifact dir by stage_run_id or path (used by eval)")
     # Execution behavior

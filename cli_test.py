@@ -1,6 +1,8 @@
 from pathlib import Path
 import textwrap
+from datetime import datetime, timezone
 
+import polars as pl
 import pytest
 
 import cli
@@ -175,9 +177,14 @@ def test_query_sampling_defaults():
     assert merged.max_train_query_hours is None
     assert merged.max_eval_query_hours_per_split is None
     assert merged.max_positives_per_user_hour == 32
+    assert merged.max_history_posts_per_query == 64
+    assert merged.user_history_partition_count == 256
+
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["--max-prior-likes", "64"])
 
 
-def test_query_selection_cannot_continue_into_legacy_stage_two(tmp_path):
+def test_user_history_cannot_continue_into_legacy_training(tmp_path):
     parser = cli.build_parser()
     merged = cli._merge_args_with_config(parser.parse_args([]))
     merged.output_dir = str(tmp_path)
@@ -188,8 +195,84 @@ def test_query_selection_cannot_continue_into_legacy_stage_two(tmp_path):
         pipeline_run_id="run",
     )
 
-    with pytest.raises(ValueError, match="--stop-after query_selection"):
+    with pytest.raises(ValueError, match="--stop-after user_history"):
         cli.cmd__run_all_exec(merged, ctx)
+
+
+def test_new_pipeline_can_stop_after_user_history():
+    args = cli._merge_args_with_config(
+        cli.build_parser().parse_args(["--stop-after", "user_history"])
+    )
+    stage_order = cli._get_stage_order_for_model_type(cli._get_train_key(args.model_type))
+    start_idx, stop_idx, _ = cli._get_stage_folder_and_start_stop_indices(
+        stage_order,
+        args.start_from,
+        args.stop_after,
+        cli._get_train_key(args.model_type),
+    )
+
+    cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
+
+
+def test_new_pipeline_runs_query_selection_through_user_history(tmp_path, monkeypatch):
+    likes_path = Path(tmp_path) / "likes.parquet"
+    pl.DataFrame({
+        "did": ["u1", "u1", "u1"],
+        "subject_uri": ["history", "target-one", "target-two"],
+        "record_created_at": [
+            "2026-01-01T09:00:00Z",
+            "2026-01-01T10:05:00Z",
+            "2026-01-01T12:05:00Z",
+        ],
+    }).write_parquet(likes_path)
+    monkeypatch.setattr(
+        "engagement_prediction.data.ingex.list_ingex_parquet_files",
+        lambda **kwargs: ([str(likes_path)], [datetime(2026, 1, 1, 8, tzinfo=timezone.utc)]),
+    )
+    args = cli._merge_args_with_config(cli.build_parser().parse_args([
+        "--stop-after", "user_history",
+        "--likes-start", "2026-01-01T08:00:00Z",
+        "--likes-end", "2026-01-02T00:00:00Z",
+        "--train-start", "2026-01-01T10:00:00Z",
+        "--val-start", "2026-01-02T00:00:00Z",
+        "--unseen-user-fraction", "0",
+        "--user-history-partition-count", "2",
+    ]))
+    output_root = Path(tmp_path) / "output"
+    output_root.mkdir()
+    args.output_dir = str(output_root)
+    args._argv = ["--stop-after", "user_history"]
+    context = cli.Context(
+        run_dir=output_root / "runs" / "run",
+        artifacts_dir=output_root / "artifacts",
+        runs_dir=output_root / "runs",
+        pipeline_run_id="run",
+    )
+
+    assert cli.cmd__run_all_exec(args, context) == 0
+    assert context.get_artifact_dir("query_selection") is not None
+    history_dir = context.get_artifact_dir("user_history")
+    assert history_dir is not None
+    assert list(history_dir.glob("query_histories_*"))
+
+
+def test_direct_legacy_training_requires_both_explicit_pins():
+    args = cli._merge_args_with_config(
+        cli.build_parser().parse_args(["--start-from", "train", "--stop-after", "train"])
+    )
+    stage_order = cli._get_stage_order_for_model_type(cli._get_train_key(args.model_type))
+    start_idx, stop_idx, _ = cli._get_stage_folder_and_start_stop_indices(
+        stage_order,
+        args.start_from,
+        args.stop_after,
+        cli._get_train_key(args.model_type),
+    )
+    with pytest.raises(ValueError, match="explicit --prior-01-get-data"):
+        cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
+
+    args.prior_01_get_data = "get"
+    args.prior_02_user_history = "history"
+    cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
 
 
 def test_background_effective_config_preserves_no_post_encoder(tmp_path):
@@ -604,6 +687,7 @@ def test_merge_args_with_config_accepts_prior_pins(tmp_path):
     config_path.write_text(
         textwrap.dedent(
             """
+            prior_01_query_selection: 20260100_000000_feedface
             prior_01_get_data: 20260101_000000_deadbeef
             prior_02_user_history: 20260102_000000_cafebabe
             """
@@ -615,5 +699,6 @@ def test_merge_args_with_config_accepts_prior_pins(tmp_path):
     raw = parser.parse_args(["--config", str(config_path)])
     merged = cli._merge_args_with_config(raw)
 
+    assert merged.prior_01_query_selection == "20260100_000000_feedface"
     assert merged.prior_01_get_data == "20260101_000000_deadbeef"
     assert merged.prior_02_user_history == "20260102_000000_cafebabe"

@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 from engagement_prediction.data import ingex
@@ -49,3 +50,20 @@ def test_list_ingex_parquet_files_filters_and_sorts():
 
     assert uris == ["gs://test-bucket/bsky_likes_20260807_020000.parquet"]
     assert timestamps == [datetime(2026, 8, 7, 2, tzinfo=timezone.utc)]
+
+
+def test_source_manifest_round_trip_records_exact_files(tmp_path):
+    start = datetime(2026, 8, 7, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 8, 7, 3, tzinfo=timezone.utc)
+    manifest = ingex.build_source_manifest(
+        gcs_bucket="bucket",
+        blob_prefix="bsky_likes",
+        start=start,
+        end=end,
+        paths=["gs://bucket/one.parquet", "gs://bucket/two.parquet"],
+        timestamps=[start, datetime(2026, 8, 7, 2, tzinfo=timezone.utc)],
+    )
+    path = Path(tmp_path) / "sources.json"
+    ingex.write_source_manifest(path, manifest)
+
+    assert ingex.load_source_manifest(path) == manifest

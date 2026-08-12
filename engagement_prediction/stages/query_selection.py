@@ -12,12 +12,11 @@ from typing import Any, Dict, Optional, Tuple
 
 import polars as pl
 
-from engagement_prediction.data import ingex
+from engagement_prediction.data import ingex, likes
 from engagement_prediction.pipeline.core import Context
 from utils.helpers import get_stage_logger
 
 
-LIKE_TIMESTAMP_COLUMN = "record_created_at"
 QUERY_KEY = ["did", "query_hour"]
 POSITIVE_KEY = ["did", "query_hour", "subject_uri"]
 RAW_POSITIVE_COUNT_COLUMN = "raw_positive_count"
@@ -135,42 +134,6 @@ def build_config(args: argparse.Namespace) -> QuerySelectionConfig:
     )
 
 
-def _timestamp_expr(lf: pl.LazyFrame) -> pl.Expr:
-    schema = lf.collect_schema()
-    if LIKE_TIMESTAMP_COLUMN not in schema:
-        raise ValueError(f"Input likes are missing required column {LIKE_TIMESTAMP_COLUMN!r}")
-    dtype = schema[LIKE_TIMESTAMP_COLUMN]
-    timestamp = pl.col(LIKE_TIMESTAMP_COLUMN)
-    if dtype == pl.String:
-        has_timezone = timestamp.str.contains(r"(Z|[+-]\d{2}:?\d{2})$")
-        normalized_text = pl.when(has_timezone).then(timestamp).otherwise(timestamp + pl.lit("Z"))
-        return normalized_text.str.to_datetime(
-            format="%Y-%m-%dT%H:%M:%S%.f%#z",
-            time_zone="UTC",
-            strict=False,
-        )
-    if isinstance(dtype, pl.Datetime):
-        if dtype.time_zone is None:
-            return timestamp.dt.replace_time_zone("UTC")
-        return timestamp.dt.convert_time_zone("UTC")
-    raise ValueError(
-        f"{LIKE_TIMESTAMP_COLUMN} must be a string or datetime column, found {dtype}"
-    )
-
-
-def _normalize_likes(likes_lf: pl.LazyFrame) -> pl.LazyFrame:
-    required = {"did", "subject_uri", LIKE_TIMESTAMP_COLUMN}
-    missing = required - set(likes_lf.collect_schema().names())
-    if missing:
-        raise ValueError(f"Input likes are missing required columns: {', '.join(sorted(missing))}")
-
-    return likes_lf.select(
-        pl.col("did").cast(pl.String),
-        pl.col("subject_uri").cast(pl.String),
-        _timestamp_expr(likes_lf).alias("like_created_at"),
-    )
-
-
 def _with_user_cohort(
     lf: pl.LazyFrame,
     *,
@@ -274,11 +237,11 @@ def _prepare_likes(
     likes_lf: pl.LazyFrame,
     config: QuerySelectionConfig,
 ) -> pl.LazyFrame:
-    filtered_lf = _normalize_likes(likes_lf)
-    if config.likes_start is not None:
-        filtered_lf = filtered_lf.filter(pl.col("like_created_at") >= pl.lit(config.likes_start))
-    if config.likes_end is not None:
-        filtered_lf = filtered_lf.filter(pl.col("like_created_at") < pl.lit(config.likes_end))
+    filtered_lf = likes.prepare_likes(
+        likes_lf,
+        start=config.likes_start,
+        end=config.likes_end,
+    )
 
     return (
         _with_split(
@@ -535,6 +498,18 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     logger.info("Found %s likes Parquet files", f"{len(like_paths):,}")
 
     artifact_suffix = out_dir.name
+    like_sources_path = out_dir / f"like_sources_{artifact_suffix}.json"
+    ingex.write_source_manifest(
+        like_sources_path,
+        ingex.build_source_manifest(
+            gcs_bucket=str(args.gcs_bucket),
+            blob_prefix="bsky_likes",
+            start=config.likes_start,
+            end=config.likes_end,
+            paths=like_paths,
+            timestamps=like_file_timestamps,
+        ),
+    )
     candidate_query_counts_path = out_dir / f"_candidate_query_counts_{artifact_suffix}.parquet"
     partial_candidate_query_counts_path = (
         out_dir / f"_candidate_query_counts_{artifact_suffix}.partial.parquet"
@@ -598,6 +573,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "last_like_file_timestamp": like_file_timestamps[-1].isoformat(),
         },
         "outputs": {
+            "like_sources_file": like_sources_path.name,
             "candidate_query_counts_file": candidate_query_counts_path.name,
             "queries_file": queries_path.name,
             "query_positives_file": query_positives_path.name,
@@ -616,6 +592,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                 f"input_like_files: {len(like_paths)}",
                 f"queries: {queries_df.height}",
                 f"query_positives: {positives_df.height}",
+                f"like_sources_file: {like_sources_path.name}",
                 f"candidate_query_counts_file: {candidate_query_counts_path.name}",
                 f"queries_file: {queries_path.name}",
                 f"query_positives_file: {query_positives_path.name}",
@@ -633,6 +610,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     return {
         "output_dir": out_dir,
         "artifacts": {
+            "like_sources_path": str(like_sources_path),
             "queries_path": str(queries_path),
             "query_positives_path": str(query_positives_path),
         },

@@ -63,9 +63,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, Sampler
 
 from engagement_prediction.pipeline.core import Context
+from engagement_prediction.data.parquet import load_parquet_from_prior
 from utils.helpers import (
     get_stage_logger,
-    load_parquet_from_prior,
     log_operation_start,
     validate_dataframe_schema,
     HISTORY_POPULARITY_SEMANTICS,
