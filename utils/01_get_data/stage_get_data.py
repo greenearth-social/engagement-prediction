@@ -194,9 +194,6 @@ TIMESTAMP_SUFFIX_GCS = "_(\\d{8})_(\\d{6})\\.parquet$"
 POLITICAL_INFERENCE_DTYPE = pl.Struct({
     "text": pl.Struct({
         "message.commit.record.text": pl.Struct({
-            "text_arbitrary": pl.Struct({
-                "Politics": pl.Float64,
-            }),
             "topic": pl.Struct({
                 "News & Social Concern": pl.Float64,
             }),
@@ -726,11 +723,6 @@ def _build_political_uris_df(
         )
         .with_columns(
             parsed_record_expr
-            .struct.field("text_arbitrary")
-            .struct.field("Politics")
-            .fill_null(0.0)
-            .alias("_politics_score"),
-            parsed_record_expr
             .struct.field("topic")
             .struct.field("News & Social Concern")
             .fill_null(0.0)
@@ -738,7 +730,7 @@ def _build_political_uris_df(
         )
         .with_columns(
             (
-                pl.min_horizontal("_politics_score", "_news_social_concern_score")
+                pl.col("_news_social_concern_score")
                 >= political_score_threshold
             ).alias("is_political")
         )
