@@ -194,6 +194,9 @@ class BSTRanker(nn.Module):
             embedding_dim=self.time_embedding_dim,
         )
         nn.init.xavier_uniform_(self.time_delta_embedding.weight)
+        self.empty_history_token = nn.Parameter(
+            torch.randn(self.transformer_input_dim) * 0.02
+        )
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.transformer_input_dim,
@@ -227,6 +230,39 @@ class BSTRanker(nn.Module):
         positive_bucket_ids = torch.bucketize(deltas, boundary_tensor, right=False) + 1
         zero_bucket_ids = torch.zeros_like(positive_bucket_ids)
         return torch.where(deltas <= 0.0, zero_bucket_ids, positive_bucket_ids).to(dtype=torch.long)
+
+    def _inject_empty_history_token(
+        self,
+        history_input: torch.Tensor,
+        history_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size = int(history_input.size(0))
+        max_history_len = int(history_input.size(1))
+        token = self.empty_history_token.reshape(1, 1, self.transformer_input_dim)
+        if max_history_len == 0:
+            return (
+                token.expand(batch_size, 1, self.transformer_input_dim),
+                torch.ones(
+                    (batch_size, 1),
+                    device=history_input.device,
+                    dtype=torch.bool,
+                ),
+            )
+
+        has_history = history_mask.any(dim=1)
+        if bool(has_history.all().item()):
+            return history_input, history_mask
+
+        inject = ~has_history
+        inject_f = inject.to(dtype=history_input.dtype).reshape(batch_size, 1, 1)
+        history_input = history_input.clone()
+        history_input[:, 0:1, :] = (
+            history_input[:, 0:1, :] * (1.0 - inject_f)
+            + token.expand(batch_size, 1, self.transformer_input_dim) * inject_f
+        )
+        history_mask = history_mask.clone()
+        history_mask[:, 0] = history_mask[:, 0] | inject
+        return history_input, history_mask
 
     def _forward_transformer(
         self,
@@ -290,13 +326,22 @@ class BSTRanker(nn.Module):
             candidate_post_author_idx,
             candidate_prior_cumulative_likes_tensor,
         ).unsqueeze(1)
-        post_sequence = torch.cat([history_post_vectors, candidate_post_vector], dim=1)
 
-        candidate_time_delta = torch.zeros((batch_size, 1), device=device, dtype=history_time_deltas_hours.dtype)
-        sequence_time_deltas = torch.cat([history_time_deltas_hours, candidate_time_delta], dim=1)
-        time_bucket_ids = self._bucketize_time_deltas_hours(sequence_time_deltas)
-        time_embeddings = self.time_delta_embedding(time_bucket_ids)
-        transformer_input = torch.cat([post_sequence, time_embeddings], dim=-1)
+        history_time_bucket_ids = self._bucketize_time_deltas_hours(history_time_deltas_hours)
+        history_time_embeddings = self.time_delta_embedding(history_time_bucket_ids)
+        history_input = torch.cat([history_post_vectors, history_time_embeddings], dim=-1)
+        history_input, history_mask = self._inject_empty_history_token(
+            history_input,
+            history_mask,
+        )
+        candidate_time_bucket_ids = torch.zeros(
+            (batch_size, 1),
+            device=device,
+            dtype=torch.long,
+        )
+        candidate_time_embeddings = self.time_delta_embedding(candidate_time_bucket_ids)
+        candidate_input = torch.cat([candidate_post_vector, candidate_time_embeddings], dim=-1)
+        transformer_input = torch.cat([history_input, candidate_input], dim=1)
 
         candidate_is_not_padding = torch.zeros((batch_size, 1), device=device, dtype=torch.bool)
         src_key_padding_mask = torch.cat([~history_mask, candidate_is_not_padding], dim=1)
@@ -497,6 +542,10 @@ class BSTRanker(nn.Module):
         candidate_time_bucket_ids = torch.zeros((num_candidates,), device=device, dtype=torch.long)
         candidate_time_embeddings = self.time_delta_embedding(candidate_time_bucket_ids)
         history_input = torch.cat([history_post_vectors, history_time_embeddings], dim=-1)
+        history_input, history_mask = self._inject_empty_history_token(
+            history_input,
+            history_mask,
+        )
         candidate_input = torch.cat([candidate_post_vectors, candidate_time_embeddings], dim=-1)
 
         if layer.norm_first:

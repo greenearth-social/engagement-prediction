@@ -215,6 +215,32 @@ def test_bst_pth_adapter_scores_bucketed_batch_in_candidate_chunks(tmp_path):
     torch.testing.assert_close(scores, expected)
 
 
+def test_bst_pth_adapter_scores_zero_history_batch(tmp_path):
+    torch.manual_seed(19)
+    config = _bst_config()
+    model = _make_bst_model(config)
+    model.eval()
+    checkpoint_path = tmp_path / "bst_ranker.pth"
+    torch.save({"model_state_dict": model.state_dict(), "config": config}, checkpoint_path)
+    batch = _bst_bucketed_batch()
+    batch["history_mask"][1] = False
+
+    adapter = BstPthAdapter(checkpoint_path, candidate_chunk_size=2)
+    adapter.prepare_for_eval("cpu")
+    scores = adapter.score_batch(batch, "cpu").scores
+
+    with torch.inference_mode():
+        expected = model.score_candidate_matrix_one_layer(
+            history_embeddings=batch["history_embeddings"],
+            history_mask=batch["history_mask"],
+            history_time_deltas_hours=batch["history_time_deltas_hours"],
+            candidate_post_embeddings=batch["candidate_post_embeddings"],
+            history_author_indices=batch["history_author_indices"],
+            candidate_post_author_idx=batch["candidate_post_author_idx"],
+        )
+    torch.testing.assert_close(scores, expected)
+
+
 def test_bst_pth_adapter_scores_popularity_checkpoint_in_candidate_chunks(tmp_path):
     torch.manual_seed(17)
     config = _bst_config()
