@@ -1,4 +1,15 @@
-"""Query-conditioned user-history selection."""
+"""Query-conditioned user-history selection and partitioning helpers.
+
+Queries and likes are first partitioned by a stable DID hash so one worker can
+construct all histories for a user. Each processed user partition also returns
+a locally deduplicated history-post URI frame. The stage writes that frame as
+an intermediate shard, then repartitions all shards by ``subject_uri`` hash so
+identical URIs from different user partitions can be globally deduplicated.
+
+Here, a *partition* is a logical hash bucket, while a *shard* is a physical
+Parquet file produced while processing one partition. A shard can contain rows
+destined for many partitions in the later URI-based repartitioning step.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +29,7 @@ HISTORY_COLUMNS = [
     "history_subject_uris",
     "history_like_created_ats",
 ]
+HISTORY_POST_URI_COLUMNS = ["subject_uri"]
 UTC_DATETIME = pl.Datetime("us", "UTC")
 HISTORY_SCHEMA = {
     "did": pl.String,
@@ -25,9 +37,13 @@ HISTORY_SCHEMA = {
     "history_subject_uris": pl.List(pl.String),
     "history_like_created_ats": pl.List(UTC_DATETIME),
 }
+HISTORY_POST_URI_SCHEMA = {
+    "subject_uri": pl.String,
+}
 
 
 def user_partition_expr(partition_count: int) -> pl.Expr:
+    """Assign a DID to the stable partition where its queries and likes are processed."""
     if partition_count <= 0:
         raise ValueError("user_history_partition_count must be positive")
     return (
@@ -36,6 +52,19 @@ def user_partition_expr(partition_count: int) -> pl.Expr:
         .mod(pl.lit(partition_count, dtype=pl.UInt64))
         .cast(pl.UInt32)
         .alias("_user_partition")
+    )
+
+
+def history_post_partition_expr(partition_count: int) -> pl.Expr:
+    """Assign a retained post URI to its stable global-deduplication partition."""
+    if partition_count <= 0:
+        raise ValueError("user_history_partition_count must be positive")
+    return (
+        pl.concat_str([pl.lit("history-post"), pl.col("subject_uri")], separator="|")
+        .hash(seed=0)
+        .mod(pl.lit(partition_count, dtype=pl.UInt64))
+        .cast(pl.UInt32)
+        .alias("_history_post_partition")
     )
 
 
@@ -68,13 +97,27 @@ def _history_frame(rows: list[dict[str, Any]]) -> pl.DataFrame:
     return pl.from_dicts(rows, schema=HISTORY_SCHEMA)
 
 
+def history_post_uri_frame(subject_uris: set[str]) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "subject_uri": pl.Series(sorted(subject_uris), dtype=pl.String),
+        },
+        schema=HISTORY_POST_URI_SCHEMA,
+    )
+
+
 def build_query_histories_for_partition(
     queries_df: pl.DataFrame,
     likes_df: pl.DataFrame,
     *,
     max_history_posts_per_query: int,
-) -> tuple[pl.DataFrame, dict[str, dict[str, int]]]:
-    """Build bounded as-of histories for one stable user partition."""
+) -> tuple[pl.DataFrame, pl.DataFrame, dict[str, dict[str, int]]]:
+    """Build histories and a locally unique URI shard for one user partition.
+
+    The returned URI frame contains only posts retained in at least one output
+    history. It is unique within this user partition, but the same URI may be
+    returned by other user partitions and is deduplicated globally later.
+    """
     if max_history_posts_per_query <= 0:
         raise ValueError("max_history_posts_per_query must be positive")
 
@@ -106,6 +149,7 @@ def build_query_histories_for_partition(
     }
 
     rows: list[dict[str, Any]] = []
+    history_post_uris: set[str] = set()
     stats: dict[str, dict[str, int]] = {}
     sorted_queries = queries_df.sort(["did", "query_hour"])
     for query in sorted_queries.iter_rows(named=True):
@@ -120,6 +164,7 @@ def build_query_histories_for_partition(
 
         history_subject_uris = [subject_uri for _, subject_uri in selected]
         history_like_created_ats = [like_created_at for like_created_at, _ in selected]
+        history_post_uris.update(history_subject_uris)
         rows.append({
             "did": did,
             "query_hour": query_hour,
@@ -155,7 +200,7 @@ def build_query_histories_for_partition(
         history_df=history_df,
         max_history_posts_per_query=max_history_posts_per_query,
     )
-    return history_df, stats
+    return history_df, history_post_uri_frame(history_post_uris), stats
 
 
 def validate_partition_artifact(
@@ -207,3 +252,51 @@ def merge_partition_stats(
 def partition_parquet_paths(dataset_path: Path, partition_id: int) -> list[Path]:
     partition_dir = Path(dataset_path) / f"_user_partition={partition_id}"
     return sorted(partition_dir.rglob("*.parquet")) if partition_dir.exists() else []
+
+
+def history_post_partition_parquet_paths(
+    dataset_path: Path,
+    partition_id: int,
+) -> list[Path]:
+    """Find routed URI shards belonging to one URI-hash partition."""
+    partition_dir = Path(dataset_path) / f"_history_post_partition={partition_id}"
+    return sorted(partition_dir.rglob("*.parquet")) if partition_dir.exists() else []
+
+
+def validate_history_post_uri_partition(
+    history_post_uris_df: pl.DataFrame,
+    *,
+    partition_id: int,
+    partition_count: int,
+) -> None:
+    if history_post_uris_df.columns != HISTORY_POST_URI_COLUMNS:
+        raise ValueError(
+            f"Unexpected history post URI columns: {history_post_uris_df.columns}"
+        )
+    if history_post_uris_df.schema != pl.Schema(HISTORY_POST_URI_SCHEMA):
+        raise ValueError(
+            f"Unexpected history post URI schema: {history_post_uris_df.schema}"
+        )
+    if history_post_uris_df["subject_uri"].null_count():
+        raise ValueError("History post URIs contain null values")
+    if history_post_uris_df["subject_uri"].n_unique() != history_post_uris_df.height:
+        raise ValueError("History post URIs contain duplicate values")
+    if history_post_uris_df["subject_uri"].to_list() != sorted(
+        history_post_uris_df["subject_uri"].to_list()
+    ):
+        raise ValueError("History post URIs are not deterministically sorted")
+    if history_post_uris_df.is_empty():
+        return
+    assigned_partitions = (
+        history_post_uris_df.with_columns(
+            history_post_partition_expr(partition_count)
+        )
+        .get_column("_history_post_partition")
+        .unique()
+        .to_list()
+    )
+    if assigned_partitions != [partition_id]:
+        raise ValueError(
+            f"History post URI partition {partition_id} contains rows assigned to "
+            f"{assigned_partitions}"
+        )

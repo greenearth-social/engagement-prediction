@@ -130,6 +130,8 @@ The history artifact includes:
 
 Every Stage 1 query has exactly one row, including explicit empty histories. Only likes strictly before the start of `query_hour` are eligible. Histories use all valid source likes from queried users, not only selected target likes, and preserve duplicate source events.
 
+Stage 2 also publishes the partitioned `history_post_uris_*` dataset. It contains one globally unique, non-null `subject_uri` for every post retained in at least one query history. Duplicate source events remain duplicated in `query_histories_*`; only this compact metadata-lookup artifact is deduplicated.
+
 Common config:
 
 ```yaml

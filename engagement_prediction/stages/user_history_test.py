@@ -19,8 +19,10 @@ UTC = timezone.utc
 def _write_query_selection_artifact(tmp_path: Path) -> tuple[Path, Path]:
     source_path = tmp_path / "likes.parquet"
     pl.DataFrame({
-        "did": ["u1", "u1", "u1", "u2", "u2", "u3"],
+        "did": ["u1", "u1", "u1", "u1", "u1", "u2", "u2", "u3"],
         "subject_uri": [
+            "outside-source-window",
+            "history-unselected",
             "history-unselected",
             "target-one",
             "target-two",
@@ -29,6 +31,8 @@ def _write_query_selection_artifact(tmp_path: Path) -> tuple[Path, Path]:
             "u3-target",
         ],
         "record_created_at": [
+            "2026-01-01T07:30:00Z",
+            "2026-01-01T09:00:00Z",
             "2026-01-01T09:00:00Z",
             "2026-01-01T10:05:00Z",
             "2026-01-01T12:05:00Z",
@@ -100,7 +104,11 @@ def test_registry_run_writes_query_conditioned_histories_and_lineage(tmp_path):
 
     output_dir = Path(result["output_dir"])
     history_path = Path(result["artifacts"]["query_histories_path"])
+    history_post_uris_path = Path(result["artifacts"]["history_post_uris_path"])
     histories = scan_parquet_artifact(history_path).collect().sort(["query_hour", "did"])
+    history_post_uris = (
+        scan_parquet_artifact(history_post_uris_path).collect().sort("subject_uri")
+    )
     assert histories.columns == [
         "did",
         "query_hour",
@@ -109,17 +117,30 @@ def test_registry_run_writes_query_conditioned_histories_and_lineage(tmp_path):
     ]
     assert histories.height == 4
     assert histories["history_subject_uris"].to_list() == [
-        ["history-unselected"],
+        ["history-unselected", "history-unselected"],
         ["u2-pre-validation"],
         [],
-        ["target-one", "history-unselected"],
+        ["target-one", "history-unselected", "history-unselected"],
+    ]
+    assert history_post_uris.schema == pl.Schema(stage.history_data.HISTORY_POST_URI_SCHEMA)
+    assert history_post_uris["subject_uri"].to_list() == [
+        "history-unselected",
+        "target-one",
+        "u2-pre-validation",
     ]
     manifest = json.loads((output_dir / "manifest.json").read_text())
     assert manifest["inputs"] == {"01_query_selection": str(stage1_dir.resolve())}
     summary = json.loads((output_dir / "summary.json").read_text())
     assert summary["outputs"]["query_count"] == 4
+    assert summary["outputs"]["history_post_uris_path"] == history_post_uris_path.name
+    assert summary["outputs"]["unique_history_post_count"] == 3
     assert summary["selection_stats_by_split"]["val_unseen_users"]["empty_history_count"] == 1
+    stage_info = (output_dir / "stage_info.txt").read_text()
+    assert f"history_post_uris_path: {history_post_uris_path.name}" in stage_info
+    assert "unique_history_post_count: 3" in stage_info
     assert list(output_dir.glob("query_histories_*.partial")) == []
+    assert list(output_dir.glob("history_post_uris_*.partial")) == []
+    assert list(output_dir.glob("_history_post_uri_*")) == []
 
 
 def test_logical_output_is_independent_of_stage_partition_count(tmp_path):
@@ -133,7 +154,61 @@ def test_logical_output_is_independent_of_stage_partition_count(tmp_path):
     second_df = scan_parquet_artifact(Path(second["artifacts"]["query_histories_path"])).collect().sort(
         ["query_hour", "did"]
     )
+    first_history_post_uris = (
+        scan_parquet_artifact(Path(first["artifacts"]["history_post_uris_path"]))
+        .collect()
+        .sort("subject_uri")
+    )
+    second_history_post_uris = (
+        scan_parquet_artifact(Path(second["artifacts"]["history_post_uris_path"]))
+        .collect()
+        .sort("subject_uri")
+    )
     assert first_df.equals(second_df)
+    assert first_history_post_uris.equals(second_history_post_uris)
+
+
+def test_history_post_uri_publication_deduplicates_across_user_partition_shards(tmp_path):
+    shards_path = tmp_path / "shards.partial"
+    shards_path.mkdir()
+    pl.DataFrame({"subject_uri": ["only-a", "shared"]}).write_parquet(
+        shards_path / "part-00000.parquet"
+    )
+    pl.DataFrame({"subject_uri": ["only-b", "shared"]}).write_parquet(
+        shards_path / "part-00001.parquet"
+    )
+    routed_path = tmp_path / "routed.partial"
+    output_path = tmp_path / "history_post_uris.partial"
+
+    unique_count = stage._write_history_post_uris(
+        history_post_uri_shards_path=shards_path,
+        routed_history_post_uris_path=routed_path,
+        partial_output_path=output_path,
+        partition_count=4,
+    )
+
+    actual = scan_parquet_artifact(output_path).collect().sort("subject_uri")
+    assert unique_count == 3
+    assert actual["subject_uri"].to_list() == ["only-a", "only-b", "shared"]
+    assert actual["subject_uri"].n_unique() == actual.height
+
+
+def test_history_post_uri_publication_writes_schema_correct_empty_dataset(tmp_path):
+    shards_path = tmp_path / "shards.partial"
+    shards_path.mkdir()
+    output_path = tmp_path / "history_post_uris.partial"
+
+    unique_count = stage._write_history_post_uris(
+        history_post_uri_shards_path=shards_path,
+        routed_history_post_uris_path=tmp_path / "routed.partial",
+        partial_output_path=output_path,
+        partition_count=4,
+    )
+
+    actual = scan_parquet_artifact(output_path).collect()
+    assert unique_count == 0
+    assert actual.is_empty()
+    assert actual.schema == pl.Schema(stage.history_data.HISTORY_POST_URI_SCHEMA)
 
 
 def test_failed_partition_does_not_publish_primary_history_dataset(tmp_path, monkeypatch):
@@ -148,8 +223,14 @@ def test_failed_partition_does_not_publish_primary_history_dataset(tmp_path, mon
 
     stage2_dirs = list((tmp_path / "artifacts" / "02_user_history").iterdir())
     assert len(stage2_dirs) == 1
-    assert list(stage2_dirs[0].glob("query_histories_*"))
-    assert all(path.name.endswith(".partial") for path in stage2_dirs[0].glob("query_histories_*"))
+    stage2_dir = stage2_dirs[0]
+    assert list(stage2_dir.glob("query_histories_*"))
+    assert all(path.name.endswith(".partial") for path in stage2_dir.glob("query_histories_*"))
+    assert not (stage2_dir / "manifest.json").exists()
+    assert not any(
+        not path.name.endswith(".partial")
+        for path in stage2_dir.glob("history_post_uris_*")
+    )
 
 
 def test_config_requires_positive_limits():
