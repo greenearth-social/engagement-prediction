@@ -297,15 +297,12 @@ def test_inference_scores_filter_uris_before_decode_and_use_latest_row(
 
     by_uri = {row["at_uri"]: row for row in scores.iter_rows(named=True)}
     assert set(by_uri) == {"political", "one-low", "missing-field", "changed"}
-    assert by_uri["political"]["politics_score"] == 0.8
     assert by_uri["political"]["news_social_concern_score"] == 0.8
-    assert by_uri["one-low"]["politics_score"] == 0.9
     assert by_uri["one-low"]["news_social_concern_score"] == 0.79
-    assert by_uri["missing-field"]["politics_score"] == 0.95
     assert by_uri["missing-field"]["news_social_concern_score"] is None
-    assert by_uri["changed"]["politics_score"] == 0.91
     assert by_uri["changed"]["news_social_concern_score"] == 0.92
     assert by_uri["changed"]["inference_indexed_at"] == "2026-08-02T00:00:00Z"
+    assert "politics_score" not in scores.columns
 
 
 def test_attach_scores_retains_unknown_candidates_and_candidate_order(popularity_module):
@@ -321,13 +318,11 @@ def test_attach_scores_retains_unknown_candidates_and_candidate_order(popularity
         [
             {
                 "at_uri": "political",
-                "politics_score": 0.9,
                 "news_social_concern_score": 0.9,
                 "inference_indexed_at": "2026-08-01T00:00:00Z",
             },
             {
                 "at_uri": "non-political",
-                "politics_score": 0.9,
                 "news_social_concern_score": 0.2,
                 "inference_indexed_at": "2026-08-01T00:00:00Z",
             },
@@ -342,7 +337,6 @@ def test_attach_scores_retains_unknown_candidates_and_candidate_order(popularity
         "non-political",
         "unknown",
     ]
-    assert output["politics_score"].to_list() == [0.9, 0.9, None]
     assert output["news_social_concern_score"].to_list() == [0.9, 0.2, None]
     assert output["inference_indexed_at"].to_list() == [
         "2026-08-01T00:00:00Z",
@@ -373,42 +367,10 @@ def test_score_distribution_reports_quantiles_missing_and_non_finite(popularity_
     assert distribution["max"] == 1.0
 
 
-def test_joint_distribution_reports_relationship_and_bivariate_bins(popularity_module):
-    joint = popularity_module.joint_score_distribution(
-        [-0.1, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0, 1.1, None],
-        [1.1, 0.9, 0.7, 0.5, 0.3, 0.1, 1.0, -0.1, 0.5],
-    )
-
-    assert joint["finite_pair_count"] == 8
-    assert joint["pearson_correlation"] == pytest.approx(-0.673202614379085)
-    assert joint["population_covariance"] == pytest.approx(-0.11265625)
-    assert joint["mean_politics_minus_news_social_concern"] == pytest.approx(0.0)
-    assert joint["mean_absolute_score_difference"] == pytest.approx(0.6)
-    assert joint["minimum_of_two_scores"]["median"] == pytest.approx(0.2)
-    assert joint["maximum_of_two_scores"]["median"] == pytest.approx(0.9)
-    histogram = joint["bivariate_histogram"]
-    assert sum(sum(row) for row in histogram["counts"]) == 8
-    assert histogram["counts"][0][-1] == 1
-    assert histogram["counts"][-1][0] == 1
-    assert histogram["counts"][-2][-2] == 1
-    assert sum(sum(row) for row in histogram["shares_of_finite_pairs"]) == 1.0
-
-
-def test_joint_histogram_bin_boundaries(popularity_module):
-    values = [-0.1, 0.0, 0.199, 0.2, 0.399, 0.4, 0.599, 0.6, 0.799, 0.8, 1.0, 1.1]
-
-    joint = popularity_module.joint_score_distribution(values, values)
-
-    counts = joint["bivariate_histogram"]["counts"]
-    assert [counts[index][index] for index in range(7)] == [1, 2, 2, 2, 2, 2, 1]
-    assert sum(sum(row) for row in counts) == len(values)
-
-
 def test_inference_score_and_top_cutoff_summaries(popularity_module):
     frame = pl.DataFrame({
         "candidate_rank": range(1, 26),
         "inference_indexed_at": ["2026-08-01T00:00:00Z"] * 20 + [None] * 5,
-        "politics_score": [0.9] * 5 + [0.1] * 15 + [None] * 5,
         "news_social_concern_score": [0.8] * 5 + [0.2] * 15 + [None] * 5,
     })
 
@@ -419,22 +381,16 @@ def test_inference_score_and_top_cutoff_summaries(popularity_module):
     assert overall["matched_inference_candidates"] == 20
     assert overall["candidates_without_inference"] == 5
     assert overall["inference_coverage"] == 0.8
-    assert overall["politics_score"]["finite_score_count"] == 20
-    assert overall["politics_score"]["mean"] == pytest.approx(0.3)
     assert overall["news_social_concern_score"]["mean"] == pytest.approx(0.35)
-    assert overall["joint_distribution"]["finite_pair_count"] == 20
     assert top["10"]["actual_cutoff"] == 10
     assert top["10"]["matched_inference_candidates"] == 10
-    assert top["10"]["politics_score"]["mean"] == pytest.approx(0.5)
     assert top["10"]["news_social_concern_score"]["mean"] == pytest.approx(0.5)
     assert top["100"]["actual_cutoff"] == 25
-    assert top["100"]["politics_score"]["mean"] == pytest.approx(0.3)
 
 
 def test_zero_coverage_and_empty_score_summaries(popularity_module):
     unknown = pl.DataFrame({
         "inference_indexed_at": pl.Series([None, None], dtype=pl.String),
-        "politics_score": pl.Series([None, None], dtype=pl.Float64),
         "news_social_concern_score": pl.Series([None, None], dtype=pl.Float64),
     })
     empty = unknown.head(0)
@@ -445,10 +401,8 @@ def test_zero_coverage_and_empty_score_summaries(popularity_module):
     assert unknown_summary["matched_inference_candidates"] == 0
     assert unknown_summary["candidates_without_inference"] == 2
     assert unknown_summary["inference_coverage"] == 0.0
-    assert unknown_summary["politics_score"]["finite_score_count"] == 0
-    assert unknown_summary["politics_score"]["mean"] is None
-    assert unknown_summary["joint_distribution"]["finite_pair_count"] == 0
-    assert unknown_summary["joint_distribution"]["pearson_correlation"] is None
+    assert unknown_summary["news_social_concern_score"]["finite_score_count"] == 0
+    assert unknown_summary["news_social_concern_score"]["mean"] is None
     assert empty_summary["inference_coverage"] is None
 
 
@@ -494,7 +448,10 @@ def test_empty_api_result_writes_empty_artifacts_without_listing_gcs(
     assert summary["api_candidates"]["api_candidates_returned"] == 0
     assert summary["inference_export_window"]["files_scanned"] == 0
     assert summary["overall"]["matched_inference_candidates"] == 0
-    assert summary["overall"]["politics_score"]["mean"] is None
+    assert summary["overall"]["news_social_concern_score"]["mean"] is None
+    assert summary["run_config"]["political_score_field"] == (
+        "topic.News & Social Concern"
+    )
     assert "top-secret" not in summary_text
 
 
@@ -529,8 +486,6 @@ def test_nonempty_api_result_with_no_inference_files_is_all_unknown(
         output_dir / "popularity_candidates_with_inference_scores.parquet"
     )
     summary = json.loads((output_dir / "summary.json").read_text())
-    assert frame["politics_score"].to_list() == [None]
     assert frame["news_social_concern_score"].to_list() == [None]
     assert summary["overall"]["candidates_without_inference"] == 1
-    assert summary["overall"]["politics_score"]["finite_score_count"] == 0
-    assert summary["overall"]["joint_distribution"]["finite_pair_count"] == 0
+    assert summary["overall"]["news_social_concern_score"]["finite_score_count"] == 0

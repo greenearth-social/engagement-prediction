@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Compare two TorchScript BST rankers on political and non-political posts.
 
-Inference parquet files define all political posts plus a random non-political
-comparison sample. Post features are hydrated from Elasticsearch in bounded
+Inference parquet files define balanced random samples of political and
+non-political posts. Post features are hydrated from Elasticsearch in bounded
 batches so post embeddings never need to be retained for the complete
 evaluation population.
 """
@@ -43,14 +43,13 @@ DEFAULT_INFERENCE_PREFIX = "bsky_inferences"
 DEFAULT_EMBEDDING_MODEL = "all_MiniLM_L12_v2"
 DEFAULT_ELASTICSEARCH_INDEX = "posts_recent"
 DEFAULT_OUTPUT_ROOT = Path("/mnt/data/dave/outputs/compare")
+DEFAULT_POLITICAL_THRESHOLD = 0.95
+POLITICAL_SCORE_FIELD = "topic.News & Social Concern"
 RANK_CUTOFFS = (10, 100, 1000)
 
 POLITICAL_INFERENCE_DTYPE = pl.Struct({
     "text": pl.Struct({
         "message.commit.record.text": pl.Struct({
-            "text_arbitrary": pl.Struct({
-                "Politics": pl.Float64,
-            }),
             "topic": pl.Struct({
                 "News & Social Concern": pl.Float64,
             }),
@@ -65,7 +64,6 @@ OUTPUT_SCHEMA = {
     "elasticsearch_indexed_at": pl.String,
     "content": pl.String,
     "current_like_count": pl.Int64,
-    "politics_score": pl.Float64,
     "news_social_concern_score": pl.Float64,
     "inference_indexed_at": pl.String,
     "is_political": pl.Boolean,
@@ -254,15 +252,15 @@ def list_inference_parquet_paths(
 def build_evaluation_posts_df(
     inference_paths: Sequence[str],
     political_threshold: float,
-    non_political_sample_size: int,
+    class_sample_size: int,
     random_seed: int,
 ) -> tuple[pl.DataFrame, dict[str, int]]:
     if not inference_paths:
         raise ValueError("At least one inference parquet path is required")
     if not 0.0 <= political_threshold <= 1.0:
         raise ValueError("--political-threshold must be between 0 and 1")
-    if non_political_sample_size < 0:
-        raise ValueError("--non-political-sample-size must be non-negative")
+    if class_sample_size < 0:
+        raise ValueError("--class-sample-size must be non-negative")
 
     parsed_record_expr = (
         pl.col("_parsed_inferences")
@@ -284,11 +282,6 @@ def build_evaluation_posts_df(
         )
         .with_columns(
             parsed_record_expr
-            .struct.field("text_arbitrary")
-            .struct.field("Politics")
-            .fill_null(0.0)
-            .alias("_politics_score"),
-            parsed_record_expr
             .struct.field("topic")
             .struct.field("News & Social Concern")
             .fill_null(0.0)
@@ -301,24 +294,17 @@ def build_evaluation_posts_df(
             .last()
             .cast(pl.String)
             .alias("inference_indexed_at"),
-            pl.col("_politics_score")
-            .sort_by("_indexed_at_dt", "indexed_at")
-            .last()
-            .alias("politics_score"),
             pl.col("_news_social_concern_score")
             .sort_by("_indexed_at_dt", "indexed_at")
             .last()
             .alias("news_social_concern_score"),
         )
         .with_columns(
-            (
-                (pl.col("politics_score") >= political_threshold)
-                & (pl.col("news_social_concern_score") >= political_threshold)
-            ).alias("is_political")
+            (pl.col("news_social_concern_score") >= political_threshold)
+            .alias("is_political")
         )
         .select(
             "at_uri",
-            "politics_score",
             "news_social_concern_score",
             "inference_indexed_at",
             "is_political",
@@ -328,20 +314,34 @@ def build_evaluation_posts_df(
     )
     political = latest.filter(pl.col("is_political"))
     non_political = latest.filter(~pl.col("is_political"))
-    selected_non_political_count = min(non_political_sample_size, non_political.height)
-    if selected_non_political_count > 0:
+    selected_per_class = min(
+        class_sample_size,
+        political.height,
+        non_political.height,
+    )
+    if selected_per_class > 0:
+        selected_political = political.sample(
+            n=selected_per_class,
+            with_replacement=False,
+            shuffle=True,
+            seed=random_seed,
+        )
         selected_non_political = non_political.sample(
-            n=selected_non_political_count,
+            n=selected_per_class,
             with_replacement=False,
             shuffle=True,
             seed=random_seed,
         )
     else:
+        selected_political = political.head(0)
         selected_non_political = non_political.head(0)
-    evaluation = pl.concat([political, selected_non_political]).sort("at_uri")
+    evaluation = pl.concat([selected_political, selected_non_political]).sort("at_uri")
     stats = {
         "unique_inference_uris": latest.height,
-        "political_uris": political.height,
+        "class_sample_size_requested": class_sample_size,
+        "class_sample_size_selected": selected_per_class,
+        "political_uris_available": political.height,
+        "political_uris_selected": selected_political.height,
         "non_political_uris_available": non_political.height,
         "non_political_uris_selected": selected_non_political.height,
         "evaluation_uris": evaluation.height,
@@ -407,6 +407,36 @@ def _required_positive_int(config: Mapping[str, Any], key: str, model_dir: Path)
     return value
 
 
+def _load_ranker(
+    model_dir: Path,
+    device: torch.device,
+) -> tuple[Any, Path]:
+    torchscript_path = model_dir / "checkpoints/ranker.pt"
+    checkpoint_path = model_dir / "checkpoints/bst_ranker_best.pth"
+    if torchscript_path.exists():
+        ranker = torch.jit.load(str(torchscript_path), map_location=device).eval()
+        ranker_path = torchscript_path
+    elif checkpoint_path.exists():
+        from utils.ranking_adapters import BstPthAdapter
+
+        adapter = BstPthAdapter(checkpoint_path, candidate_chunk_size=1)
+        adapter.prepare_for_eval(str(device))
+        if adapter.model is None:
+            raise RuntimeError(f"Failed to reconstruct BST ranker from {checkpoint_path}")
+        ranker = adapter.model
+        ranker_path = checkpoint_path
+    else:
+        raise FileNotFoundError(
+            "No loadable BST ranker was found; expected either "
+            f"{torchscript_path} or {checkpoint_path}"
+        )
+
+    if not callable(getattr(ranker, "score_candidate_matrix", None)):
+        raise RuntimeError(f"BST ranker does not expose score_candidate_matrix: {ranker_path}")
+    LOGGER.info("Loaded BST model from %s", ranker_path)
+    return ranker, ranker_path
+
+
 def load_model_bundle(
     label: str,
     model_dir: Path,
@@ -415,11 +445,8 @@ def load_model_bundle(
 ) -> ModelBundle:
     model_dir = model_dir.expanduser().resolve()
     config_path = model_dir / "training_config.json"
-    ranker_path = model_dir / "checkpoints/ranker.pt"
     if not config_path.exists():
         raise FileNotFoundError(f"Required BST training config was not found: {config_path}")
-    if not ranker_path.exists():
-        raise FileNotFoundError(f"Required TorchScript BST ranker was not found: {ranker_path}")
 
     config = _read_json(config_path)
     if config.get("model_type") != "bst-ranker":
@@ -436,9 +463,7 @@ def load_model_bundle(
     author_idx_path = resolve_author_idx_path(get_data_dir)
     author_idx_by_did = load_author_idx_map(author_idx_path)
 
-    ranker = torch.jit.load(str(ranker_path), map_location=device).eval()
-    if not callable(getattr(ranker, "score_candidate_matrix", None)):
-        raise RuntimeError(f"TorchScript BST ranker does not expose score_candidate_matrix: {ranker_path}")
+    ranker, _ = _load_ranker(model_dir, device)
 
     history_embeddings = torch.zeros(
         (1, max_history_len, post_embedding_dim), device=device, dtype=torch.float32
@@ -973,7 +998,8 @@ def build_summary(
             "start_date_inclusive": window.start.isoformat(),
             "end_date_exclusive": window.end.isoformat(),
             "political_threshold": args.political_threshold,
-            "non_political_sample_size": args.non_political_sample_size,
+            "political_score_field": POLITICAL_SCORE_FIELD,
+            "class_sample_size": args.class_sample_size,
             "random_seed": args.random_seed,
             "elasticsearch_url": sanitize_elasticsearch_url(elasticsearch_url),
             "elasticsearch_index": args.elasticsearch_index,
@@ -1192,7 +1218,7 @@ def print_console_summary(summary: Mapping[str, Any], output_dir: Path) -> None:
     print("\nBST political-score comparison")
     print(
         f"  Evaluation URIs: {inference['evaluation_uris']:,} "
-        f"({inference['political_uris']:,} political, "
+        f"({inference['political_uris_selected']:,} sampled political, "
         f"{inference['non_political_uris_selected']:,} sampled non-political) from "
         f"{inference['files_scanned']:,} inference files"
     )
@@ -1242,8 +1268,8 @@ async def run(args: argparse.Namespace, environ: Mapping[str, str]) -> Path:
         raise ValueError("--elasticsearch-batch-size must be positive")
     if args.elasticsearch_timeout_seconds <= 0:
         raise ValueError("--elasticsearch-timeout-seconds must be positive")
-    if args.non_political_sample_size < 0:
-        raise ValueError("--non-political-sample-size must be non-negative")
+    if args.class_sample_size < 0:
+        raise ValueError("--class-sample-size must be non-negative")
 
     evaluated_at = datetime.now(timezone.utc)
     window = resolve_date_window(args.start_date, args.end_date)
@@ -1279,7 +1305,7 @@ async def run(args: argparse.Namespace, environ: Mapping[str, str]) -> Path:
     evaluation_df, inference_selection_stats = build_evaluation_posts_df(
         inference_paths,
         args.political_threshold,
-        args.non_political_sample_size,
+        args.class_sample_size,
         args.random_seed,
     )
     inference_rows = {
@@ -1287,11 +1313,12 @@ async def run(args: argparse.Namespace, environ: Mapping[str, str]) -> Path:
     }
     evaluation_uris = list(inference_rows)
     LOGGER.info(
-        "Selected %d evaluation URIs: %d political and %d sampled non-political "
-        "(%d non-political available)",
+        "Selected %d evaluation URIs: %d political and %d non-political "
+        "(%d political and %d non-political available)",
         inference_selection_stats["evaluation_uris"],
-        inference_selection_stats["political_uris"],
+        inference_selection_stats["political_uris_selected"],
         inference_selection_stats["non_political_uris_selected"],
+        inference_selection_stats["political_uris_available"],
         inference_selection_stats["non_political_uris_available"],
     )
 
@@ -1345,7 +1372,6 @@ async def run(args: argparse.Namespace, environ: Mapping[str, str]) -> Path:
                         "elasticsearch_indexed_at": post.indexed_at,
                         "content": post.content,
                         "current_like_count": post.like_count,
-                        "politics_score": float(inference_row["politics_score"]),
                         "news_social_concern_score": float(
                             inference_row["news_social_concern_score"]
                         ),
@@ -1403,8 +1429,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         help="Exclusive UTC end date in YYYY-MM-DD format",
     )
-    parser.add_argument("--political-threshold", type=float, default=0.8)
-    parser.add_argument("--non-political-sample-size", type=int, default=10_000)
+    parser.add_argument(
+        "--political-threshold",
+        type=float,
+        default=DEFAULT_POLITICAL_THRESHOLD,
+        help=(
+            "Minimum topic.News & Social Concern score used to classify political "
+            f"posts (default: {DEFAULT_POLITICAL_THRESHOLD})"
+        ),
+    )
+    parser.add_argument(
+        "--class-sample-size",
+        type=int,
+        default=10_000,
+        help="Number of political and non-political posts to sample (default: 10000)",
+    )
     parser.add_argument("--random-seed", type=int, default=42)
     parser.add_argument("--embedding-model", default=DEFAULT_EMBEDDING_MODEL)
     parser.add_argument("--elasticsearch-url")

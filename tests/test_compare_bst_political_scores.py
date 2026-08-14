@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import importlib
 import importlib.util
 import json
 import sys
@@ -85,8 +86,8 @@ def test_cli_uses_positional_model_directories_and_expected_defaults(comparison_
     assert args.model_b_dir == Path("model-b")
     assert args.start_date == "2026-08-07"
     assert args.end_date == "2026-08-10"
-    assert args.political_threshold == 0.8
-    assert args.non_political_sample_size == 10_000
+    assert args.political_threshold == 0.95
+    assert args.class_sample_size == 10_000
     assert args.random_seed == 42
     assert args.elasticsearch_index == "posts_recent"
     assert args.elasticsearch_batch_size == 1000
@@ -223,15 +224,15 @@ def test_inference_file_listing_fails_when_window_is_empty(comparison_module):
         )
 
 
-def test_political_extraction_uses_both_thresholds_missing_as_zero_and_latest_row(
+def test_political_extraction_uses_news_threshold_missing_as_zero_and_latest_row(
     comparison_module, tmp_path
 ):
     path = tmp_path / "inferences.parquet"
     pl.DataFrame(
         {
             "at_uri": [
-                "both-boundary",
-                "one-low",
+                "news-boundary",
+                "politics-only",
                 "missing-field",
                 "became-nonpolitical",
                 "became-nonpolitical",
@@ -252,7 +253,7 @@ def test_political_extraction_uses_both_thresholds_missing_as_zero_and_latest_ro
                 "2026-08-03T00:00:00Z",
             ],
             "inferences": [
-                _inference_json(0.8, 0.8),
+                _inference_json(0.1, 0.8),
                 _inference_json(0.9, 0.79),
                 _inference_json(0.9, None),
                 _inference_json(0.95, 0.95),
@@ -266,41 +267,46 @@ def test_political_extraction_uses_both_thresholds_missing_as_zero_and_latest_ro
     ).write_parquet(path)
 
     result, stats = comparison_module.build_evaluation_posts_df(
-        [str(path)], 0.8, 0, 42
+        [str(path)], 0.8, 10, 42
     )
 
-    assert result["at_uri"].to_list() == [
+    political_result = result.filter(pl.col("is_political"))
+    assert political_result["at_uri"].to_list() == [
         "became-political",
-        "both-boundary",
+        "news-boundary",
         "null-indexed-at",
     ]
     by_uri = {row["at_uri"]: row for row in result.iter_rows(named=True)}
-    assert by_uri["both-boundary"]["politics_score"] == 0.8
-    assert by_uri["both-boundary"]["news_social_concern_score"] == 0.8
-    assert by_uri["became-political"]["politics_score"] == 0.91
-    assert by_uri["null-indexed-at"]["politics_score"] == 0.85
-    assert all(result["is_political"])
+    assert by_uri["news-boundary"]["news_social_concern_score"] == 0.8
+    assert by_uri["became-political"]["news_social_concern_score"] == 0.92
+    assert by_uri["null-indexed-at"]["news_social_concern_score"] == 0.86
+    assert "politics_score" not in result.columns
+    assert political_result.height == 3
+    assert result.filter(~pl.col("is_political")).height == 3
     assert stats == {
         "unique_inference_uris": 6,
-        "political_uris": 3,
+        "class_sample_size_requested": 10,
+        "class_sample_size_selected": 3,
+        "political_uris_available": 3,
+        "political_uris_selected": 3,
         "non_political_uris_available": 3,
-        "non_political_uris_selected": 0,
-        "evaluation_uris": 3,
+        "non_political_uris_selected": 3,
+        "evaluation_uris": 6,
     }
 
 
-def test_non_political_sampling_keeps_all_political_posts_and_is_deterministic(
+def test_class_sampling_is_balanced_and_deterministic(
     comparison_module, tmp_path
 ):
     path = tmp_path / "sampling_inferences.parquet"
-    political_uris = [f"political-{index}" for index in range(3)]
+    political_uris = [f"political-{index}" for index in range(20)]
     non_political_uris = [f"non-political-{index}" for index in range(20)]
     pl.DataFrame(
         {
             "at_uri": political_uris + non_political_uris,
-            "indexed_at": ["2026-08-01T00:00:00Z"] * 23,
+            "indexed_at": ["2026-08-01T00:00:00Z"] * 40,
             "inferences": (
-                [_inference_json(0.9, 0.9)] * 3
+                [_inference_json(0.9, 0.9)] * 20
                 + [_inference_json(0.2, 0.3)] * 20
             ),
         }
@@ -315,13 +321,16 @@ def test_non_political_sampling_keeps_all_political_posts_and_is_deterministic(
 
     assert first.to_dicts() == second.to_dicts()
     assert first_stats == second_stats == {
-        "unique_inference_uris": 23,
-        "political_uris": 3,
+        "unique_inference_uris": 40,
+        "class_sample_size_requested": 10,
+        "class_sample_size_selected": 10,
+        "political_uris_available": 20,
+        "political_uris_selected": 10,
         "non_political_uris_available": 20,
         "non_political_uris_selected": 10,
-        "evaluation_uris": 13,
+        "evaluation_uris": 20,
     }
-    assert set(first.filter(pl.col("is_political"))["at_uri"]) == set(political_uris)
+    assert first.filter(pl.col("is_political")).height == 10
     assert first.filter(~pl.col("is_political")).height == 10
 
     with pytest.raises(ValueError, match="must be non-negative"):
@@ -532,7 +541,6 @@ def test_score_frame_uses_global_normalization_and_neutral_delta_labels(
                 "elasticsearch_indexed_at": None,
                 "content": "content",
                 "current_like_count": 1,
-                "politics_score": 0.9,
                 "news_social_concern_score": 0.9,
                 "inference_indexed_at": "2026-08-01T00:00:00Z",
                 "is_political": is_political,
@@ -588,7 +596,6 @@ def test_ranking_summary_reports_top_100_political_share_and_auc(comparison_modu
                 "elasticsearch_indexed_at": None,
                 "content": "content",
                 "current_like_count": 1,
-                "politics_score": 0.9 if is_political else 0.1,
                 "news_social_concern_score": 0.9 if is_political else 0.1,
                 "inference_indexed_at": "2026-08-01T00:00:00Z",
                 "is_political": is_political,
@@ -656,6 +663,107 @@ def test_strict_model_loading_requires_ranker_pt_and_exported_matrix_method(
         )
 
 
+def test_model_loading_falls_back_to_best_pth_and_preserves_matrix_scores(
+    comparison_module, tmp_path
+):
+    model_dir = tmp_path / "model"
+    checkpoints_dir = model_dir / "checkpoints"
+    get_data_dir = tmp_path / "get-data"
+    checkpoints_dir.mkdir(parents=True)
+    get_data_dir.mkdir()
+    config = {
+        "model_type": "bst-ranker",
+        "post_embedding_dim": 2,
+        "max_history_len": 3,
+        "use_author_embedding_table": True,
+        "author_table_num_rows": 3,
+        "author_embedding_dim": 2,
+        "content_projection_dim": 2,
+        "author_projection_dim": 2,
+        "model_dim": 4,
+        "time_embedding_dim": 2,
+        "num_attention_heads": 2,
+        "num_transformer_layers": 1,
+        "transformer_ff_dim": 8,
+        "dropout_rate": 0.0,
+        "author_unknown_dropout_rate": 0.0,
+        "norm_first": False,
+        "time_delta_bucket_boundaries_hours": [1.0, 24.0],
+        "prediction_hidden_dims": [4],
+        "bst_use_popularity_feature": True,
+        "bst_popularity_projection_dim": 2,
+        "bst_popularity_log_mean": 1.0,
+        "bst_popularity_log_std": 2.0,
+    }
+    (model_dir / "training_config.json").write_text(json.dumps(config))
+    (model_dir / "manifest.json").write_text(
+        json.dumps({"inputs": {"01_get_data": str(get_data_dir)}})
+    )
+    pl.DataFrame({"author_did": ["did:a"], "author_idx": [2]}).write_parquet(
+        get_data_dir / "author_idx_test.parquet"
+    )
+
+    stage_train_bst_ranker = importlib.import_module(
+        "utils.03_train.stage_train_bst_ranker"
+    )
+    source_model = stage_train_bst_ranker.BSTRanker(
+        post_embedding_dim=config["post_embedding_dim"],
+        author_table_num_rows=config["author_table_num_rows"],
+        author_embedding_dim=config["author_embedding_dim"],
+        content_projection_dim=config["content_projection_dim"],
+        author_projection_dim=config["author_projection_dim"],
+        model_dim=config["model_dim"],
+        time_embedding_dim=config["time_embedding_dim"],
+        num_attention_heads=config["num_attention_heads"],
+        num_transformer_layers=config["num_transformer_layers"],
+        transformer_ff_dim=config["transformer_ff_dim"],
+        dropout_rate=config["dropout_rate"],
+        author_unknown_dropout_rate=config["author_unknown_dropout_rate"],
+        norm_first=config["norm_first"],
+        time_delta_bucket_boundaries_hours=config[
+            "time_delta_bucket_boundaries_hours"
+        ],
+        prediction_hidden_dims=config["prediction_hidden_dims"],
+        use_popularity_feature=config["bst_use_popularity_feature"],
+        popularity_projection_dim=config["bst_popularity_projection_dim"],
+        popularity_log_mean=config["bst_popularity_log_mean"],
+        popularity_log_std=config["bst_popularity_log_std"],
+    ).eval()
+    torch.save(
+        {"model_state_dict": source_model.state_dict()},
+        checkpoints_dir / "bst_ranker_best.pth",
+    )
+
+    bundle = comparison_module.load_model_bundle(
+        "A", model_dir, None, torch.device("cpu")
+    )
+    history_embeddings = torch.tensor([[[0.1, 0.2], [0.3, 0.4], [0.0, 0.0]]])
+    history_mask = torch.tensor([[True, True, False]])
+    history_times = torch.tensor([[0.5, 3.0, 0.0]])
+    candidate_embeddings = torch.tensor([[0.5, 0.6], [0.7, 0.8]])
+    history_authors = torch.tensor([[2, 1, 0]])
+    candidate_authors = torch.tensor([2, 1])
+    history_likes = torch.tensor([[4.0, 8.0, 0.0]])
+    candidate_likes = torch.tensor([16.0, 32.0])
+    inputs = (
+        history_embeddings,
+        history_mask,
+        history_times,
+        candidate_embeddings,
+        history_authors,
+        candidate_authors,
+        history_likes,
+        candidate_likes,
+    )
+
+    with torch.inference_mode():
+        expected = source_model.score_candidate_matrix(*inputs)
+        actual = bundle.ranker.score_candidate_matrix(*inputs)
+
+    assert torch.equal(actual, expected)
+    assert bundle.use_popularity_feature is True
+
+
 def test_summary_omits_api_key_and_writes_empty_outputs(comparison_module, tmp_path):
     ranker = object()
     model_a = _model_bundle(comparison_module, "A", ranker)
@@ -665,8 +773,8 @@ def test_summary_omits_api_key_and_writes_empty_outputs(comparison_module, tmp_p
         inference_prefix="bsky_inferences",
         start_date="2026-08-07",
         end_date="2026-08-10",
-        political_threshold=0.8,
-        non_political_sample_size=10_000,
+        political_threshold=0.95,
+        class_sample_size=10_000,
         random_seed=42,
         elasticsearch_index="posts_recent",
         elasticsearch_batch_size=1000,
@@ -686,7 +794,10 @@ def test_summary_omits_api_key_and_writes_empty_outputs(comparison_module, tmp_p
         [],
         {
             "unique_inference_uris": 0,
-            "political_uris": 0,
+            "class_sample_size_requested": 10_000,
+            "class_sample_size_selected": 0,
+            "political_uris_available": 0,
+            "political_uris_selected": 0,
             "non_political_uris_available": 0,
             "non_political_uris_selected": 0,
             "evaluation_uris": 0,
@@ -697,6 +808,10 @@ def test_summary_omits_api_key_and_writes_empty_outputs(comparison_module, tmp_p
         model_b,
         "https://user:password@example.com:9200?token=secret",
         datetime(2026, 8, 10, tzinfo=timezone.utc),
+    )
+    assert summary["run_config"]["political_threshold"] == 0.95
+    assert summary["run_config"]["political_score_field"] == (
+        "topic.News & Social Concern"
     )
 
     serialized = json.dumps(summary)

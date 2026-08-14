@@ -200,6 +200,7 @@ POLITICAL_INFERENCE_DTYPE = pl.Struct({
         }),
     }),
 })
+POLITICAL_SCORE_FIELD = "topic.News & Social Concern"
 
 
 def _validate_political_sampling_parameters(
@@ -1200,7 +1201,7 @@ def _load_posts_core_polars(
     - in_random_sample: True if post was selected by hash-sampling,
                         False if included only because it was liked
     - is_liked: True if post is in likes core dataset, False otherwise
-    - is_political: True for sampled negatives meeting the politics thresholds; null otherwise
+    - is_political: True for sampled negatives meeting the News & Social Concern threshold; null otherwise
     - negative_hour_bucket: Hour bucket for sampled negatives; null for liked-only rows
     - prior_cumulative_likes: Exact prior-hour like count; null for liked-only rows
 
@@ -1341,6 +1342,7 @@ def _load_posts_core_polars(
         'negative_samples_per_hour': negative_samples_per_hour,
         'political_negative_samples_per_hour': political_negative_samples_per_hour,
         'political_score_threshold': political_score_threshold,
+        'political_score_field': POLITICAL_SCORE_FIELD,
         'negative_sampling_alpha': negative_sampling_alpha,
         'n_posts_core': n_posts_core,
         'n_posts_core_unique': n_posts_core_unique,
@@ -1958,6 +1960,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"min_author_support={min_author_support}, negative_samples_per_hour={negative_samples_per_hour}, "
         f"political_negative_samples_per_hour={political_negative_samples_per_hour}, "
         f"political_score_threshold={political_score_threshold}, "
+        f"political_score_field={POLITICAL_SCORE_FIELD}, "
         f"negative_sampling_alpha={negative_sampling_alpha}, min_likes_per_negative_post={min_likes_per_negative_post}, "
         f"initial_negative_sampling_pct={initial_negative_sampling_pct}, "
         f"skip_embeddings={skip_embeddings}",

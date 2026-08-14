@@ -548,6 +548,7 @@ def test_build_political_uris_uses_latest_inference_without_candidate_filtering(
     assert political_uris_df.to_dicts() == [
         {"at_uri": "post:high_both", "is_political": True},
         {"at_uri": "post:ineligible", "is_political": True},
+        {"at_uri": "post:news_only", "is_political": True},
     ]
 
 

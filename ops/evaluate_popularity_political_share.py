@@ -31,22 +31,11 @@ INFERENCE_BUFFER_DAYS = 6
 SUPPORTED_MAX_AGE_HOURS = (6, 12, 24, 48, 72, 168)
 TOP_CUTOFFS = (10, 25, 50, 100)
 SCORE_QUANTILES = (0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99)
-SCORE_BIN_LABELS = (
-    "below_0.0",
-    "0.0_to_below_0.2",
-    "0.2_to_below_0.4",
-    "0.4_to_below_0.6",
-    "0.6_to_below_0.8",
-    "0.8_to_1.0",
-    "above_1.0",
-)
+POLITICAL_SCORE_FIELD = "topic.News & Social Concern"
 
 POLITICAL_INFERENCE_DTYPE = pl.Struct({
     "text": pl.Struct({
         "message.commit.record.text": pl.Struct({
-            "text_arbitrary": pl.Struct({
-                "Politics": pl.Float64,
-            }),
             "topic": pl.Struct({
                 "News & Social Concern": pl.Float64,
             }),
@@ -66,7 +55,6 @@ CANDIDATE_SCHEMA = {
 
 INFERENCE_SCORE_SCHEMA = {
     "at_uri": pl.String,
-    "politics_score": pl.Float64,
     "news_social_concern_score": pl.Float64,
     "inference_indexed_at": pl.String,
 }
@@ -325,10 +313,6 @@ def build_candidate_inference_scores(
         )
         .with_columns(
             parsed_record_expr
-            .struct.field("text_arbitrary")
-            .struct.field("Politics")
-            .alias("politics_score"),
-            parsed_record_expr
             .struct.field("topic")
             .struct.field("News & Social Concern")
             .alias("news_social_concern_score"),
@@ -337,7 +321,6 @@ def build_candidate_inference_scores(
             "at_uri",
             pl.col("indexed_at").cast(pl.String).alias("inference_indexed_at"),
             "_indexed_at_dt",
-            "politics_score",
             "news_social_concern_score",
         )
         .collect(engine="streaming")
@@ -429,102 +412,6 @@ def score_distribution(values: Sequence[Optional[float]]) -> dict[str, Any]:
     return result
 
 
-def _score_bin_index(value: float) -> int:
-    if value < 0.0:
-        return 0
-    if value < 0.2:
-        return 1
-    if value < 0.4:
-        return 2
-    if value < 0.6:
-        return 3
-    if value < 0.8:
-        return 4
-    if value <= 1.0:
-        return 5
-    return 6
-
-
-def joint_score_distribution(
-    politics_values: Sequence[Optional[float]],
-    news_values: Sequence[Optional[float]],
-) -> dict[str, Any]:
-    pairs = [
-        (float(politics), float(news))
-        for politics, news in zip(politics_values, news_values)
-        if politics is not None
-        and news is not None
-        and math.isfinite(politics)
-        and math.isfinite(news)
-    ]
-    histogram_counts = [
-        [0 for _ in SCORE_BIN_LABELS]
-        for _ in SCORE_BIN_LABELS
-    ]
-    for politics, news in pairs:
-        histogram_counts[_score_bin_index(politics)][_score_bin_index(news)] += 1
-    pair_count = len(pairs)
-    histogram_shares = [
-        [count / pair_count if pair_count else None for count in row]
-        for row in histogram_counts
-    ]
-
-    result: dict[str, Any] = {
-        "finite_pair_count": pair_count,
-        "pearson_correlation": None,
-        "population_covariance": None,
-        "mean_politics_minus_news_social_concern": None,
-        "mean_absolute_score_difference": None,
-        "minimum_of_two_scores": score_distribution([]),
-        "maximum_of_two_scores": score_distribution([]),
-        "bivariate_histogram": {
-            "politics_score_bins": list(SCORE_BIN_LABELS),
-            "news_social_concern_score_bins": list(SCORE_BIN_LABELS),
-            "counts": histogram_counts,
-            "shares_of_finite_pairs": histogram_shares,
-        },
-    }
-    if not pairs:
-        return result
-
-    politics_scores = [pair[0] for pair in pairs]
-    news_scores = [pair[1] for pair in pairs]
-    politics_mean = sum(politics_scores) / pair_count
-    news_mean = sum(news_scores) / pair_count
-    covariance = sum(
-        (politics - politics_mean) * (news - news_mean)
-        for politics, news in pairs
-    ) / pair_count
-    politics_variance = sum(
-        (politics - politics_mean) ** 2 for politics in politics_scores
-    ) / pair_count
-    news_variance = sum(
-        (news - news_mean) ** 2 for news in news_scores
-    ) / pair_count
-    correlation_denominator = math.sqrt(politics_variance * news_variance)
-    result.update({
-        "pearson_correlation": (
-            covariance / correlation_denominator
-            if correlation_denominator > 0.0
-            else None
-        ),
-        "population_covariance": covariance,
-        "mean_politics_minus_news_social_concern": sum(
-            politics - news for politics, news in pairs
-        ) / pair_count,
-        "mean_absolute_score_difference": sum(
-            abs(politics - news) for politics, news in pairs
-        ) / pair_count,
-        "minimum_of_two_scores": score_distribution([
-            min(politics, news) for politics, news in pairs
-        ]),
-        "maximum_of_two_scores": score_distribution([
-            max(politics, news) for politics, news in pairs
-        ]),
-    })
-    return result
-
-
 def inference_score_summary(frame: pl.DataFrame) -> dict[str, Any]:
     total = frame.height
     matched = (
@@ -532,19 +419,13 @@ def inference_score_summary(frame: pl.DataFrame) -> dict[str, Any]:
         if total
         else 0
     )
-    politics_values = frame["politics_score"].to_list() if total else []
     news_values = frame["news_social_concern_score"].to_list() if total else []
     return {
         "total_candidates": total,
         "matched_inference_candidates": matched,
         "candidates_without_inference": total - matched,
         "inference_coverage": matched / total if total else None,
-        "politics_score": score_distribution(politics_values),
         "news_social_concern_score": score_distribution(news_values),
-        "joint_distribution": joint_score_distribution(
-            politics_values,
-            news_values,
-        ),
     }
 
 
@@ -594,6 +475,7 @@ def build_summary(
             "gcs_bucket": args.gcs_bucket,
             "inference_prefix": args.inference_prefix,
             "inference_buffer_days": INFERENCE_BUFFER_DAYS,
+            "political_score_field": POLITICAL_SCORE_FIELD,
             "output_dir": str(output_dir),
         },
         "candidate_window": {
@@ -612,14 +494,13 @@ def build_summary(
         "overall": inference_score_summary(output_frame),
         "top_cutoffs": top_cutoff_summaries(output_frame),
         "score_semantics": (
-            "Scores are retained from the latest inference row per candidate URI. "
-            "Missing inference rows and missing individual score fields remain null."
+            "The topic.News & Social Concern score is retained from the latest "
+            "inference row per candidate URI. Missing inference rows and missing "
+            "score fields remain null."
         ),
         "distribution_methodology": {
             "quantiles": "linear interpolation between ordered finite scores",
-            "dispersion": "population standard deviation and covariance",
-            "joint_statistics": "calculated only for candidates with two finite scores",
-            "bivariate_histogram_bins": list(SCORE_BIN_LABELS),
+            "dispersion": "population standard deviation",
         },
     }
 
@@ -652,38 +533,23 @@ def print_console_summary(summary: Mapping[str, Any], output_dir: Path) -> None:
         f"{overall['total_candidates']:,}, "
         f"coverage={_format_percent(overall['inference_coverage'])}"
     )
-    for display_name, key in (
-        ("Politics", "politics_score"),
-        ("News & Social Concern", "news_social_concern_score"),
-    ):
-        distribution = overall[key]
-        print(
-            f"  {display_name}: n={distribution['finite_score_count']:,}, "
-            f"missing={distribution['missing_score_count']:,}, "
-            f"mean={_format_stat(distribution['mean'])}, "
-            f"median={_format_stat(distribution['median'])}, "
-            f"p90={_format_stat(distribution['p90'])}, "
-            f"p99={_format_stat(distribution['p99'])}, "
-            f"max={_format_stat(distribution['max'])}"
-        )
-    joint = overall["joint_distribution"]
-    minimum = joint["minimum_of_two_scores"]
+    distribution = overall["news_social_concern_score"]
     print(
-        f"  Joint: complete pairs={joint['finite_pair_count']:,}, "
-        f"correlation={_format_stat(joint['pearson_correlation'])}, "
-        f"mean absolute difference="
-        f"{_format_stat(joint['mean_absolute_score_difference'])}, "
-        f"median minimum score={_format_stat(minimum['median'])}"
+        f"  News & Social Concern: n={distribution['finite_score_count']:,}, "
+        f"missing={distribution['missing_score_count']:,}, "
+        f"mean={_format_stat(distribution['mean'])}, "
+        f"median={_format_stat(distribution['median'])}, "
+        f"p90={_format_stat(distribution['p90'])}, "
+        f"p95={_format_stat(distribution['p95'])}, "
+        f"p99={_format_stat(distribution['p99'])}, "
+        f"max={_format_stat(distribution['max'])}"
     )
     for cutoff, cutoff_summary in summary["top_cutoffs"].items():
-        politics = cutoff_summary["politics_score"]
         news = cutoff_summary["news_social_concern_score"]
         print(
             f"  Top {cutoff}: matched={cutoff_summary['matched_inference_candidates']:,}/"
             f"{cutoff_summary['actual_cutoff']:,}, "
-            f"Politics mean/median={_format_stat(politics['mean'])}/"
-            f"{_format_stat(politics['median'])}, "
-            f"News mean/median={_format_stat(news['mean'])}/"
+            f"News & Social Concern mean/median={_format_stat(news['mean'])}/"
             f"{_format_stat(news['median'])}"
         )
     print(f"  Output: {output_dir}")

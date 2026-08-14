@@ -115,7 +115,7 @@ def test_political_negative_sampling_args_merge_from_cli_and_config(tmp_path):
     assert merged.political_negative_samples_per_hour == 100
     assert merged.political_score_threshold == 0.9
     assert cli.DEFAULTS["political_negative_samples_per_hour"] == 0
-    assert cli.DEFAULTS["political_score_threshold"] == 0.8
+    assert cli.DEFAULTS["political_score_threshold"] == 0.95
 
     config_path = Path(tmp_path) / "political_sampling.yml"
     config_path.write_text(
