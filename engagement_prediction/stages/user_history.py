@@ -361,6 +361,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         shutil.rmtree(routed_history_post_uris_path)
     query_histories_partial_path.replace(query_histories_path)
     history_post_uris_partial_path.replace(history_post_uris_path)
+    # These DID-partitioned datasets are required only while constructing and
+    # validating the two public outputs above. Keep them on failed runs for
+    # diagnosis, but do not retain them in a successfully completed artifact.
+    logger.info("Removing successful-run query and queried-user-like staging datasets")
+    shutil.rmtree(query_partitions_path)
+    shutil.rmtree(queried_user_likes_path)
 
     _log_stats(logger, stats)
     logger.info(

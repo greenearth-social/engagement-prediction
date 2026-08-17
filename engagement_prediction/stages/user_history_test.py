@@ -141,6 +141,8 @@ def test_registry_run_writes_query_conditioned_histories_and_lineage(tmp_path):
     assert list(output_dir.glob("query_histories_*.partial")) == []
     assert list(output_dir.glob("history_post_uris_*.partial")) == []
     assert list(output_dir.glob("_history_post_uri_*")) == []
+    assert list(output_dir.glob("_query_partitions_*")) == []
+    assert list(output_dir.glob("_queried_user_likes_*")) == []
 
 
 def test_logical_output_is_independent_of_stage_partition_count(tmp_path):
@@ -231,6 +233,8 @@ def test_failed_partition_does_not_publish_primary_history_dataset(tmp_path, mon
         not path.name.endswith(".partial")
         for path in stage2_dir.glob("history_post_uris_*")
     )
+    assert list(stage2_dir.glob("_query_partitions_*"))
+    assert list(stage2_dir.glob("_queried_user_likes_*"))
 
 
 def test_config_requires_positive_limits():
