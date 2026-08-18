@@ -16,6 +16,7 @@ from .core import ROOT, Context, load_run_callable
 STAGE_SPECS: Dict[str, Tuple[str, str]] = {
     'query_selection': ("engagement_prediction/stages/query_selection.py",     "01_query_selection"),
     'user_history':    ("engagement_prediction/stages/user_history.py",        "02_user_history"),
+    'post_selection':  ("engagement_prediction/stages/post_selection.py",      "03_post_selection"),
     'train_mlp':       ("utils/03_train/stage_train_mlp.py",                    "03_train"),
     'train_two_tower': ("utils/03_train/stage_train_two_tower.py",              "03_train"),
     'train_bst_ranker': ("utils/03_train/stage_train_bst_ranker.py",            "03_train"),

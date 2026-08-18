@@ -6,9 +6,9 @@ Helpers for resolving lineage-aligned stage artifacts.
 This module keeps the provenance logic out of ``cli.py`` so the CLI stays
 focused on argument handling and stage orchestration.
 
-The active data pipeline currently ends at query-conditioned user history:
+The active data pipeline currently ends at post selection:
 
-01_query_selection -> 02_user_history
+01_query_selection -> 02_user_history -> 03_post_selection
 
 The unchanged training and evaluation stages remain available only through an
 explicitly pinned legacy compatibility path.
@@ -45,6 +45,8 @@ def get_stage_input_folders() -> Dict[str, List[str]]:
         dependencies["01_query_selection"] = []
     if "02_user_history" in registered_folders:
         dependencies["02_user_history"] = ["01_query_selection"]
+    if "03_post_selection" in registered_folders:
+        dependencies["03_post_selection"] = ["02_user_history"]
     if "03_train" in registered_folders:
         dependencies["03_train"] = []
     if "04_evaluate" in registered_folders:

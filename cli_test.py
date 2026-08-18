@@ -57,81 +57,60 @@ def test_merge_args_with_config_rejects_unknown_keys(tmp_path, argv):
         cli._merge_args_with_config(args)
 
 
-def test_negative_samples_per_hour_replaces_old_negative_posts_sample(tmp_path):
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--negative-samples-per-hour",
+        "--political-negative-samples-per-hour",
+        "--negative-sampling-alpha",
+        "--min-likes-per-negative-post",
+        "--initial-negative-sampling-pct",
+        "--cap-random-seed",
+    ],
+)
+def test_obsolete_negative_sampling_flags_are_rejected(flag):
     parser = cli.build_parser()
-    raw = parser.parse_args(["--negative-samples-per-hour", "123"])
-    merged = cli._merge_args_with_config(raw)
-
-    assert merged.negative_samples_per_hour == 123
-    assert cli.DEFAULTS["negative_samples_per_hour"] == 1000
-    assert "negative_posts_sample" not in cli.DEFAULTS
-
     with pytest.raises(SystemExit):
-        parser.parse_args(["--negative-posts-sample", "123"])
-
-    config_path = Path(tmp_path) / "old.yml"
-    config_path.write_text("negative_posts_sample: 123\n")
-    raw = parser.parse_args(["--config", str(config_path)])
-    with pytest.raises(ValueError):
-        cli._merge_args_with_config(raw)
+        parser.parse_args([flag, "1"])
+    assert flag.removeprefix("--").replace("-", "_") not in cli.DEFAULTS
 
 
-def test_negative_sampling_popularity_args_merge_from_cli_and_config(tmp_path):
+def test_post_selection_args_merge_from_cli_and_config(tmp_path):
     parser = cli.build_parser()
     raw = parser.parse_args([
-        "--negative-sampling-alpha", "0.25",
-        "--min-likes-per-negative-post", "12",
-        "--initial-negative-sampling-pct", "0.2",
-    ])
-    merged = cli._merge_args_with_config(raw)
-
-    assert merged.negative_sampling_alpha == 0.25
-    assert merged.min_likes_per_negative_post == 12
-    assert merged.initial_negative_sampling_pct == 0.2
-    assert cli.DEFAULTS["negative_sampling_alpha"] == 0.15
-    assert cli.DEFAULTS["min_likes_per_negative_post"] == 50
-    assert cli.DEFAULTS["initial_negative_sampling_pct"] == 0.1
-
-    config_path = Path(tmp_path) / "negative_sampling.yml"
-    config_path.write_text(
-        "negative_sampling_alpha: 0.75\n"
-        "min_likes_per_negative_post: 80\n"
-        "initial_negative_sampling_pct: 0.05\n"
-    )
-    raw = parser.parse_args(["--config", str(config_path), "--negative-sampling-alpha", "0.4"])
-    merged = cli._merge_args_with_config(raw)
-
-    assert merged.negative_sampling_alpha == 0.4
-    assert merged.min_likes_per_negative_post == 80
-    assert merged.initial_negative_sampling_pct == 0.05
-
-
-def test_political_negative_sampling_args_merge_from_cli_and_config(tmp_path):
-    parser = cli.build_parser()
-    raw = parser.parse_args([
-        "--political-negative-samples-per-hour", "100",
+        "--random-candidate-sampling-fraction", "0.2",
+        "--max-political-candidates-per-creation-hour", "100",
         "--political-score-threshold", "0.9",
+        "--political-inference-window-padding-days", "7",
+        "--post-selection-partition-count", "64",
     ])
     merged = cli._merge_args_with_config(raw)
 
-    assert merged.political_negative_samples_per_hour == 100
+    assert merged.random_candidate_sampling_fraction == 0.2
+    assert merged.max_political_candidates_per_creation_hour == 100
     assert merged.political_score_threshold == 0.9
-    assert cli.DEFAULTS["political_negative_samples_per_hour"] == 0
-    assert cli.DEFAULTS["political_score_threshold"] == 0.8
+    assert merged.political_inference_window_padding_days == 7
+    assert merged.post_selection_partition_count == 64
 
     config_path = Path(tmp_path) / "political_sampling.yml"
     config_path.write_text(
-        "political_negative_samples_per_hour: 25\n"
+        "random_candidate_sampling_fraction: 0.3\n"
+        "max_political_candidates_per_creation_hour: 25\n"
         "political_score_threshold: 0.75\n"
+        "political_inference_window_padding_days: 3\n"
+        "post_selection_partition_count: 32\n"
     )
     raw = parser.parse_args([
         "--config", str(config_path),
-        "--political-negative-samples-per-hour", "50",
+        "--max-political-candidates-per-creation-hour", "50",
     ])
     merged = cli._merge_args_with_config(raw)
 
-    assert merged.political_negative_samples_per_hour == 50
+    assert merged.random_candidate_sampling_fraction == 0.3
+    assert merged.max_political_candidates_per_creation_hour == 50
     assert merged.political_score_threshold == 0.75
+    assert merged.political_inference_window_padding_days == 3
+    assert merged.post_selection_partition_count == 32
 
 
 def test_query_sampling_args_replace_user_sampling_args(tmp_path):
@@ -179,12 +158,17 @@ def test_query_sampling_defaults():
     assert merged.max_positives_per_user_hour == 32
     assert merged.max_history_posts_per_query == 64
     assert merged.user_history_partition_count == 256
+    assert merged.random_candidate_sampling_fraction == 0.10
+    assert merged.max_political_candidates_per_creation_hour == 1000
+    assert merged.political_score_threshold == 0.95
+    assert merged.political_inference_window_padding_days == 5
+    assert merged.post_selection_partition_count == 256
 
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(["--max-prior-likes", "64"])
 
 
-def test_user_history_cannot_continue_into_legacy_training(tmp_path):
+def test_post_selection_cannot_continue_into_legacy_training(tmp_path):
     parser = cli.build_parser()
     merged = cli._merge_args_with_config(parser.parse_args([]))
     merged.output_dir = str(tmp_path)
@@ -195,13 +179,28 @@ def test_user_history_cannot_continue_into_legacy_training(tmp_path):
         pipeline_run_id="run",
     )
 
-    with pytest.raises(ValueError, match="--stop-after user_history"):
+    with pytest.raises(ValueError, match="--stop-after post_selection"):
         cli.cmd__run_all_exec(merged, ctx)
 
 
 def test_new_pipeline_can_stop_after_user_history():
     args = cli._merge_args_with_config(
         cli.build_parser().parse_args(["--stop-after", "user_history"])
+    )
+    stage_order = cli._get_stage_order_for_model_type(cli._get_train_key(args.model_type))
+    start_idx, stop_idx, _ = cli._get_stage_folder_and_start_stop_indices(
+        stage_order,
+        args.start_from,
+        args.stop_after,
+        cli._get_train_key(args.model_type),
+    )
+
+    cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
+
+
+def test_new_pipeline_can_stop_after_post_selection():
+    args = cli._merge_args_with_config(
+        cli.build_parser().parse_args(["--stop-after", "post_selection"])
     )
     stage_order = cli._get_stage_order_for_model_type(cli._get_train_key(args.model_type))
     start_idx, stop_idx, _ = cli._get_stage_folder_and_start_stop_indices(
@@ -254,6 +253,72 @@ def test_new_pipeline_runs_query_selection_through_user_history(tmp_path, monkey
     history_dir = context.get_artifact_dir("user_history")
     assert history_dir is not None
     assert list(history_dir.glob("query_histories_*"))
+
+
+def test_new_pipeline_runs_query_selection_through_post_selection(tmp_path, monkeypatch):
+    likes_path = Path(tmp_path) / "likes.parquet"
+    pl.DataFrame({
+        "did": ["u1", "u1", "u1"],
+        "subject_uri": ["history", "target-one", "target-two"],
+        "record_created_at": [
+            "2026-01-01T09:00:00Z",
+            "2026-01-01T10:05:00Z",
+            "2026-01-01T12:05:00Z",
+        ],
+    }).write_parquet(likes_path)
+    posts_path = Path(tmp_path) / "posts.parquet"
+    pl.DataFrame({
+        "at_uri": ["history", "target-one", "target-two"],
+        "record_created_at": [
+            "2026-01-01T08:00:00Z",
+            "2026-01-01T09:00:00Z",
+            "2026-01-01T11:00:00Z",
+        ],
+        "did": ["author-one", "author-two", "author-three"],
+    }).write_parquet(posts_path)
+
+    def list_sources(*, blob_prefix, **kwargs):
+        if blob_prefix == "bsky_likes":
+            return [str(likes_path)], [datetime(2026, 1, 1, 8, tzinfo=timezone.utc)]
+        assert blob_prefix == "bsky_posts"
+        return [str(posts_path)], [datetime(2026, 1, 1, 8, tzinfo=timezone.utc)]
+
+    monkeypatch.setattr(
+        "engagement_prediction.data.ingex.list_ingex_parquet_files",
+        list_sources,
+    )
+    args = cli._merge_args_with_config(cli.build_parser().parse_args([
+        "--stop-after", "post_selection",
+        "--likes-start", "2026-01-01T08:00:00Z",
+        "--likes-end", "2026-01-02T00:00:00Z",
+        "--posts-start", "2026-01-01T00:00:00Z",
+        "--posts-end", "2026-01-02T00:00:00Z",
+        "--train-start", "2026-01-01T10:00:00Z",
+        "--val-start", "2026-01-02T00:00:00Z",
+        "--unseen-user-fraction", "0",
+        "--user-history-partition-count", "2",
+        "--post-selection-partition-count", "2",
+        "--random-candidate-sampling-fraction", "0",
+        "--max-political-candidates-per-creation-hour", "0",
+    ]))
+    output_root = Path(tmp_path) / "output"
+    output_root.mkdir()
+    args.output_dir = str(output_root)
+    args._argv = ["--stop-after", "post_selection"]
+    context = cli.Context(
+        run_dir=output_root / "runs" / "run",
+        artifacts_dir=output_root / "artifacts",
+        runs_dir=output_root / "runs",
+        pipeline_run_id="run",
+    )
+
+    assert cli.cmd__run_all_exec(args, context) == 0
+    post_selection_dir = context.get_artifact_dir("post_selection")
+    assert post_selection_dir is not None
+    posts = pl.scan_parquet(
+        post_selection_dir / "post_universe_*" / "posts" / "*.parquet"
+    ).collect()
+    assert set(posts["subject_uri"]) == {"history", "target-one", "target-two"}
 
 
 def test_direct_legacy_training_requires_both_explicit_pins():

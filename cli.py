@@ -9,8 +9,8 @@ Runs the engagement prediction artifact pipeline.
 Note: The historical `run-all` subcommand is now optional (kept for backwards compatibility).
 
 Usage examples:
-    python cli.py --config config.yml --stop-after user_history
-    python cli.py run-all --config config.yml --stop-after user_history
+    python cli.py --config config.yml --stop-after post_selection
+    python cli.py run-all --config config.yml --stop-after post_selection
 """
 
 import argparse
@@ -45,7 +45,7 @@ from engagement_prediction.pipeline.core import (
 CLI_FILE_DIR = Path(__file__).parent
 
 TRAIN_PLACEHOLDER = 'train_placeholder'
-STAGE_ORDER = ['query_selection', 'user_history', TRAIN_PLACEHOLDER, 'evaluate']
+STAGE_ORDER = ['query_selection', 'user_history', 'post_selection', TRAIN_PLACEHOLDER, 'evaluate']
 VALID_USER_ENCODERS_BY_MODEL_TYPE: Dict[str, Tuple[str, ...]] = {
     "mlp": ("summarized", "full_transformer", "cross_attention"),
     "two-tower": ("full_transformer", "cross_attention"),
@@ -64,15 +64,15 @@ DEFAULTS: Dict[str, Any] = {
     "max_train_query_hours": None,
     "max_eval_query_hours_per_split": None,
     "max_positives_per_user_hour": 32,
+    # STage 2: User histroy
     "max_history_posts_per_query": 64,
-    "user_history_partition_count": 256,
-    "negative_samples_per_hour": 1000,  # Stage 1: sampled negative post-hour rows per bucket
-    "political_negative_samples_per_hour": 0,  # Stage 1: additional political negative post-hour rows per bucket; 0 disables inference loading
-    "political_score_threshold": 0.8,  # Stage 1: minimum required score for both politics inference signals
-    "negative_sampling_alpha": 0.15,  # Stage 1: popularity weighting exponent for negative sampling
-    "min_likes_per_negative_post": 50,  # Stage 1: minimum global likes for negative-sampling candidates
-    "initial_negative_sampling_pct": 0.1,  # Stage 1: hash-sampled post rate before global like counts for negatives
-    "cap_random_seed": 42,
+    "user_history_partition_count": 32,
+    # Stage 3: Post selection
+    "random_candidate_sampling_fraction": 0.10,
+    "max_political_candidates_per_creation_hour": 1000,
+    "political_score_threshold": 0.95,
+    "political_inference_window_padding_days": 5,
+    "post_selection_partition_count": 32,
     "max_memory_gb": None,  # Stage 1: max memory in GB (None = auto based on percentage)
     "max_memory_pct": 0.75,  # Stage 1: max percentage of available RAM to use
     "memory_check": "full",  # Stage 1: memory check mode (full/ignore/skip)
@@ -653,11 +653,11 @@ def _validate_data_pipeline_boundary(
     start_idx: int,
     stop_idx: int,
 ) -> None:
-    user_history_idx = stage_order.index("user_history")
-    if start_idx <= user_history_idx < stop_idx:
+    post_selection_idx = stage_order.index("post_selection")
+    if start_idx <= post_selection_idx < stop_idx:
         raise ValueError(
-            "user_history cannot yet continue into unchanged training stages. "
-            "Run the new data pipeline with --stop-after user_history."
+            "post_selection cannot yet continue into unchanged training stages. "
+            "Run the new data pipeline with --stop-after post_selection."
         )
     train_idx = next(idx for idx, key in enumerate(stage_order) if key.startswith("train_"))
     evaluate_idx = stage_order.index("evaluate")
@@ -788,10 +788,11 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
             label_map = {
                 'query_selection': "Stage 1: Select user-hour queries…",
                 'user_history': "Stage 2: Generate user history…",
-                'train_mlp': "Stage 3: Train model (MLP)…",
-                'train_two_tower': "Stage 3: Train model (Two-Tower)…",
-                'train_bst_ranker': "Stage 3: Train model (BST Ranker)…",
-                'evaluate': "Stage 4: Evaluate model…",
+                'post_selection': "Stage 3: Select post universe…",
+                'train_mlp': "Legacy training: Train model (MLP)…",
+                'train_two_tower': "Legacy training: Train model (Two-Tower)…",
+                'train_bst_ranker': "Legacy training: Train model (BST Ranker)…",
+                'evaluate': "Legacy evaluation: Evaluate model…",
             }
             label = label_map.get(key, f"Stage {idx+1}: {key}…")
             print(f"\n[{idx+1}/{len(stage_order)}] ▶️  {label}")
@@ -840,9 +841,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help=f"compare-rankers BST candidate chunk size (default: {compare_rankers.DEFAULT_COMPARE_BST_CANDIDATE_CHUNK_SIZE})",
     )
-    # run-all (modular 4-stage end-to-end)
+    # run-all (modular pipeline)
     p_all = parser
-    # Stage 1 options
+    # Data-source options
     _add_arg_with_default(p_all, "--gcs-bucket", type=str, default=argparse.SUPPRESS,
                           help_text="GCS bucket name for ingex data")
     _add_arg_with_default(p_all, "--posts-start", type=str, default=argparse.SUPPRESS,
@@ -863,20 +864,6 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Optional independent query-hour cap for each evaluation split")
     _add_arg_with_default(p_all, "--max-positives-per-user-hour", type=int, default=argparse.SUPPRESS,
                           help_text="Discard selected user-hours with more than this many positives")
-    _add_arg_with_default(p_all, "--negative-samples-per-hour", type=int, default=argparse.SUPPRESS,
-                          help_text="Number of negative post-hour rows to sample per hour in Stage 1")
-    _add_arg_with_default(p_all, "--political-negative-samples-per-hour", type=int, default=argparse.SUPPRESS,
-                          help_text="Target number of supplemental political negative post-hour rows per hour in Stage 1; 0 disables inference loading")
-    _add_arg_with_default(p_all, "--political-score-threshold", type=float, default=argparse.SUPPRESS,
-                          help_text="Minimum required score for both politics inference signals in Stage 1")
-    _add_arg_with_default(p_all, "--negative-sampling-alpha", type=float, default=argparse.SUPPRESS,
-                          help_text="Popularity weighting exponent for negative sampling in Stage 1")
-    _add_arg_with_default(p_all, "--min-likes-per-negative-post", type=int, default=argparse.SUPPRESS,
-                          help_text="Minimum global like count for posts eligible for negative sampling in Stage 1")
-    _add_arg_with_default(p_all, "--initial-negative-sampling-pct", type=float, default=argparse.SUPPRESS,
-                          help_text="Initial hash-sampled post rate before global like counts for negative sampling in Stage 1")
-    _add_arg_with_default(p_all, "--cap-random-seed", type=int, default=argparse.SUPPRESS,
-                          help_text="Random seed for ingestion capping")
     _add_arg_with_default(p_all, "--max-memory-gb", type=float, default=argparse.SUPPRESS,
                           help_text="Maximum memory to use in GB (None = auto based on available RAM)")
     _add_arg_with_default(p_all, "--max-memory-pct", type=float, default=argparse.SUPPRESS,
@@ -899,6 +886,22 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Maximum recent like events retained in each Stage 2 query history")
     _add_arg_with_default(p_all, "--user-history-partition-count", type=int, default=argparse.SUPPRESS,
                           help_text="Stable DID-hash partition count used to bound Stage 2 memory")
+    # Stage 3 post selection
+    _add_arg_with_default(p_all, "--random-candidate-sampling-fraction", type=float,
+                          default=argparse.SUPPRESS,
+                          help_text="Stable fraction of unique posts retained in the random candidate reservoir")
+    _add_arg_with_default(p_all, "--max-political-candidates-per-creation-hour", type=int,
+                          default=argparse.SUPPRESS,
+                          help_text="Maximum political candidates retained per UTC post-creation hour; 0 disables inference loading")
+    _add_arg_with_default(p_all, "--political-score-threshold", type=float,
+                          default=argparse.SUPPRESS,
+                          help_text="Inclusive News & Social Concern score threshold for political candidates")
+    _add_arg_with_default(p_all, "--political-inference-window-padding-days", type=int,
+                          default=argparse.SUPPRESS,
+                          help_text="Days added only to the end of the inference-file listing window")
+    _add_arg_with_default(p_all, "--post-selection-partition-count", type=int,
+                          default=argparse.SUPPRESS,
+                          help_text="Stable URI-hash partition count used to bound Stage 3 memory")
     _add_arg_with_default(p_all, "--train-start", type=str, default=argparse.SUPPRESS,
                           help_text="ISO date string for start of training dataset window")
     _add_arg_with_default(p_all, "--val-start", type=str, default=argparse.SUPPRESS,
@@ -1056,10 +1059,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="(Deprecated) Always enabled during sequential run-all")
     # Selective reruns and prior pinning
     _add_arg_with_default(p_all, "--start-from", type=str,
-                          choices=["query_selection", "user_history", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "evaluate"],
+                          choices=["query_selection", "user_history", "post_selection", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Begin execution at this stage")
     _add_arg_with_default(p_all, "--stop-after", type=str,
-                          choices=["query_selection", "user_history", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "evaluate"],
+                          choices=["query_selection", "user_history", "post_selection", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Stop after this stage completes")
     _add_arg_with_default(p_all, "--pick-prior", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help_text="If multiple prior outputs exist, prompt to pick (foreground only)")
@@ -1068,7 +1071,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--prior-01-get-data", type=str, default=argparse.SUPPRESS,
                           help_text="Pin legacy Stage 1 (01_get_data) artifact dir by stage_run_id or path")
     _add_arg_with_default(p_all, "--prior-02-user-history", type=str, default=argparse.SUPPRESS,
-                          help_text="Pin legacy Stage 2 (02_user_history) artifact dir for direct training")
+                          help_text="Pin Stage 2 (02_user_history) for a direct post-selection rerun, or a legacy Stage 2 for direct training")
     _add_arg_with_default(p_all, "--prior-03-train", type=str, default=argparse.SUPPRESS,
                           help_text="Pin prior Stage 3 (03_train) artifact dir by stage_run_id or path (used by eval)")
     # Execution behavior

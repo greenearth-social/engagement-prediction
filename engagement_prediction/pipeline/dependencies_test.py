@@ -35,6 +35,7 @@ def test_get_stage_folder_to_keys_is_derived_from_registry():
     assert get_stage_folder_to_keys() == {
         "01_query_selection": ("query_selection",),
         "02_user_history": ("user_history",),
+        "03_post_selection": ("post_selection",),
         "03_train": ("train_mlp", "train_two_tower", "train_bst_ranker"),
         "04_evaluate": ("evaluate",),
     }
@@ -44,6 +45,7 @@ def test_get_stage_input_folders_is_derived_from_stage_order():
     assert get_stage_input_folders() == {
         "01_query_selection": [],
         "02_user_history": ["01_query_selection"],
+        "03_post_selection": ["02_user_history"],
         "03_train": [],
         "04_evaluate": [],
     }
@@ -65,6 +67,40 @@ def test_resolve_stage_dependencies_for_user_history_selects_latest_query_artifa
     )
 
     assert resolved == {"01_query_selection": query_new.resolve()}
+
+
+def test_resolve_post_selection_from_history_pin_infers_query_ancestor(tmp_path):
+    artifacts_dir = Path(tmp_path) / "artifacts"
+    run_dir = Path(tmp_path) / "runs" / "run1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    query_selection = _make_stage_output(
+        artifacts_dir,
+        "01_query_selection",
+        "20260101_000000_query",
+    )
+    user_history = _make_stage_output(
+        artifacts_dir,
+        "02_user_history",
+        "20260102_000000_history",
+        inputs={"01_query_selection": str(query_selection)},
+    )
+    ctx = Context(
+        run_dir=run_dir,
+        artifacts_dir=artifacts_dir,
+        runs_dir=Path(tmp_path) / "runs",
+        use_latest=True,
+    )
+    ctx.prior_outputs["02_user_history"] = user_history
+
+    resolved = resolve_stage_dependencies_for_run(
+        ctx=ctx,
+        consumer_stage_folder="03_post_selection",
+    )
+
+    assert resolved == {
+        "01_query_selection": query_selection.resolve(),
+        "02_user_history": user_history.resolve(),
+    }
 
 
 def test_validate_explicit_prior_pin_consistency_rejects_misaligned_query_history(tmp_path):
