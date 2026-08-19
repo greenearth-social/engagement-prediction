@@ -250,11 +250,16 @@ def process_uri_partitions(
             inference_stats.append(partition_inference_stats)
         labeled_posts_df = post_data.label_posts(unique_posts_df, latest_inferences_df)
 
-        found_required_df = required_posts_df.join(
-            labeled_posts_df.select("subject_uri"), on="subject_uri", how="semi"
+        required_found_with_metadata_df = labeled_posts_df.join(
+            required_posts_df,
+            on="subject_uri",
+            how="inner",
+        )
+        found_required_df = required_found_with_metadata_df.select(
+            post_data.REQUIRED_POST_COLUMNS
         )
         missing_required_df = required_posts_df.join(
-            labeled_posts_df.select("subject_uri"), on="subject_uri", how="anti"
+            found_required_df.select("subject_uri"), on="subject_uri", how="anti"
         ).sort("subject_uri")
         _write_if_not_empty(
             required_posts_df,
@@ -271,8 +276,8 @@ def process_uri_partitions(
                 config.random_seed,
             )
         )
-        required_found_posts_df = labeled_posts_df.join(
-            found_required_df.select("subject_uri"), on="subject_uri", how="semi"
+        required_found_posts_df = required_found_with_metadata_df.select(
+            post_data.POST_COLUMNS
         )
         base_posts_df = (
             pl.concat([required_found_posts_df, random_posts_df])
