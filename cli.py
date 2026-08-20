@@ -847,9 +847,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--gcs-bucket", type=str, default=argparse.SUPPRESS,
                           help_text="GCS bucket name for ingex data")
     _add_arg_with_default(p_all, "--posts-start", type=str, default=argparse.SUPPRESS,
-                          help_text="ISO date string for ingex GCS posts start (inclusive)")
+                          help_text="ISO date string for Stage 1/3 ingex GCS posts start (inclusive)")
     _add_arg_with_default(p_all, "--posts-end", type=str, default=argparse.SUPPRESS,
-                          help_text="ISO date string for ingex GCS posts end (exclusive)")
+                          help_text="ISO date string for Stage 1/3 ingex GCS posts end (exclusive)")
     _add_arg_with_default(p_all, "--likes-start", type=str, default=argparse.SUPPRESS,
                           help_text="ISO date string for ingex GCS likes start (inclusive)")
     _add_arg_with_default(p_all, "--likes-end", type=str, default=argparse.SUPPRESS,
@@ -863,7 +863,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--max-eval-query-hours-per-split", type=int, default=argparse.SUPPRESS,
                           help_text="Optional independent query-hour cap for each evaluation split")
     _add_arg_with_default(p_all, "--max-positives-per-user-hour", type=int, default=argparse.SUPPRESS,
-                          help_text="Discard selected user-hours with more than this many positives")
+                          help_text="Discard selected user-hours with more than this many retained root-post positives")
     _add_arg_with_default(p_all, "--max-memory-gb", type=float, default=argparse.SUPPRESS,
                           help_text="Maximum memory to use in GB (None = auto based on available RAM)")
     _add_arg_with_default(p_all, "--max-memory-pct", type=float, default=argparse.SUPPRESS,
@@ -901,7 +901,7 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Days added only to the end of the inference-file listing window")
     _add_arg_with_default(p_all, "--post-selection-partition-count", type=int,
                           default=argparse.SUPPRESS,
-                          help_text="Stable URI-hash partition count used to bound Stage 3 memory")
+                          help_text="Stable URI-hash partition count used to bound Stage 1/3 post processing")
     _add_arg_with_default(p_all, "--train-start", type=str, default=argparse.SUPPRESS,
                           help_text="ISO date string for start of training dataset window")
     _add_arg_with_default(p_all, "--val-start", type=str, default=argparse.SUPPRESS,

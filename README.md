@@ -2,7 +2,7 @@
 
 This repo trains and evaluates engagement rankers for Bluesky posts. The artifact pipeline is being migrated to production-shaped user-hour queries:
 
-1. `01_query_selection`: load Ingex likes and select bounded `(user, hour)` queries with their positive posts.
+1. `01_query_selection`: load Ingex likes, select bounded `(user, hour)` queries, and retain positive posts found in the selected `bsky_posts` snapshot.
 2. `02_user_history`: select the bounded as-of like history for every query.
 3. `03_post_selection`: collect required posts and bounded random and political candidate reservoirs.
 
@@ -88,12 +88,14 @@ Each stage writes `manifest.json`, `resolved_config.json`, `stage.log`, and `sta
 
 ### Stage 1: Query Selection
 
-Stage 1 reads Ingex likes from GCS and writes production-shaped user-hour queries plus their positive posts.
+Stage 1 reads Ingex likes and posts from GCS and writes production-shaped user-hour queries plus positive posts found in the selected `bsky_posts` snapshot.
 
 Common config keys:
 
 ```yaml
 gcs_bucket: "greenearth-471522-ingex-extract-prod"
+posts_start: "2026-06-20T00:00:00Z"
+posts_end: "2026-06-24T00:00:00Z"
 likes_start: "2026-06-20"
 likes_end: "2026-06-24"
 train_start: "2026-06-20"
@@ -105,6 +107,7 @@ max_hours_per_user_per_split: 64
 max_train_query_hours: null
 max_eval_query_hours_per_split: null
 max_positives_per_user_hour: 32
+post_selection_partition_count: 256
 random_seed: 42
 ```
 
@@ -114,10 +117,11 @@ Important Stage 1 behavior:
 - Seen users produce `train`, `val`, and `holdout_seen_users` queries. Unseen users produce only `val_unseen_users` and `holdout_unseen_users` queries.
 - Query-hours are hash-sampled independently of their positive counts. Each user contributes at most 64 query-hours per split by default.
 - Training and each evaluation split can be capped directly with query-hour budgets. The global caps default to no limit for the first slice.
-- Selected hours with more than 32 unique positives are discarded without backfill.
+- Sampling caps are applied provisionally using all valid likes. Stage 1 then deduplicates positives within each selected user-hour and retains only URIs present in valid `bsky_posts` rows.
+- Positive counts are recomputed after post filtering. Selected hours with no retained positives or more than 32 retained positives are discarded without backfill; an hour with exactly 32 is retained.
 - There is no minimum-likes eligibility filter.
 
-Primary artifacts are `queries_*.parquet`, keyed by `(did, query_hour)`, and `query_positives_*.parquet`, keyed by `(did, query_hour, subject_uri)`. Stage 1 also records the exact Ingex like-file snapshot in `like_sources_*.json` for Stage 2.
+Primary artifacts are `queries_*.parquet`, keyed by `(did, query_hour)`, and `query_positives_*.parquet`, keyed by `(did, query_hour, subject_uri)`. Stage 1 records the exact Ingex like-file snapshot in `like_sources_*.json` for Stage 2 and the exact membership-check post snapshot in `post_sources_*.json`. `posts_start` and `posts_end` must be UTC, hour-aligned, ordered, and cover every provisionally sampled query hour.
 
 ### Stage 2: User History
 

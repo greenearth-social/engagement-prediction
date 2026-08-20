@@ -22,6 +22,9 @@ def _config(**overrides):
         "max_eval_query_hours_per_split": None,
         "max_positives_per_user_hour": 32,
         "random_seed": 42,
+        "posts_start": datetime(2026, 1, 1, tzinfo=UTC),
+        "posts_end": datetime(2026, 1, 10, tzinfo=UTC),
+        "post_selection_partition_count": 4,
         "likes_start": datetime(2026, 1, 1, tzinfo=UTC),
         "likes_end": datetime(2026, 1, 10, tzinfo=UTC),
         "train_start": datetime(2026, 1, 1, tzinfo=UTC),
@@ -33,13 +36,25 @@ def _config(**overrides):
     return stage.QuerySelectionConfig(**values)
 
 
-def _collect(rows, config):
+def _collect(rows, config, eligible_subject_uris=None):
     positive_rows_lf = stage._prepare_likes(pl.DataFrame(rows).lazy(), config)
-    lazyframes = stage._build_query_lazyframes_from_counts(
+    provisional_lazyframes = stage._build_query_lazyframes_from_counts(
         positive_rows_lf=positive_rows_lf,
         candidate_query_counts_lf=stage._candidate_query_counts_lf(positive_rows_lf),
         config=config,
     )
+    if eligible_subject_uris is None:
+        lazyframes = provisional_lazyframes
+    else:
+        eligible_positive_rows_lf = provisional_lazyframes["provisional_positives"].filter(
+            pl.col("subject_uri").is_in(eligible_subject_uris)
+        )
+        lazyframes = stage._build_query_lazyframes_from_counts(
+            positive_rows_lf=positive_rows_lf,
+            candidate_query_counts_lf=stage._candidate_query_counts_lf(positive_rows_lf),
+            config=config,
+            eligible_positive_rows_lf=eligible_positive_rows_lf,
+        )
     return stage.collect_query_artifacts(lazyframes, config)
 
 
@@ -292,7 +307,7 @@ def test_thirty_two_positives_are_retained_and_thirty_three_are_discarded():
     assert positives.height == 32
 
 
-def test_raw_row_count_discards_query_that_deduplication_would_make_valid():
+def test_duplicate_raw_rows_are_capped_after_selected_hour_deduplication():
     rows = [
         {
             "did": "did:one",
@@ -309,13 +324,121 @@ def test_raw_row_count_discards_query_that_deduplication_would_make_valid():
 
     queries, positives, stats = _collect(rows, _config())
 
-    assert queries["query_hour"].to_list() == [datetime(2026, 1, 2, 1, tzinfo=UTC)]
-    assert positives["subject_uri"].to_list() == ["at://post/retained"]
-    assert stats["oversized_query_count_by_split"]["train"] == 1
+    assert queries["query_hour"].to_list() == [
+        datetime(2026, 1, 2, 0, tzinfo=UTC),
+        datetime(2026, 1, 2, 1, tzinfo=UTC),
+    ]
+    assert positives["subject_uri"].to_list() == [
+        "at://post/duplicate",
+        "at://post/retained",
+    ]
+    assert stats["oversized_query_count_by_split"]["train"] == 0
+
+
+def test_post_membership_recomputes_counts_and_drops_zero_positive_queries():
+    rows = [
+        {
+            "did": "did:one",
+            "subject_uri": "at://post/found",
+            "record_created_at": "2026-01-02T00:05:00Z",
+        },
+        {
+            "did": "did:one",
+            "subject_uri": "at://post/missing",
+            "record_created_at": "2026-01-02T00:10:00Z",
+        },
+        {
+            "did": "did:one",
+            "subject_uri": "at://post/all-missing",
+            "record_created_at": "2026-01-02T01:05:00Z",
+        },
+    ]
+
+    queries, positives, stats = _collect(
+        rows,
+        _config(),
+        eligible_subject_uris=["at://post/found"],
+    )
+
+    assert queries["query_hour"].to_list() == [datetime(2026, 1, 2, 0, tzinfo=UTC)]
+    assert queries["positive_count"].to_list() == [1]
+    assert positives["subject_uri"].to_list() == ["at://post/found"]
+    assert stats["zero_positive_query_count_by_split"]["train"] == 1
+
+
+def test_raw_oversized_hour_can_become_valid_after_post_membership_filtering():
+    rows = [
+        {
+            "did": "did:one",
+            "subject_uri": f"at://post/{idx}",
+            "record_created_at": "2026-01-02T00:05:00Z",
+        }
+        for idx in range(33)
+    ]
+    rows.append({
+        "did": "did:one",
+        "subject_uri": "at://post/other-hour",
+        "record_created_at": "2026-01-02T01:05:00Z",
+    })
+
+    queries, positives, stats = _collect(
+        rows,
+        _config(),
+        eligible_subject_uris=[f"at://post/{idx}" for idx in range(32)] + [
+            "at://post/other-hour"
+        ],
+    )
+
+    assert queries.height == 2
+    assert queries["positive_count"].to_list() == [32, 1]
+    assert positives.height == 33
+    assert stats["oversized_query_count_by_split"]["train"] == 0
+
+
+def test_post_filtering_happens_after_query_budget_without_backfill():
+    candidate_keys = pl.DataFrame({
+        "did": ["did:one"] * 3,
+        "split": ["train"] * 3,
+        "query_hour": [datetime(2026, 1, 2, hour, tzinfo=UTC) for hour in range(3)],
+    }).with_columns(stage._query_priority_expr(42).alias("priority"))
+    selected_hours = candidate_keys.sort(["priority", "did", "query_hour"])[
+        "query_hour"
+    ].to_list()[:2]
+    removed_hour, retained_hour = selected_hours
+    unselected_hour = next(
+        hour for hour in candidate_keys["query_hour"].to_list() if hour not in selected_hours
+    )
+    rows = [
+        {
+            "did": "did:one",
+            "subject_uri": f"at://post/{hour.hour}",
+            "record_created_at": hour.replace(minute=5).isoformat(),
+        }
+        for hour in candidate_keys["query_hour"].to_list()
+    ]
+
+    queries, positives, stats = _collect(
+        rows,
+        _config(max_train_query_hours=2),
+        eligible_subject_uris=[
+            f"at://post/{retained_hour.hour}",
+            f"at://post/{unselected_hour.hour}",
+        ],
+    )
+
+    assert removed_hour not in queries["query_hour"].to_list()
+    assert unselected_hour not in queries["query_hour"].to_list()
+    assert queries["query_hour"].to_list() == [retained_hour]
+    assert positives["subject_uri"].to_list() == [f"at://post/{retained_hour.hour}"]
+    assert stats["queries_by_phase_and_split"]["after_split_cap"]["train"]["query_count"] == 2
+    assert stats["queries_by_phase_and_split"]["final"]["train"]["query_count"] == 1
+    assert stats["zero_positive_query_count_by_split"]["train"] == 1
 
 
 def test_build_config_validates_hour_alignment():
     args = SimpleNamespace(
+        posts_start="2026-01-01T00:00:00Z",
+        posts_end="2026-01-10T00:00:00Z",
         likes_start="2026-01-01T00:00:00Z",
         likes_end="2026-01-10T00:00:00Z",
         train_start="2026-01-01T00:30:00Z",
@@ -327,6 +450,7 @@ def test_build_config_validates_hour_alignment():
         max_train_query_hours=None,
         max_eval_query_hours_per_split=None,
         max_positives_per_user_hour=32,
+        post_selection_partition_count=4,
         random_seed=42,
     )
 
@@ -335,17 +459,22 @@ def test_build_config_validates_hour_alignment():
 
 
 @pytest.mark.parametrize(
-    ("field_name", "value", "error_match"),
+    ("posts_start", "posts_end", "error_match"),
     [
-        ("unseen_user_fraction", 1.0, "unseen_user_fraction"),
-        ("max_hours_per_user_per_split", 0, "max_hours_per_user_per_split"),
-        ("max_train_query_hours", -1, "max_train_query_hours"),
-        ("max_eval_query_hours_per_split", -1, "max_eval_query_hours_per_split"),
-        ("max_positives_per_user_hour", 0, "max_positives_per_user_hour"),
+        (None, "2026-01-10T00:00:00Z", "posts_start and posts_end are required"),
+        ("2026-01-01T00:00:00Z", None, "posts_start and posts_end are required"),
+        ("2026-01-10T00:00:00Z", "2026-01-01T00:00:00Z", "posts_end must be after"),
+        (
+            "2026-01-01T00:30:00Z",
+            "2026-01-10T00:00:00Z",
+            "posts_start must be aligned",
+        ),
     ],
 )
-def test_build_config_validates_sampling_parameters(field_name, value, error_match):
+def test_build_config_validates_post_window(posts_start, posts_end, error_match):
     args = SimpleNamespace(
+        posts_start=posts_start,
+        posts_end=posts_end,
         likes_start="2026-01-01T00:00:00Z",
         likes_end="2026-01-10T00:00:00Z",
         train_start="2026-01-01T00:00:00Z",
@@ -357,6 +486,53 @@ def test_build_config_validates_sampling_parameters(field_name, value, error_mat
         max_train_query_hours=None,
         max_eval_query_hours_per_split=None,
         max_positives_per_user_hour=32,
+        post_selection_partition_count=4,
+        random_seed=42,
+    )
+
+    with pytest.raises(ValueError, match=error_match):
+        stage.build_config(args)
+
+
+def test_post_window_must_cover_provisionally_sampled_query_hours():
+    sampled_queries_lf = pl.DataFrame({
+        "query_hour": [datetime(2026, 1, 2, 3, tzinfo=UTC)],
+    }).lazy()
+
+    with pytest.raises(ValueError, match="must cover every provisionally selected query hour"):
+        stage._validate_post_window(
+            sampled_queries_lf,
+            _config(posts_end=datetime(2026, 1, 2, 3, tzinfo=UTC)),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "error_match"),
+    [
+        ("unseen_user_fraction", 1.0, "unseen_user_fraction"),
+        ("max_hours_per_user_per_split", 0, "max_hours_per_user_per_split"),
+        ("max_train_query_hours", -1, "max_train_query_hours"),
+        ("max_eval_query_hours_per_split", -1, "max_eval_query_hours_per_split"),
+        ("max_positives_per_user_hour", 0, "max_positives_per_user_hour"),
+        ("post_selection_partition_count", 0, "post_selection_partition_count"),
+    ],
+)
+def test_build_config_validates_sampling_parameters(field_name, value, error_match):
+    args = SimpleNamespace(
+        posts_start="2026-01-01T00:00:00Z",
+        posts_end="2026-01-10T00:00:00Z",
+        likes_start="2026-01-01T00:00:00Z",
+        likes_end="2026-01-10T00:00:00Z",
+        train_start="2026-01-01T00:00:00Z",
+        val_start="2026-01-04T00:00:00Z",
+        holdout_start="2026-01-07T00:00:00Z",
+        holdout_end="2026-01-10T00:00:00Z",
+        unseen_user_fraction=0.1,
+        max_hours_per_user_per_split=64,
+        max_train_query_hours=None,
+        max_eval_query_hours_per_split=None,
+        max_positives_per_user_hour=32,
+        post_selection_partition_count=4,
         random_seed=42,
     )
     setattr(args, field_name, value)
@@ -372,13 +548,25 @@ def test_registry_run_writes_query_artifacts_and_manifest(tmp_path, monkeypatch)
         "subject_uri": ["at://post/one", "at://post/two"],
         "record_created_at": ["2026-01-02T01:05:00Z", "2026-01-02T01:10:00Z"],
     }).write_parquet(likes_path)
-    monkeypatch.setattr(
-        stage.ingex,
-        "list_ingex_parquet_files",
-        lambda **kwargs: ([str(likes_path)], [datetime(2026, 1, 2, 1, tzinfo=UTC)]),
-    )
+    posts_path = tmp_path / "posts.parquet"
+    pl.DataFrame({
+        "at_uri": ["at://post/one"],
+        "record_created_at": ["2026-01-02T00:30:00Z"],
+        "did": ["did:author"],
+    }).write_parquet(posts_path)
+
+    def list_sources(**kwargs):
+        if kwargs["blob_prefix"] == "bsky_likes":
+            return [str(likes_path)], [datetime(2026, 1, 2, 1, tzinfo=UTC)]
+        if kwargs["blob_prefix"] == "bsky_posts":
+            return [str(posts_path)], [datetime(2026, 1, 2, 0, tzinfo=UTC)]
+        raise AssertionError(f"Unexpected source lookup: {kwargs['blob_prefix']}")
+
+    monkeypatch.setattr(stage.ingex, "list_ingex_parquet_files", list_sources)
     args = SimpleNamespace(
         gcs_bucket="unused",
+        posts_start="2026-01-01T00:00:00Z",
+        posts_end="2026-01-10T00:00:00Z",
         likes_start="2026-01-01T00:00:00Z",
         likes_end="2026-01-10T00:00:00Z",
         train_start="2026-01-01T00:00:00Z",
@@ -390,6 +578,7 @@ def test_registry_run_writes_query_artifacts_and_manifest(tmp_path, monkeypatch)
         max_train_query_hours=None,
         max_eval_query_hours_per_split=None,
         max_positives_per_user_hour=32,
+        post_selection_partition_count=4,
         random_seed=42,
         _argv=["--stop-after", "query_selection"],
     )
@@ -405,6 +594,8 @@ def test_registry_run_writes_query_artifacts_and_manifest(tmp_path, monkeypatch)
     queries = pl.read_parquet(result["artifacts"]["queries_path"])
     positives = pl.read_parquet(result["artifacts"]["query_positives_path"])
     like_sources = json.loads(Path(result["artifacts"]["like_sources_path"]).read_text())
+    post_sources = json.loads(Path(result["artifacts"]["post_sources_path"]).read_text())
+    summary = json.loads((output_dir / "summary.json").read_text())
     candidate_query_counts_paths = list(output_dir.glob("_candidate_query_counts_*.parquet"))
 
     assert output_dir.parent.name == "01_query_selection"
@@ -421,8 +612,94 @@ def test_registry_run_writes_query_artifacts_and_manifest(tmp_path, monkeypatch)
     assert queries.columns == ["did", "query_hour", "user_cohort", "split", "positive_count"]
     assert positives.columns == ["did", "query_hour", "subject_uri", "like_created_at"]
     assert queries.height == 1
-    assert positives.height == 2
+    assert positives.height == 1
+    assert positives["subject_uri"].to_list() == ["at://post/one"]
     assert [entry["uri"] for entry in like_sources["files"]] == [str(likes_path)]
+    assert [entry["uri"] for entry in post_sources["files"]] == [str(posts_path)]
+    assert post_sources["blob_prefix"] == "bsky_posts"
+    assert post_sources["start"] == "2026-01-01T00:00:00+00:00"
+    assert post_sources["end"] == "2026-01-10T00:00:00+00:00"
+    assert summary["outputs"]["post_sources_file"] == Path(
+        result["artifacts"]["post_sources_path"]
+    ).name
+    assert summary["selection_stats"]["positive_filter_by_split"]["train"] == {
+        "selected_like_row_count": 2,
+        "provisional_positive_count": 2,
+        "retained_positive_count": 1,
+        "missing_post_positive_count": 1,
+    }
+    assert not list(output_dir.glob("_query_post_rows_*.partial"))
+    assert not list(output_dir.glob("_provisional_positive_rows_*.partial"))
+    assert not list(output_dir.glob("_eligible_positive_rows_*.partial"))
     assert json.loads((output_dir / "manifest.json").read_text())["stage_key"] == "query_selection"
     assert (output_dir / "summary.json").exists()
     assert (output_dir / "stage.log").exists()
+
+
+def test_partition_failure_does_not_publish_final_artifacts_or_manifest(tmp_path, monkeypatch):
+    likes_path = tmp_path / "likes.parquet"
+    pl.DataFrame({
+        "did": ["did:one"],
+        "subject_uri": ["at://post/one"],
+        "record_created_at": ["2026-01-02T01:05:00Z"],
+    }).write_parquet(likes_path)
+    posts_path = tmp_path / "posts.parquet"
+    pl.DataFrame({
+        "at_uri": ["at://post/one"],
+        "record_created_at": ["2026-01-02T00:30:00Z"],
+        "did": ["did:author"],
+    }).write_parquet(posts_path)
+
+    def list_sources(**kwargs):
+        if kwargs["blob_prefix"] == "bsky_likes":
+            return [str(likes_path)], [datetime(2026, 1, 2, 1, tzinfo=UTC)]
+        if kwargs["blob_prefix"] == "bsky_posts":
+            return [str(posts_path)], [datetime(2026, 1, 2, 0, tzinfo=UTC)]
+        raise AssertionError(f"Unexpected source lookup: {kwargs['blob_prefix']}")
+
+    monkeypatch.setattr(stage.ingex, "list_ingex_parquet_files", list_sources)
+
+    def fail_partition(**kwargs):
+        raise RuntimeError("partition failed")
+
+    monkeypatch.setattr(
+        stage.query_selection_artifacts,
+        "filter_positive_partitions",
+        fail_partition,
+    )
+    args = SimpleNamespace(
+        gcs_bucket="unused",
+        posts_start="2026-01-01T00:00:00Z",
+        posts_end="2026-01-10T00:00:00Z",
+        likes_start="2026-01-01T00:00:00Z",
+        likes_end="2026-01-10T00:00:00Z",
+        train_start="2026-01-01T00:00:00Z",
+        val_start="2026-01-04T00:00:00Z",
+        holdout_start="2026-01-07T00:00:00Z",
+        holdout_end="2026-01-10T00:00:00Z",
+        unseen_user_fraction=0.0,
+        max_hours_per_user_per_split=64,
+        max_train_query_hours=None,
+        max_eval_query_hours_per_split=None,
+        max_positives_per_user_hour=32,
+        post_selection_partition_count=4,
+        random_seed=42,
+        _argv=["--stop-after", "query_selection"],
+    )
+    context = Context(
+        run_dir=tmp_path / "runs" / "run",
+        artifacts_dir=tmp_path / "artifacts",
+        runs_dir=tmp_path / "runs",
+        pipeline_run_id="run",
+    )
+
+    with pytest.raises(RuntimeError, match="partition failed"):
+        registry.run_stage("query_selection", context, args)
+
+    output_dirs = list((tmp_path / "artifacts" / "01_query_selection").iterdir())
+    assert len(output_dirs) == 1
+    output_dir = output_dirs[0]
+    assert not (output_dir / "manifest.json").exists()
+    assert not list(output_dir.glob("queries_*.parquet"))
+    assert not list(output_dir.glob("query_positives_*.parquet"))
+    assert list(output_dir.glob("*.partial"))

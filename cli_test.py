@@ -157,12 +157,12 @@ def test_query_sampling_defaults():
     assert merged.max_eval_query_hours_per_split is None
     assert merged.max_positives_per_user_hour == 32
     assert merged.max_history_posts_per_query == 64
-    assert merged.user_history_partition_count == 256
+    assert merged.user_history_partition_count == 32
     assert merged.random_candidate_sampling_fraction == 0.10
     assert merged.max_political_candidates_per_creation_hour == 1000
     assert merged.political_score_threshold == 0.95
     assert merged.political_inference_window_padding_days == 5
-    assert merged.post_selection_partition_count == 256
+    assert merged.post_selection_partition_count == 32
 
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(["--max-prior-likes", "64"])
@@ -224,18 +224,37 @@ def test_new_pipeline_runs_query_selection_through_user_history(tmp_path, monkey
             "2026-01-01T12:05:00Z",
         ],
     }).write_parquet(likes_path)
+    posts_path = Path(tmp_path) / "posts.parquet"
+    pl.DataFrame({
+        "at_uri": ["target-one", "target-two"],
+        "record_created_at": [
+            "2026-01-01T09:00:00Z",
+            "2026-01-01T11:00:00Z",
+        ],
+        "did": ["author-one", "author-two"],
+    }).write_parquet(posts_path)
+
+    def list_sources(*, blob_prefix, **kwargs):
+        if blob_prefix == "bsky_likes":
+            return [str(likes_path)], [datetime(2026, 1, 1, 8, tzinfo=timezone.utc)]
+        assert blob_prefix == "bsky_posts"
+        return [str(posts_path)], [datetime(2026, 1, 1, 8, tzinfo=timezone.utc)]
+
     monkeypatch.setattr(
         "engagement_prediction.data.ingex.list_ingex_parquet_files",
-        lambda **kwargs: ([str(likes_path)], [datetime(2026, 1, 1, 8, tzinfo=timezone.utc)]),
+        list_sources,
     )
     args = cli._merge_args_with_config(cli.build_parser().parse_args([
         "--stop-after", "user_history",
         "--likes-start", "2026-01-01T08:00:00Z",
         "--likes-end", "2026-01-02T00:00:00Z",
+        "--posts-start", "2026-01-01T00:00:00Z",
+        "--posts-end", "2026-01-02T00:00:00Z",
         "--train-start", "2026-01-01T10:00:00Z",
         "--val-start", "2026-01-02T00:00:00Z",
         "--unseen-user-fraction", "0",
         "--user-history-partition-count", "2",
+        "--post-selection-partition-count", "2",
     ]))
     output_root = Path(tmp_path) / "output"
     output_root.mkdir()

@@ -7,12 +7,13 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 import logging
+import shutil
 import time
 from typing import Any, Dict, Optional, Tuple
 
 import polars as pl
 
-from engagement_prediction.data import ingex, likes
+from engagement_prediction.data import ingex, likes, query_selection_artifacts
 from engagement_prediction.pipeline.core import Context
 from utils.helpers import get_stage_logger
 
@@ -38,6 +39,9 @@ class QuerySelectionConfig:
     max_eval_query_hours_per_split: Optional[int]
     max_positives_per_user_hour: int
     random_seed: int
+    posts_start: datetime
+    posts_end: datetime
+    post_selection_partition_count: int
     likes_start: Optional[datetime]
     likes_end: Optional[datetime]
     train_start: datetime
@@ -63,6 +67,8 @@ def _optional_nonnegative_int(value: Any, field_name: str) -> Optional[int]:
 
 
 def build_config(args: argparse.Namespace) -> QuerySelectionConfig:
+    posts_start = ingex.parse_utc_datetime(args.posts_start, field_name="posts_start")
+    posts_end = ingex.parse_utc_datetime(args.posts_end, field_name="posts_end")
     likes_start = ingex.parse_utc_datetime(args.likes_start, field_name="likes_start")
     likes_end = ingex.parse_utc_datetime(args.likes_end, field_name="likes_end")
     train_start_raw = args.train_start if args.train_start is not None else args.likes_start
@@ -71,6 +77,10 @@ def build_config(args: argparse.Namespace) -> QuerySelectionConfig:
     holdout_start = ingex.parse_utc_datetime(args.holdout_start, field_name="holdout_start")
     holdout_end = ingex.parse_utc_datetime(args.holdout_end, field_name="holdout_end")
 
+    if posts_start is None or posts_end is None:
+        raise ValueError("posts_start and posts_end are required for query_selection")
+    if posts_end <= posts_start:
+        raise ValueError("posts_end must be after posts_start")
     if train_start is None:
         raise ValueError("train_start is required when likes_start is not provided")
     if val_start is None:
@@ -93,6 +103,8 @@ def build_config(args: argparse.Namespace) -> QuerySelectionConfig:
         raise ValueError("holdout_end must not be after likes_end")
 
     for field_name, value in (
+        ("posts_start", posts_start),
+        ("posts_end", posts_end),
         ("likes_start", likes_start),
         ("likes_end", likes_end),
         ("train_start", train_start),
@@ -111,6 +123,9 @@ def build_config(args: argparse.Namespace) -> QuerySelectionConfig:
     max_positives_per_user_hour = int(args.max_positives_per_user_hour)
     if max_positives_per_user_hour <= 0:
         raise ValueError("max_positives_per_user_hour must be positive")
+    post_selection_partition_count = int(args.post_selection_partition_count)
+    if post_selection_partition_count <= 0:
+        raise ValueError("post_selection_partition_count must be positive")
 
     return QuerySelectionConfig(
         unseen_user_fraction=unseen_user_fraction,
@@ -125,6 +140,9 @@ def build_config(args: argparse.Namespace) -> QuerySelectionConfig:
         ),
         max_positives_per_user_hour=max_positives_per_user_hour,
         random_seed=int(args.random_seed),
+        posts_start=posts_start,
+        posts_end=posts_end,
+        post_selection_partition_count=post_selection_partition_count,
         likes_start=likes_start,
         likes_end=likes_end,
         train_start=train_start,
@@ -269,9 +287,7 @@ def _candidate_query_counts_lf(positive_rows_lf: pl.LazyFrame) -> pl.LazyFrame:
     )
 
 
-def _build_query_lazyframes_from_counts(
-    *,
-    positive_rows_lf: pl.LazyFrame,
+def _build_provisional_query_lazyframes(
     candidate_query_counts_lf: pl.LazyFrame,
     config: QuerySelectionConfig,
 ) -> Dict[str, pl.LazyFrame]:
@@ -280,40 +296,85 @@ def _build_query_lazyframes_from_counts(
     )
     after_user_cap_lf = _cap_queries_per_user(candidate_queries_lf, config)
     after_split_cap_lf = _cap_queries_per_split(after_user_cap_lf, config)
+    return {
+        "candidate_queries": candidate_queries_lf,
+        "after_user_cap": after_user_cap_lf,
+        "after_split_cap": after_split_cap_lf,
+    }
 
-    # Apply the cap to raw rows after query sampling. Deduplication does not make
-    # an otherwise oversized query eligible, and discarded queries are not backfilled.
-    selected_query_counts_lf = after_split_cap_lf.filter(
-        pl.col(RAW_POSITIVE_COUNT_COLUMN) <= config.max_positives_per_user_hour
-    )
 
-    # Only selected user-hours are deduplicated. The same user/post pair may be
-    # retained in different query-hours.
-    positives_lf = (
-        positive_rows_lf
-        .join(selected_query_counts_lf.select(QUERY_KEY), on=QUERY_KEY, how="inner")
-        .group_by(POSITIVE_KEY)
-        .agg(pl.col("like_created_at").min())
-        .select(["did", "query_hour", "subject_uri", "like_created_at"])
-        .sort(["query_hour", "did", "subject_uri"])
-    )
-    final_counts_lf = positives_lf.group_by(QUERY_KEY).agg(
+def _build_final_query_lazyframes(
+    *,
+    positive_rows_lf: Optional[pl.LazyFrame],
+    provisional_query_lazyframes: Dict[str, pl.LazyFrame],
+    config: QuerySelectionConfig,
+    eligible_positive_rows_lf: Optional[pl.LazyFrame] = None,
+) -> Dict[str, pl.LazyFrame]:
+    after_split_cap_lf = provisional_query_lazyframes["after_split_cap"]
+
+    provisional_positives_lf = None
+    if positive_rows_lf is not None:
+        # Only selected user-hours are deduplicated. The same user/post pair may
+        # be retained in different query-hours.
+        provisional_positives_lf = (
+            positive_rows_lf
+            .join(after_split_cap_lf.select(QUERY_KEY), on=QUERY_KEY, how="inner")
+            .group_by([*POSITIVE_KEY, "user_cohort", "split"])
+            .agg(pl.col("like_created_at").min())
+            .select(query_selection_artifacts.INTERNAL_POSITIVE_COLUMNS)
+            .sort(["query_hour", "did", "subject_uri"])
+        )
+    if eligible_positive_rows_lf is None:
+        if provisional_positives_lf is None:
+            raise ValueError("positive_rows_lf is required without prefiltered positives")
+        eligible_positive_rows_lf = provisional_positives_lf
+    eligible_counts_lf = eligible_positive_rows_lf.group_by(QUERY_KEY).agg(
         pl.len().cast(pl.UInt32).alias("positive_count")
     )
+    final_counts_lf = eligible_counts_lf.filter(
+        pl.col("positive_count") <= config.max_positives_per_user_hour
+    )
     queries_lf = (
-        selected_query_counts_lf
+        after_split_cap_lf
         .select(["did", "query_hour", "user_cohort", "split"])
         .join(final_counts_lf, on=QUERY_KEY, how="inner")
         .select(["did", "query_hour", "user_cohort", "split", "positive_count"])
         .sort(["query_hour", "did"])
     )
-    return {
-        "candidate_queries": candidate_queries_lf,
-        "after_user_cap": after_user_cap_lf,
-        "after_split_cap": after_split_cap_lf,
+    positives_lf = (
+        eligible_positive_rows_lf
+        .join(final_counts_lf.select(QUERY_KEY), on=QUERY_KEY, how="inner")
+        .select(["did", "query_hour", "subject_uri", "like_created_at"])
+        .sort(["query_hour", "did", "subject_uri"])
+    )
+    lazyframes = {
+        **provisional_query_lazyframes,
+        "eligible_counts": eligible_counts_lf,
         "queries": queries_lf,
         "positives": positives_lf,
     }
+    if provisional_positives_lf is not None:
+        lazyframes["provisional_positives"] = provisional_positives_lf
+    return lazyframes
+
+
+def _build_query_lazyframes_from_counts(
+    *,
+    positive_rows_lf: pl.LazyFrame,
+    candidate_query_counts_lf: pl.LazyFrame,
+    config: QuerySelectionConfig,
+    eligible_positive_rows_lf: Optional[pl.LazyFrame] = None,
+) -> Dict[str, pl.LazyFrame]:
+    provisional_query_lazyframes = _build_provisional_query_lazyframes(
+        candidate_query_counts_lf,
+        config,
+    )
+    return _build_final_query_lazyframes(
+        positive_rows_lf=positive_rows_lf,
+        provisional_query_lazyframes=provisional_query_lazyframes,
+        config=config,
+        eligible_positive_rows_lf=eligible_positive_rows_lf,
+    )
 
 
 def _split_summary_lf(lf: pl.LazyFrame, phase: str) -> pl.LazyFrame:
@@ -347,6 +408,7 @@ def _positive_count_distribution_lf(
 def collect_query_artifacts(
     lazyframes: Dict[str, pl.LazyFrame],
     config: QuerySelectionConfig,
+    positive_filter_stats_by_split: Optional[Dict[str, Dict[str, int]]] = None,
 ) -> Tuple[pl.DataFrame, pl.DataFrame, Dict[str, Any]]:
     summaries_lf = pl.concat(
         [
@@ -369,17 +431,40 @@ def collect_query_artifacts(
         how="vertical_relaxed",
     )
     oversized_lf = (
+        lazyframes["eligible_counts"]
+        .filter(pl.col("positive_count") > config.max_positives_per_user_hour)
+        .join(
+            lazyframes["after_split_cap"].select([*QUERY_KEY, "split"]),
+            on=QUERY_KEY,
+            how="inner",
+        )
+        .group_by("split")
+        .agg(pl.len().cast(pl.UInt64).alias("query_count"))
+    )
+    zero_positive_lf = (
         lazyframes["after_split_cap"]
-        .filter(pl.col(RAW_POSITIVE_COUNT_COLUMN) > config.max_positives_per_user_hour)
+        .join(
+            lazyframes["eligible_counts"].select(QUERY_KEY),
+            on=QUERY_KEY,
+            how="anti",
+        )
         .group_by("split")
         .agg(pl.len().cast(pl.UInt64).alias("query_count"))
     )
 
-    summaries_df, distributions_df, oversized_df, queries_df, positives_df = pl.collect_all(
+    (
+        summaries_df,
+        distributions_df,
+        oversized_df,
+        zero_positive_df,
+        queries_df,
+        positives_df,
+    ) = pl.collect_all(
         [
             summaries_lf,
             distributions_lf,
             oversized_lf,
+            zero_positive_lf,
             lazyframes["queries"],
             lazyframes["positives"],
         ],
@@ -389,7 +474,13 @@ def collect_query_artifacts(
         raise ValueError("Query selection produced no queries")
 
     _validate_artifacts(queries_df, positives_df)
-    return queries_df, positives_df, _build_stats(summaries_df, distributions_df, oversized_df)
+    return queries_df, positives_df, _build_stats(
+        summaries_df,
+        distributions_df,
+        oversized_df,
+        zero_positive_df,
+        positive_filter_stats_by_split,
+    )
 
 
 def _validate_artifacts(queries_df: pl.DataFrame, positives_df: pl.DataFrame) -> None:
@@ -430,6 +521,8 @@ def _build_stats(
     summaries_df: pl.DataFrame,
     distributions_df: pl.DataFrame,
     oversized_df: pl.DataFrame,
+    zero_positive_df: pl.DataFrame,
+    positive_filter_stats_by_split: Optional[Dict[str, Dict[str, int]]],
 ) -> Dict[str, Any]:
     by_phase: Dict[str, Dict[str, Dict[str, int]]] = {}
     for phase in ("candidate", "after_user_cap", "after_split_cap", "final"):
@@ -456,10 +549,42 @@ def _build_stats(
     for row in oversized_df.iter_rows(named=True):
         oversized_by_split[row["split"]] = int(row["query_count"])
 
+    zero_positive_by_split = {split: 0 for split in SPLITS}
+    for row in zero_positive_df.iter_rows(named=True):
+        zero_positive_by_split[row["split"]] = int(row["query_count"])
+
+    positive_filter_by_split = {
+        split: {
+            "selected_like_row_count": 0,
+            "provisional_positive_count": 0,
+            "retained_positive_count": 0,
+            "missing_post_positive_count": 0,
+        }
+        for split in SPLITS
+    }
+    if positive_filter_stats_by_split is not None:
+        for split, values in positive_filter_stats_by_split.items():
+            positive_filter_by_split[split] = {
+                key: int(value)
+                for key, value in values.items()
+            }
+    positive_filter_totals = {
+        field_name: sum(values[field_name] for values in positive_filter_by_split.values())
+        for field_name in (
+            "selected_like_row_count",
+            "provisional_positive_count",
+            "retained_positive_count",
+            "missing_post_positive_count",
+        )
+    }
+
     return {
         "queries_by_phase_and_split": by_phase,
         "positive_count_distribution": positive_count_distribution,
         "oversized_query_count_by_split": oversized_by_split,
+        "zero_positive_query_count_by_split": zero_positive_by_split,
+        "positive_filter_by_split": positive_filter_by_split,
+        "positive_filter_totals": positive_filter_totals,
     }
 
 
@@ -468,15 +593,43 @@ def _log_stats(logger: logging.Logger, stats: Dict[str, Any]) -> None:
         candidate = stats["queries_by_phase_and_split"]["candidate"][split]
         final = stats["queries_by_phase_and_split"]["final"][split]
         oversized = stats["oversized_query_count_by_split"][split]
+        zero_positive = stats["zero_positive_query_count_by_split"][split]
+        positive_filter = stats["positive_filter_by_split"][split]
         logger.info(
-            "%s: candidate_queries=%s candidate_users=%s final_queries=%s final_users=%s oversized_dropped=%s",
+            "%s: candidate_queries=%s candidate_users=%s final_queries=%s "
+            "final_users=%s provisional_positives=%s retained_positives=%s "
+            "missing_post_positives=%s zero_positive_dropped=%s oversized_dropped=%s",
             split,
             f"{candidate['query_count']:,}",
             f"{candidate['unique_user_count']:,}",
             f"{final['query_count']:,}",
             f"{final['unique_user_count']:,}",
+            f"{positive_filter['provisional_positive_count']:,}",
+            f"{positive_filter['retained_positive_count']:,}",
+            f"{positive_filter['missing_post_positive_count']:,}",
+            f"{zero_positive:,}",
             f"{oversized:,}",
         )
+
+
+def _validate_post_window(
+    sampled_queries_lf: pl.LazyFrame,
+    config: QuerySelectionConfig,
+) -> tuple[datetime, datetime]:
+    bounds = sampled_queries_lf.select(
+        pl.col("query_hour").min().alias("min_query_hour"),
+        pl.col("query_hour").max().alias("max_query_hour"),
+    ).collect(engine="streaming")
+    min_query_hour = bounds.item(0, "min_query_hour")
+    max_query_hour = bounds.item(0, "max_query_hour")
+    if min_query_hour is None or max_query_hour is None:
+        raise ValueError("Query selection produced no provisionally sampled query-hours")
+    if config.posts_start > min_query_hour or config.posts_end <= max_query_hour:
+        raise ValueError(
+            "posts_start/posts_end must cover every provisionally selected query hour: "
+            f"query range is {min_query_hour.isoformat()} to {max_query_hour.isoformat()}"
+        )
+    return min_query_hour, max_query_hour
 
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
@@ -484,7 +637,17 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     logger = get_stage_logger("01_QUERY_SELECTION", log_file=out_dir / "stage.log")
     started_at = time.time()
     config = build_config(args)
+    logger.info(
+        "Starting query selection: likes_window=[%s, %s) posts_window=[%s, %s) "
+        "post_partitions=%s",
+        config.likes_start.isoformat() if config.likes_start is not None else None,
+        config.likes_end.isoformat() if config.likes_end is not None else None,
+        config.posts_start.isoformat(),
+        config.posts_end.isoformat(),
+        config.post_selection_partition_count,
+    )
 
+    logger.info("Phase 1/5: listing exact likes and posts source snapshots")
     like_paths, like_file_timestamps = ingex.list_ingex_parquet_files(
         gcs_bucket=str(args.gcs_bucket),
         blob_prefix="bsky_likes",
@@ -496,9 +659,21 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             f"No likes Parquet files found for {config.likes_start} to {config.likes_end}"
         )
     logger.info("Found %s likes Parquet files", f"{len(like_paths):,}")
+    post_paths, post_file_timestamps = ingex.list_ingex_parquet_files(
+        gcs_bucket=str(args.gcs_bucket),
+        blob_prefix="bsky_posts",
+        start=config.posts_start,
+        end=config.posts_end,
+    )
+    if not post_paths:
+        raise ValueError(
+            f"No posts Parquet files found for {config.posts_start} to {config.posts_end}"
+        )
+    logger.info("Found %s posts Parquet files", f"{len(post_paths):,}")
 
     artifact_suffix = out_dir.name
     like_sources_path = out_dir / f"like_sources_{artifact_suffix}.json"
+    post_sources_path = out_dir / f"post_sources_{artifact_suffix}.json"
     ingex.write_source_manifest(
         like_sources_path,
         ingex.build_source_manifest(
@@ -510,11 +685,25 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             timestamps=like_file_timestamps,
         ),
     )
+    ingex.write_source_manifest(
+        post_sources_path,
+        ingex.build_source_manifest(
+            gcs_bucket=str(args.gcs_bucket),
+            blob_prefix="bsky_posts",
+            start=config.posts_start,
+            end=config.posts_end,
+            paths=post_paths,
+            timestamps=post_file_timestamps,
+        ),
+    )
+    logger.info("Saved exact likes and posts source-file manifests")
+
     candidate_query_counts_path = out_dir / f"_candidate_query_counts_{artifact_suffix}.parquet"
     partial_candidate_query_counts_path = (
         out_dir / f"_candidate_query_counts_{artifact_suffix}.partial.parquet"
     )
 
+    logger.info("Phase 2/5: aggregating raw likes and sampling provisional query-hours")
     positive_rows_lf = _prepare_likes(
         ingex.scan_parquet_files(like_paths),
         config,
@@ -529,32 +718,107 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     partial_candidate_query_counts_path.replace(candidate_query_counts_path)
     logger.info("Saved candidate user-hour counts to %s", candidate_query_counts_path)
 
-    # Start a new plan from the compact user-hour table, then rescan likes only
-    # to populate positives for the selected query keys.
-    selected_positive_rows_lf = _prepare_likes(
-        ingex.scan_parquet_files(like_paths),
+    provisional_query_lazyframes = _build_provisional_query_lazyframes(
+        pl.scan_parquet(candidate_query_counts_path),
         config,
     )
-    lazyframes = _build_query_lazyframes_from_counts(
-        positive_rows_lf=selected_positive_rows_lf,
-        candidate_query_counts_lf=pl.scan_parquet(candidate_query_counts_path),
-        config=config,
+    sampled_queries_path = out_dir / f"_sampled_query_hours_{artifact_suffix}.partial.parquet"
+    provisional_query_lazyframes["after_split_cap"].sink_parquet(
+        sampled_queries_path,
+        compression="zstd",
+        maintain_order=False,
+        engine="streaming",
+    )
+    sampled_queries_lf = pl.scan_parquet(sampled_queries_path)
+    min_query_hour, max_query_hour = _validate_post_window(sampled_queries_lf, config)
+    logger.info(
+        "Saved provisional query-hours with range [%s, %s]",
+        min_query_hour.isoformat(),
+        max_query_hour.isoformat(),
     )
 
-    # the collection and validation of the query artifacts happens in here
-    queries_df, positives_df, stats = collect_query_artifacts(lazyframes, config)
+    logger.info("Phase 3/5: partitioning post rows and selected positive-like rows by URI")
+    post_rows_path = out_dir / f"_query_post_rows_{artifact_suffix}.partial"
+    provisional_positive_rows_path = (
+        out_dir / f"_provisional_positive_rows_{artifact_suffix}.partial"
+    )
+    eligible_positive_rows_path = (
+        out_dir / f"_eligible_positive_rows_{artifact_suffix}.partial"
+    )
+    query_selection_artifacts.materialize_post_rows(
+        post_paths=post_paths,
+        posts_start=config.posts_start,
+        posts_end=config.posts_end,
+        partition_count=config.post_selection_partition_count,
+        output_path=post_rows_path,
+        logger=logger,
+    )
+    query_selection_artifacts.materialize_provisional_positive_rows(
+        positive_rows_lf=_prepare_likes(
+            ingex.scan_parquet_files(like_paths),
+            config,
+        ),
+        sampled_queries_lf=sampled_queries_lf,
+        partition_count=config.post_selection_partition_count,
+        output_path=provisional_positive_rows_path,
+        logger=logger,
+    )
+
+    logger.info("Phase 4/5: filtering positives to URIs present in the posts snapshot")
+    membership_stats = query_selection_artifacts.filter_positive_partitions(
+        provisional_positive_rows_path=provisional_positive_rows_path,
+        post_rows_path=post_rows_path,
+        eligible_positive_rows_path=eligible_positive_rows_path,
+        partition_count=config.post_selection_partition_count,
+        splits=SPLITS,
+        logger=logger,
+    )
+
+    materialized_query_lazyframes = {
+        **provisional_query_lazyframes,
+        "after_split_cap": sampled_queries_lf,
+    }
+    lazyframes = _build_final_query_lazyframes(
+        positive_rows_lf=None,
+        provisional_query_lazyframes=materialized_query_lazyframes,
+        config=config,
+        eligible_positive_rows_lf=query_selection_artifacts.scan_eligible_positive_rows(
+            eligible_positive_rows_path
+        ),
+    )
+
+    logger.info("Phase 5/5: building, validating, and publishing final query artifacts")
+    queries_df, positives_df, stats = collect_query_artifacts(
+        lazyframes,
+        config,
+        membership_stats["positive_filter_stats_by_split"],
+    )
     _log_stats(logger, stats)
 
     queries_path = out_dir / f"queries_{artifact_suffix}.parquet"
     query_positives_path = out_dir / f"query_positives_{artifact_suffix}.parquet"
-    queries_df.write_parquet(queries_path, compression="zstd")
-    positives_df.write_parquet(query_positives_path, compression="zstd")
+    partial_queries_path = out_dir / f"queries_{artifact_suffix}.partial.parquet"
+    partial_query_positives_path = (
+        out_dir / f"query_positives_{artifact_suffix}.partial.parquet"
+    )
+    queries_df.write_parquet(partial_queries_path, compression="zstd")
+    positives_df.write_parquet(partial_query_positives_path, compression="zstd")
+    partial_queries_path.replace(queries_path)
+    partial_query_positives_path.replace(query_positives_path)
+
+    sampled_queries_path.unlink()
+    shutil.rmtree(post_rows_path)
+    shutil.rmtree(provisional_positive_rows_path)
+    shutil.rmtree(eligible_positive_rows_path)
+    logger.info("Removed successful post-membership staging data")
 
     runtime_seconds = time.time() - started_at
     summary = {
         "gcs_bucket": str(args.gcs_bucket),
         "likes_start": config.likes_start.isoformat() if config.likes_start is not None else None,
         "likes_end": config.likes_end.isoformat() if config.likes_end is not None else None,
+        "posts_start": config.posts_start.isoformat(),
+        "posts_end": config.posts_end.isoformat(),
         "parameters": {
             "train_start": config.train_start.isoformat(),
             "val_start": config.val_start.isoformat(),
@@ -566,14 +830,20 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "max_eval_query_hours_per_split": config.max_eval_query_hours_per_split,
             "max_positives_per_user_hour": config.max_positives_per_user_hour,
             "random_seed": config.random_seed,
+            "post_selection_partition_count": config.post_selection_partition_count,
         },
         "input": {
             "like_file_count": len(like_paths),
             "first_like_file_timestamp": like_file_timestamps[0].isoformat(),
             "last_like_file_timestamp": like_file_timestamps[-1].isoformat(),
+            "post_file_count": len(post_paths),
+            "first_post_file_timestamp": post_file_timestamps[0].isoformat(),
+            "last_post_file_timestamp": post_file_timestamps[-1].isoformat(),
+            "post_source_stats": membership_stats["post_source_stats"],
         },
         "outputs": {
             "like_sources_file": like_sources_path.name,
+            "post_sources_file": post_sources_path.name,
             "candidate_query_counts_file": candidate_query_counts_path.name,
             "queries_file": queries_path.name,
             "query_positives_file": query_positives_path.name,
@@ -590,9 +860,17 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                 "stage: query_selection",
                 f"runtime_seconds: {runtime_seconds:.2f}",
                 f"input_like_files: {len(like_paths)}",
+                f"input_post_files: {len(post_paths)}",
                 f"queries: {queries_df.height}",
                 f"query_positives: {positives_df.height}",
+                "provisional_query_positives: "
+                f"{stats['positive_filter_totals']['provisional_positive_count']}",
+                "post_snapshot_query_positives: "
+                f"{stats['positive_filter_totals']['retained_positive_count']}",
+                "positives_absent_from_post_snapshot: "
+                f"{stats['positive_filter_totals']['missing_post_positive_count']}",
                 f"like_sources_file: {like_sources_path.name}",
+                f"post_sources_file: {post_sources_path.name}",
                 f"candidate_query_counts_file: {candidate_query_counts_path.name}",
                 f"queries_file: {queries_path.name}",
                 f"query_positives_file: {query_positives_path.name}",
@@ -611,6 +889,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "output_dir": out_dir,
         "artifacts": {
             "like_sources_path": str(like_sources_path),
+            "post_sources_path": str(post_sources_path),
             "queries_path": str(queries_path),
             "query_positives_path": str(query_positives_path),
         },
