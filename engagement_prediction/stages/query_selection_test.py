@@ -36,23 +36,29 @@ def _config(**overrides):
 
 def _collect(rows, config, eligible_subject_uris=None):
     positive_rows_lf = stage._prepare_likes(pl.DataFrame(rows).lazy(), config)
-    provisional_lazyframes = stage._build_query_lazyframes_from_counts(
-        positive_rows_lf=positive_rows_lf,
-        candidate_query_counts_lf=stage._candidate_query_counts_lf(positive_rows_lf),
+    provisional_lazyframes = stage._build_provisional_query_lazyframes(
+        stage._candidate_query_counts_lf(positive_rows_lf),
         config=config,
     )
-    if eligible_subject_uris is None:
-        lazyframes = provisional_lazyframes
-    else:
-        eligible_positive_rows_lf = provisional_lazyframes["provisional_positives"].filter(
+    eligible_positive_rows_lf = (
+        positive_rows_lf
+        .join(
+            provisional_lazyframes["after_split_cap"].select(stage.QUERY_KEY),
+            on=stage.QUERY_KEY,
+            how="inner",
+        )
+        .group_by([*stage.POSITIVE_KEY, "user_cohort", "split"])
+        .agg(pl.col("like_created_at").min())
+    )
+    if eligible_subject_uris is not None:
+        eligible_positive_rows_lf = eligible_positive_rows_lf.filter(
             pl.col("subject_uri").is_in(eligible_subject_uris)
         )
-        lazyframes = stage._build_query_lazyframes_from_counts(
-            positive_rows_lf=positive_rows_lf,
-            candidate_query_counts_lf=stage._candidate_query_counts_lf(positive_rows_lf),
-            config=config,
-            eligible_positive_rows_lf=eligible_positive_rows_lf,
-        )
+    lazyframes = stage._build_final_query_lazyframes(
+        provisional_query_lazyframes=provisional_lazyframes,
+        eligible_positive_rows_lf=eligible_positive_rows_lf,
+        config=config,
+    )
     return stage.collect_query_artifacts(lazyframes, config)
 
 

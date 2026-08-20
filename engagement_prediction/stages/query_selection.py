@@ -298,29 +298,11 @@ def _build_provisional_query_lazyframes(
 
 def _build_final_query_lazyframes(
     *,
-    positive_rows_lf: Optional[pl.LazyFrame],
     provisional_query_lazyframes: Dict[str, pl.LazyFrame],
+    eligible_positive_rows_lf: pl.LazyFrame,
     config: QuerySelectionConfig,
-    eligible_positive_rows_lf: Optional[pl.LazyFrame] = None,
 ) -> Dict[str, pl.LazyFrame]:
     after_split_cap_lf = provisional_query_lazyframes["after_split_cap"]
-
-    provisional_positives_lf = None
-    if positive_rows_lf is not None:
-        # Only selected user-hours are deduplicated. The same user/post pair may
-        # be retained in different query-hours.
-        provisional_positives_lf = (
-            positive_rows_lf
-            .join(after_split_cap_lf.select(QUERY_KEY), on=QUERY_KEY, how="inner")
-            .group_by([*POSITIVE_KEY, "user_cohort", "split"])
-            .agg(pl.col("like_created_at").min())
-            .select(query_selection_artifacts.INTERNAL_POSITIVE_COLUMNS)
-            .sort(["query_hour", "did", "subject_uri"])
-        )
-    if eligible_positive_rows_lf is None:
-        if provisional_positives_lf is None:
-            raise ValueError("positive_rows_lf is required without prefiltered positives")
-        eligible_positive_rows_lf = provisional_positives_lf
     eligible_counts_lf = eligible_positive_rows_lf.group_by(QUERY_KEY).agg(
         pl.len().cast(pl.UInt32).alias("positive_count")
     )
@@ -340,34 +322,12 @@ def _build_final_query_lazyframes(
         .select(["did", "query_hour", "subject_uri", "like_created_at"])
         .sort(["query_hour", "did", "subject_uri"])
     )
-    lazyframes = {
+    return {
         **provisional_query_lazyframes,
         "eligible_counts": eligible_counts_lf,
         "queries": queries_lf,
         "positives": positives_lf,
     }
-    if provisional_positives_lf is not None:
-        lazyframes["provisional_positives"] = provisional_positives_lf
-    return lazyframes
-
-
-def _build_query_lazyframes_from_counts(
-    *,
-    positive_rows_lf: pl.LazyFrame,
-    candidate_query_counts_lf: pl.LazyFrame,
-    config: QuerySelectionConfig,
-    eligible_positive_rows_lf: Optional[pl.LazyFrame] = None,
-) -> Dict[str, pl.LazyFrame]:
-    provisional_query_lazyframes = _build_provisional_query_lazyframes(
-        candidate_query_counts_lf,
-        config,
-    )
-    return _build_final_query_lazyframes(
-        positive_rows_lf=positive_rows_lf,
-        provisional_query_lazyframes=provisional_query_lazyframes,
-        config=config,
-        eligible_positive_rows_lf=eligible_positive_rows_lf,
-    )
 
 
 def _split_summary_lf(lf: pl.LazyFrame, phase: str) -> pl.LazyFrame:
@@ -778,12 +738,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "after_split_cap": sampled_queries_lf,
     }
     lazyframes = _build_final_query_lazyframes(
-        positive_rows_lf=None,
         provisional_query_lazyframes=materialized_query_lazyframes,
-        config=config,
         eligible_positive_rows_lf=query_selection_artifacts.scan_eligible_positive_rows(
             eligible_positive_rows_path
         ),
+        config=config,
     )
 
     logger.info("Phase 5/5: building, validating, and publishing final query artifacts")
