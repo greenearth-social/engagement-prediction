@@ -328,7 +328,6 @@ def cmd_compare_rankers(
             split=split_name,
             max_history_len=eval_max_history_len,
             embed_dim=embed_dim,
-            bst_political_batch_negatives=0,
             use_author_embedding_table=True,
             use_popularity_feature=use_popularity_feature_for_compare,
             logger=logger,

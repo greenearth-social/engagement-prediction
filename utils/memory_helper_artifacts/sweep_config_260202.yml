@@ -24,7 +24,6 @@ sweep:
 fixed:
   gcs_bucket: "greenearth-471522-ingex-extract-stage"
   posts_start: "2026-01-01"
-  likes_start: "2026-01-01"
   min_likes_per_user: 2
   cap_random_seed: 42
   embedding_model: "all_MiniLM_L6_v2"

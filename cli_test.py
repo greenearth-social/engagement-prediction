@@ -62,10 +62,16 @@ def test_merge_args_with_config_rejects_unknown_keys(tmp_path, argv):
     [
         "--negative-samples-per-hour",
         "--political-negative-samples-per-hour",
+        "--max-political-candidates-per-creation-hour",
+        "--political-score-threshold",
+        "--political-inference-window-padding-days",
         "--negative-sampling-alpha",
         "--min-likes-per-negative-post",
         "--initial-negative-sampling-pct",
         "--cap-random-seed",
+        "--likes-start",
+        "--likes-end",
+        "--bst-political-batch-negatives",
     ],
 )
 def test_obsolete_negative_sampling_flags_are_rejected(flag):
@@ -79,37 +85,22 @@ def test_post_selection_args_merge_from_cli_and_config(tmp_path):
     parser = cli.build_parser()
     raw = parser.parse_args([
         "--random-candidate-sampling-fraction", "0.2",
-        "--max-political-candidates-per-creation-hour", "100",
-        "--political-score-threshold", "0.9",
-        "--political-inference-window-padding-days", "7",
         "--post-selection-partition-count", "64",
     ])
     merged = cli._merge_args_with_config(raw)
 
     assert merged.random_candidate_sampling_fraction == 0.2
-    assert merged.max_political_candidates_per_creation_hour == 100
-    assert merged.political_score_threshold == 0.9
-    assert merged.political_inference_window_padding_days == 7
     assert merged.post_selection_partition_count == 64
 
-    config_path = Path(tmp_path) / "political_sampling.yml"
+    config_path = Path(tmp_path) / "post_selection.yml"
     config_path.write_text(
         "random_candidate_sampling_fraction: 0.3\n"
-        "max_political_candidates_per_creation_hour: 25\n"
-        "political_score_threshold: 0.75\n"
-        "political_inference_window_padding_days: 3\n"
         "post_selection_partition_count: 32\n"
     )
-    raw = parser.parse_args([
-        "--config", str(config_path),
-        "--max-political-candidates-per-creation-hour", "50",
-    ])
+    raw = parser.parse_args(["--config", str(config_path)])
     merged = cli._merge_args_with_config(raw)
 
     assert merged.random_candidate_sampling_fraction == 0.3
-    assert merged.max_political_candidates_per_creation_hour == 50
-    assert merged.political_score_threshold == 0.75
-    assert merged.political_inference_window_padding_days == 3
     assert merged.post_selection_partition_count == 32
 
 
@@ -159,9 +150,6 @@ def test_query_sampling_defaults():
     assert merged.max_history_posts_per_query == 64
     assert merged.user_history_partition_count == 32
     assert merged.random_candidate_sampling_fraction == 0.10
-    assert merged.max_political_candidates_per_creation_hour == 1000
-    assert merged.political_score_threshold == 0.95
-    assert merged.political_inference_window_padding_days == 5
     assert merged.post_selection_partition_count == 32
 
     with pytest.raises(SystemExit):
@@ -246,12 +234,10 @@ def test_new_pipeline_runs_query_selection_through_user_history(tmp_path, monkey
     )
     args = cli._merge_args_with_config(cli.build_parser().parse_args([
         "--stop-after", "user_history",
-        "--likes-start", "2026-01-01T08:00:00Z",
-        "--likes-end", "2026-01-02T00:00:00Z",
         "--posts-start", "2026-01-01T00:00:00Z",
         "--posts-end", "2026-01-02T00:00:00Z",
         "--train-start", "2026-01-01T10:00:00Z",
-        "--val-start", "2026-01-02T00:00:00Z",
+        "--val-start", "2026-01-01T20:00:00Z",
         "--unseen-user-fraction", "0",
         "--user-history-partition-count", "2",
         "--post-selection-partition-count", "2",
@@ -295,12 +281,20 @@ def test_new_pipeline_runs_query_selection_through_post_selection(tmp_path, monk
         ],
         "did": ["author-one", "author-two", "author-three"],
     }).write_parquet(posts_path)
+    replies_path = Path(tmp_path) / "replies.parquet"
+    pl.DataFrame({
+        "at_uri": ["unused-reply"],
+        "record_created_at": ["2026-01-01T08:30:00Z"],
+        "did": ["reply-author"],
+    }).write_parquet(replies_path)
 
     def list_sources(*, blob_prefix, **kwargs):
         if blob_prefix == "bsky_likes":
             return [str(likes_path)], [datetime(2026, 1, 1, 8, tzinfo=timezone.utc)]
-        assert blob_prefix == "bsky_posts"
-        return [str(posts_path)], [datetime(2026, 1, 1, 8, tzinfo=timezone.utc)]
+        if blob_prefix == "bsky_posts":
+            return [str(posts_path)], [datetime(2026, 1, 1, 8, tzinfo=timezone.utc)]
+        assert blob_prefix == "bsky_replies"
+        return [str(replies_path)], [datetime(2026, 1, 1, 8, tzinfo=timezone.utc)]
 
     monkeypatch.setattr(
         "engagement_prediction.data.ingex.list_ingex_parquet_files",
@@ -308,17 +302,14 @@ def test_new_pipeline_runs_query_selection_through_post_selection(tmp_path, monk
     )
     args = cli._merge_args_with_config(cli.build_parser().parse_args([
         "--stop-after", "post_selection",
-        "--likes-start", "2026-01-01T08:00:00Z",
-        "--likes-end", "2026-01-02T00:00:00Z",
         "--posts-start", "2026-01-01T00:00:00Z",
         "--posts-end", "2026-01-02T00:00:00Z",
         "--train-start", "2026-01-01T10:00:00Z",
-        "--val-start", "2026-01-02T00:00:00Z",
+        "--val-start", "2026-01-01T20:00:00Z",
         "--unseen-user-fraction", "0",
         "--user-history-partition-count", "2",
         "--post-selection-partition-count", "2",
         "--random-candidate-sampling-fraction", "0",
-        "--max-political-candidates-per-creation-hour", "0",
     ]))
     output_root = Path(tmp_path) / "output"
     output_root.mkdir()
@@ -485,7 +476,6 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
             prediction_hidden_dims: [128, 64]
             bst_weight_decay: 0.02
             bst_additional_batch_negatives: 32
-            bst_political_batch_negatives: 8
             batch_size: 16
             bst_max_train_batches_per_epoch: 5
             bst_use_popularity_feature: false
@@ -507,7 +497,6 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
     assert merged.bst_num_attention_heads == 8
     assert merged.prediction_hidden_dims == [128, 64]
     assert merged.bst_additional_batch_negatives == 32
-    assert merged.bst_political_batch_negatives == 8
     assert merged.batch_size == 16
     assert merged.bst_max_train_batches_per_epoch == 5
     assert merged.bst_use_popularity_feature is False
@@ -524,29 +513,10 @@ def test_bst_ranker_training_defaults():
     merged = cli._merge_args_with_config(raw)
 
     assert merged.bst_additional_batch_negatives == 64
-    assert merged.bst_political_batch_negatives == 0
     assert merged.batch_size == cli.DEFAULTS["batch_size"]
     assert merged.bst_max_train_batches_per_epoch is None
     assert merged.bst_use_popularity_feature is True
     assert merged.bst_popularity_projection_dim == 8
-    cli._validate_bst_config(merged)
-
-
-def test_bst_political_batch_negatives_cli_overrides_config(tmp_path):
-    config_path = Path(tmp_path) / "bst.yml"
-    config_path.write_text(
-        "model_type: bst-ranker\n"
-        "use_author_embedding_table: true\n"
-        "bst_political_batch_negatives: 4\n"
-    )
-    parser = cli.build_parser()
-    raw = parser.parse_args([
-        "--config", str(config_path),
-        "--bst-political-batch-negatives", "7",
-    ])
-    merged = cli._merge_args_with_config(raw)
-
-    assert merged.bst_political_batch_negatives == 7
     cli._validate_bst_config(merged)
 
 
@@ -582,33 +552,6 @@ def test_bst_ranker_rejects_non_positive_listwise_training_controls(flag, messag
     merged = cli._merge_args_with_config(raw)
 
     with pytest.raises(ValueError, match=message):
-        cli._validate_bst_config(merged)
-
-
-def test_bst_ranker_rejects_negative_political_batch_negatives():
-    parser = cli.build_parser()
-    raw = parser.parse_args([
-        "--model-type", "bst-ranker",
-        "--use-author-embedding-table",
-        "--bst-political-batch-negatives", "-1",
-    ])
-    merged = cli._merge_args_with_config(raw)
-
-    with pytest.raises(ValueError, match="bst-political-batch-negatives"):
-        cli._validate_bst_config(merged)
-
-
-def test_bst_ranker_rejects_political_batch_negatives_above_total():
-    parser = cli.build_parser()
-    raw = parser.parse_args([
-        "--model-type", "bst-ranker",
-        "--use-author-embedding-table",
-        "--bst-additional-batch-negatives", "4",
-        "--bst-political-batch-negatives", "5",
-    ])
-    merged = cli._merge_args_with_config(raw)
-
-    with pytest.raises(ValueError, match="must not exceed"):
         cli._validate_bst_config(merged)
 
 

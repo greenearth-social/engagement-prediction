@@ -91,6 +91,7 @@ def materialize_post_rows(
         ingex.scan_parquet_files(post_paths),
         posts_start=posts_start,
         posts_end=posts_end,
+        is_reply=False,
     ).select(list(MEMBERSHIP_POST_SCHEMA)).with_columns(
         post_data.post_partition_expr(partition_count)
     )

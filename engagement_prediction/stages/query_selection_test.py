@@ -25,8 +25,6 @@ def _config(**overrides):
         "posts_start": datetime(2026, 1, 1, tzinfo=UTC),
         "posts_end": datetime(2026, 1, 10, tzinfo=UTC),
         "post_selection_partition_count": 4,
-        "likes_start": datetime(2026, 1, 1, tzinfo=UTC),
-        "likes_end": datetime(2026, 1, 10, tzinfo=UTC),
         "train_start": datetime(2026, 1, 1, tzinfo=UTC),
         "val_start": datetime(2026, 1, 4, tzinfo=UTC),
         "holdout_start": datetime(2026, 1, 7, tzinfo=UTC),
@@ -111,6 +109,35 @@ def test_split_boundaries_include_all_five_splits_and_exclude_holdout_end():
     assert by_user[seen[0]] == {"train", "val", "holdout_seen_users"}
     assert by_user[unseen[0]] == {"val_unseen_users", "holdout_unseen_users"}
     assert set(queries["split"].to_list()) == set(stage.SPLITS)
+
+
+def test_common_source_window_keeps_train_start_and_excludes_warmup_and_end_from_targets():
+    config = _config(
+        posts_start=datetime(2026, 1, 1, tzinfo=UTC),
+        train_start=datetime(2026, 1, 1, 2, tzinfo=UTC),
+        val_start=datetime(2026, 1, 1, 4, tzinfo=UTC),
+        holdout_start=None,
+        holdout_end=None,
+        posts_end=datetime(2026, 1, 1, 6, tzinfo=UTC),
+    )
+    rows = [
+        {
+            "did": "did:one",
+            "subject_uri": subject_uri,
+            "record_created_at": timestamp,
+        }
+        for subject_uri, timestamp in (
+            ("warmup", "2026-01-01T01:00:00Z"),
+            ("train-start", "2026-01-01T02:00:00Z"),
+            ("before-source-end", "2026-01-01T05:59:59Z"),
+            ("source-end", "2026-01-01T06:00:00Z"),
+        )
+    ]
+
+    queries, positives, _ = _collect(rows, config)
+
+    assert positives["subject_uri"].to_list() == ["train-start", "before-source-end"]
+    assert queries["split"].to_list() == ["train", "val"]
 
 
 def test_user_with_one_query_is_eligible():
@@ -439,8 +466,6 @@ def test_build_config_validates_hour_alignment():
     args = SimpleNamespace(
         posts_start="2026-01-01T00:00:00Z",
         posts_end="2026-01-10T00:00:00Z",
-        likes_start="2026-01-01T00:00:00Z",
-        likes_end="2026-01-10T00:00:00Z",
         train_start="2026-01-01T00:30:00Z",
         val_start="2026-01-04T00:00:00Z",
         holdout_start="2026-01-07T00:00:00Z",
@@ -455,6 +480,68 @@ def test_build_config_validates_hour_alignment():
     )
 
     with pytest.raises(ValueError, match="train_start must be aligned"):
+        stage.build_config(args)
+
+
+def test_build_config_allows_source_window_to_start_at_train_start():
+    args = SimpleNamespace(
+        posts_start="2026-01-01T00:00:00Z",
+        posts_end="2026-01-10T00:00:00Z",
+        train_start="2026-01-01T00:00:00Z",
+        val_start="2026-01-04T00:00:00Z",
+        holdout_start="2026-01-07T00:00:00Z",
+        holdout_end="2026-01-10T00:00:00Z",
+        unseen_user_fraction=0.1,
+        max_hours_per_user_per_split=64,
+        max_train_query_hours=None,
+        max_eval_query_hours_per_split=None,
+        max_positives_per_user_hour=32,
+        post_selection_partition_count=4,
+        random_seed=42,
+    )
+
+    config = stage.build_config(args)
+
+    assert config.posts_start == config.train_start
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error_match"),
+    [
+        ("train_start", "2025-12-31T23:00:00Z", "train_start must not be before"),
+        ("val_start", "2026-01-10T00:00:00Z", "val_start must be before posts_end"),
+        ("holdout_start", "2026-01-10T00:00:00Z", "holdout_start must be before"),
+        ("holdout_end", "2026-01-10T01:00:00Z", "holdout_end must not be after"),
+    ],
+)
+def test_build_config_requires_target_boundaries_within_source_window(
+    field,
+    value,
+    error_match,
+):
+    args = SimpleNamespace(
+        posts_start="2026-01-01T00:00:00Z",
+        posts_end="2026-01-10T00:00:00Z",
+        train_start="2026-01-02T00:00:00Z",
+        val_start="2026-01-04T00:00:00Z",
+        holdout_start="2026-01-07T00:00:00Z",
+        holdout_end="2026-01-10T00:00:00Z",
+        unseen_user_fraction=0.1,
+        max_hours_per_user_per_split=64,
+        max_train_query_hours=None,
+        max_eval_query_hours_per_split=None,
+        max_positives_per_user_hour=32,
+        post_selection_partition_count=4,
+        random_seed=42,
+    )
+    setattr(args, field, value)
+    if field == "val_start":
+        args.holdout_start = None
+        args.holdout_end = None
+    elif field == "holdout_start":
+        args.holdout_end = None
+
+    with pytest.raises(ValueError, match=error_match):
         stage.build_config(args)
 
 
@@ -475,8 +562,6 @@ def test_build_config_validates_post_window(posts_start, posts_end, error_match)
     args = SimpleNamespace(
         posts_start=posts_start,
         posts_end=posts_end,
-        likes_start="2026-01-01T00:00:00Z",
-        likes_end="2026-01-10T00:00:00Z",
         train_start="2026-01-01T00:00:00Z",
         val_start="2026-01-04T00:00:00Z",
         holdout_start="2026-01-07T00:00:00Z",
@@ -521,8 +606,6 @@ def test_build_config_validates_sampling_parameters(field_name, value, error_mat
     args = SimpleNamespace(
         posts_start="2026-01-01T00:00:00Z",
         posts_end="2026-01-10T00:00:00Z",
-        likes_start="2026-01-01T00:00:00Z",
-        likes_end="2026-01-10T00:00:00Z",
         train_start="2026-01-01T00:00:00Z",
         val_start="2026-01-04T00:00:00Z",
         holdout_start="2026-01-07T00:00:00Z",
@@ -567,8 +650,6 @@ def test_registry_run_writes_query_artifacts_and_manifest(tmp_path, monkeypatch)
         gcs_bucket="unused",
         posts_start="2026-01-01T00:00:00Z",
         posts_end="2026-01-10T00:00:00Z",
-        likes_start="2026-01-01T00:00:00Z",
-        likes_end="2026-01-10T00:00:00Z",
         train_start="2026-01-01T00:00:00Z",
         val_start="2026-01-04T00:00:00Z",
         holdout_start="2026-01-07T00:00:00Z",
@@ -616,6 +697,8 @@ def test_registry_run_writes_query_artifacts_and_manifest(tmp_path, monkeypatch)
     assert positives["subject_uri"].to_list() == ["at://post/one"]
     assert [entry["uri"] for entry in like_sources["files"]] == [str(likes_path)]
     assert [entry["uri"] for entry in post_sources["files"]] == [str(posts_path)]
+    assert like_sources["start"] == post_sources["start"]
+    assert like_sources["end"] == post_sources["end"]
     assert post_sources["blob_prefix"] == "bsky_posts"
     assert post_sources["start"] == "2026-01-01T00:00:00+00:00"
     assert post_sources["end"] == "2026-01-10T00:00:00+00:00"
@@ -671,8 +754,6 @@ def test_partition_failure_does_not_publish_final_artifacts_or_manifest(tmp_path
         gcs_bucket="unused",
         posts_start="2026-01-01T00:00:00Z",
         posts_end="2026-01-10T00:00:00Z",
-        likes_start="2026-01-01T00:00:00Z",
-        likes_end="2026-01-10T00:00:00Z",
         train_start="2026-01-01T00:00:00Z",
         val_start="2026-01-04T00:00:00Z",
         holdout_start="2026-01-07T00:00:00Z",

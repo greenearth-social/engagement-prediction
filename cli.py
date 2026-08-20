@@ -57,8 +57,6 @@ DEFAULTS: Dict[str, Any] = {
     "gcs_bucket": 'greenearth-471522-ingex-extract-stage',
     "posts_start": None,
     "posts_end": None,
-    "likes_start": None,
-    "likes_end": None,
     "unseen_user_fraction": 0.10,
     "max_hours_per_user_per_split": 64,
     "max_train_query_hours": None,
@@ -69,9 +67,6 @@ DEFAULTS: Dict[str, Any] = {
     "user_history_partition_count": 32,
     # Stage 3: Post selection
     "random_candidate_sampling_fraction": 0.10,
-    "max_political_candidates_per_creation_hour": 1000,
-    "political_score_threshold": 0.95,
-    "political_inference_window_padding_days": 5,
     "post_selection_partition_count": 32,
     "max_memory_gb": None,  # Stage 1: max memory in GB (None = auto based on percentage)
     "max_memory_pct": 0.75,  # Stage 1: max percentage of available RAM to use
@@ -115,7 +110,6 @@ DEFAULTS: Dict[str, Any] = {
     "author_projection_dim": 32,
     "prediction_hidden_dims": [64, 32, 16],
     "bst_additional_batch_negatives": 64,
-    "bst_political_batch_negatives": 0,
     "bst_model_dim": 128,
     "bst_time_embedding_dim": 16,
     "bst_num_attention_heads": 4,
@@ -572,7 +566,6 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
     num_attention_heads = int(args.bst_num_attention_heads)
     num_transformer_layers = int(args.bst_num_transformer_layers)
     bst_additional_batch_negatives = int(args.bst_additional_batch_negatives)
-    bst_political_batch_negatives = int(args.bst_political_batch_negatives)
     batch_size = int(args.batch_size)
     bst_max_train_batches_per_epoch = args.bst_max_train_batches_per_epoch
     bst_popularity_projection_dim = int(args.bst_popularity_projection_dim)
@@ -592,12 +585,6 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
         raise ValueError("BST ranker requires --bst-num-transformer-layers=1.")
     if bst_additional_batch_negatives <= 0:
         raise ValueError("--bst-additional-batch-negatives must be positive.")
-    if bst_political_batch_negatives < 0:
-        raise ValueError("--bst-political-batch-negatives must be non-negative.")
-    if bst_political_batch_negatives > bst_additional_batch_negatives:
-        raise ValueError(
-            "--bst-political-batch-negatives must not exceed --bst-additional-batch-negatives."
-        )
     if batch_size <= 0:
         raise ValueError("--batch-size must be positive.")
     if bst_max_train_batches_per_epoch is not None and int(bst_max_train_batches_per_epoch) <= 0:
@@ -847,13 +834,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--gcs-bucket", type=str, default=argparse.SUPPRESS,
                           help_text="GCS bucket name for ingex data")
     _add_arg_with_default(p_all, "--posts-start", type=str, default=argparse.SUPPRESS,
-                          help_text="ISO date string for Stage 1/3 ingex GCS posts start (inclusive)")
+                          help_text="UTC start of the common Ingex posts, replies, and likes window (inclusive)")
     _add_arg_with_default(p_all, "--posts-end", type=str, default=argparse.SUPPRESS,
-                          help_text="ISO date string for Stage 1/3 ingex GCS posts end (exclusive)")
-    _add_arg_with_default(p_all, "--likes-start", type=str, default=argparse.SUPPRESS,
-                          help_text="ISO date string for ingex GCS likes start (inclusive)")
-    _add_arg_with_default(p_all, "--likes-end", type=str, default=argparse.SUPPRESS,
-                          help_text="ISO date string for ingex GCS likes end (exclusive)")
+                          help_text="UTC end of the common Ingex posts, replies, and likes window (exclusive)")
     _add_arg_with_default(p_all, "--unseen-user-fraction", type=float, default=argparse.SUPPRESS,
                           help_text="Stable fraction of users reserved for unseen-user evaluation")
     _add_arg_with_default(p_all, "--max-hours-per-user-per-split", type=int, default=argparse.SUPPRESS,
@@ -890,20 +873,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--random-candidate-sampling-fraction", type=float,
                           default=argparse.SUPPRESS,
                           help_text="Stable fraction of unique posts retained in the random candidate reservoir")
-    _add_arg_with_default(p_all, "--max-political-candidates-per-creation-hour", type=int,
-                          default=argparse.SUPPRESS,
-                          help_text="Maximum political candidates retained per UTC post-creation hour; 0 disables inference loading")
-    _add_arg_with_default(p_all, "--political-score-threshold", type=float,
-                          default=argparse.SUPPRESS,
-                          help_text="Inclusive News & Social Concern score threshold for political candidates")
-    _add_arg_with_default(p_all, "--political-inference-window-padding-days", type=int,
-                          default=argparse.SUPPRESS,
-                          help_text="Days added only to the end of the inference-file listing window")
     _add_arg_with_default(p_all, "--post-selection-partition-count", type=int,
                           default=argparse.SUPPRESS,
                           help_text="Stable URI-hash partition count used to bound Stage 1/3 post processing")
     _add_arg_with_default(p_all, "--train-start", type=str, default=argparse.SUPPRESS,
-                          help_text="ISO date string for start of training dataset window")
+                          help_text="UTC start of target eligibility and the training split")
     _add_arg_with_default(p_all, "--val-start", type=str, default=argparse.SUPPRESS,
                           help_text="ISO date string for start of validation dataset window. Must be >= train-start")
     _add_arg_with_default(p_all, "--holdout-start", type=str, default=argparse.SUPPRESS,
@@ -965,8 +939,6 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Ranker prediction-head hidden dimensions. Use no values for a direct linear head")
     _add_arg_with_default(p_all, "--bst-additional-batch-negatives", type=int, default=argparse.SUPPRESS,
                           help_text="Additional same-hour negative-pool posts to sample per BST training batch")
-    _add_arg_with_default(p_all, "--bst-political-batch-negatives", type=int, default=argparse.SUPPRESS,
-                          help_text="Minimum political posts within each BST additional-negative sample")
     # BST ranker specific options
     _add_arg_with_default(p_all, "--bst-model-dim", type=int, default=argparse.SUPPRESS,
                           help_text="BST ranker fused post/author model dimension")

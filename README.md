@@ -4,7 +4,7 @@ This repo trains and evaluates engagement rankers for Bluesky posts. The artifac
 
 1. `01_query_selection`: load Ingex likes, select bounded `(user, hour)` queries, and retain positive posts found in the selected `bsky_posts` snapshot.
 2. `02_user_history`: select the bounded as-of like history for every query.
-3. `03_post_selection`: collect required posts and bounded random and political candidate reservoirs.
+3. `03_post_selection`: resolve required roots and replies and collect a bounded random root-post candidate reservoir.
 
 Post selection is currently the explicit new-pipeline boundary. Run the new data path with `--stop-after post_selection`; it cannot yet continue into unchanged training. Direct legacy training reruns require explicit aligned `01_get_data` and legacy `02_user_history` pins.
 
@@ -51,7 +51,7 @@ Tests use the `*_test.py` naming convention and live next to the code they cover
 - `engagement_prediction/stages/user_history.py`: active Stage 2 orchestration.
 - `engagement_prediction/stages/post_selection.py`: active Stage 3 post-universe orchestration.
 - `engagement_prediction/data/ingex.py`: reusable Ingex access and exact source-file manifests.
-- `engagement_prediction/data/`: Parquet loading plus reusable like, history, post, and inference transformations.
+- `engagement_prediction/data/`: Parquet loading plus reusable like, history, and post transformations.
 - `utils/01_get_data/stage_get_data.py`: unregistered legacy Stage 1 retained while downstream stages still consume its artifacts.
 - `utils/02_user_history/stage_generate_user_history.py`: unregistered legacy Stage 2 retained for pinned legacy training artifacts.
 - `utils/03_train/stage_train_mlp.py`: legacy MLP matrix ranker.
@@ -96,11 +96,9 @@ Common config keys:
 gcs_bucket: "greenearth-471522-ingex-extract-prod"
 posts_start: "2026-06-20T00:00:00Z"
 posts_end: "2026-06-24T00:00:00Z"
-likes_start: "2026-06-20"
-likes_end: "2026-06-24"
-train_start: "2026-06-20"
-val_start: "2026-06-22"
-holdout_start: "2026-06-23"
+train_start: "2026-06-21T00:00:00Z"
+val_start: "2026-06-22T00:00:00Z"
+holdout_start: "2026-06-23T00:00:00Z"
 holdout_end: null
 unseen_user_fraction: 0.10
 max_hours_per_user_per_split: 64
@@ -121,7 +119,9 @@ Important Stage 1 behavior:
 - Positive counts are recomputed after post filtering. Selected hours with no retained positives or more than 32 retained positives are discarded without backfill; an hour with exactly 32 is retained.
 - There is no minimum-likes eligibility filter.
 
-Primary artifacts are `queries_*.parquet`, keyed by `(did, query_hour)`, and `query_positives_*.parquet`, keyed by `(did, query_hour, subject_uri)`. Stage 1 records the exact Ingex like-file snapshot in `like_sources_*.json` for Stage 2 and the exact membership-check post snapshot in `post_sources_*.json`. `posts_start` and `posts_end` must be UTC, hour-aligned, ordered, and cover every provisionally sampled query hour.
+Primary artifacts are `queries_*.parquet`, keyed by `(did, query_hour)`, and `query_positives_*.parquet`, keyed by `(did, query_hour, subject_uri)`. Stage 1 records the exact Ingex like-file snapshot in `like_sources_*.json` for Stage 2 and the exact membership-check post snapshot in `post_sources_*.json`. Both snapshots use the common half-open `[posts_start, posts_end)` source window.
+
+All source and split boundaries must be UTC and hour-aligned. `posts_start <= train_start < val_start`, and the validation and optional holdout boundaries must remain ordered and fall within the source window. Likes at `posts_start` are available for later history construction, while only likes at or after `train_start` can become targets. Likes and post rows at `posts_end` are excluded. Setting `posts_start == train_start` is valid, but provides no pre-training history warm-up; production datasets should normally use `posts_start < train_start`.
 
 ### Stage 2: User History
 
@@ -143,11 +143,11 @@ max_history_posts_per_query: 64
 user_history_partition_count: 256
 ```
 
-The source history window begins at `likes_start`. Set `likes_start` earlier than `train_start` when training queries need a warm-up period.
+The source history window begins at `posts_start`, using the exact Stage 1 `like_sources_*.json` snapshot. Set `posts_start` earlier than `train_start` when training queries need a warm-up period. Stage 2 performs no post or reply lookup: unresolved URIs and duplicate raw events remain in its aligned lists for Stage 3 to resolve later.
 
 ### Stage 3: Post Selection
 
-Stage 3 combines unique Stage 1 positive URIs with Stage 2 `history_post_uris_*`, then scans the configured post window to attach canonical creation-time and author metadata. Required posts are retained whenever metadata exists, independently of candidate sampling.
+Stage 3 combines unique Stage 1 positive URIs with Stage 2 `history_post_uris_*`, then resolves them against root posts and replies from the common source window. It reuses Stage 1's exact root-post snapshot and records an exact `bsky_replies` snapshot. Required posts are retained whenever metadata exists, independently of candidate sampling.
 
 Common config:
 
@@ -155,22 +155,19 @@ Common config:
 posts_start: "2026-06-20T00:00:00Z"
 posts_end: "2026-06-24T00:00:00Z"
 random_candidate_sampling_fraction: 0.10
-max_political_candidates_per_creation_hour: 1000
-political_score_threshold: 0.95
-political_inference_window_padding_days: 5
 post_selection_partition_count: 256
 ```
 
-The random reservoir uses a stable URI hash and is approximate rather than exactly sized. Political discovery reads only the `News & Social Concern` inference, uses its latest `indexed_at` value, and caps qualifying posts independently within each UTC post-creation hour. Inference files are listed from `posts_start` through `posts_end + political_inference_window_padding_days`; the beginning is not padded. Setting the political cap to `0` disables inference loading.
+The random reservoir uses a stable URI hash and is approximate rather than exactly sized. Candidates are drawn only from root posts. Replies can enter the universe only when required by at least one retained history; they never become positive labels or candidate posts. If a URI occurs in both source types, root metadata takes precedence. Missing or reply-only positives fail the stage, while unresolved history URIs are reported without rewriting Stage 2 history lists.
 
 Stage 3 atomically publishes `post_universe_*`, containing separate partitioned Parquet datasets:
 
-- `posts/`: metadata and nullable political-inference fields for every retained universe post.
+- `posts/`: `subject_uri`, UTC `post_created_at`, `author_did`, and `is_reply` for every retained universe post.
 - `required_posts/`: unique positive/history membership flags.
-- `candidate_sources/`: unique `random` and `political` reservoir memberships.
+- `candidate_sources/`: unique `random` reservoir memberships.
 - `missing_required_posts/`: required URIs for which valid post metadata was not found.
 
-Exact `bsky_posts` and `bsky_inferences` source-file manifests are stored in the same bundle. Popularity, post-liker histories, and query-specific negative selection are deferred to later stages.
+Exact `bsky_posts` and `bsky_replies` source-file manifests are stored in the same bundle. Popularity, post-liker histories, query-specific negative selection, and non-model feed-policy rules are deferred to later work.
 
 ### Legacy Training
 
@@ -243,12 +240,9 @@ python cli.py --model-type bst-ranker \
 
 BST training uses matrix ranking over same-hour candidate sets with additional sampled negatives. It requires `bst_num_transformer_layers: 1` because it uses the optimized one-layer matrix scorer.
 
-`--bst-political-batch-negatives` sets the minimum number of politics-labeled posts within the existing `--bst-additional-batch-negatives` cap. It defaults to `0`; if a batch's hourly pool contains fewer political negatives than requested, training uses all available political negatives without failing.
-
 Useful options:
 
 - `--bst-additional-batch-negatives`
-- `--bst-political-batch-negatives`
 - `--content-projection-dim`
 - `--author-projection-dim`
 - `--bst-model-dim`

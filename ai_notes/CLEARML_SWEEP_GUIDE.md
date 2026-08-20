@@ -42,7 +42,6 @@ Parameters that stay constant across all experiments:
 ```yaml
 fixed:
   posts_start: "2026-01-01"
-  likes_start: "2026-01-01"
   stop_after: "get_data"  # Only run Stage 1
 ```
 

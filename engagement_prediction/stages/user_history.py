@@ -301,13 +301,27 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     query_count = queries_lf.select(pl.len()).collect(engine="streaming").item()
     if query_count == 0:
         raise ValueError("query_selection produced no queries")
-    max_query_hour = queries_lf.select(pl.col("query_hour").max()).collect().item()
+    query_bounds = queries_lf.select(
+        pl.col("query_hour").min().alias("min_query_hour"),
+        pl.col("query_hour").max().alias("max_query_hour"),
+    ).collect()
+    min_query_hour = query_bounds.item(0, "min_query_hour")
+    max_query_hour = query_bounds.item(0, "max_query_hour")
 
     like_sources_path = _find_like_sources_path(query_selection_dir)
     source_manifest = ingex.load_source_manifest(like_sources_path)
+    if source_manifest.get("blob_prefix") != "bsky_likes":
+        raise ValueError("Stage 1 like source manifest must use bsky_likes")
     source_like_paths = [entry["uri"] for entry in source_manifest["files"]]
-    source_start = ingex.parse_utc_datetime(source_manifest.get("start"), field_name="likes_start")
-    source_end = ingex.parse_utc_datetime(source_manifest.get("end"), field_name="likes_end")
+    source_start = ingex.parse_utc_datetime(source_manifest.get("start"), field_name="posts_start")
+    source_end = ingex.parse_utc_datetime(source_manifest.get("end"), field_name="posts_end")
+    if source_start is None or source_end is None or source_end <= source_start:
+        raise ValueError("Stage 1 like source manifest must contain an ordered source window")
+    for field_name, value in (("posts_start", source_start), ("posts_end", source_end)):
+        if value.minute or value.second or value.microsecond:
+            raise ValueError(f"Stage 1 like source {field_name} must be hour-aligned")
+    if min_query_hour < source_start or max_query_hour >= source_end:
+        raise ValueError("Stage 1 query hours must fall within its recorded like source window")
 
     artifact_suffix = out_dir.name
     query_partitions_path = out_dir / f"_query_partitions_{artifact_suffix}"
@@ -385,8 +399,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "query_count": query_count,
             "like_sources_file": like_sources_path.name,
             "like_file_count": len(source_like_paths),
-            "likes_start": source_manifest.get("start"),
-            "likes_end": source_manifest.get("end"),
+            "source_start": source_manifest.get("start"),
+            "source_end": source_manifest.get("end"),
         },
         "outputs": {
             "query_histories_path": query_histories_path.name,

@@ -42,8 +42,6 @@ class QuerySelectionConfig:
     posts_start: datetime
     posts_end: datetime
     post_selection_partition_count: int
-    likes_start: Optional[datetime]
-    likes_end: Optional[datetime]
     train_start: datetime
     val_start: datetime
     holdout_start: Optional[datetime]
@@ -69,20 +67,31 @@ def _optional_nonnegative_int(value: Any, field_name: str) -> Optional[int]:
 def build_config(args: argparse.Namespace) -> QuerySelectionConfig:
     posts_start = ingex.parse_utc_datetime(args.posts_start, field_name="posts_start")
     posts_end = ingex.parse_utc_datetime(args.posts_end, field_name="posts_end")
-    likes_start = ingex.parse_utc_datetime(args.likes_start, field_name="likes_start")
-    likes_end = ingex.parse_utc_datetime(args.likes_end, field_name="likes_end")
-    train_start_raw = args.train_start if args.train_start is not None else args.likes_start
-    train_start = ingex.parse_utc_datetime(train_start_raw, field_name="train_start")
+    train_start = ingex.parse_utc_datetime(args.train_start, field_name="train_start")
     val_start = ingex.parse_utc_datetime(args.val_start, field_name="val_start")
     holdout_start = ingex.parse_utc_datetime(args.holdout_start, field_name="holdout_start")
     holdout_end = ingex.parse_utc_datetime(args.holdout_end, field_name="holdout_end")
 
     if posts_start is None or posts_end is None:
         raise ValueError("posts_start and posts_end are required for query_selection")
+    for field_name, value in (
+        ("posts_start", posts_start),
+        ("posts_end", posts_end),
+        ("train_start", train_start),
+        ("val_start", val_start),
+        ("holdout_start", holdout_start),
+        ("holdout_end", holdout_end),
+    ):
+        _validate_hour_aligned(value, field_name)
+
     if posts_end <= posts_start:
         raise ValueError("posts_end must be after posts_start")
     if train_start is None:
-        raise ValueError("train_start is required when likes_start is not provided")
+        raise ValueError("train_start is required")
+    if train_start < posts_start:
+        raise ValueError("train_start must not be before posts_start")
+    if train_start >= posts_end:
+        raise ValueError("train_start must be before posts_end")
     if val_start is None:
         raise ValueError("val_start is required")
     if val_start <= train_start:
@@ -93,26 +102,12 @@ def build_config(args: argparse.Namespace) -> QuerySelectionConfig:
         raise ValueError("holdout_start is required when holdout_end is provided")
     if holdout_end is not None and holdout_start is not None and holdout_end <= holdout_start:
         raise ValueError("holdout_end must be after holdout_start")
-    if likes_start is not None and likes_end is not None and likes_end <= likes_start:
-        raise ValueError("likes_end must be after likes_start")
-    if likes_start is not None and train_start < likes_start:
-        raise ValueError("train_start must not be before likes_start")
-    if likes_end is not None and train_start >= likes_end:
-        raise ValueError("train_start must be before likes_end")
-    if holdout_end is not None and likes_end is not None and holdout_end > likes_end:
-        raise ValueError("holdout_end must not be after likes_end")
-
-    for field_name, value in (
-        ("posts_start", posts_start),
-        ("posts_end", posts_end),
-        ("likes_start", likes_start),
-        ("likes_end", likes_end),
-        ("train_start", train_start),
-        ("val_start", val_start),
-        ("holdout_start", holdout_start),
-        ("holdout_end", holdout_end),
-    ):
-        _validate_hour_aligned(value, field_name)
+    if val_start >= posts_end:
+        raise ValueError("val_start must be before posts_end")
+    if holdout_start is not None and holdout_start >= posts_end:
+        raise ValueError("holdout_start must be before posts_end")
+    if holdout_end is not None and holdout_end > posts_end:
+        raise ValueError("holdout_end must not be after posts_end")
 
     unseen_user_fraction = float(args.unseen_user_fraction)
     if not 0.0 <= unseen_user_fraction < 1.0:
@@ -143,8 +138,6 @@ def build_config(args: argparse.Namespace) -> QuerySelectionConfig:
         posts_start=posts_start,
         posts_end=posts_end,
         post_selection_partition_count=post_selection_partition_count,
-        likes_start=likes_start,
-        likes_end=likes_end,
         train_start=train_start,
         val_start=val_start,
         holdout_start=holdout_start,
@@ -257,8 +250,8 @@ def _prepare_likes(
 ) -> pl.LazyFrame:
     filtered_lf = likes.prepare_likes(
         likes_lf,
-        start=config.likes_start,
-        end=config.likes_end,
+        start=config.posts_start,
+        end=config.posts_end,
     )
 
     return (
@@ -638,10 +631,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     started_at = time.time()
     config = build_config(args)
     logger.info(
-        "Starting query selection: likes_window=[%s, %s) posts_window=[%s, %s) "
-        "post_partitions=%s",
-        config.likes_start.isoformat() if config.likes_start is not None else None,
-        config.likes_end.isoformat() if config.likes_end is not None else None,
+        "Starting query selection: source_window=[%s, %s) post_partitions=%s",
         config.posts_start.isoformat(),
         config.posts_end.isoformat(),
         config.post_selection_partition_count,
@@ -651,12 +641,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     like_paths, like_file_timestamps = ingex.list_ingex_parquet_files(
         gcs_bucket=str(args.gcs_bucket),
         blob_prefix="bsky_likes",
-        start=config.likes_start,
-        end=config.likes_end,
+        start=config.posts_start,
+        end=config.posts_end,
     )
     if not like_paths:
         raise ValueError(
-            f"No likes Parquet files found for {config.likes_start} to {config.likes_end}"
+            f"No likes Parquet files found for {config.posts_start} to {config.posts_end}"
         )
     logger.info("Found %s likes Parquet files", f"{len(like_paths):,}")
     post_paths, post_file_timestamps = ingex.list_ingex_parquet_files(
@@ -679,8 +669,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         ingex.build_source_manifest(
             gcs_bucket=str(args.gcs_bucket),
             blob_prefix="bsky_likes",
-            start=config.likes_start,
-            end=config.likes_end,
+            start=config.posts_start,
+            end=config.posts_end,
             paths=like_paths,
             timestamps=like_file_timestamps,
         ),
@@ -815,8 +805,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     runtime_seconds = time.time() - started_at
     summary = {
         "gcs_bucket": str(args.gcs_bucket),
-        "likes_start": config.likes_start.isoformat() if config.likes_start is not None else None,
-        "likes_end": config.likes_end.isoformat() if config.likes_end is not None else None,
         "posts_start": config.posts_start.isoformat(),
         "posts_end": config.posts_end.isoformat(),
         "parameters": {

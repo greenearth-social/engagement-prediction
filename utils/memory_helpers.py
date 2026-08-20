@@ -857,7 +857,6 @@ def generate_sweep_config(
         'fixed': {
             'gcs_bucket': gcs_bucket,
             'posts_start': posts_start,
-            'likes_start': posts_start,
             'min_likes_per_user': min_likes_per_user,
             'cap_random_seed': 42,
             'embedding_model': embedding_model,
@@ -962,7 +961,7 @@ def _generate_experiment_grid(config: Dict[str, Any]) -> List[Tuple[str, Dict[st
             exp_params = dict(fixed_params)
             exp_params.update(exp_def.get('params', {}))
             
-            # Handle data_window_days -> posts_end, likes_end conversion
+            # Handle data_window_days -> posts_end conversion
             if 'data_window_days' in exp_params:
                 days = exp_params.pop('data_window_days')
                 start_date_str = fixed_params.get('posts_start', '2026-01-01')
@@ -970,7 +969,6 @@ def _generate_experiment_grid(config: Dict[str, Any]) -> List[Tuple[str, Dict[st
                 end_date = start_date + timedelta(days=days)
                 end_date_str = end_date.strftime('%Y-%m-%d')
                 exp_params['posts_end'] = end_date_str
-                exp_params['likes_end'] = end_date_str
             
             experiments.append((exp_name, exp_params))
         return experiments
@@ -999,14 +997,12 @@ def _generate_experiment_grid(config: Dict[str, Any]) -> List[Tuple[str, Dict[st
                     for name, value in zip(param_names, values):
                         exp_params[name] = value
                     exp_params['posts_end'] = end_date_str
-                    exp_params['likes_end'] = end_date_str
                     exp_name = _generate_experiment_name(exp_params, index)
                     experiments.append((exp_name, exp_params))
                     index += 1
             else:
                 exp_params = dict(fixed_params)
                 exp_params['posts_end'] = end_date_str
-                exp_params['likes_end'] = end_date_str
                 exp_name = _generate_experiment_name(exp_params, index)
                 experiments.append((exp_name, exp_params))
                 index += 1
@@ -1260,7 +1256,7 @@ def run_memory_sweep(
 # CSV field names for sweep results (in order)
 SWEEP_RESULTS_FIELDNAMES = [
     'task_id', 'task_name', 'status',
-    'data_window_days', 'posts_start', 'posts_end', 'likes_start', 'likes_end',
+    'data_window_days', 'posts_start', 'posts_end',
     'max_liking_users', 'max_likes_per_user', 'negative_posts_sample', 'min_likes_per_user',
     'memory_peak_gb', 'memory_estimated_peak_gb', 'memory_start_gb',
     'memory_end_gb', 'memory_growth_gb', 'memory_estimate_accuracy_pct',
@@ -1395,8 +1391,6 @@ def _extract_clearml_task_data(task: Any) -> Optional[Dict[str, Any]]:
         
         posts_start = _extract_clearml_parameter(params, 'posts_start')
         posts_end = _extract_clearml_parameter(params, 'posts_end')
-        likes_start = _extract_clearml_parameter(params, 'likes_start')
-        likes_end = _extract_clearml_parameter(params, 'likes_end')
         
         name_match = re.match(r'(\d+)_(\d+)d_(\d+)ku_(\d+)l_(\d+)kn', task_name)
         
@@ -1434,8 +1428,6 @@ def _extract_clearml_task_data(task: Any) -> Optional[Dict[str, Any]]:
             'data_window_days': data_window_days,
             'posts_start': posts_start,
             'posts_end': posts_end,
-            'likes_start': likes_start,
-            'likes_end': likes_end,
             'max_liking_users': max_liking_users,
             'max_likes_per_user': max_likes_per_user,
             'negative_posts_sample': negative_posts_sample,
