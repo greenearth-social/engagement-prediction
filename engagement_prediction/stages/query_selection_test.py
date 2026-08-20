@@ -717,6 +717,12 @@ def test_registry_run_writes_query_artifacts_and_manifest(tmp_path, monkeypatch)
     assert json.loads((output_dir / "manifest.json").read_text())["stage_key"] == "query_selection"
     assert (output_dir / "summary.json").exists()
     assert (output_dir / "stage.log").exists()
+    stage_log = (output_dir / "stage.log").read_text()
+    assert (
+        "source_manifest_window=[2026-01-01T00:00:00+00:00, "
+        "2026-01-10T00:00:00+00:00) query_positive_window="
+        "[2026-01-01T00:00:00+00:00, 2026-01-10T00:00:00+00:00)"
+    ) in stage_log
 
 
 def test_partition_failure_does_not_publish_final_artifacts_or_manifest(tmp_path, monkeypatch):

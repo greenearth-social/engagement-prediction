@@ -53,6 +53,11 @@ VALID_USER_ENCODERS_BY_MODEL_TYPE: Dict[str, Tuple[str, ...]] = {
 
 # Central default map for all run-all parameters
 DEFAULTS: Dict[str, Any] = {
+    "output_dir": None,
+    "debug": False,
+    "random_seed": 42,
+    "embedding_model": "all_MiniLM_L12_v2",
+    "skip_embeddings": False,
     # Stage 1: Query selection
     "gcs_bucket": 'greenearth-471522-ingex-extract-stage',
     "posts_start": None,
@@ -62,25 +67,16 @@ DEFAULTS: Dict[str, Any] = {
     "max_train_query_hours": None,
     "max_eval_query_hours_per_split": None,
     "max_positives_per_user_hour": 32,
-    # STage 2: User histroy
-    "max_history_posts_per_query": 64,
-    "user_history_partition_count": 32,
-    # Stage 3: Post selection
-    "random_candidate_sampling_fraction": 0.10,
-    "post_selection_partition_count": 32,
-    "max_memory_gb": None,  # Stage 1: max memory in GB (None = auto based on percentage)
-    "max_memory_pct": 0.75,  # Stage 1: max percentage of available RAM to use
-    "memory_check": "full",  # Stage 1: memory check mode (full/ignore/skip)
-    "output_dir": None,
-    "debug": False,
-    "random_seed": 42,
-    "embedding_model": "all_MiniLM_L12_v2",
-    "skip_embeddings": False,
-    # Stage 1 split labels / Stage 2 history
     "train_start": None,
     "val_start": None,
     "holdout_start": None,
     "holdout_end": None,
+    # Stage 2: User histroy
+    "max_history_posts_per_query": 64,
+    "user_history_partition_count": 32,
+    # Stage 3: Post selection
+    "random_candidate_sampling_fraction": 0.1,
+    "post_selection_partition_count": 32,
     # Stage 3 (train) - Model architecture
     "user_summarization": "mean",  # MLP user-history summarization: mean, ema, linear_recency
     "ema_alpha": 0.1,  # EMA smoothing factor (only used when user_summarization=ema)

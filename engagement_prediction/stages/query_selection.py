@@ -630,10 +630,19 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     logger = get_stage_logger("01_QUERY_SELECTION", log_file=out_dir / "stage.log")
     started_at = time.time()
     config = build_config(args)
+    query_positive_end = (
+        config.holdout_end if config.holdout_end is not None else config.posts_end
+    )
     logger.info(
-        "Starting query selection: source_window=[%s, %s) post_partitions=%s",
+        "Starting query selection: source_manifest_window=[%s, %s) "
+        "query_positive_window=[%s, %s) val_start=%s holdout_start=%s "
+        "post_partitions=%s",
         config.posts_start.isoformat(),
         config.posts_end.isoformat(),
+        config.train_start.isoformat(),
+        query_positive_end.isoformat(),
+        config.val_start.isoformat(),
+        config.holdout_start.isoformat() if config.holdout_start is not None else None,
         config.post_selection_partition_count,
     )
 
