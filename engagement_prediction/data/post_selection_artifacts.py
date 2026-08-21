@@ -355,57 +355,10 @@ def process_uri_partitions(
     }
 
 
-def materialize_final_routes(
+def write_and_validate_public_outputs(
     *,
     base_posts_shards_path: Path,
     random_candidate_shards_path: Path,
-    final_posts_routed_path: Path,
-    final_candidates_routed_path: Path,
-    partition_count: int,
-    logger: logging.Logger,
-) -> None:
-    """Route final post and candidate rows back to stable URI partitions."""
-    base_post_paths = sorted(base_posts_shards_path.glob("*.parquet"))
-    if base_post_paths:
-        started = time.monotonic()
-        logger.info("Routing final post rows from %s URI shards", f"{len(base_post_paths):,}")
-        sink_partitioned(
-            pl.scan_parquet(base_post_paths)
-            .select(post_data.POST_COLUMNS)
-            .with_columns(post_data.post_partition_expr(partition_count)),
-            output_path=final_posts_routed_path,
-            key="_post_partition",
-        )
-        logger.info("Finished routing final post rows in %.1fs", time.monotonic() - started)
-    else:
-        final_posts_routed_path.mkdir(parents=True, exist_ok=False)
-
-    random_source_paths = sorted(random_candidate_shards_path.glob("*.parquet"))
-    if random_source_paths:
-        started = time.monotonic()
-        logger.info(
-            "Routing final candidate-source rows from %s random shards",
-            f"{len(random_source_paths):,}",
-        )
-        sink_partitioned(
-            pl.scan_parquet(random_source_paths).with_columns(
-                post_data.post_partition_expr(partition_count)
-            ),
-            output_path=final_candidates_routed_path,
-            key="_post_partition",
-        )
-        logger.info(
-            "Finished routing final candidate-source rows in %.1fs",
-            time.monotonic() - started,
-        )
-    else:
-        final_candidates_routed_path.mkdir(parents=True, exist_ok=False)
-
-
-def write_and_validate_public_outputs(
-    *,
-    final_posts_routed_path: Path,
-    final_candidates_routed_path: Path,
     posts_path: Path,
     required_posts_path: Path,
     candidate_sources_path: Path,
@@ -426,17 +379,15 @@ def write_and_validate_public_outputs(
     validation_started = time.monotonic()
     for partition_id in range(config.post_selection_partition_count):
         posts_df = (
-            _load_paths(
-                post_data.partition_parquet_paths(final_posts_routed_path, partition_id),
-                post_data.POST_SCHEMA,
-            )
+            _public_part(base_posts_shards_path, partition_id, post_data.POST_SCHEMA)
             .select(post_data.POST_COLUMNS)
             .unique(subset="subject_uri")
             .sort("subject_uri")
         )
         candidate_sources_df = (
-            _load_paths(
-                post_data.partition_parquet_paths(final_candidates_routed_path, partition_id),
+            _public_part(
+                random_candidate_shards_path,
+                partition_id,
                 post_data.CANDIDATE_SOURCE_SCHEMA,
             )
             .select(post_data.CANDIDATE_SOURCE_COLUMNS)

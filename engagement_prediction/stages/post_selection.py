@@ -233,8 +233,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     normalized_replies_path = staging_root / "normalized_replies"
     base_posts_shards_path = staging_root / "base_posts_shards"
     random_candidate_shards_path = staging_root / "random_candidate_shards"
-    final_posts_routed_path = staging_root / "final_posts_routed"
-    final_candidates_routed_path = staging_root / "final_candidates_routed"
 
     logger.info(
         "Phase 3/6: routing positive and history requirements into %s URI partitions",
@@ -280,18 +278,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"{required_stats['missing_history_required_post_count']:,}",
     )
 
-    logger.info("Phase 6/6: routing, validating, and publishing public datasets")
-    post_selection_artifacts.materialize_final_routes(
+    logger.info("Phase 6/6: validating and publishing public datasets")
+    output_stats = post_selection_artifacts.write_and_validate_public_outputs(
         base_posts_shards_path=base_posts_shards_path,
         random_candidate_shards_path=random_candidate_shards_path,
-        final_posts_routed_path=final_posts_routed_path,
-        final_candidates_routed_path=final_candidates_routed_path,
-        partition_count=config.post_selection_partition_count,
-        logger=logger,
-    )
-    output_stats = post_selection_artifacts.write_and_validate_public_outputs(
-        final_posts_routed_path=final_posts_routed_path,
-        final_candidates_routed_path=final_candidates_routed_path,
         posts_path=posts_path,
         required_posts_path=required_posts_path,
         candidate_sources_path=candidate_sources_path,
