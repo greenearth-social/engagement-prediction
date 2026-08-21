@@ -240,6 +240,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "Phase 3/6: routing positive and history requirements into %s URI partitions",
         config.post_selection_partition_count,
     )
+    # write required (positive and history) posts, partitioned
     post_selection_artifacts.materialize_required_rows(
         query_positives_lf=query_positives_lf,
         history_post_uris_lf=history_post_uris_lf,
@@ -247,6 +248,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         partition_count=config.post_selection_partition_count,
     )
 
+    # write ALL posts and replies, partitioned (subset of cols)
     logger.info("Phase 4/6: normalizing and partitioning root and reply source rows")
     post_selection_artifacts.materialize_source_rows(
         post_paths=post_paths,
