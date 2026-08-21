@@ -209,6 +209,7 @@ def process_uri_partitions(
             post_data.partition_parquet_paths(required_rows_path, partition_id),
             post_data.REQUIRED_POST_SCHEMA,
         )
+        # de-duped required posts [subject_uri, is_positive, is_history]
         required_posts_df = post_data.build_required_posts(required_rows_df)
         normalized_root_df = _load_paths(
             post_data.partition_parquet_paths(normalized_posts_path, partition_id),
@@ -218,6 +219,7 @@ def process_uri_partitions(
             post_data.partition_parquet_paths(normalized_replies_path, partition_id),
             post_data.NORMALIZED_POST_SCHEMA,
         )
+        # de-duped raw posts and replies
         root_posts_df, partition_root_stats = post_data.select_latest_post_rows(
             normalized_root_df
         )
@@ -226,16 +228,19 @@ def process_uri_partitions(
         )
         root_stats.append(partition_root_stats)
         reply_stats.append(partition_reply_stats)
+        # handle posts that are in both root and reply dfs, combine [subject_uri, post_created_at, author_did, is_reply]
         resolved_posts_df, overlap_count = post_data.resolve_root_and_reply_posts(
             root_posts_df,
             reply_posts_df,
         )
 
+        # [subject_uri, post_created_at, author_did, is_reply, is_positive, is_history]
         required_found_with_metadata_df = resolved_posts_df.join(
             required_posts_df,
             on="subject_uri",
             how="inner",
         )
+        # [subject_uri, is_positive, is_history]
         found_required_df = required_found_with_metadata_df.select(
             post_data.REQUIRED_POST_COLUMNS
         )
@@ -270,6 +275,7 @@ def process_uri_partitions(
                 config.random_seed,
             )
         )
+        # [subject_uri, post_created_at, author_did, is_reply]
         required_found_posts_df = required_found_with_metadata_df.select(
             post_data.POST_COLUMNS
         )
