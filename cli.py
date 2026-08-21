@@ -73,10 +73,10 @@ DEFAULTS: Dict[str, Any] = {
     "holdout_end": None,
     # Stage 2: User histroy
     "max_history_posts_per_query": 64,
-    "user_history_partition_count": 32,
+    "user_history_partition_count": 16,
     # Stage 3: Post selection
     "random_candidate_sampling_fraction": 0.1,
-    "post_selection_partition_count": 32,
+    "post_selection_partition_count": 16,
     # Stage 3 (train) - Model architecture
     "user_summarization": "mean",  # MLP user-history summarization: mean, ema, linear_recency
     "ema_alpha": 0.1,  # EMA smoothing factor (only used when user_summarization=ema)
