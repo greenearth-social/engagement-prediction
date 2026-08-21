@@ -231,8 +231,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     required_rows_path = staging_root / "required_rows"
     normalized_posts_path = staging_root / "normalized_posts"
     normalized_replies_path = staging_root / "normalized_replies"
-    base_posts_shards_path = staging_root / "base_posts_shards"
-    random_candidate_shards_path = staging_root / "random_candidate_shards"
 
     logger.info(
         "Phase 3/6: routing positive and history requirements into %s URI partitions",
@@ -257,19 +255,22 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         logger=logger,
     )
 
-    logger.info("Phase 5/6: resolving metadata and memberships by URI partition")
+    logger.info(
+        "Phase 5/6: resolving, validating, and writing public URI partitions"
+    )
     selection_stats = post_selection_artifacts.process_uri_partitions(
         required_rows_path=required_rows_path,
         normalized_posts_path=normalized_posts_path,
         normalized_replies_path=normalized_replies_path,
+        posts_path=posts_path,
         required_posts_path=required_posts_path,
+        candidate_sources_path=candidate_sources_path,
         missing_required_posts_path=missing_required_posts_path,
-        base_posts_shards_path=base_posts_shards_path,
-        random_candidate_shards_path=random_candidate_shards_path,
         config=config,
         logger=logger,
     )
     required_stats = selection_stats["required_post_stats"]
+    output_stats = selection_stats["output_stats"]
     logger.info(
         "Resolved URI partitions: roots=%s replies=%s required=%s missing_history=%s",
         f"{selection_stats['root_source_stats'].get('unique_valid_count', 0):,}",
@@ -278,19 +279,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"{required_stats['missing_history_required_post_count']:,}",
     )
 
-    logger.info("Phase 6/6: validating and publishing public datasets")
-    output_stats = post_selection_artifacts.write_and_validate_public_outputs(
-        base_posts_shards_path=base_posts_shards_path,
-        random_candidate_shards_path=random_candidate_shards_path,
-        posts_path=posts_path,
-        required_posts_path=required_posts_path,
-        candidate_sources_path=candidate_sources_path,
-        missing_required_posts_path=missing_required_posts_path,
-        config=config,
-        logger=logger,
-    )
-
-    logger.info("Removing successful staging data and publishing the completed bundle")
+    logger.info("Phase 6/6: removing staging data and publishing the completed bundle")
     shutil.rmtree(staging_root)
     bundle_partial_path.replace(bundle_path)
     final_posts_path = bundle_path / "posts"

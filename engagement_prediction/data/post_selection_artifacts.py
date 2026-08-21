@@ -62,17 +62,6 @@ def _ensure_nonempty_dataset(path: Path, schema: dict[str, pl.DataType]) -> None
         )
 
 
-def _public_part(
-    path: Path,
-    partition_id: int,
-    schema: dict[str, pl.DataType],
-) -> pl.DataFrame:
-    part_path = path / f"part-{partition_id:05d}.parquet"
-    if not part_path.exists():
-        return post_data.empty_frame(schema)
-    return pl.read_parquet(part_path)
-
-
 def _merge_numeric_stats(stats: list[dict[str, int]]) -> dict[str, int]:
     merged: dict[str, int] = {}
     for values in stats:
@@ -159,19 +148,19 @@ def process_uri_partitions(
     required_rows_path: Path,
     normalized_posts_path: Path,
     normalized_replies_path: Path,
+    posts_path: Path,
     required_posts_path: Path,
+    candidate_sources_path: Path,
     missing_required_posts_path: Path,
-    base_posts_shards_path: Path,
-    random_candidate_shards_path: Path,
     config: PostSelectionConfig,
     logger: logging.Logger,
 ) -> dict[str, Any]:
-    """Resolve root/reply metadata and candidate membership by URI partition."""
+    """Resolve, validate, and write one public URI partition at a time."""
     for path in (
+        posts_path,
         required_posts_path,
+        candidate_sources_path,
         missing_required_posts_path,
-        base_posts_shards_path,
-        random_candidate_shards_path,
     ):
         path.mkdir(parents=True, exist_ok=False)
 
@@ -191,6 +180,13 @@ def process_uri_partitions(
         "history_resolved_as_root_count": 0,
         "history_resolved_as_reply_count": 0,
         "root_reply_overlap_count": 0,
+    }
+    output_counts = {
+        "post_count": 0,
+        "root_post_count": 0,
+        "reply_post_count": 0,
+        "candidate_source_count": 0,
+        "random_candidate_count": 0,
     }
     processing_started = time.monotonic()
     logger.info(
@@ -260,15 +256,6 @@ def process_uri_partitions(
                 f"{reply_positive_count} required positive posts resolved only as replies"
             )
 
-        _write_if_not_empty(
-            required_posts_df,
-            required_posts_path / f"part-{partition_id:05d}.parquet",
-        )
-        _write_if_not_empty(
-            missing_required_df,
-            missing_required_posts_path / f"part-{partition_id:05d}.parquet",
-        )
-
         random_posts_df = root_posts_df.filter(
             post_data.random_candidate_expr(
                 config.random_candidate_sampling_fraction,
@@ -288,13 +275,30 @@ def process_uri_partitions(
             "subject_uri",
             pl.lit("random").alias("candidate_source"),
         ).sort(["subject_uri", "candidate_source"])
+
+        post_data.validate_public_partition(
+            posts_df=base_posts_df,
+            required_posts_df=required_posts_df,
+            candidate_sources_df=random_candidate_sources_df,
+            missing_required_posts_df=missing_required_df,
+            partition_id=partition_id,
+            partition_count=config.post_selection_partition_count,
+        )
         _write_if_not_empty(
             base_posts_df,
-            base_posts_shards_path / f"part-{partition_id:05d}.parquet",
+            posts_path / f"part-{partition_id:05d}.parquet",
+        )
+        _write_if_not_empty(
+            required_posts_df,
+            required_posts_path / f"part-{partition_id:05d}.parquet",
         )
         _write_if_not_empty(
             random_candidate_sources_df,
-            random_candidate_shards_path / f"part-{partition_id:05d}.parquet",
+            candidate_sources_path / f"part-{partition_id:05d}.parquet",
+        )
+        _write_if_not_empty(
+            missing_required_df,
+            missing_required_posts_path / f"part-{partition_id:05d}.parquet",
         )
 
         required_counts["required_post_count"] += required_posts_df.height
@@ -330,6 +334,15 @@ def process_uri_partitions(
             ).height
         )
         required_counts["root_reply_overlap_count"] += overlap_count
+        output_counts["post_count"] += base_posts_df.height
+        output_counts["root_post_count"] += base_posts_df.filter(
+            ~pl.col("is_reply")
+        ).height
+        output_counts["reply_post_count"] += base_posts_df.filter(
+            pl.col("is_reply")
+        ).height
+        output_counts["candidate_source_count"] += random_candidate_sources_df.height
+        output_counts["random_candidate_count"] += random_candidate_sources_df.height
         logger.info(
             "Resolved URI partition %s/%s in %.1fs: roots=%s replies=%s "
             "required=%s missing_history=%s random=%s overlaps=%s",
@@ -348,89 +361,6 @@ def process_uri_partitions(
         "Finished all URI partitions in %.1fs",
         time.monotonic() - processing_started,
     )
-    return {
-        "root_source_stats": _merge_numeric_stats(root_stats),
-        "reply_source_stats": _merge_numeric_stats(reply_stats),
-        "required_post_stats": required_counts,
-    }
-
-
-def write_and_validate_public_outputs(
-    *,
-    base_posts_shards_path: Path,
-    random_candidate_shards_path: Path,
-    posts_path: Path,
-    required_posts_path: Path,
-    candidate_sources_path: Path,
-    missing_required_posts_path: Path,
-    config: PostSelectionConfig,
-    logger: logging.Logger,
-) -> dict[str, int]:
-    """Publish and validate one aligned public URI partition at a time."""
-    posts_path.mkdir(parents=True, exist_ok=False)
-    candidate_sources_path.mkdir(parents=True, exist_ok=False)
-    counts = {
-        "post_count": 0,
-        "root_post_count": 0,
-        "reply_post_count": 0,
-        "candidate_source_count": 0,
-        "random_candidate_count": 0,
-    }
-    validation_started = time.monotonic()
-    for partition_id in range(config.post_selection_partition_count):
-        posts_df = (
-            _public_part(base_posts_shards_path, partition_id, post_data.POST_SCHEMA)
-            .select(post_data.POST_COLUMNS)
-            .unique(subset="subject_uri")
-            .sort("subject_uri")
-        )
-        candidate_sources_df = (
-            _public_part(
-                random_candidate_shards_path,
-                partition_id,
-                post_data.CANDIDATE_SOURCE_SCHEMA,
-            )
-            .select(post_data.CANDIDATE_SOURCE_COLUMNS)
-            .unique()
-            .sort(["subject_uri", "candidate_source"])
-        )
-        _write_if_not_empty(posts_df, posts_path / f"part-{partition_id:05d}.parquet")
-        _write_if_not_empty(
-            candidate_sources_df,
-            candidate_sources_path / f"part-{partition_id:05d}.parquet",
-        )
-
-        required_df = _public_part(
-            required_posts_path, partition_id, post_data.REQUIRED_POST_SCHEMA
-        )
-        missing_df = _public_part(
-            missing_required_posts_path, partition_id, post_data.REQUIRED_POST_SCHEMA
-        )
-        post_data.validate_public_partition(
-            posts_df=posts_df,
-            required_posts_df=required_df,
-            candidate_sources_df=candidate_sources_df,
-            missing_required_posts_df=missing_df,
-            partition_id=partition_id,
-            partition_count=config.post_selection_partition_count,
-        )
-
-        counts["post_count"] += posts_df.height
-        counts["root_post_count"] += posts_df.filter(~pl.col("is_reply")).height
-        counts["reply_post_count"] += posts_df.filter(pl.col("is_reply")).height
-        counts["candidate_source_count"] += candidate_sources_df.height
-        counts["random_candidate_count"] += candidate_sources_df.height
-        completed = partition_id + 1
-        if completed == 1 or completed == config.post_selection_partition_count or completed % 16 == 0:
-            logger.info(
-                "Wrote and validated public partition %s/%s: cumulative_posts=%s "
-                "cumulative_candidate_sources=%s",
-                completed,
-                config.post_selection_partition_count,
-                f"{counts['post_count']:,}",
-                f"{counts['candidate_source_count']:,}",
-            )
-
     for path, schema in (
         (posts_path, post_data.POST_SCHEMA),
         (required_posts_path, post_data.REQUIRED_POST_SCHEMA),
@@ -438,8 +368,9 @@ def write_and_validate_public_outputs(
         (missing_required_posts_path, post_data.REQUIRED_POST_SCHEMA),
     ):
         _ensure_nonempty_dataset(path, schema)
-    logger.info(
-        "Finished writing and validating public datasets in %.1fs",
-        time.monotonic() - validation_started,
-    )
-    return counts
+    return {
+        "root_source_stats": _merge_numeric_stats(root_stats),
+        "reply_source_stats": _merge_numeric_stats(reply_stats),
+        "required_post_stats": required_counts,
+        "output_stats": output_counts,
+    }
