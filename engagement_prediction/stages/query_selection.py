@@ -302,13 +302,18 @@ def _build_final_query_lazyframes(
     eligible_positive_rows_lf: pl.LazyFrame,
     config: QuerySelectionConfig,
 ) -> Dict[str, pl.LazyFrame]:
+    # selected queries before joining to posts dataset
     after_split_cap_lf = provisional_query_lazyframes["after_split_cap"]
+    # new (user,hour,positive_count) summary but now with posts in posts dataset
     eligible_counts_lf = eligible_positive_rows_lf.group_by(QUERY_KEY).agg(
         pl.len().cast(pl.UInt32).alias("positive_count")
     )
+    # filter out anomaly user-hours with too many positives
     final_counts_lf = eligible_counts_lf.filter(
         pl.col("positive_count") <= config.max_positives_per_user_hour
     )
+    # join original selected queries to new queries with joined positives
+    # (to get metadata fields)
     queries_lf = (
         after_split_cap_lf
         .select(["did", "query_hour", "user_cohort", "split"])
@@ -316,6 +321,7 @@ def _build_final_query_lazyframes(
         .select(["did", "query_hour", "user_cohort", "split", "positive_count"])
         .sort(["query_hour", "did"])
     )
+    # filter valid eligible positives based on final selected queries
     positives_lf = (
         eligible_positive_rows_lf
         .join(final_counts_lf.select(QUERY_KEY), on=QUERY_KEY, how="inner")
