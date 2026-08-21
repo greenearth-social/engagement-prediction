@@ -12,6 +12,7 @@ import polars as pl
 
 from engagement_prediction.data import ingex
 from engagement_prediction.data import post_selection as post_data
+from engagement_prediction.data.parquet import read_parquet_parts, sink_partitioned_parquet
 
 
 QUERY_KEY = ["did", "query_hour"]
@@ -36,32 +37,6 @@ MEMBERSHIP_POST_SCHEMA = {
     "subject_uri": pl.String,
     "_post_row_valid": pl.Boolean,
 }
-
-
-def _sink_partitioned(
-    lf: pl.LazyFrame,
-    *,
-    output_path: Path,
-    key: str,
-) -> None:
-    output_path.mkdir(parents=True, exist_ok=False)
-    lf.sink_parquet(
-        pl.PartitionBy(
-            output_path,
-            key=key,
-            include_key=False,
-            approximate_bytes_per_file="auto",
-        ),
-        compression="zstd",
-        maintain_order=False,
-        engine="streaming",
-    )
-
-
-def _load_paths(paths: list[Path], schema: dict[str, pl.DataType]) -> pl.DataFrame:
-    if not paths:
-        return pl.DataFrame(schema=schema)
-    return pl.read_parquet(paths)
 
 
 def _merge_numeric_stats(stats: list[dict[str, int]]) -> dict[str, int]:
@@ -95,7 +70,7 @@ def materialize_post_rows(
     ).select(list(MEMBERSHIP_POST_SCHEMA)).with_columns(
         post_data.post_partition_expr(partition_count)
     )
-    _sink_partitioned(
+    sink_partitioned_parquet(
         post_rows_lf,
         output_path=output_path,
         key="_post_partition",
@@ -120,7 +95,7 @@ def materialize_provisional_positive_rows(
         .with_columns(post_data.post_partition_expr(partition_count))
     )
     logger.info("Rescanning likes and routing provisional positives into URI partitions")
-    _sink_partitioned(
+    sink_partitioned_parquet(
         provisional_lf,
         output_path=output_path,
         key="_post_partition",
@@ -199,17 +174,17 @@ def filter_positive_partitions(
 
     for partition_id in range(partition_count):
         partition_started = time.monotonic()
-        positive_rows_df = _load_paths(
+        positive_rows_df = read_parquet_parts(
             post_data.partition_parquet_paths(
                 provisional_positive_rows_path,
                 partition_id,
             ),
-            INTERNAL_POSITIVE_SCHEMA,
+            empty=pl.DataFrame(schema=INTERNAL_POSITIVE_SCHEMA),
         )
         deduplicated_df = _deduplicate_positive_rows(positive_rows_df)
-        normalized_posts_df = _load_paths(
+        normalized_posts_df = read_parquet_parts(
             post_data.partition_parquet_paths(post_rows_path, partition_id),
-            MEMBERSHIP_POST_SCHEMA,
+            empty=pl.DataFrame(schema=MEMBERSHIP_POST_SCHEMA),
         )
         unique_posts_df, partition_post_stats = _select_valid_post_keys(normalized_posts_df)
         post_stats.append(partition_post_stats)

@@ -22,7 +22,11 @@ from typing import Any, Dict
 import polars as pl
 
 from engagement_prediction.data import ingex, likes
-from engagement_prediction.data.parquet import load_parquet_from_prior
+from engagement_prediction.data.parquet import (
+    load_parquet_from_prior,
+    read_parquet_parts,
+    sink_partitioned_parquet,
+)
 from engagement_prediction.data import user_history as history_data
 from engagement_prediction.pipeline.core import Context
 from utils.helpers import get_stage_logger
@@ -68,27 +72,12 @@ def _publish_partitioned_dataset(
     partial_path: Path,
     final_path: Path,
 ) -> None:
-    partial_path.mkdir(parents=True, exist_ok=False)
-    lf.sink_parquet(
-        pl.PartitionBy(
-            partial_path,
-            key="_user_partition",
-            include_key=False,
-            approximate_bytes_per_file="auto",
-        ),
-        compression="zstd",
-        maintain_order=False,
-        engine="streaming",
+    sink_partitioned_parquet(
+        lf,
+        output_path=partial_path,
+        key="_user_partition",
     )
     partial_path.replace(final_path)
-
-
-def _load_partition(paths: list[Path], *, empty: pl.DataFrame | None = None) -> pl.DataFrame:
-    if not paths:
-        if empty is None:
-            raise ValueError("Expected a non-empty Parquet partition")
-        return empty
-    return pl.read_parquet(paths)
 
 
 def _materialize_partitioned_inputs(
@@ -114,8 +103,7 @@ def _materialize_partitioned_inputs(
     )
 
     selected_users_lf = queries_lf.select("did").unique()
-    selected_user_count = selected_users_lf.select(pl.len()).collect(engine="streaming").item()
-    logger.info("Scanning like history for %s queried users", f"{selected_user_count:,}")
+    logger.info("Scanning like history for users represented in selected queries")
     queried_user_likes_lf = (
         likes.prepare_likes(
             ingex.scan_parquet_files(source_like_paths),
@@ -163,8 +151,8 @@ def _write_query_histories(
             queried_user_likes_path,
             partition_id,
         )
-        queries_df = _load_partition(query_paths)
-        likes_df = _load_partition(like_paths, empty=history_data.empty_likes())
+        queries_df = read_parquet_parts(query_paths)
+        likes_df = read_parquet_parts(like_paths, empty=history_data.empty_likes())
         history_df, history_post_uris_df, partition_stats = (
             history_data.build_query_histories_for_partition(
                 queries_df,
@@ -226,22 +214,13 @@ def _write_history_post_uris(
         )
         return 0
 
-    routed_history_post_uris_path.mkdir(parents=True, exist_ok=False)
     # Repartition physical user-partition shards by the logical URI hash key.
-    (
-        pl.scan_parquet(shard_paths)
-        .with_columns(history_data.history_post_partition_expr(partition_count))
-        .sink_parquet(
-            pl.PartitionBy(
-                routed_history_post_uris_path,
-                key="_history_post_partition",
-                include_key=False,
-                approximate_bytes_per_file="auto",
-            ),
-            compression="zstd",
-            maintain_order=False,
-            engine="streaming",
-        )
+    sink_partitioned_parquet(
+        pl.scan_parquet(shard_paths).with_columns(
+            history_data.history_post_partition_expr(partition_count)
+        ),
+        output_path=routed_history_post_uris_path,
+        key="_history_post_partition",
     )
 
     unique_history_post_count = 0
@@ -298,15 +277,16 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     )
     queries_lf = load_parquet_from_prior(query_selection_dir, "queries_")
     history_data.validate_queries_schema(queries_lf)
-    query_count = queries_lf.select(pl.len()).collect(engine="streaming").item()
-    if query_count == 0:
-        raise ValueError("query_selection produced no queries")
-    query_bounds = queries_lf.select(
+    query_summary = queries_lf.select(
+        pl.len().alias("query_count"),
         pl.col("query_hour").min().alias("min_query_hour"),
         pl.col("query_hour").max().alias("max_query_hour"),
-    ).collect()
-    min_query_hour = query_bounds.item(0, "min_query_hour")
-    max_query_hour = query_bounds.item(0, "max_query_hour")
+    ).collect(engine="streaming")
+    query_count = query_summary.item(0, "query_count")
+    if query_count == 0:
+        raise ValueError("query_selection produced no queries")
+    min_query_hour = query_summary.item(0, "min_query_hour")
+    max_query_hour = query_summary.item(0, "max_query_hour")
 
     like_sources_path = _find_like_sources_path(query_selection_dir)
     source_manifest = ingex.load_source_manifest(like_sources_path)

@@ -6,7 +6,9 @@ import pytest
 from engagement_prediction.data.parquet import (
     find_artifact_path,
     load_parquet_from_prior,
+    read_parquet_parts,
     scan_parquet_artifact,
+    sink_partitioned_parquet,
 )
 
 
@@ -38,3 +40,23 @@ def test_parquet_helpers_ignore_partial_and_reject_empty_dataset(tmp_path):
     empty.mkdir()
     with pytest.raises(FileNotFoundError, match="No Parquet parts"):
         scan_parquet_artifact(empty)
+
+
+def test_sink_and_read_partitioned_parquet_parts(tmp_path):
+    output_path = Path(tmp_path) / "partitioned"
+    sink_partitioned_parquet(
+        pl.DataFrame({"value": [1, 2], "partition": [0, 1]}).lazy(),
+        output_path=output_path,
+        key="partition",
+    )
+
+    first_partition_paths = sorted((output_path / "partition=0").glob("*.parquet"))
+    assert read_parquet_parts(first_partition_paths)["value"].to_list() == [1]
+
+
+def test_read_parquet_parts_supports_schema_correct_empty_frame():
+    empty = pl.DataFrame(schema={"value": pl.Int64})
+
+    assert read_parquet_parts([], empty=empty).schema == empty.schema
+    with pytest.raises(ValueError, match="Expected at least one Parquet part"):
+        read_parquet_parts([])

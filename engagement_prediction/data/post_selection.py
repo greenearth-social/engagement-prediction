@@ -222,7 +222,7 @@ def validate_public_partition(
             raise ValueError("Public post-selection artifact contains a null subject_uri")
         if frame.height != frame.unique(subset=sort_columns).height:
             raise ValueError(f"Duplicate rows in public post-selection artifact {columns}")
-        if frame.sort(sort_columns).to_dicts() != frame.to_dicts():
+        if not frame.equals(frame.sort(sort_columns)):
             raise ValueError(f"Public post-selection artifact is not sorted by {sort_columns}")
         if not frame.is_empty():
             assigned = (

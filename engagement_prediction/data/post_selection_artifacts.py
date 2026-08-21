@@ -12,6 +12,7 @@ import polars as pl
 
 from engagement_prediction.data import ingex
 from engagement_prediction.data import post_selection as post_data
+from engagement_prediction.data.parquet import read_parquet_parts, sink_partitioned_parquet
 
 
 class PostSelectionConfig(Protocol):
@@ -20,33 +21,6 @@ class PostSelectionConfig(Protocol):
     random_candidate_sampling_fraction: float
     post_selection_partition_count: int
     random_seed: int
-
-
-def sink_partitioned(
-    lf: pl.LazyFrame,
-    *,
-    output_path: Path,
-    key: str,
-) -> None:
-    """Stream a narrow lazy frame into hive-style partitions."""
-    output_path.mkdir(parents=True, exist_ok=False)
-    lf.sink_parquet(
-        pl.PartitionBy(
-            output_path,
-            key=key,
-            include_key=False,
-            approximate_bytes_per_file="auto",
-        ),
-        compression="zstd",
-        maintain_order=False,
-        engine="streaming",
-    )
-
-
-def _load_paths(paths: list[Path], schema: dict[str, pl.DataType]) -> pl.DataFrame:
-    if not paths:
-        return post_data.empty_frame(schema)
-    return pl.read_parquet(paths)
 
 
 def _write_if_not_empty(df: pl.DataFrame, path: Path) -> None:
@@ -98,7 +72,7 @@ def materialize_required_rows(
             ),
         ]
     ).filter(pl.col("subject_uri").is_not_null())
-    sink_partitioned(
+    sink_partitioned_parquet(
         required_rows_lf.with_columns(post_data.post_partition_expr(partition_count)),
         output_path=output_path,
         key="_post_partition",
@@ -131,7 +105,7 @@ def materialize_source_rows(
             posts_end=config.posts_end,
             is_reply=is_reply,
         ).with_columns(post_data.post_partition_expr(config.post_selection_partition_count))
-        sink_partitioned(
+        sink_partitioned_parquet(
             normalized_lf,
             output_path=output_path,
             key="_post_partition",
@@ -201,19 +175,19 @@ def process_uri_partitions(
             partition_id + 1,
             config.post_selection_partition_count,
         )
-        required_rows_df = _load_paths(
+        required_rows_df = read_parquet_parts(
             post_data.partition_parquet_paths(required_rows_path, partition_id),
-            post_data.REQUIRED_POST_SCHEMA,
+            empty=post_data.empty_frame(post_data.REQUIRED_POST_SCHEMA),
         )
         # de-duped required posts [subject_uri, is_positive, is_history]
         required_posts_df = post_data.build_required_posts(required_rows_df)
-        normalized_root_df = _load_paths(
+        normalized_root_df = read_parquet_parts(
             post_data.partition_parquet_paths(normalized_posts_path, partition_id),
-            post_data.NORMALIZED_POST_SCHEMA,
+            empty=post_data.empty_frame(post_data.NORMALIZED_POST_SCHEMA),
         )
-        normalized_reply_df = _load_paths(
+        normalized_reply_df = read_parquet_parts(
             post_data.partition_parquet_paths(normalized_replies_path, partition_id),
-            post_data.NORMALIZED_POST_SCHEMA,
+            empty=post_data.empty_frame(post_data.NORMALIZED_POST_SCHEMA),
         )
         # de-duped raw posts and replies
         root_posts_df, partition_root_stats = post_data.select_latest_post_rows(
@@ -266,26 +240,26 @@ def process_uri_partitions(
         required_found_posts_df = required_found_with_metadata_df.select(
             post_data.POST_COLUMNS
         )
-        base_posts_df = (
+        posts_df = (
             pl.concat([required_found_posts_df, random_posts_df])
             .unique(subset="subject_uri")
             .sort("subject_uri")
         )
-        random_candidate_sources_df = random_posts_df.select(
+        candidate_sources_df = random_posts_df.select(
             "subject_uri",
             pl.lit("random").alias("candidate_source"),
         ).sort(["subject_uri", "candidate_source"])
 
         post_data.validate_public_partition(
-            posts_df=base_posts_df,
+            posts_df=posts_df,
             required_posts_df=required_posts_df,
-            candidate_sources_df=random_candidate_sources_df,
+            candidate_sources_df=candidate_sources_df,
             missing_required_posts_df=missing_required_df,
             partition_id=partition_id,
             partition_count=config.post_selection_partition_count,
         )
         _write_if_not_empty(
-            base_posts_df,
+            posts_df,
             posts_path / f"part-{partition_id:05d}.parquet",
         )
         _write_if_not_empty(
@@ -293,7 +267,7 @@ def process_uri_partitions(
             required_posts_path / f"part-{partition_id:05d}.parquet",
         )
         _write_if_not_empty(
-            random_candidate_sources_df,
+            candidate_sources_df,
             candidate_sources_path / f"part-{partition_id:05d}.parquet",
         )
         _write_if_not_empty(
@@ -334,15 +308,15 @@ def process_uri_partitions(
             ).height
         )
         required_counts["root_reply_overlap_count"] += overlap_count
-        output_counts["post_count"] += base_posts_df.height
-        output_counts["root_post_count"] += base_posts_df.filter(
+        output_counts["post_count"] += posts_df.height
+        output_counts["root_post_count"] += posts_df.filter(
             ~pl.col("is_reply")
         ).height
-        output_counts["reply_post_count"] += base_posts_df.filter(
+        output_counts["reply_post_count"] += posts_df.filter(
             pl.col("is_reply")
         ).height
-        output_counts["candidate_source_count"] += random_candidate_sources_df.height
-        output_counts["random_candidate_count"] += random_candidate_sources_df.height
+        output_counts["candidate_source_count"] += candidate_sources_df.height
+        output_counts["random_candidate_count"] += candidate_sources_df.height
         logger.info(
             "Resolved URI partition %s/%s in %.1fs: roots=%s replies=%s "
             "required=%s missing_history=%s random=%s overlaps=%s",
