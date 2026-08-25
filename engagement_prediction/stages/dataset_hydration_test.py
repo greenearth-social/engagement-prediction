@@ -296,6 +296,7 @@ def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
         SimpleNamespace(
             embedding_model="all_MiniLM_L12_v2",
             embedding_source_batch_size=64,
+            embedding_partition_worker_count=2,
             min_author_training_feature_count=1,
             _argv=["--stop-after", "dataset_hydration"],
         ),
@@ -322,6 +323,8 @@ def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
         {"author_did": "c", "author_idx": 4},
     ]
     summary = json.loads(Path(result["output_dir"], "summary.json").read_text())
+    assert summary["parameters"]["embedding_partition_worker_count"] == 2
+    assert summary["embeddings"]["embedding_partition_worker_count"] == 1
     assert summary["parameters"]["min_author_training_feature_count"] == 1
     assert summary["author_vocabulary"]["training_positive_count"] == 1
     assert summary["author_vocabulary"]["training_history_count"] == 1
@@ -388,6 +391,7 @@ def test_stage_failure_retains_partial_diagnostics_without_publishing(tmp_path, 
             SimpleNamespace(
                 embedding_model="all_MiniLM_L12_v2",
                 embedding_source_batch_size=64,
+                embedding_partition_worker_count=2,
                 min_author_training_feature_count=1,
                 _argv=["--stop-after", "dataset_hydration"],
             ),
@@ -429,6 +433,7 @@ def test_stage_rejects_obsolete_indexed_stage6_schema(tmp_path):
             SimpleNamespace(
                 embedding_model="all_MiniLM_L12_v2",
                 embedding_source_batch_size=64,
+                embedding_partition_worker_count=2,
                 min_author_training_feature_count=1,
                 _argv=["--stop-after", "dataset_hydration"],
             ),

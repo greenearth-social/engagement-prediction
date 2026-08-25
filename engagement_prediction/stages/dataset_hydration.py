@@ -129,9 +129,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     embedding_model = str(args.embedding_model)
     embedding_dim = get_embedding_dim_for_known_model(embedding_model)
     embedding_source_batch_size = int(args.embedding_source_batch_size)
+    embedding_partition_worker_count = int(args.embedding_partition_worker_count)
     min_author_training_feature_count = int(args.min_author_training_feature_count)
     if embedding_source_batch_size <= 0:
         raise ValueError("embedding_source_batch_size must be positive")
+    if embedding_partition_worker_count <= 0:
+        raise ValueError("embedding_partition_worker_count must be positive")
     if min_author_training_feature_count < 1:
         raise ValueError("min_author_training_feature_count must be at least 1")
 
@@ -186,7 +189,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "Starting dataset hydration: source_window=[%s, %s) model=%s dim=%s "
         "post_partitions=%s liker_partitions=%s user_partitions=%s "
         "author_partitions=%s embedding_source_batch_size=%s "
-        "min_author_training_feature_count=%s",
+        "embedding_partition_worker_count=%s min_author_training_feature_count=%s",
         source_start.isoformat(),
         source_end.isoformat(),
         embedding_model,
@@ -196,6 +199,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         stage2_partition_count,
         author_partition_count,
         embedding_source_batch_size,
+        embedding_partition_worker_count,
         min_author_training_feature_count,
     )
 
@@ -314,9 +318,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         logger=logger,
     )
 
-    # Each URI partition selects one latest valid payload and writes a NumPy
-    # shard. Partition-order concatenation makes emb_idx dense and aligned with
-    # the public posts rows.
+    # Worker processes independently select one latest valid vector per URI
+    # partition and write NumPy shards. Partition-order concatenation keeps
+    # emb_idx dense and aligned with the public posts rows regardless of worker
+    # completion order.
     logger.info("Phase 4/9: selecting vectors and publishing the exact memmap/post index")
     embedding_stats = dataset_hydration_artifacts.write_embedding_shards(
         selected_embedding_rows_path=selected_embedding_rows_path,
@@ -325,6 +330,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         embedding_model=embedding_model,
         embedding_dim=embedding_dim,
         partition_count=stage3_partition_count,
+        worker_count=embedding_partition_worker_count,
         logger=logger,
     )
     # From this point onward the selected payload Parquet is redundant: every
@@ -492,6 +498,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "embedding_model": embedding_model,
             "embedding_dim": embedding_dim,
             "embedding_source_batch_size": embedding_source_batch_size,
+            "embedding_partition_worker_count": embedding_partition_worker_count,
             "min_author_training_feature_count": min_author_training_feature_count,
             "source_metadata_partition_count": stage3_partition_count,
             "post_liker_history_partition_count": stage5_partition_count,
@@ -545,6 +552,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             f"embedding_model: {embedding_model}",
             f"embedding_dim: {embedding_dim}",
             f"embedding_source_batch_size: {embedding_source_batch_size}",
+            f"embedding_partition_worker_count: {embedding_partition_worker_count}",
+            f"effective_embedding_partition_worker_count: {embedding_stats['embedding_partition_worker_count']}",
             f"min_author_training_feature_count: {min_author_training_feature_count}",
             f"hydrated_post_count: {post_stats['hydrated_post_count']}",
             f"author_vocabulary_count: {vocabulary_stats['eligible_author_count']}",

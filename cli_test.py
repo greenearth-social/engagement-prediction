@@ -158,12 +158,15 @@ def test_dataset_hydration_args_merge_from_cli():
         cli.build_parser().parse_args([
             "--embedding-source-batch-size",
             "32",
+            "--embedding-partition-worker-count",
+            "3",
             "--min-author-training-feature-count",
             "75",
         ])
     )
 
     assert merged.embedding_source_batch_size == 32
+    assert merged.embedding_partition_worker_count == 3
     assert merged.min_author_training_feature_count == 75
 
 
@@ -221,6 +224,7 @@ def test_query_sampling_defaults():
     assert merged.post_liker_history_partition_count == 16
     assert merged.author_statistics_partition_count == 16
     assert merged.embedding_source_batch_size == 64
+    assert merged.embedding_partition_worker_count == 2
     assert merged.min_author_training_feature_count == 50
 
     with pytest.raises(SystemExit):

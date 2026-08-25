@@ -1,6 +1,10 @@
+import base64
 from datetime import datetime, timezone
 import logging
+import struct
+import zlib
 
+import numpy as np
 import polars as pl
 
 from engagement_prediction.data import dataset_hydration
@@ -15,6 +19,15 @@ UTC = timezone.utc
 def _write_part(path, frame):
     path.mkdir(parents=True)
     frame.write_parquet(path / "part-00000.parquet")
+
+
+def _compressed(values: list[float]) -> str:
+    payload = struct.pack(f"<{len(values)}f", *values)
+    return base64.b85encode(zlib.compress(payload)).decode()
+
+
+def _embedding(values: list[float]) -> list[dict[str, str]]:
+    return [{"key": "all_MiniLM_L12_v2", "value": _compressed(values)}]
 
 
 def test_embedding_source_batching_loads_keys_once_and_writes_only_selected_payloads(
@@ -151,6 +164,101 @@ def test_embedding_source_batching_loads_keys_once_and_writes_only_selected_payl
         "matched_embedding_source_row_count": 2,
     }
     assert not temporary_routes_root.exists()
+
+
+def test_embedding_shard_writer_reuses_the_vectors_decoded_during_validation(
+    tmp_path,
+    monkeypatch,
+):
+    source_path = tmp_path / "selected-embedding-rows" / "partition-00000"
+    source_path.mkdir(parents=True)
+    pl.DataFrame({
+        "subject_uri": ["post", "post"],
+        "post_created_at": [
+            datetime(2026, 1, 1, 1, tzinfo=UTC),
+            datetime(2026, 1, 1, 2, tzinfo=UTC),
+        ],
+        "author_did": ["author", "author"],
+        "embeddings": [_embedding([1.0, 2.0]), _embedding([3.0, 4.0])],
+    }).write_parquet(source_path / "rows.parquet")
+
+    decode_count = 0
+    original_decode = dataset_hydration.get_expanded_embedding_vector
+
+    def count_decode(payload, model):
+        nonlocal decode_count
+        decode_count += 1
+        return original_decode(payload, model)
+
+    monkeypatch.setattr(
+        dataset_hydration,
+        "get_expanded_embedding_vector",
+        count_decode,
+    )
+    stats = dataset_hydration_artifacts.write_embedding_shards(
+        selected_embedding_rows_path=tmp_path / "selected-embedding-rows",
+        valid_embedding_rows_path=tmp_path / "valid-embedding-rows",
+        embedding_shards_path=tmp_path / "embedding-shards",
+        embedding_model="all_MiniLM_L12_v2",
+        embedding_dim=2,
+        partition_count=1,
+        worker_count=1,
+        logger=logging.getLogger("embedding-shard-test"),
+    )
+
+    # Both source rows must be validated, but the selected second row is not
+    # decoded again when its vector is written to the NumPy shard.
+    assert decode_count == 2
+    shard = np.load(tmp_path / "embedding-shards" / "part-00000.npy")
+    assert shard.tolist() == [[3.0, 4.0]]
+    assert stats["embedding_partition_worker_count"] == 1
+    assert stats["embedding_partition_counts"] == [1]
+
+
+def test_embedding_shards_are_deterministic_with_parallel_partition_workers(tmp_path):
+    selected_rows_path = tmp_path / "selected-embedding-rows"
+    for partition_id, uri, vector in (
+        (0, "a", [1.0, 2.0]),
+        (1, "b", [3.0, 4.0]),
+    ):
+        partition_path = selected_rows_path / f"partition-{partition_id:05d}"
+        partition_path.mkdir(parents=True)
+        pl.DataFrame({
+            "subject_uri": [uri],
+            "post_created_at": [datetime(2026, 1, 1, tzinfo=UTC)],
+            "author_did": [f"author-{uri}"],
+            "embeddings": [_embedding(vector)],
+        }).write_parquet(partition_path / "rows.parquet")
+
+    stats = dataset_hydration_artifacts.write_embedding_shards(
+        selected_embedding_rows_path=selected_rows_path,
+        valid_embedding_rows_path=tmp_path / "valid-embedding-rows",
+        embedding_shards_path=tmp_path / "embedding-shards",
+        embedding_model="all_MiniLM_L12_v2",
+        embedding_dim=2,
+        partition_count=2,
+        worker_count=2,
+        logger=logging.getLogger("parallel-embedding-shard-test"),
+    )
+
+    assert stats["embedding_partition_worker_count"] == 2
+    assert stats["embedding_partition_counts"] == [1, 1]
+    assert [row["partition_id"] for row in stats["embedding_partition_stats"]] == [
+        0,
+        1,
+    ]
+    assert np.load(tmp_path / "embedding-shards" / "part-00000.npy").tolist() == [
+        [1.0, 2.0]
+    ]
+    assert np.load(tmp_path / "embedding-shards" / "part-00001.npy").tolist() == [
+        [3.0, 4.0]
+    ]
+    assert pl.read_parquet(
+        tmp_path / "valid-embedding-rows" / "part-00000.parquet"
+    ).get_column("subject_uri").to_list() == ["a"]
+    assert pl.read_parquet(
+        tmp_path / "valid-embedding-rows" / "part-00001.parquet"
+    ).get_column("subject_uri").to_list() == ["b"]
 
 
 def test_author_vocabulary_uses_only_surviving_training_feature_occurrences(tmp_path):

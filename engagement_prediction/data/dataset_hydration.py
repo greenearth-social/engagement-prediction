@@ -237,19 +237,23 @@ def _stable_payload_key(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
 
-def select_latest_valid_embedding_payloads(
+def select_latest_valid_embedding_vectors(
     source_rows_df: pl.DataFrame,
     *,
     embedding_model: str,
     embedding_dim: int,
-) -> tuple[list[tuple[str, datetime, str, Any]], dict[str, int]]:
-    """Select compact payloads for the latest usable vector for every URI.
+) -> tuple[list[tuple[str, datetime, str, np.ndarray]], dict[str, int]]:
+    """Select the latest usable decoded vector for every URI.
 
     This operates on one URI-hash partition. A later row lacking a usable
     vector does not erase an older valid vector. Equal timestamps prefer the
-    ascending author DID and then a stable serialized payload ordering. The
-    decoded vector is discarded after validation so a large partition does not
-    retain Python float arrays for every selected post.
+    ascending author DID and then a stable serialized payload ordering.
+
+    The winning decoded ``Float32`` vector is retained alongside each URI.
+    Stage 7 can therefore write the NumPy shard without decoding every selected
+    payload a second time. This intentionally spends more partition-local
+    memory to remove the duplicate CPU work; the caller still processes only a
+    bounded URI partition at a time.
     """
     required = {"subject_uri", "post_created_at", "author_did", "embeddings"}
     missing = required - set(source_rows_df.columns)
@@ -258,7 +262,7 @@ def select_latest_valid_embedding_payloads(
             "Embedding source rows are missing columns: " + ", ".join(sorted(missing))
         )
 
-    best: dict[str, tuple[datetime, str, str, Any]] = {}
+    best: dict[str, tuple[datetime, str, str, np.ndarray]] = {}
     stats = {
         "source_row_count": source_rows_df.height,
         "null_embedding_count": 0,
@@ -309,7 +313,7 @@ def select_latest_valid_embedding_payloads(
                 created_at,
                 str(author_did),
                 payload_key,
-                row["embeddings"],
+                array,
             )
 
     selected = [
@@ -327,7 +331,7 @@ def select_latest_valid_embeddings(
     embedding_dim: int,
 ) -> tuple[pl.DataFrame, dict[str, int]]:
     """Return selected vectors as a DataFrame for bounded transformations/tests."""
-    selected, stats = select_latest_valid_embedding_payloads(
+    selected, stats = select_latest_valid_embedding_vectors(
         source_rows_df,
         embedding_model=embedding_model,
         embedding_dim=embedding_dim,
@@ -338,12 +342,9 @@ def select_latest_valid_embeddings(
             "subject_uri": uri,
             "source_post_created_at": created_at,
             "source_author_did": author_did,
-            "_emb_vec": np.asarray(
-                get_expanded_embedding_vector(payload, embedding_model),
-                dtype=np.float32,
-            ).tolist(),
+            "_emb_vec": vector.tolist(),
         }
-        for uri, created_at, author_did, payload in selected
+        for uri, created_at, author_did, vector in selected
     ]
     result = (
         pl.from_dicts(rows, schema=VALID_EMBEDDING_SCHEMA)

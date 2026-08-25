@@ -23,6 +23,8 @@ the intentional resident exceptions.
 from __future__ import annotations
 
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 from pathlib import Path
 import logging
 import shutil
@@ -41,7 +43,6 @@ from engagement_prediction.data.parquet import (
     scan_parquet_artifact,
     sink_partitioned_parquet,
 )
-from shared.input_data_helpers import get_expanded_embedding_vector
 
 
 def _public_part(path: Path, partition_id: int) -> list[Path]:
@@ -371,6 +372,79 @@ def materialize_selected_embedding_rows(
     }
 
 
+def _write_embedding_partition(
+    *,
+    selected_embedding_rows_path: Path,
+    valid_embedding_rows_path: Path,
+    embedding_shards_path: Path,
+    embedding_model: str,
+    embedding_dim: int,
+    partition_id: int,
+) -> dict[str, Any]:
+    """Decode, select, and write one independent URI partition.
+
+    This top-level worker is intentionally process-safe. It reads and writes
+    only files owned by ``partition_id``, so multiple workers can run without
+    coordinating mutable state. The returned object contains only compact
+    statistics; decoded vectors never cross the process boundary.
+    """
+    source_paths = sorted(
+        (selected_embedding_rows_path / f"partition-{partition_id:05d}").glob(
+            "*.parquet"
+        )
+    )
+    if source_paths:
+        source_df = pl.read_parquet(source_paths)
+    else:
+        source_df = dataset_hydration.empty_frame({
+            "subject_uri": pl.String,
+            "post_created_at": dataset_hydration.UTC_DATETIME,
+            "author_did": pl.String,
+            "embeddings": pl.List(
+                pl.Struct({"key": pl.String, "value": pl.String})
+            ),
+        })
+
+    # Validation produces the actual Float32 winner. Keeping that array avoids
+    # decompressing and unpacking the same selected payload again while writing
+    # the shard.
+    selected_vectors, stats = dataset_hydration.select_latest_valid_embedding_vectors(
+        source_df,
+        embedding_model=embedding_model,
+        embedding_dim=embedding_dim,
+    )
+    source_row_count = source_df.height
+    del source_df
+
+    selected_metadata_df = pl.DataFrame(
+        {"subject_uri": [row[0] for row in selected_vectors]},
+        schema=dataset_hydration.VALID_EMBEDDING_KEY_SCHEMA,
+    )
+    selected_metadata_df.write_parquet(
+        valid_embedding_rows_path / f"part-{partition_id:05d}.parquet",
+        compression="zstd",
+    )
+    shard_path = embedding_shards_path / f"part-{partition_id:05d}.npy"
+    shard = np.lib.format.open_memmap(
+        shard_path,
+        mode="w+",
+        dtype=np.float32,
+        shape=(len(selected_vectors), embedding_dim),
+    )
+    for row_index, (_uri, _created_at, _author_did, vector) in enumerate(
+        selected_vectors
+    ):
+        shard[row_index] = vector
+    shard.flush()
+    del shard
+    return {
+        "partition_id": partition_id,
+        "embedding_count": len(selected_vectors),
+        "source_row_count": source_row_count,
+        "stats": stats,
+    }
+
+
 def write_embedding_shards(
     *,
     selected_embedding_rows_path: Path,
@@ -379,79 +453,94 @@ def write_embedding_shards(
     embedding_model: str,
     embedding_dim: int,
     partition_count: int,
+    worker_count: int,
     logger: logging.Logger,
 ) -> dict[str, Any]:
-    """Select one vector per URI and write one exact NumPy shard per URI partition.
+    """Select and write embedding shards with bounded partition concurrency.
 
     ``selected_embedding_rows`` still contains encoded payloads and duplicate
-    source rows. This function validates those payloads, chooses one latest
-    usable row per URI, and writes only decoded vectors to ``embedding_shards``.
-    The aligned ``valid_embedding_rows`` keys preserve each shard's row order.
+    source rows. Every URI-hash partition is complete and independent, so a
+    spawn-based process pool can decode several partitions concurrently. The
+    aligned ``valid_embedding_rows`` keys preserve each shard's row order, and
+    the caller still concatenates shards in partition-ID order for stable
+    global embedding indices.
+
+    Set ``worker_count=1`` for a serial low-memory/debugging path.
     """
+    if partition_count <= 0:
+        raise ValueError("partition_count must be positive")
+    if worker_count <= 0:
+        raise ValueError("embedding_partition_worker_count must be positive")
     valid_embedding_rows_path.mkdir(parents=True, exist_ok=False)
     embedding_shards_path.mkdir(parents=True, exist_ok=False)
-    counts: list[int] = []
+    effective_worker_count = min(worker_count, partition_count)
+    logger.info(
+        "Selecting embeddings across %s URI partitions with %s worker processes",
+        partition_count,
+        effective_worker_count,
+    )
+
+    results: list[dict[str, Any]] = []
+    worker_kwargs = [
+        {
+            "selected_embedding_rows_path": selected_embedding_rows_path,
+            "valid_embedding_rows_path": valid_embedding_rows_path,
+            "embedding_shards_path": embedding_shards_path,
+            "embedding_model": embedding_model,
+            "embedding_dim": embedding_dim,
+            "partition_id": partition_id,
+        }
+        for partition_id in range(partition_count)
+    ]
+    if effective_worker_count == 1:
+        for kwargs in worker_kwargs:
+            result = _write_embedding_partition(**kwargs)
+            results.append(result)
+            logger.info(
+                "Selected embeddings for URI partition %s/%s: valid=%s source_rows=%s",
+                result["partition_id"] + 1,
+                partition_count,
+                f"{result['embedding_count']:,}",
+                f"{result['source_row_count']:,}",
+            )
+    else:
+        # Polars is multithreaded, so use ``spawn`` rather than forking its
+        # existing thread pool. Each child owns one bounded eager partition and
+        # exits after the pool closes, releasing its retained decoded vectors.
+        with ProcessPoolExecutor(
+            max_workers=effective_worker_count,
+            mp_context=multiprocessing.get_context("spawn"),
+        ) as executor:
+            futures = {
+                executor.submit(_write_embedding_partition, **kwargs): kwargs[
+                    "partition_id"
+                ]
+                for kwargs in worker_kwargs
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                results.append(result)
+                logger.info(
+                    "Selected embeddings for URI partition %s/%s: valid=%s "
+                    "source_rows=%s",
+                    result["partition_id"] + 1,
+                    partition_count,
+                    f"{result['embedding_count']:,}",
+                    f"{result['source_row_count']:,}",
+                )
+
+    results.sort(key=lambda result: result["partition_id"])
+    counts = [int(result["embedding_count"]) for result in results]
     totals: dict[str, int] = defaultdict(int)
     partition_stats: list[dict[str, int]] = []
-    for partition_id in range(partition_count):
-        source_paths = sorted(
-            (selected_embedding_rows_path / f"partition-{partition_id:05d}").glob("*.parquet")
-        )
-        if source_paths:
-            source_df = pl.read_parquet(source_paths)
-        else:
-            source_df = dataset_hydration.empty_frame({
-                "subject_uri": pl.String,
-                "post_created_at": dataset_hydration.UTC_DATETIME,
-                "author_did": pl.String,
-                "embeddings": pl.List(pl.Struct({"key": pl.String, "value": pl.String})),
-            })
-        # Keep compact encoded payloads during selection; vectors are decoded
-        # into the NumPy shard one at a time below.
-        selected_payloads, stats = dataset_hydration.select_latest_valid_embedding_payloads(
-            source_df,
-            embedding_model=embedding_model,
-            embedding_dim=embedding_dim,
-        )
-        source_row_count = source_df.height
-        del source_df
+    for result in results:
+        stats = result["stats"]
         for name, value in stats.items():
             totals[name] += int(value)
-        selected_metadata_df = pl.DataFrame(
-            {"subject_uri": [row[0] for row in selected_payloads]},
-            schema=dataset_hydration.VALID_EMBEDDING_KEY_SCHEMA,
-        )
-        selected_metadata_df.write_parquet(
-            valid_embedding_rows_path / f"part-{partition_id:05d}.parquet",
-            compression="zstd",
-        )
-        shard_path = embedding_shards_path / f"part-{partition_id:05d}.npy"
-        shard = np.lib.format.open_memmap(
-            shard_path,
-            mode="w+",
-            dtype=np.float32,
-            shape=(len(selected_payloads), embedding_dim),
-        )
-        for row_index, (_uri, _created_at, _author_did, payload) in enumerate(
-            selected_payloads
-        ):
-            vector = get_expanded_embedding_vector(payload, embedding_model)
-            if vector is None:
-                raise RuntimeError("A validated embedding payload could not be decoded")
-            shard[row_index] = np.asarray(vector, dtype=np.float32)
-        shard.flush()
-        del shard
-        counts.append(len(selected_payloads))
-        partition_stats.append({"partition_id": partition_id, **stats})
-        logger.info(
-            "Selected embeddings for URI partition %s/%s: valid=%s source_rows=%s",
-            partition_id + 1,
-            partition_count,
-            f"{len(selected_payloads):,}",
-            f"{source_row_count:,}",
-        )
+        partition_stats.append({"partition_id": result["partition_id"], **stats})
     return {
         **dict(totals),
+        "embedding_partition_worker_count": effective_worker_count,
         "embedding_partition_counts": counts,
         "embedding_partition_stats": partition_stats,
     }

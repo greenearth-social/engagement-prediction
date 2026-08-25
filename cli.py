@@ -88,6 +88,7 @@ DEFAULTS: Dict[str, Any] = {
     "author_statistics_partition_count": 16,
     # Stage 7: Dataset hydration
     "embedding_source_batch_size": 64,
+    "embedding_partition_worker_count": 2,
     "min_author_training_feature_count": 50,
     # Stage 3 (train) - Model architecture
     "user_summarization": "mean",  # MLP user-history summarization: mean, ema, linear_recency
@@ -964,6 +965,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--embedding-source-batch-size", type=int,
                           default=argparse.SUPPRESS,
                           help_text="Raw post/reply files processed per Stage 7 embedding scan")
+    _add_arg_with_default(p_all, "--embedding-partition-worker-count", type=int,
+                          default=argparse.SUPPRESS,
+                          help_text="Worker processes used for Stage 7 URI-partition embedding decoding")
     _add_arg_with_default(p_all, "--min-author-training-feature-count", type=int,
                           default=argparse.SUPPRESS,
                           help_text="Minimum final training-feature occurrences required for a dedicated author index")
