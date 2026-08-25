@@ -50,3 +50,83 @@ def test_resolve_prior_spec_raises_if_missing(tmp_path):
             artifacts_dir=artifacts_dir,
             stage_folder="01_get_data",
         )
+
+
+def test_resolve_prior_post_selection_stage_run_id(tmp_path):
+    output_root = Path(tmp_path) / "out"
+    artifacts_dir = output_root / "artifacts"
+    target = artifacts_dir / "03_post_selection" / "20260103_000000_posts"
+    target.mkdir(parents=True)
+
+    resolved = cli._resolve_prior_spec(
+        target.name,
+        output_root=output_root,
+        artifacts_dir=artifacts_dir,
+        stage_folder="03_post_selection",
+    )
+
+    assert resolved == target.resolve()
+
+
+def test_resolve_prior_negative_selection_stage_run_id(tmp_path):
+    output_root = Path(tmp_path) / "out"
+    artifacts_dir = output_root / "artifacts"
+    target = artifacts_dir / "04_negative_selection" / "20260104_000000_negatives"
+    target.mkdir(parents=True)
+
+    resolved = cli._resolve_prior_spec(
+        target.name,
+        output_root=output_root,
+        artifacts_dir=artifacts_dir,
+        stage_folder="04_negative_selection",
+    )
+
+    assert resolved == target.resolve()
+
+
+def test_resolve_prior_post_liker_history_stage_run_id(tmp_path):
+    output_root = Path(tmp_path) / "out"
+    artifacts_dir = output_root / "artifacts"
+    target = artifacts_dir / "05_post_liker_history" / "20260105_000000_likers"
+    target.mkdir(parents=True)
+
+    resolved = cli._resolve_prior_spec(
+        target.name,
+        output_root=output_root,
+        artifacts_dir=artifacts_dir,
+        stage_folder="05_post_liker_history",
+    )
+
+    assert resolved == target.resolve()
+
+
+def test_resolve_prior_author_statistics_stage_run_id(tmp_path):
+    output_root = Path(tmp_path) / "out"
+    artifacts_dir = output_root / "artifacts"
+    target = artifacts_dir / "06_author_statistics" / "20260106_000000_authors"
+    target.mkdir(parents=True)
+
+    resolved = cli._resolve_prior_spec(
+        target.name,
+        output_root=output_root,
+        artifacts_dir=artifacts_dir,
+        stage_folder="06_author_statistics",
+    )
+
+    assert resolved == target.resolve()
+
+
+def test_resolve_prior_dataset_hydration_stage_run_id(tmp_path):
+    output_root = Path(tmp_path) / "out"
+    artifacts_dir = output_root / "artifacts"
+    target = artifacts_dir / "07_dataset_hydration" / "20260107_000000_hydrated"
+    target.mkdir(parents=True)
+
+    resolved = cli._resolve_prior_spec(
+        target.name,
+        output_root=output_root,
+        artifacts_dir=artifacts_dir,
+        stage_folder="07_dataset_hydration",
+    )
+
+    assert resolved == target.resolve()

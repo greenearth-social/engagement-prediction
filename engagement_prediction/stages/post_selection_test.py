@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import polars as pl
 import pytest
 
-from engagement_prediction.data import ingex
+from engagement_prediction.data import ingex, source_metadata
 from engagement_prediction.data import post_selection as post_data
 from engagement_prediction.data.parquet import scan_parquet_artifact
 from engagement_prediction.pipeline import registry
@@ -17,7 +17,76 @@ from engagement_prediction.stages import post_selection as stage
 UTC = timezone.utc
 
 
-def _write_upstream_artifacts(tmp_path: Path, posts_path: Path) -> tuple[Path, Path]:
+def _write_source_metadata_artifact(
+    tmp_path: Path,
+    posts_path: Path,
+    replies_path: Path,
+    *,
+    partition_count: int,
+) -> Path:
+    stage_dir = tmp_path / "artifacts" / "00_source_metadata" / "stage0"
+    bundle = stage_dir / "source_metadata_stage0"
+    metadata_path = bundle / "post_metadata"
+    metadata_path.mkdir(parents=True)
+    roots, root_stats = source_metadata.select_latest_metadata_rows(
+        source_metadata.normalize_source_records(
+            pl.scan_parquet(posts_path),
+            posts_start=datetime(2026, 1, 1, tzinfo=UTC),
+            posts_end=datetime(2026, 1, 2, tzinfo=UTC),
+            is_reply=False,
+        ).collect()
+    )
+    replies, reply_stats = source_metadata.select_latest_metadata_rows(
+        source_metadata.normalize_source_records(
+            pl.scan_parquet(replies_path),
+            posts_start=datetime(2026, 1, 1, tzinfo=UTC),
+            posts_end=datetime(2026, 1, 2, tzinfo=UTC),
+            is_reply=True,
+        ).collect()
+    )
+    metadata, overlap_count = source_metadata.apply_root_precedence(roots, replies)
+    routed = metadata.with_columns(source_metadata.uri_partition_expr(partition_count))
+    for partition_id in range(partition_count):
+        part = routed.filter(pl.col("_post_partition") == partition_id).drop(
+            "_post_partition"
+        )
+        if not part.is_empty():
+            part.write_parquet(metadata_path / f"part-{partition_id:05d}.parquet")
+    for prefix, blob_prefix, path in (
+        ("post", "bsky_posts", posts_path),
+        ("reply", "bsky_replies", replies_path),
+    ):
+        ingex.write_source_manifest(
+            bundle / f"{prefix}_sources_stage0.json",
+            ingex.build_source_manifest(
+                gcs_bucket="unused",
+                blob_prefix=blob_prefix,
+                start=datetime(2026, 1, 1, tzinfo=UTC),
+                end=datetime(2026, 1, 2, tzinfo=UTC),
+                paths=[str(path)],
+                timestamps=[datetime(2026, 1, 1, tzinfo=UTC)],
+            ),
+        )
+    (stage_dir / "summary.json").write_text(json.dumps({
+        "parameters": {"source_metadata_partition_count": partition_count},
+        "index": {
+            "root_source_stats": root_stats,
+            "reply_source_stats": reply_stats,
+            "root_reply_overlap_count": overlap_count,
+        },
+    }))
+    (stage_dir / "manifest.json").write_text(json.dumps({
+        "stage_key": "source_metadata",
+        "stage_folder": "00_source_metadata",
+        "inputs": {},
+    }))
+    return stage_dir
+
+
+def _write_upstream_artifacts(
+    tmp_path: Path,
+    source_metadata_dir: Path,
+) -> tuple[Path, Path]:
     stage1_dir = tmp_path / "artifacts" / "01_query_selection" / "stage1"
     stage1_dir.mkdir(parents=True)
     pl.DataFrame({
@@ -36,21 +105,10 @@ def _write_upstream_artifacts(tmp_path: Path, posts_path: Path) -> tuple[Path, P
             datetime(2026, 1, 1, 10, 6, tzinfo=UTC),
         ],
     }).write_parquet(stage1_dir / "query_positives_stage1.parquet")
-    ingex.write_source_manifest(
-        stage1_dir / "post_sources_stage1.json",
-        ingex.build_source_manifest(
-            gcs_bucket="unused",
-            blob_prefix="bsky_posts",
-            start=datetime(2026, 1, 1, tzinfo=UTC),
-            end=datetime(2026, 1, 2, tzinfo=UTC),
-            paths=[str(posts_path)],
-            timestamps=[datetime(2026, 1, 1, tzinfo=UTC)],
-        ),
-    )
     (stage1_dir / "manifest.json").write_text(json.dumps({
         "stage_key": "query_selection",
         "stage_folder": "01_query_selection",
-        "inputs": {},
+        "inputs": {"00_source_metadata": str(source_metadata_dir.resolve())},
     }) + "\n")
 
     stage2_dir = tmp_path / "artifacts" / "02_user_history" / "stage2"
@@ -68,12 +126,16 @@ def _write_upstream_artifacts(tmp_path: Path, posts_path: Path) -> tuple[Path, P
     (stage2_dir / "manifest.json").write_text(json.dumps({
         "stage_key": "user_history",
         "stage_folder": "02_user_history",
-        "inputs": {"01_query_selection": str(stage1_dir.resolve())},
+        "inputs": {
+            "00_source_metadata": str(source_metadata_dir.resolve()),
+            "01_query_selection": str(stage1_dir.resolve()),
+        },
     }) + "\n")
     return stage1_dir, stage2_dir
 
 
 def _write_sources(tmp_path: Path) -> tuple[Path, Path]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     posts_path = tmp_path / "bsky_posts_20260101_000000.parquet"
     pl.DataFrame({
         "at_uri": [
@@ -117,56 +179,68 @@ def _write_sources(tmp_path: Path) -> tuple[Path, Path]:
     return posts_path, replies_path
 
 
-def _context(tmp_path: Path, stage1_dir: Path, stage2_dir: Path) -> Context:
+def _context(tmp_path: Path, stage2_dir: Path) -> Context:
     context = Context(
         run_dir=tmp_path / "runs" / "run",
         artifacts_dir=tmp_path / "artifacts",
         runs_dir=tmp_path / "runs",
         pipeline_run_id="run",
     )
-    context.prior_outputs["01_query_selection"] = stage1_dir
     context.prior_outputs["02_user_history"] = stage2_dir
     return context
 
 
-def _args(partition_count=4, random_fraction=1.0):
+def _args(random_fraction=1.0):
     return SimpleNamespace(
         gcs_bucket="unused",
         posts_start="2026-01-01T00:00:00Z",
         posts_end="2026-01-02T00:00:00Z",
         random_candidate_sampling_fraction=random_fraction,
-        post_selection_partition_count=partition_count,
         random_seed=42,
         _argv=["--start-from", "post_selection", "--stop-after", "post_selection"],
     )
 
 
-def _install_reply_listing(monkeypatch, replies_path: Path, calls):
-    def list_sources(*, gcs_bucket, blob_prefix, start, end):
-        calls.append((blob_prefix, start, end))
-        assert blob_prefix == "bsky_replies"
-        return [str(replies_path)], [datetime(2026, 1, 1, tzinfo=UTC)]
-
-    monkeypatch.setattr(stage.ingex, "list_ingex_parquet_files", list_sources)
-
-
 def _run_stage(tmp_path, monkeypatch, partition_count=4):
     posts_source, replies_source = _write_sources(tmp_path)
-    stage1_dir, stage2_dir = _write_upstream_artifacts(tmp_path, posts_source)
-    calls = []
-    _install_reply_listing(monkeypatch, replies_source, calls)
+    source_metadata_dir = _write_source_metadata_artifact(
+        tmp_path,
+        posts_source,
+        replies_source,
+        partition_count=partition_count,
+    )
+    stage1_dir, stage2_dir = _write_upstream_artifacts(tmp_path, source_metadata_dir)
+    monkeypatch.setattr(
+        stage.ingex,
+        "list_ingex_parquet_files",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("Stage 3 must not list raw sources")
+        ),
+    )
     result = registry.run_stage(
         "post_selection",
-        _context(tmp_path, stage1_dir, stage2_dir),
-        _args(partition_count),
+        _context(tmp_path, stage2_dir),
+        _args(),
     )
-    return result, stage1_dir, stage2_dir, posts_source, replies_source, calls
+    return (
+        result,
+        source_metadata_dir,
+        stage1_dir,
+        stage2_dir,
+        posts_source,
+        replies_source,
+    )
 
 
 def test_registry_run_publishes_root_and_reply_post_universe(tmp_path, monkeypatch):
-    result, stage1_dir, stage2_dir, posts_source, replies_source, calls = _run_stage(
-        tmp_path, monkeypatch
-    )
+    (
+        result,
+        source_metadata_dir,
+        stage1_dir,
+        stage2_dir,
+        posts_source,
+        replies_source,
+    ) = _run_stage(tmp_path, monkeypatch)
     output_dir = Path(result["output_dir"])
     bundle_path = Path(result["artifacts"]["post_universe_path"])
     posts = scan_parquet_artifact(Path(result["artifacts"]["posts_path"])).collect().sort(
@@ -202,11 +276,6 @@ def test_registry_run_publishes_root_and_reply_post_universe(tmp_path, monkeypat
     assert set(candidates["subject_uri"]) == {
         "history-root", "overlap", "positive", "random"
     }
-    assert calls == [(
-        "bsky_replies",
-        datetime(2026, 1, 1, tzinfo=UTC),
-        datetime(2026, 1, 2, tzinfo=UTC),
-    )]
     assert bundle_path.is_dir()
     assert not list(bundle_path.glob("inference_sources_*.json"))
     post_sources = json.loads(Path(result["artifacts"]["post_sources_path"]).read_text())
@@ -218,6 +287,7 @@ def test_registry_run_publishes_root_and_reply_post_universe(tmp_path, monkeypat
     assert not list(output_dir.glob("post_universe_*.partial"))
     assert not list(output_dir.glob("_post_selection_staging_*"))
     assert json.loads((output_dir / "manifest.json").read_text())["inputs"] == {
+        "00_source_metadata": str(source_metadata_dir.resolve()),
         "01_query_selection": str(stage1_dir.resolve()),
         "02_user_history": str(stage2_dir.resolve()),
     }
@@ -228,23 +298,14 @@ def test_registry_run_publishes_root_and_reply_post_universe(tmp_path, monkeypat
     assert summary["required_post_stats"]["history_resolved_as_reply_count"] == 1
     assert summary["required_post_stats"]["root_reply_overlap_count"] == 1
     stage_info = (output_dir / "stage_info.txt").read_text()
-    assert "reply_file_count: 1" in stage_info
-    assert "root_reply_overlap_count: 1" in stage_info
+    assert "source_metadata_partition_count: 4" in stage_info
     stage_log = (output_dir / "stage.log").read_text()
-    assert "Phase 4/6: normalizing and partitioning root and reply source rows" in stage_log
-    assert "Scanning and stream-sinking 1 reply source files" in stage_log
+    assert "no raw post/reply rescan is needed" in stage_log
 
 
 def test_logical_output_is_partition_count_independent(tmp_path, monkeypatch):
-    posts_source, replies_source = _write_sources(tmp_path)
-    stage1_dir, stage2_dir = _write_upstream_artifacts(tmp_path, posts_source)
-    _install_reply_listing(monkeypatch, replies_source, [])
-    first = registry.run_stage(
-        "post_selection", _context(tmp_path, stage1_dir, stage2_dir), _args(1)
-    )
-    second = registry.run_stage(
-        "post_selection", _context(tmp_path, stage1_dir, stage2_dir), _args(7)
-    )
+    first = _run_stage(tmp_path / "one", monkeypatch, partition_count=1)[0]
+    second = _run_stage(tmp_path / "seven", monkeypatch, partition_count=7)[0]
 
     for artifact in (
         "posts_path",
@@ -267,12 +328,14 @@ def test_reply_only_positive_fails(tmp_path, monkeypatch):
         "did": ["reply-positive-author"],
     }))
     replies.write_parquet(replies_source)
-    stage1_dir, stage2_dir = _write_upstream_artifacts(tmp_path, posts_source)
-    _install_reply_listing(monkeypatch, replies_source, [])
+    source_metadata_dir = _write_source_metadata_artifact(
+        tmp_path, posts_source, replies_source, partition_count=4
+    )
+    _, stage2_dir = _write_upstream_artifacts(tmp_path, source_metadata_dir)
 
     with pytest.raises(ValueError, match="resolved only as replies"):
         registry.run_stage(
-            "post_selection", _context(tmp_path, stage1_dir, stage2_dir), _args()
+            "post_selection", _context(tmp_path, stage2_dir), _args()
         )
 
 
@@ -281,39 +344,32 @@ def test_missing_positive_fails(tmp_path, monkeypatch):
     pl.read_parquet(posts_source).filter(
         pl.col("at_uri") != "positive"
     ).write_parquet(posts_source)
-    stage1_dir, stage2_dir = _write_upstream_artifacts(tmp_path, posts_source)
-    _install_reply_listing(monkeypatch, replies_source, [])
+    source_metadata_dir = _write_source_metadata_artifact(
+        tmp_path, posts_source, replies_source, partition_count=4
+    )
+    _, stage2_dir = _write_upstream_artifacts(tmp_path, source_metadata_dir)
 
     with pytest.raises(ValueError, match="absent from the exact root snapshot"):
         registry.run_stage(
-            "post_selection", _context(tmp_path, stage1_dir, stage2_dir), _args()
-        )
-
-
-def test_no_reply_source_files_fails_clearly(tmp_path, monkeypatch):
-    posts_source, _ = _write_sources(tmp_path)
-    stage1_dir, stage2_dir = _write_upstream_artifacts(tmp_path, posts_source)
-    monkeypatch.setattr(stage.ingex, "list_ingex_parquet_files", lambda **kwargs: ([], []))
-
-    with pytest.raises(ValueError, match="No bsky_replies"):
-        registry.run_stage(
-            "post_selection", _context(tmp_path, stage1_dir, stage2_dir), _args()
+            "post_selection", _context(tmp_path, stage2_dir), _args()
         )
 
 
 def test_failed_partition_leaves_partial_bundle_and_no_manifest(tmp_path, monkeypatch):
     posts_source, replies_source = _write_sources(tmp_path)
-    stage1_dir, stage2_dir = _write_upstream_artifacts(tmp_path, posts_source)
-    _install_reply_listing(monkeypatch, replies_source, [])
+    source_metadata_dir = _write_source_metadata_artifact(
+        tmp_path, posts_source, replies_source, partition_count=4
+    )
+    _, stage2_dir = _write_upstream_artifacts(tmp_path, source_metadata_dir)
     monkeypatch.setattr(
-        stage.post_selection_artifacts.post_data,
-        "select_latest_post_rows",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("partition failed")),
+        stage.post_selection_artifacts,
+        "process_uri_partitions",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("partition failed")),
     )
 
     with pytest.raises(RuntimeError, match="partition failed"):
         registry.run_stage(
-            "post_selection", _context(tmp_path, stage1_dir, stage2_dir), _args()
+            "post_selection", _context(tmp_path, stage2_dir), _args()
         )
 
     stage3_dir = next((tmp_path / "artifacts" / "03_post_selection").iterdir())
@@ -329,7 +385,6 @@ def test_failed_partition_leaves_partial_bundle_and_no_manifest(tmp_path, monkey
     ("field", "value"),
     [
         ("random_candidate_sampling_fraction", 1.1),
-        ("post_selection_partition_count", 0),
     ],
 )
 def test_config_validation(field, value):

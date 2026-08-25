@@ -4,6 +4,7 @@ import logging
 import polars as pl
 
 from engagement_prediction.data import query_selection_artifacts as artifacts
+from engagement_prediction.data import source_metadata
 
 
 UTC = timezone.utc
@@ -52,19 +53,27 @@ def _run_membership_filter(tmp_path, partition_count):
         "did": ["did:one", "did:two"],
         "query_hour": [query_hour, query_hour],
     }).lazy()
-    post_rows_path = tmp_path / f"post-rows-{partition_count}"
+    post_metadata_path = tmp_path / f"post-metadata-{partition_count}"
+    post_metadata_path.mkdir()
     provisional_path = tmp_path / f"provisional-{partition_count}"
     eligible_path = tmp_path / f"eligible-{partition_count}"
     logger = logging.getLogger(__name__)
 
-    artifacts.materialize_post_rows(
-        post_paths=[str(posts_path)],
-        posts_start=datetime(2026, 1, 1, tzinfo=UTC),
-        posts_end=datetime(2026, 1, 2, tzinfo=UTC),
-        partition_count=partition_count,
-        output_path=post_rows_path,
-        logger=logger,
+    canonical, _ = source_metadata.select_latest_metadata_rows(
+        source_metadata.normalize_source_records(
+            pl.scan_parquet(posts_path),
+            posts_start=datetime(2026, 1, 1, tzinfo=UTC),
+            posts_end=datetime(2026, 1, 2, tzinfo=UTC),
+            is_reply=False,
+        ).collect()
     )
+    routed = canonical.with_columns(source_metadata.uri_partition_expr(partition_count))
+    for partition_id in range(partition_count):
+        part = routed.filter(pl.col("_post_partition") == partition_id).drop(
+            "_post_partition"
+        )
+        if not part.is_empty():
+            part.write_parquet(post_metadata_path / f"part-{partition_id:05d}.parquet")
     artifacts.materialize_provisional_positive_rows(
         positive_rows_lf=positive_rows_lf,
         sampled_queries_lf=sampled_queries_lf,
@@ -74,7 +83,7 @@ def _run_membership_filter(tmp_path, partition_count):
     )
     stats = artifacts.filter_positive_partitions(
         provisional_positive_rows_path=provisional_path,
-        post_rows_path=post_rows_path,
+        post_metadata_path=post_metadata_path,
         eligible_positive_rows_path=eligible_path,
         partition_count=partition_count,
         splits=["train"],
@@ -104,13 +113,6 @@ def test_partitioned_membership_deduplicates_before_join_and_preserves_earliest_
         "retained_positive_count": 2,
         "missing_post_positive_count": 1,
     }
-    assert stats["post_source_stats"] == {
-        "post_source_row_count": 5,
-        "invalid_post_row_count": 3,
-        "duplicate_post_row_count": 1,
-        "duplicate_post_uri_count": 1,
-        "unique_valid_post_count": 1,
-    }
 
 
 def test_membership_filter_is_logically_independent_of_partition_count(tmp_path):
@@ -136,19 +138,12 @@ def test_membership_filter_writes_schema_correct_empty_dataset(tmp_path):
         "subject_uri": ["at://post/found"],
         "like_created_at": [datetime(2026, 1, 1, 1, 5, tzinfo=UTC)],
     }).lazy()
-    post_rows_path = tmp_path / "post-rows"
+    post_metadata_path = tmp_path / "post-metadata"
+    post_metadata_path.mkdir()
     provisional_path = tmp_path / "provisional"
     eligible_path = tmp_path / "eligible"
     logger = logging.getLogger(__name__)
 
-    artifacts.materialize_post_rows(
-        post_paths=[str(posts_path)],
-        posts_start=datetime(2026, 1, 1, tzinfo=UTC),
-        posts_end=datetime(2026, 1, 2, tzinfo=UTC),
-        partition_count=2,
-        output_path=post_rows_path,
-        logger=logger,
-    )
     artifacts.materialize_provisional_positive_rows(
         positive_rows_lf=positive_rows_lf,
         sampled_queries_lf=pl.DataFrame({
@@ -161,7 +156,7 @@ def test_membership_filter_writes_schema_correct_empty_dataset(tmp_path):
     )
     artifacts.filter_positive_partitions(
         provisional_positive_rows_path=provisional_path,
-        post_rows_path=post_rows_path,
+        post_metadata_path=post_metadata_path,
         eligible_positive_rows_path=eligible_path,
         partition_count=2,
         splits=["train"],

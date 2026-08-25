@@ -185,7 +185,7 @@ class ColdStartCurvesModule(EvalModule):
 
         metric_cols = [
             col for col in ranking_rows_df.columns
-            if col.startswith('ndcg@') or col.startswith('recall@') or col in ('average_precision', 'auc_roc')
+            if col.startswith('ndcg@') or col in ('average_precision', 'auc_roc')
         ]
         rows = []
         for bin_label in bin_labels:

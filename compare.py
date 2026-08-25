@@ -194,6 +194,10 @@ def cmd_compare_rankers(
     raw_model_specs = list(getattr(args, "model", []) or [])
     if not raw_model_specs:
         raise SystemExit("compare-rankers requires at least one --model name:type:path")
+    raise SystemExit(
+        "compare-rankers is temporarily unavailable until it is connected to "
+        "07_dataset_hydration; legacy Stage 1/2 data artifacts are no longer supported"
+    )
 
     run_timestamp = generate_run_timestamp()
     if not hasattr(args, "output_dir"):
@@ -261,7 +265,7 @@ def cmd_compare_rankers(
         BucketedEngagementDataset,
         load_bucketed_training_data,
     )
-    from utils.matrix_ranking import evaluate_matrix_scorer
+    from engagement_prediction.training.ranking import evaluate_matrix_scorer
 
     device_arg = getattr(args, "device", None)
     device = str(device_arg) if device_arg else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -277,20 +281,12 @@ def cmd_compare_rankers(
         use_latest=True,
     )
 
-    prior_01_get_data = resolve_prior_spec(
-        getattr(args, "prior_01_get_data", None),
-        output_root=output_root,
-        artifacts_dir=artifacts_dir,
-        stage_folder="01_get_data",
-    )
     prior_02_user_history = resolve_prior_spec(
         getattr(args, "prior_02_user_history", None),
         output_root=output_root,
         artifacts_dir=artifacts_dir,
         stage_folder="02_user_history",
     )
-    if prior_01_get_data is not None:
-        ctx.prior_outputs["01_get_data"] = prior_01_get_data
     if prior_02_user_history is not None:
         ctx.prior_outputs["02_user_history"] = prior_02_user_history
     validate_explicit_prior_pin_consistency(ctx)

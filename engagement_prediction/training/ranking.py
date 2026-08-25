@@ -52,17 +52,23 @@ class TorchMatrixModelScorer:
         return MatrixBatchScores(scores=scores, loss=loss)
 
 
-def empty_rank_metric_sums(metrics_top_ks: list[int]) -> Dict[str, float]:
+def empty_rank_metric_sums(
+    metrics_top_ks: list[int],
+    *,
+    include_mean_average_precision: bool = True,
+) -> Dict[str, float]:
     metric_sums = {f"dcg@{k}": 0.0 for k in metrics_top_ks}
     metric_sums.update({f"ndcg@{k}": 0.0 for k in metrics_top_ks})
-    metric_sums.update({f"recall@{k}": 0.0 for k in metrics_top_ks})
-    metric_sums["mean_average_precision"] = 0.0
+    if include_mean_average_precision:
+        metric_sums["mean_average_precision"] = 0.0
     return metric_sums
 
 
 def calc_baseline_rank_metrics_for_batch(
     unranked_labels: torch.Tensor,
     metrics_top_ks: list[int],
+    *,
+    include_mean_average_precision: bool = True,
 ) -> Tuple[Dict[str, float], int]:
     """Calculate expected rank metrics for a uniformly random candidate order."""
     if unranked_labels.dim() != 2:
@@ -73,7 +79,10 @@ def calc_baseline_rank_metrics_for_batch(
         total_relevant = labels.sum(dim=1)
         eligible = total_relevant > 0
         eligible_count = int(eligible.sum().item())
-        metric_sums = empty_rank_metric_sums(metrics_top_ks)
+        metric_sums = empty_rank_metric_sums(
+            metrics_top_ks,
+            include_mean_average_precision=include_mean_average_precision,
+        )
         if eligible_count == 0:
             return metric_sums, 0
 
@@ -85,16 +94,25 @@ def calc_baseline_rank_metrics_for_batch(
         )
         cumulative_discounts = discounts.cumsum(dim=0)
         relevant_probability = total_relevant / float(num_candidates)
-        positions = torch.arange(1, num_candidates + 1, device=labels.device, dtype=torch.float32)
-        if num_candidates == 1:
-            expected_average_precision = torch.ones_like(total_relevant)
-        else:
-            harmonic_sum = (1.0 / positions).sum()
-            tail_sum = ((positions - 1.0) / positions).sum()
-            expected_average_precision = (
-                harmonic_sum + tail_sum * ((total_relevant - 1.0) / float(num_candidates - 1))
-            ) / float(num_candidates)
-        metric_sums["mean_average_precision"] = float(expected_average_precision.sum().item())
+        if include_mean_average_precision:
+            positions = torch.arange(
+                1,
+                num_candidates + 1,
+                device=labels.device,
+                dtype=torch.float32,
+            )
+            if num_candidates == 1:
+                expected_average_precision = torch.ones_like(total_relevant)
+            else:
+                harmonic_sum = (1.0 / positions).sum()
+                tail_sum = ((positions - 1.0) / positions).sum()
+                expected_average_precision = (
+                    harmonic_sum
+                    + tail_sum * ((total_relevant - 1.0) / float(num_candidates - 1))
+                ) / float(num_candidates)
+            metric_sums["mean_average_precision"] = float(
+                expected_average_precision.sum().item()
+            )
 
         for k in metrics_top_ks:
             k_eff = min(k, num_candidates)
@@ -102,11 +120,8 @@ def calc_baseline_rank_metrics_for_batch(
             dcg = relevant_probability * discount_sum
             ideal_counts = total_relevant.clamp(max=k_eff).to(dtype=torch.long)
             idcg = cumulative_discounts[ideal_counts - 1].clamp(min=1.0e-12)
-            recall = torch.full_like(total_relevant, fill_value=float(k_eff) / float(num_candidates))
-
             metric_sums[f"dcg@{k}"] = float(dcg.sum().item())
             metric_sums[f"ndcg@{k}"] = float((dcg / idcg).sum().item())
-            metric_sums[f"recall@{k}"] = float(recall.sum().item())
 
         return metric_sums, eligible_count
 
@@ -114,6 +129,8 @@ def calc_baseline_rank_metrics_for_batch(
 def rank_metric_sums_for_batch(
     ranked_labels: torch.Tensor,
     metrics_top_ks: list[int],
+    *,
+    include_mean_average_precision: bool = True,
 ) -> Tuple[Dict[str, float], int]:
     """Return summed per-user rank metrics for one [users, ranked_candidates] batch."""
     if ranked_labels.dim() != 2:
@@ -124,22 +141,30 @@ def rank_metric_sums_for_batch(
         total_relevant = ranked_labels.sum(dim=1)
         eligible = total_relevant > 0
         eligible_count = int(eligible.sum().item())
-        metric_sums = empty_rank_metric_sums(metrics_top_ks)
+        metric_sums = empty_rank_metric_sums(
+            metrics_top_ks,
+            include_mean_average_precision=include_mean_average_precision,
+        )
         if eligible_count == 0:
             return metric_sums, 0
 
         ranked_labels = ranked_labels[eligible]
         total_relevant = total_relevant[eligible]
-        positions = torch.arange(
-            1,
-            ranked_labels.size(1) + 1,
-            device=ranked_labels.device,
-            dtype=torch.float32,
-        )
-        cumulative_relevant = ranked_labels.cumsum(dim=1)
-        precision_at_rank = cumulative_relevant / positions
-        average_precision = (precision_at_rank * ranked_labels).sum(dim=1) / total_relevant
-        metric_sums["mean_average_precision"] = float(average_precision.sum().item())
+        if include_mean_average_precision:
+            positions = torch.arange(
+                1,
+                ranked_labels.size(1) + 1,
+                device=ranked_labels.device,
+                dtype=torch.float32,
+            )
+            cumulative_relevant = ranked_labels.cumsum(dim=1)
+            precision_at_rank = cumulative_relevant / positions
+            average_precision = (
+                precision_at_rank * ranked_labels
+            ).sum(dim=1) / total_relevant
+            metric_sums["mean_average_precision"] = float(
+                average_precision.sum().item()
+            )
 
         max_k = min(max(metrics_top_ks), ranked_labels.size(1))
         discounts = 1.0 / torch.log2(
@@ -157,11 +182,8 @@ def rank_metric_sums_for_batch(
             has_ideal_gain = ideal_counts > 0
             idcg[has_ideal_gain] = cumulative_discounts[ideal_counts[has_ideal_gain] - 1]
             idcg = idcg.clamp(min=1.0e-12)
-            recall = top_labels.sum(dim=1) / total_relevant
-
             metric_sums[f"dcg@{k}"] = float(dcg.sum().item())
             metric_sums[f"ndcg@{k}"] = float((dcg / idcg).sum().item())
-            metric_sums[f"recall@{k}"] = float(recall.sum().item())
 
         return metric_sums, eligible_count
 
@@ -189,9 +211,15 @@ def zero_history_rank_metric_sums_for_batch(
     batch: Dict[str, Any],
     ranked_labels: torch.Tensor,
     metrics_top_ks: list[int],
+    *,
+    include_mean_average_precision: bool = True,
 ) -> Tuple[Dict[str, float], int]:
     zero_history_mask = zero_history_row_mask_for_batch(batch, ranked_labels)
-    return rank_metric_sums_for_batch(ranked_labels[zero_history_mask], metrics_top_ks)
+    return rank_metric_sums_for_batch(
+        ranked_labels[zero_history_mask],
+        metrics_top_ks,
+        include_mean_average_precision=include_mean_average_precision,
+    )
 
 
 def finalize_zero_history_rank_metrics(
@@ -253,7 +281,6 @@ def ranking_rows_for_batch(
                 idcg = float(cumulative_discounts[ideal_count - 1].item()) if ideal_count > 0 else 0.0
                 row[f"dcg@{k}"] = dcg
                 row[f"ndcg@{k}"] = dcg / max(idcg, 1.0e-12)
-                row[f"recall@{k}"] = float(top_labels.sum().item()) / positive_count
 
             y_true = row_labels.numpy()
             y_score = row_scores.numpy()
@@ -266,7 +293,6 @@ def ranking_rows_for_batch(
             for k in metrics_top_ks:
                 row[f"dcg@{k}"] = 0.0
                 row[f"ndcg@{k}"] = 0.0
-                row[f"recall@{k}"] = 0.0
             row["average_precision"] = None
             row["auc_roc"] = None
 
@@ -550,20 +576,18 @@ def log_zero_history_rank_metrics(
     if experiment_tracker is None:
         return
     for k in metrics_top_ks:
-        for metric_name, metric_label in (
-            (f"{ZERO_HISTORY_METRIC_PREFIX}ndcg@{k}", f"Zero-History NDCG@{k}"),
-            (f"{ZERO_HISTORY_METRIC_PREFIX}recall@{k}", f"Zero-History Recall@{k}"),
-        ):
-            for split_name, metrics in split_metrics.items():
-                metric_value = optional_float_metric(metrics.get(metric_name))
-                if metric_value is None:
-                    continue
-                experiment_tracker.log_scalar(
-                    title=metric_label,
-                    series=f"{split_metric_label(split_name)} {metric_label}",
-                    value=metric_value,
-                    iteration=iteration,
-                )
+        metric_name = f"{ZERO_HISTORY_METRIC_PREFIX}ndcg@{k}"
+        metric_label = f"Zero-History NDCG@{k}"
+        for split_name, metrics in split_metrics.items():
+            metric_value = optional_float_metric(metrics.get(metric_name))
+            if metric_value is None:
+                continue
+            experiment_tracker.log_scalar(
+                title=metric_label,
+                series=f"{split_metric_label(split_name)} {metric_label}",
+                value=metric_value,
+                iteration=iteration,
+            )
     for metric_name, metric_label in (
         (f"{ZERO_HISTORY_METRIC_PREFIX}mean_average_precision", "Zero-History MAP"),
         (ZERO_HISTORY_RANK_METRIC_USER_COUNT, "Zero-History User Count"),
@@ -600,12 +624,6 @@ def stage_info_metric_lines(split_metrics: Dict[str, Dict[str, Any]]) -> List[st
         zero_history_metric_names.extend(
             sorted(
                 (key for key in metrics if key.startswith(f"{ZERO_HISTORY_METRIC_PREFIX}ndcg@")),
-                key=_metric_at_k_sort_key,
-            )
-        )
-        zero_history_metric_names.extend(
-            sorted(
-                (key for key in metrics if key.startswith(f"{ZERO_HISTORY_METRIC_PREFIX}recall@")),
                 key=_metric_at_k_sort_key,
             )
         )

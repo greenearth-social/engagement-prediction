@@ -20,7 +20,6 @@ def _ranking_rows_df():
         "positive_count": [1, 2, 1],
         "positive_rank_mean": [1.0, 2.0, 3.0],
         "ndcg@1": [1.0, 0.5, 0.0],
-        "recall@1": [1.0, 0.5, 0.0],
         "average_precision": [1.0, 0.75, 0.5],
         "auc_roc": [1.0, 0.8, 0.4],
     })

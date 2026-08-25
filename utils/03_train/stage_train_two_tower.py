@@ -125,8 +125,8 @@ from utils.dataloaders import (
     TransformerDualPoolingEncoder,
     CrossAttentionPoolingEncoder,
 )
-from utils.author_features import ProjectedPostFeatureEncoder
-from utils.matrix_ranking import (
+from engagement_prediction.models.common import ProjectedPostFeatureEncoder
+from engagement_prediction.training.ranking import (
     evaluate_matrix_model,
     log_final_classification_metrics,
     log_zero_history_rank_metrics,
@@ -782,24 +782,6 @@ def train_two_tower_model(
                     value=float(val_unseen_metrics_dict[f"ndcg@{k}"]),
                     iteration=iteration,
                 )
-                experiment_tracker.log_scalar(
-                    title=f"Recall@{k}",
-                    series=f"Train Recall@{k}",
-                    value=float(train_metrics_dict[f"recall@{k}"]),
-                    iteration=iteration,
-                )
-                experiment_tracker.log_scalar(
-                    title=f"Recall@{k}",
-                    series=f"Validation Recall@{k}",
-                    value=float(val_metrics_dict[f"recall@{k}"]),
-                    iteration=iteration,
-                )
-                experiment_tracker.log_scalar(
-                    title=f"Recall@{k}",
-                    series=f"Validation Unseen Users Recall@{k}",
-                    value=float(val_unseen_metrics_dict[f"recall@{k}"]),
-                    iteration=iteration,
-                )
                 if calc_baseline_metrics:
                     experiment_tracker.log_scalar(
                         title=f"Baseline NDCG@{k}",
@@ -817,24 +799,6 @@ def train_two_tower_model(
                         title=f"Baseline NDCG@{k}",
                         series=f"Validation Unseen Users Baseline NDCG@{k}",
                         value=float(val_unseen_baseline_metrics_dict[f"ndcg@{k}"]),
-                        iteration=iteration,
-                    )
-                    experiment_tracker.log_scalar(
-                        title=f"Baseline Recall@{k}",
-                        series=f"Train Baseline Recall@{k}",
-                        value=float(train_baseline_metrics_dict[f"recall@{k}"]),
-                        iteration=iteration,
-                    )
-                    experiment_tracker.log_scalar(
-                        title=f"Baseline Recall@{k}",
-                        series=f"Validation Baseline Recall@{k}",
-                        value=float(val_baseline_metrics_dict[f"recall@{k}"]),
-                        iteration=iteration,
-                    )
-                    experiment_tracker.log_scalar(
-                        title=f"Baseline Recall@{k}",
-                        series=f"Validation Unseen Users Baseline Recall@{k}",
-                        value=float(val_unseen_baseline_metrics_dict[f"recall@{k}"]),
                         iteration=iteration,
                     )
             log_zero_history_rank_metrics(

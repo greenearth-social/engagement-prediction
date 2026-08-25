@@ -11,6 +11,8 @@ LIKE_TIMESTAMP_COLUMN = "record_created_at"
 
 
 def like_timestamp_expr(lf: pl.LazyFrame) -> pl.Expr:
+    """Normalize the raw like timestamp column to a nullable UTC datetime."""
+
     schema = lf.collect_schema()
     if LIKE_TIMESTAMP_COLUMN not in schema:
         raise ValueError(f"Input likes are missing required column {LIKE_TIMESTAMP_COLUMN!r}")

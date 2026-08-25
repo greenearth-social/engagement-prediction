@@ -5,7 +5,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from utils.matrix_ranking import ranking_rows_for_batch
+from engagement_prediction.training.ranking import ranking_rows_for_batch
 
 stage_train_mlp = importlib.import_module("utils.03_train.stage_train_mlp")
 MLPModel = stage_train_mlp.MLPModel
@@ -167,7 +167,7 @@ def test_all_positive_candidate_rows_have_valid_ap_and_undefined_auc():
 
     assert rows[0]["average_precision"] == pytest.approx(1.0)
     assert rows[0]["auc_roc"] is None
-    assert rows[0]["recall@2"] == pytest.approx(2.0 / 3.0)
+    assert not any("recall" in key for key in rows[0])
 
 
 def test_cross_attention_mlp_uses_learned_sequence_encoder_for_matrix_batches():

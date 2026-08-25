@@ -17,6 +17,13 @@ UTC = timezone.utc
 
 
 def _write_query_selection_artifact(tmp_path: Path) -> tuple[Path, Path]:
+    source_metadata_dir = tmp_path / "artifacts" / "00_source_metadata" / "stage0"
+    source_metadata_dir.mkdir(parents=True)
+    (source_metadata_dir / "manifest.json").write_text(json.dumps({
+        "stage_key": "source_metadata",
+        "stage_folder": "00_source_metadata",
+        "inputs": {},
+    }) + "\n")
     source_path = tmp_path / "likes.parquet"
     pl.DataFrame({
         "did": ["u1", "u1", "u1", "u1", "u1", "u2", "u2", "u3"],
@@ -74,7 +81,7 @@ def _write_query_selection_artifact(tmp_path: Path) -> tuple[Path, Path]:
     (stage_dir / "manifest.json").write_text(json.dumps({
         "stage_key": "query_selection",
         "stage_folder": "01_query_selection",
-        "inputs": {},
+        "inputs": {"00_source_metadata": str(source_metadata_dir.resolve())},
     }) + "\n")
     return stage_dir, source_path
 
@@ -117,10 +124,10 @@ def test_registry_run_writes_query_conditioned_histories_and_lineage(tmp_path):
     ]
     assert histories.height == 4
     assert histories["history_subject_uris"].to_list() == [
-        ["history-unselected", "history-unselected"],
+        ["history-unselected"],
         ["u2-pre-validation"],
         [],
-        ["target-one", "history-unselected", "history-unselected"],
+        ["target-one", "history-unselected"],
     ]
     assert history_post_uris.schema == pl.Schema(stage.history_data.HISTORY_POST_URI_SCHEMA)
     assert history_post_uris["subject_uri"].to_list() == [
@@ -129,7 +136,12 @@ def test_registry_run_writes_query_conditioned_histories_and_lineage(tmp_path):
         "u2-pre-validation",
     ]
     manifest = json.loads((output_dir / "manifest.json").read_text())
-    assert manifest["inputs"] == {"01_query_selection": str(stage1_dir.resolve())}
+    assert manifest["inputs"] == {
+        "00_source_metadata": str(
+            (tmp_path / "artifacts" / "00_source_metadata" / "stage0").resolve()
+        ),
+        "01_query_selection": str(stage1_dir.resolve()),
+    }
     summary = json.loads((output_dir / "summary.json").read_text())
     assert summary["outputs"]["query_count"] == 4
     assert summary["outputs"]["history_post_uris_path"] == history_post_uris_path.name

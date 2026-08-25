@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import polars as pl
 import pytest
 
+from engagement_prediction.data import ingex, source_metadata
 from engagement_prediction.pipeline.core import Context
 from engagement_prediction.pipeline import registry
 from engagement_prediction.stages import query_selection as stage
@@ -24,7 +25,6 @@ def _config(**overrides):
         "random_seed": 42,
         "posts_start": datetime(2026, 1, 1, tzinfo=UTC),
         "posts_end": datetime(2026, 1, 10, tzinfo=UTC),
-        "post_selection_partition_count": 4,
         "train_start": datetime(2026, 1, 1, tzinfo=UTC),
         "val_start": datetime(2026, 1, 4, tzinfo=UTC),
         "holdout_start": datetime(2026, 1, 7, tzinfo=UTC),
@@ -32,6 +32,67 @@ def _config(**overrides):
     }
     values.update(overrides)
     return stage.QuerySelectionConfig(**values)
+
+
+def _write_source_metadata(tmp_path, posts_path, *, partition_count=4):
+    """Create the canonical Stage 00 fixture consumed by Stage 1 runner tests."""
+
+    stage_dir = tmp_path / "artifacts" / "00_source_metadata" / "stage0"
+    bundle = stage_dir / "source_metadata_stage0"
+    metadata_path = bundle / "post_metadata"
+    metadata_path.mkdir(parents=True)
+    metadata = (
+        source_metadata.normalize_source_records(
+            pl.scan_parquet(posts_path),
+            posts_start=datetime(2026, 1, 1, tzinfo=UTC),
+            posts_end=datetime(2026, 1, 10, tzinfo=UTC),
+            is_reply=False,
+        )
+        .collect()
+    )
+    canonical, _ = source_metadata.select_latest_metadata_rows(metadata)
+    routed = canonical.with_columns(source_metadata.uri_partition_expr(partition_count))
+    for partition_id in range(partition_count):
+        part = routed.filter(pl.col("_post_partition") == partition_id).drop(
+            "_post_partition"
+        )
+        if not part.is_empty():
+            part.write_parquet(metadata_path / f"part-{partition_id:05d}.parquet")
+    reply_path = tmp_path / "replies.parquet"
+    pl.DataFrame({
+        "at_uri": ["at://reply/unused"],
+        "record_created_at": ["2026-01-02T00:00:00Z"],
+        "did": ["did:reply-author"],
+    }).write_parquet(reply_path)
+    for prefix, blob_prefix, path in (
+        ("post", "bsky_posts", posts_path),
+        ("reply", "bsky_replies", reply_path),
+    ):
+        ingex.write_source_manifest(
+            bundle / f"{prefix}_sources_stage0.json",
+            ingex.build_source_manifest(
+                gcs_bucket="unused",
+                blob_prefix=blob_prefix,
+                start=datetime(2026, 1, 1, tzinfo=UTC),
+                end=datetime(2026, 1, 10, tzinfo=UTC),
+                paths=[str(path)],
+                timestamps=[datetime(2026, 1, 2, tzinfo=UTC)],
+            ),
+        )
+    (stage_dir / "summary.json").write_text(json.dumps({
+        "parameters": {"source_metadata_partition_count": partition_count},
+        "index": {
+            "root_source_stats": {},
+            "reply_source_stats": {},
+            "root_reply_overlap_count": 0,
+        },
+    }))
+    (stage_dir / "manifest.json").write_text(json.dumps({
+        "stage_key": "source_metadata",
+        "stage_folder": "00_source_metadata",
+        "inputs": {},
+    }))
+    return stage_dir
 
 
 def _collect(rows, config, eligible_subject_uris=None):
@@ -481,7 +542,6 @@ def test_build_config_validates_hour_alignment():
         max_train_query_hours=None,
         max_eval_query_hours_per_split=None,
         max_positives_per_user_hour=32,
-        post_selection_partition_count=4,
         random_seed=42,
     )
 
@@ -502,7 +562,6 @@ def test_build_config_allows_source_window_to_start_at_train_start():
         max_train_query_hours=None,
         max_eval_query_hours_per_split=None,
         max_positives_per_user_hour=32,
-        post_selection_partition_count=4,
         random_seed=42,
     )
 
@@ -537,7 +596,6 @@ def test_build_config_requires_target_boundaries_within_source_window(
         max_train_query_hours=None,
         max_eval_query_hours_per_split=None,
         max_positives_per_user_hour=32,
-        post_selection_partition_count=4,
         random_seed=42,
     )
     setattr(args, field, value)
@@ -577,7 +635,6 @@ def test_build_config_validates_post_window(posts_start, posts_end, error_match)
         max_train_query_hours=None,
         max_eval_query_hours_per_split=None,
         max_positives_per_user_hour=32,
-        post_selection_partition_count=4,
         random_seed=42,
     )
 
@@ -605,7 +662,6 @@ def test_post_window_must_cover_provisionally_sampled_query_hours():
         ("max_train_query_hours", -1, "max_train_query_hours"),
         ("max_eval_query_hours_per_split", -1, "max_eval_query_hours_per_split"),
         ("max_positives_per_user_hour", 0, "max_positives_per_user_hour"),
-        ("post_selection_partition_count", 0, "post_selection_partition_count"),
     ],
 )
 def test_build_config_validates_sampling_parameters(field_name, value, error_match):
@@ -621,7 +677,6 @@ def test_build_config_validates_sampling_parameters(field_name, value, error_mat
         max_train_query_hours=None,
         max_eval_query_hours_per_split=None,
         max_positives_per_user_hour=32,
-        post_selection_partition_count=4,
         random_seed=42,
     )
     setattr(args, field_name, value)
@@ -647,8 +702,6 @@ def test_registry_run_writes_query_artifacts_and_manifest(tmp_path, monkeypatch)
     def list_sources(**kwargs):
         if kwargs["blob_prefix"] == "bsky_likes":
             return [str(likes_path)], [datetime(2026, 1, 2, 1, tzinfo=UTC)]
-        if kwargs["blob_prefix"] == "bsky_posts":
-            return [str(posts_path)], [datetime(2026, 1, 2, 0, tzinfo=UTC)]
         raise AssertionError(f"Unexpected source lookup: {kwargs['blob_prefix']}")
 
     monkeypatch.setattr(stage.ingex, "list_ingex_parquet_files", list_sources)
@@ -665,23 +718,23 @@ def test_registry_run_writes_query_artifacts_and_manifest(tmp_path, monkeypatch)
         max_train_query_hours=None,
         max_eval_query_hours_per_split=None,
         max_positives_per_user_hour=32,
-        post_selection_partition_count=4,
         random_seed=42,
         _argv=["--stop-after", "query_selection"],
     )
+    source_metadata_dir = _write_source_metadata(tmp_path, posts_path)
     context = Context(
         run_dir=tmp_path / "runs" / "run",
         artifacts_dir=tmp_path / "artifacts",
         runs_dir=tmp_path / "runs",
         pipeline_run_id="run",
     )
+    context.prior_outputs["00_source_metadata"] = source_metadata_dir
 
     result = registry.run_stage("query_selection", context, args)
     output_dir = Path(result["output_dir"])
     queries = pl.read_parquet(result["artifacts"]["queries_path"])
     positives = pl.read_parquet(result["artifacts"]["query_positives_path"])
     like_sources = json.loads(Path(result["artifacts"]["like_sources_path"]).read_text())
-    post_sources = json.loads(Path(result["artifacts"]["post_sources_path"]).read_text())
     summary = json.loads((output_dir / "summary.json").read_text())
     candidate_query_counts_paths = list(output_dir.glob("_candidate_query_counts_*.parquet"))
 
@@ -702,25 +755,21 @@ def test_registry_run_writes_query_artifacts_and_manifest(tmp_path, monkeypatch)
     assert positives.height == 1
     assert positives["subject_uri"].to_list() == ["at://post/one"]
     assert [entry["uri"] for entry in like_sources["files"]] == [str(likes_path)]
-    assert [entry["uri"] for entry in post_sources["files"]] == [str(posts_path)]
-    assert like_sources["start"] == post_sources["start"]
-    assert like_sources["end"] == post_sources["end"]
-    assert post_sources["blob_prefix"] == "bsky_posts"
-    assert post_sources["start"] == "2026-01-01T00:00:00+00:00"
-    assert post_sources["end"] == "2026-01-10T00:00:00+00:00"
-    assert summary["outputs"]["post_sources_file"] == Path(
-        result["artifacts"]["post_sources_path"]
-    ).name
+    assert result["artifacts"]["source_metadata_path"] == str(
+        source_metadata_dir / "source_metadata_stage0"
+    )
+    assert summary["input"]["source_metadata_dir"] == str(source_metadata_dir.resolve())
     assert summary["selection_stats"]["positive_filter_by_split"]["train"] == {
         "selected_like_row_count": 2,
         "provisional_positive_count": 2,
         "retained_positive_count": 1,
         "missing_post_positive_count": 1,
     }
-    assert not list(output_dir.glob("_query_post_rows_*.partial"))
     assert not list(output_dir.glob("_provisional_positive_rows_*.partial"))
     assert not list(output_dir.glob("_eligible_positive_rows_*.partial"))
-    assert json.loads((output_dir / "manifest.json").read_text())["stage_key"] == "query_selection"
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    assert manifest["stage_key"] == "query_selection"
+    assert manifest["inputs"]["00_source_metadata"] == str(source_metadata_dir.resolve())
     assert (output_dir / "summary.json").exists()
     assert (output_dir / "stage.log").exists()
     stage_log = (output_dir / "stage.log").read_text()
@@ -748,8 +797,6 @@ def test_partition_failure_does_not_publish_final_artifacts_or_manifest(tmp_path
     def list_sources(**kwargs):
         if kwargs["blob_prefix"] == "bsky_likes":
             return [str(likes_path)], [datetime(2026, 1, 2, 1, tzinfo=UTC)]
-        if kwargs["blob_prefix"] == "bsky_posts":
-            return [str(posts_path)], [datetime(2026, 1, 2, 0, tzinfo=UTC)]
         raise AssertionError(f"Unexpected source lookup: {kwargs['blob_prefix']}")
 
     monkeypatch.setattr(stage.ingex, "list_ingex_parquet_files", list_sources)
@@ -775,16 +822,17 @@ def test_partition_failure_does_not_publish_final_artifacts_or_manifest(tmp_path
         max_train_query_hours=None,
         max_eval_query_hours_per_split=None,
         max_positives_per_user_hour=32,
-        post_selection_partition_count=4,
         random_seed=42,
         _argv=["--stop-after", "query_selection"],
     )
+    source_metadata_dir = _write_source_metadata(tmp_path, posts_path)
     context = Context(
         run_dir=tmp_path / "runs" / "run",
         artifacts_dir=tmp_path / "artifacts",
         runs_dir=tmp_path / "runs",
         pipeline_run_id="run",
     )
+    context.prior_outputs["00_source_metadata"] = source_metadata_dir
 
     with pytest.raises(RuntimeError, match="partition failed"):
         registry.run_stage("query_selection", context, args)

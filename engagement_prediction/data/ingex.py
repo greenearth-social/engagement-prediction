@@ -82,11 +82,18 @@ def list_ingex_parquet_files(
     )
 
 
-def scan_parquet_files(paths: Sequence[str]) -> pl.LazyFrame:
+def scan_parquet_files(
+    paths: Sequence[str],
+    *,
+    include_file_paths: str | None = None,
+) -> pl.LazyFrame:
     """Create a lazy Parquet scan for an explicit non-empty path collection."""
     if not paths:
         raise ValueError("Cannot scan an empty collection of Parquet files")
-    return pl.scan_parquet(list(paths))
+    return pl.scan_parquet(
+        list(paths),
+        include_file_paths=include_file_paths,
+    )
 
 
 def build_source_manifest(

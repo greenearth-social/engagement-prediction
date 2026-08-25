@@ -36,7 +36,7 @@ from utils.helpers import (
     plot_training_history,
     set_random_seeds,
 )
-from utils.matrix_ranking import (
+from engagement_prediction.training.ranking import (
     MatrixBatchScores,
     calc_baseline_rank_metrics_for_batch,
     empty_rank_metric_sums,
@@ -49,8 +49,7 @@ from utils.matrix_ranking import (
     zero_history_rank_metric_sums_for_batch,
 )
 from engagement_prediction.pipeline.core import Context
-from utils.author_features import ProjectedPostFeatureEncoder
-from utils.ranker_utilities import LinearPredictionHead
+from engagement_prediction.models.common import LinearPredictionHead, ProjectedPostFeatureEncoder
 
 
 STAGE_LOG_NAME = "STAGE_03_TRAIN_BST_RANKER"
@@ -746,9 +745,7 @@ def _log_bst_epoch_metrics(
 
 
 def _listwise_history_metric_names(metrics_top_ks: List[int]) -> List[str]:
-    names: List[str] = []
-    for k in metrics_top_ks:
-        names.extend([f"ndcg@{k}", f"recall@{k}"])
+    names = [f"ndcg@{k}" for k in metrics_top_ks]
     names.append("mean_average_precision")
     return names
 
@@ -790,29 +787,30 @@ def _log_bst_listwise_epoch_metrics(
             iteration,
         )
     for k in metrics_top_ks:
-        for metric_name, metric_label in ((f"ndcg@{k}", f"NDCG@{k}"), (f"recall@{k}", f"Recall@{k}")):
-            for split_label, metrics in (
-                ("Train", train_metrics),
-                ("Validation", val_metrics),
-                ("Validation Unseen Users", val_unseen_metrics),
-            ):
-                metric_value = metrics.get(metric_name)
-                if metric_value is None:
-                    continue
-                experiment_tracker.log_scalar(metric_label, f"{split_label} {metric_label}", float(metric_value), iteration)
+        metric_name = f"ndcg@{k}"
+        metric_label = f"NDCG@{k}"
+        for split_label, metrics in (
+            ("Train", train_metrics),
+            ("Validation", val_metrics),
+            ("Validation Unseen Users", val_unseen_metrics),
+        ):
+            metric_value = metrics.get(metric_name)
+            if metric_value is None:
+                continue
+            experiment_tracker.log_scalar(metric_label, f"{split_label} {metric_label}", float(metric_value), iteration)
         if calc_baseline_metrics:
-            for metric_name, metric_label in ((f"ndcg@{k}", f"Baseline NDCG@{k}"), (f"recall@{k}", f"Baseline Recall@{k}")):
-                for split_label, metrics in (
-                    ("Train", train_baseline_metrics),
-                    ("Validation", val_baseline_metrics),
-                    ("Validation Unseen Users", val_unseen_baseline_metrics),
-                ):
-                    experiment_tracker.log_scalar(
-                        metric_label,
-                        f"{split_label} {metric_label}",
-                        float(metrics[metric_name]),
-                        iteration,
-                    )
+            baseline_label = f"Baseline NDCG@{k}"
+            for split_label, metrics in (
+                ("Train", train_baseline_metrics),
+                ("Validation", val_baseline_metrics),
+                ("Validation Unseen Users", val_unseen_baseline_metrics),
+            ):
+                experiment_tracker.log_scalar(
+                    baseline_label,
+                    f"{split_label} {baseline_label}",
+                    float(metrics[metric_name]),
+                    iteration,
+                )
     log_zero_history_rank_metrics(
         experiment_tracker,
         {

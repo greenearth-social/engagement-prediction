@@ -29,16 +29,21 @@ from engagement_prediction.data.parquet import (
 )
 from engagement_prediction.data import user_history as history_data
 from engagement_prediction.pipeline.core import Context
+from engagement_prediction.pipeline.lineage import resolve_recorded_stage_lineage
 from utils.helpers import get_stage_logger
 
 
 @dataclass(frozen=True)
 class UserHistoryConfig:
+    """Validated history cap and physical user-partition count."""
+
     max_history_posts_per_query: int
     user_history_partition_count: int
 
 
 def build_config(args: argparse.Namespace) -> UserHistoryConfig:
+    """Parse the Stage 2 CLI settings that bound each partition's work."""
+
     max_history_posts_per_query = int(args.max_history_posts_per_query)
     if max_history_posts_per_query <= 0:
         raise ValueError("max_history_posts_per_query must be positive")
@@ -52,6 +57,8 @@ def build_config(args: argparse.Namespace) -> UserHistoryConfig:
 
 
 def _find_like_sources_path(query_selection_dir: Path) -> Path:
+    """Locate the one immutable like-source snapshot recorded by Stage 1."""
+
     candidates = sorted(query_selection_dir.glob("like_sources_*.json"))
     if not candidates:
         raise FileNotFoundError(
@@ -72,6 +79,8 @@ def _publish_partitioned_dataset(
     partial_path: Path,
     final_path: Path,
 ) -> None:
+    """Stream a hash-partitioned relation and publish it by atomic rename."""
+
     sink_partitioned_parquet(
         lf,
         output_path=partial_path,
@@ -94,6 +103,13 @@ def _materialize_partitioned_inputs(
     queried_user_likes_path: Path,
     logger: logging.Logger,
 ) -> None:
+    """Co-locate each queried user's queries and source-window likes.
+
+    The semi-join limits the raw like rescan to DIDs that survived Stage 1.
+    Likes remain otherwise complete because unselected activity is valid user
+    history for a later query.
+    """
+
     partition_expr = history_data.user_partition_expr(partition_count)
     logger.info("Partitioning selected queries into %s stable user buckets", partition_count)
     _publish_partitioned_dataset(
@@ -253,6 +269,8 @@ def _write_history_post_uris(
 
 
 def _log_stats(logger: logging.Logger, stats: dict[str, dict[str, int]]) -> None:
+    """Log history coverage and truncation separately for every split."""
+
     for split, values in stats.items():
         logger.info(
             "%s: queries=%s users=%s empty=%s truncated=%s retained_items=%s",
@@ -266,15 +284,22 @@ def _log_stats(logger: logging.Logger, stats: dict[str, dict[str, int]]) -> None
 
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
+    """Run Stage 2 and publish aligned histories plus their unique post URIs."""
+
     out_dir = context.new_stage_dir("02_user_history")
     logger = get_stage_logger("02_USER_HISTORY", log_file=out_dir / "stage.log")
     started_at = time.time()
     config = build_config(args)
 
-    query_selection_dir = context.resolve_prior_output(
-        "01_query_selection",
-        prior_path=context.prior_outputs.get("01_query_selection"),
+    # Stage 1's manifest fixes both query keys and the raw-like snapshot. A
+    # direct Stage 2 rerun must use those exact inputs rather than relist GCS.
+    lineage = resolve_recorded_stage_lineage(
+        context,
+        terminal_stage_folder="01_query_selection",
+        ancestor_stage_folders=("00_source_metadata",),
     )
+    source_metadata_dir = lineage["00_source_metadata"]
+    query_selection_dir = lineage["01_query_selection"]
     queries_lf = load_parquet_from_prior(query_selection_dir, "queries_")
     history_data.validate_queries_schema(queries_lf)
     query_summary = queries_lf.select(
@@ -317,6 +342,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     history_post_uris_path = out_dir / f"history_post_uris_{artifact_suffix}"
     history_post_uris_partial_path = out_dir / f"history_post_uris_{artifact_suffix}.partial"
 
+    # First partition by DID so every query and every eligible like for a user
+    # is processed together. The intermediate datasets are deleted on success.
     _materialize_partitioned_inputs(
         queries_lf=queries_lf,
         source_like_paths=source_like_paths,
@@ -344,6 +371,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError(
             f"Query history count {output_query_count:,} does not match Stage 1 query count {query_count:,}"
         )
+    # History construction emits locally unique URI shards. Repartitioning the
+    # shards by URI makes partition-local deduplication globally sufficient.
     unique_history_post_count = _write_history_post_uris(
         history_post_uri_shards_path=history_post_uri_shards_path,
         routed_history_post_uris_path=routed_history_post_uris_path,
@@ -375,6 +404,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "user_history_partition_count": config.user_history_partition_count,
         },
         "input": {
+            "source_metadata_dir": str(source_metadata_dir),
             "query_selection_dir": str(query_selection_dir),
             "query_count": query_count,
             "like_sources_file": like_sources_path.name,

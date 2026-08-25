@@ -204,7 +204,7 @@ class PerformanceInequalityModule(EvalModule):
     def _ranking_metric_columns(self, ranking_rows_df: pd.DataFrame) -> List[str]:
         return [
             col for col in ranking_rows_df.columns
-            if col.startswith('ndcg@') or col.startswith('recall@') or col in ('average_precision', 'auc_roc')
+            if col.startswith('ndcg@') or col in ('average_precision', 'auc_roc')
         ]
 
     def _metric_filename(self, metric: str) -> str:

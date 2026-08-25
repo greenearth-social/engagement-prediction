@@ -13,8 +13,14 @@ from typing import Any, Dict, Optional, Tuple
 
 import polars as pl
 
-from engagement_prediction.data import ingex, likes, query_selection_artifacts
+from engagement_prediction.data import (
+    ingex,
+    likes,
+    query_selection_artifacts,
+    source_metadata_artifacts,
+)
 from engagement_prediction.pipeline.core import Context
+from engagement_prediction.pipeline.lineage import resolve_recorded_stage_lineage
 from utils.helpers import get_stage_logger
 
 
@@ -33,6 +39,8 @@ HASH_BUCKET_COUNT = 1_000_000
 
 @dataclass(frozen=True)
 class QuerySelectionConfig:
+    """Validated Stage 1 settings shared by selection and artifact construction."""
+
     unseen_user_fraction: float
     max_hours_per_user_per_split: int
     max_train_query_hours: Optional[int]
@@ -41,7 +49,6 @@ class QuerySelectionConfig:
     random_seed: int
     posts_start: datetime
     posts_end: datetime
-    post_selection_partition_count: int
     train_start: datetime
     val_start: datetime
     holdout_start: Optional[datetime]
@@ -49,6 +56,8 @@ class QuerySelectionConfig:
 
 
 def _validate_hour_aligned(value: Optional[datetime], field_name: str) -> None:
+    """Reject boundaries that cannot be represented as query-hour buckets."""
+
     if value is None:
         return
     if value.minute != 0 or value.second != 0 or value.microsecond != 0:
@@ -56,6 +65,8 @@ def _validate_hour_aligned(value: Optional[datetime], field_name: str) -> None:
 
 
 def _optional_nonnegative_int(value: Any, field_name: str) -> Optional[int]:
+    """Parse an optional query budget while preserving ``None`` as unbounded."""
+
     if value is None:
         return None
     parsed = int(value)
@@ -65,6 +76,8 @@ def _optional_nonnegative_int(value: Any, field_name: str) -> Optional[int]:
 
 
 def build_config(args: argparse.Namespace) -> QuerySelectionConfig:
+    """Parse CLI values and validate the common source and target windows."""
+
     posts_start = ingex.parse_utc_datetime(args.posts_start, field_name="posts_start")
     posts_end = ingex.parse_utc_datetime(args.posts_end, field_name="posts_end")
     train_start = ingex.parse_utc_datetime(args.train_start, field_name="train_start")
@@ -118,10 +131,6 @@ def build_config(args: argparse.Namespace) -> QuerySelectionConfig:
     max_positives_per_user_hour = int(args.max_positives_per_user_hour)
     if max_positives_per_user_hour <= 0:
         raise ValueError("max_positives_per_user_hour must be positive")
-    post_selection_partition_count = int(args.post_selection_partition_count)
-    if post_selection_partition_count <= 0:
-        raise ValueError("post_selection_partition_count must be positive")
-
     return QuerySelectionConfig(
         unseen_user_fraction=unseen_user_fraction,
         max_hours_per_user_per_split=max_hours_per_user_per_split,
@@ -137,7 +146,6 @@ def build_config(args: argparse.Namespace) -> QuerySelectionConfig:
         random_seed=int(args.random_seed),
         posts_start=posts_start,
         posts_end=posts_end,
-        post_selection_partition_count=post_selection_partition_count,
         train_start=train_start,
         val_start=val_start,
         holdout_start=holdout_start,
@@ -151,6 +159,12 @@ def _with_user_cohort(
     unseen_user_fraction: float,
     random_seed: int,
 ) -> pl.LazyFrame:
+    """Assign stable seen/unseen membership using only DID and the seed.
+
+    User activity and the set of available query hours therefore cannot affect
+    whether a user is held out for unseen-user evaluation.
+    """
+
     unseen_bucket_count = int(unseen_user_fraction * HASH_BUCKET_COUNT)
     cohort_bucket = (
         pl.concat_str([pl.lit("user-cohort"), pl.col("did")], separator="|")
@@ -166,6 +180,8 @@ def _with_user_cohort(
 
 
 def _with_split(lf: pl.LazyFrame, config: QuerySelectionConfig) -> pl.LazyFrame:
+    """Map target likes to one of the five cohort-aware temporal splits."""
+
     timestamp = pl.col("like_created_at")
     trainval = pl.col("user_cohort") == "trainval"
     unseen = pl.col("user_cohort") == "unseen_eval"
@@ -199,6 +215,8 @@ def _with_split(lf: pl.LazyFrame, config: QuerySelectionConfig) -> pl.LazyFrame:
 
 
 def _query_priority_expr(random_seed: int) -> pl.Expr:
+    """Return the stable pseudo-random rank used to sample query hours."""
+
     return pl.concat_str(
         [
             pl.lit("query-hour"),
@@ -211,6 +229,8 @@ def _query_priority_expr(random_seed: int) -> pl.Expr:
 
 
 def _cap_queries_per_user(queries_lf: pl.LazyFrame, config: QuerySelectionConfig) -> pl.LazyFrame:
+    """Limit one user's contribution independently within every split."""
+
     return (
         queries_lf
         .sort(["did", "split", "_query_priority", "query_hour"])
@@ -220,6 +240,8 @@ def _cap_queries_per_user(queries_lf: pl.LazyFrame, config: QuerySelectionConfig
 
 
 def _cap_queries_per_split(queries_lf: pl.LazyFrame, config: QuerySelectionConfig) -> pl.LazyFrame:
+    """Apply the optional train and per-evaluation query-hour budgets."""
+
     columns = [
         "did",
         "query_hour",
@@ -248,6 +270,8 @@ def _prepare_likes(
     likes_lf: pl.LazyFrame,
     config: QuerySelectionConfig,
 ) -> pl.LazyFrame:
+    """Normalize target likes and attach cohort, split, and query-hour fields."""
+
     filtered_lf = likes.prepare_likes(
         likes_lf,
         start=config.posts_start,
@@ -273,6 +297,8 @@ def _prepare_likes(
 
 
 def _candidate_query_counts_lf(positive_rows_lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Collapse raw target-like rows to narrow provisional user-hour counts."""
+
     return (
         positive_rows_lf
         .group_by(["did", "query_hour", "user_cohort", "split"])
@@ -284,6 +310,8 @@ def _build_provisional_query_lazyframes(
     candidate_query_counts_lf: pl.LazyFrame,
     config: QuerySelectionConfig,
 ) -> Dict[str, pl.LazyFrame]:
+    """Build candidate, per-user-capped, and split-capped query plans."""
+
     candidate_queries_lf = candidate_query_counts_lf.with_columns(
         _query_priority_expr(config.random_seed).alias("_query_priority")
     )
@@ -302,18 +330,23 @@ def _build_final_query_lazyframes(
     eligible_positive_rows_lf: pl.LazyFrame,
     config: QuerySelectionConfig,
 ) -> Dict[str, pl.LazyFrame]:
-    # selected queries before joining to posts dataset
+    """Finalize queries after root-post membership has filtered positives.
+
+    Sampling happens before root-post filtering. A query that becomes empty or
+    oversized here is therefore dropped without replacement.
+    """
+
+    # Replace the sampled query's raw row count with the number of deduplicated
+    # positives that actually resolved in the exact post snapshot.
     after_split_cap_lf = provisional_query_lazyframes["after_split_cap"]
-    # new (user,hour,positive_count) summary but now with posts in posts dataset
     eligible_counts_lf = eligible_positive_rows_lf.group_by(QUERY_KEY).agg(
         pl.len().cast(pl.UInt32).alias("positive_count")
     )
-    # filter out anomaly user-hours with too many positives
     final_counts_lf = eligible_counts_lf.filter(
         pl.col("positive_count") <= config.max_positives_per_user_hour
     )
-    # join original selected queries to new queries with joined positives
-    # (to get metadata fields)
+    # The inner join removes both zero-positive and oversized query keys while
+    # preserving cohort and split metadata assigned before sampling.
     queries_lf = (
         after_split_cap_lf
         .select(["did", "query_hour", "user_cohort", "split"])
@@ -321,7 +354,8 @@ def _build_final_query_lazyframes(
         .select(["did", "query_hour", "user_cohort", "split", "positive_count"])
         .sort(["query_hour", "did"])
     )
-    # filter valid eligible positives based on final selected queries
+    # Filter positives through the same key set to establish referential
+    # integrity between the two public Stage 1 artifacts.
     positives_lf = (
         eligible_positive_rows_lf
         .join(final_counts_lf.select(QUERY_KEY), on=QUERY_KEY, how="inner")
@@ -337,6 +371,8 @@ def _build_final_query_lazyframes(
 
 
 def _split_summary_lf(lf: pl.LazyFrame, phase: str) -> pl.LazyFrame:
+    """Summarize query and unique-user counts for one selection phase."""
+
     return (
         lf.group_by("split")
         .agg(
@@ -353,6 +389,8 @@ def _positive_count_distribution_lf(
     phase: str,
     count_column: str,
 ) -> pl.LazyFrame:
+    """Build an exact positive-count histogram by split for one phase."""
+
     return (
         lf.group_by(["split", count_column])
         .agg(pl.len().cast(pl.UInt64).alias("query_count"))
@@ -369,6 +407,8 @@ def collect_query_artifacts(
     config: QuerySelectionConfig,
     positive_filter_stats_by_split: Optional[Dict[str, Dict[str, int]]] = None,
 ) -> Tuple[pl.DataFrame, pl.DataFrame, Dict[str, Any]]:
+    """Collect final public rows and diagnostic selection summaries."""
+
     summaries_lf = pl.concat(
         [
             _split_summary_lf(lazyframes["candidate_queries"], "candidate"),
@@ -443,6 +483,8 @@ def collect_query_artifacts(
 
 
 def _validate_artifacts(queries_df: pl.DataFrame, positives_df: pl.DataFrame) -> None:
+    """Enforce schemas, unique keys, counts, and positive-to-query linkage."""
+
     expected_query_columns = ["did", "query_hour", "user_cohort", "split", "positive_count"]
     expected_positive_columns = ["did", "query_hour", "subject_uri", "like_created_at"]
     if queries_df.columns != expected_query_columns:
@@ -483,6 +525,8 @@ def _build_stats(
     zero_positive_df: pl.DataFrame,
     positive_filter_stats_by_split: Optional[Dict[str, Dict[str, int]]],
 ) -> Dict[str, Any]:
+    """Convert diagnostic frames into JSON-serializable stage statistics."""
+
     by_phase: Dict[str, Dict[str, Dict[str, int]]] = {}
     for phase in ("candidate", "after_user_cap", "after_split_cap", "final"):
         by_phase[phase] = {
@@ -548,6 +592,8 @@ def _build_stats(
 
 
 def _log_stats(logger: logging.Logger, stats: Dict[str, Any]) -> None:
+    """Log per-split attrition from candidate hours to final queries."""
+
     for split in SPLITS:
         candidate = stats["queries_by_phase_and_split"]["candidate"][split]
         final = stats["queries_by_phase_and_split"]["final"][split]
@@ -575,6 +621,8 @@ def _validate_post_window(
     sampled_queries_lf: pl.LazyFrame,
     config: QuerySelectionConfig,
 ) -> tuple[datetime, datetime]:
+    """Ensure the post snapshot covers every provisionally sampled hour."""
+
     bounds = sampled_queries_lf.select(
         pl.col("query_hour").min().alias("min_query_hour"),
         pl.col("query_hour").max().alias("max_query_hour"),
@@ -592,27 +640,47 @@ def _validate_post_window(
 
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
+    """Run Stage 1 and publish query, positive, and source-snapshot artifacts."""
+
     out_dir = context.new_stage_dir("01_query_selection")
     logger = get_stage_logger("01_QUERY_SELECTION", log_file=out_dir / "stage.log")
     started_at = time.time()
     config = build_config(args)
+    lineage = resolve_recorded_stage_lineage(
+        context,
+        terminal_stage_folder="00_source_metadata",
+        ancestor_stage_folders=(),
+    )
+    source_metadata_dir = lineage["00_source_metadata"]
+    source_artifact = source_metadata_artifacts.load_source_metadata_artifact(
+        source_metadata_dir
+    )
+    if (
+        source_artifact.post_snapshot.gcs_bucket != str(args.gcs_bucket)
+        or source_artifact.post_snapshot.start != config.posts_start
+        or source_artifact.post_snapshot.end != config.posts_end
+    ):
+        raise ValueError(
+            "Stage 1 configuration does not match the pinned Stage 00 source bucket/window"
+        )
+    partition_count = source_artifact.partition_count
     query_positive_end = (
         config.holdout_end if config.holdout_end is not None else config.posts_end
     )
     logger.info(
         "Starting query selection: source_manifest_window=[%s, %s) "
         "query_positive_window=[%s, %s) val_start=%s holdout_start=%s "
-        "post_partitions=%s",
+        "source_metadata_partitions=%s",
         config.posts_start.isoformat(),
         config.posts_end.isoformat(),
         config.train_start.isoformat(),
         query_positive_end.isoformat(),
         config.val_start.isoformat(),
         config.holdout_start.isoformat() if config.holdout_start is not None else None,
-        config.post_selection_partition_count,
+        partition_count,
     )
 
-    logger.info("Phase 1/5: listing exact likes and posts source snapshots")
+    logger.info("Phase 1/5: validating Stage 00 metadata and listing exact likes")
     like_paths, like_file_timestamps = ingex.list_ingex_parquet_files(
         gcs_bucket=str(args.gcs_bucket),
         blob_prefix="bsky_likes",
@@ -624,21 +692,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             f"No likes Parquet files found for {config.posts_start} to {config.posts_end}"
         )
     logger.info("Found %s likes Parquet files", f"{len(like_paths):,}")
-    post_paths, post_file_timestamps = ingex.list_ingex_parquet_files(
-        gcs_bucket=str(args.gcs_bucket),
-        blob_prefix="bsky_posts",
-        start=config.posts_start,
-        end=config.posts_end,
-    )
-    if not post_paths:
-        raise ValueError(
-            f"No posts Parquet files found for {config.posts_start} to {config.posts_end}"
-        )
-    logger.info("Found %s posts Parquet files", f"{len(post_paths):,}")
-
     artifact_suffix = out_dir.name
     like_sources_path = out_dir / f"like_sources_{artifact_suffix}.json"
-    post_sources_path = out_dir / f"post_sources_{artifact_suffix}.json"
     ingex.write_source_manifest(
         like_sources_path,
         ingex.build_source_manifest(
@@ -650,19 +705,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             timestamps=like_file_timestamps,
         ),
     )
-    ingex.write_source_manifest(
-        post_sources_path,
-        ingex.build_source_manifest(
-            gcs_bucket=str(args.gcs_bucket),
-            blob_prefix="bsky_posts",
-            start=config.posts_start,
-            end=config.posts_end,
-            paths=post_paths,
-            timestamps=post_file_timestamps,
-        ),
-    )
-    logger.info("Saved exact likes and posts source-file manifests")
+    logger.info("Saved exact likes source-file manifest")
 
+    # Materializing the narrow counts prevents later ranking and capping plans
+    # from repeatedly executing the all-like user-hour aggregation.
     candidate_query_counts_path = out_dir / f"_candidate_query_counts_{artifact_suffix}.parquet"
     partial_candidate_query_counts_path = (
         out_dir / f"_candidate_query_counts_{artifact_suffix}.partial.parquet"
@@ -702,21 +748,14 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         max_query_hour.isoformat(),
     )
 
-    logger.info("Phase 3/5: partitioning post rows and selected positive-like rows by URI")
-    post_rows_path = out_dir / f"_query_post_rows_{artifact_suffix}.partial"
+    logger.info("Phase 3/5: partitioning selected positive-like rows by metadata URI")
+    # Matching URI partitions let Phase 4 use bounded local semi-joins instead
+    # of one global posts-to-positives join.
     provisional_positive_rows_path = (
         out_dir / f"_provisional_positive_rows_{artifact_suffix}.partial"
     )
     eligible_positive_rows_path = (
         out_dir / f"_eligible_positive_rows_{artifact_suffix}.partial"
-    )
-    query_selection_artifacts.materialize_post_rows(
-        post_paths=post_paths,
-        posts_start=config.posts_start,
-        posts_end=config.posts_end,
-        partition_count=config.post_selection_partition_count,
-        output_path=post_rows_path,
-        logger=logger,
     )
     query_selection_artifacts.materialize_provisional_positive_rows(
         positive_rows_lf=_prepare_likes(
@@ -724,17 +763,17 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             config,
         ),
         sampled_queries_lf=sampled_queries_lf,
-        partition_count=config.post_selection_partition_count,
+        partition_count=partition_count,
         output_path=provisional_positive_rows_path,
         logger=logger,
     )
 
-    logger.info("Phase 4/5: filtering positives to URIs present in the posts snapshot")
+    logger.info("Phase 4/5: filtering positives to canonical Stage 00 root URIs")
     membership_stats = query_selection_artifacts.filter_positive_partitions(
         provisional_positive_rows_path=provisional_positive_rows_path,
-        post_rows_path=post_rows_path,
+        post_metadata_path=source_artifact.post_metadata_path,
         eligible_positive_rows_path=eligible_positive_rows_path,
-        partition_count=config.post_selection_partition_count,
+        partition_count=partition_count,
         splits=SPLITS,
         logger=logger,
     )
@@ -765,13 +804,14 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     partial_query_positives_path = (
         out_dir / f"query_positives_{artifact_suffix}.partial.parquet"
     )
+    # Public files use temporary names until both have been written. The
+    # pipeline manifest is created only after the runner returns successfully.
     queries_df.write_parquet(partial_queries_path, compression="zstd")
     positives_df.write_parquet(partial_query_positives_path, compression="zstd")
     partial_queries_path.replace(queries_path)
     partial_query_positives_path.replace(query_positives_path)
 
     sampled_queries_path.unlink()
-    shutil.rmtree(post_rows_path)
     shutil.rmtree(provisional_positive_rows_path)
     shutil.rmtree(eligible_positive_rows_path)
     logger.info("Removed successful post-membership staging data")
@@ -792,20 +832,18 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "max_eval_query_hours_per_split": config.max_eval_query_hours_per_split,
             "max_positives_per_user_hour": config.max_positives_per_user_hour,
             "random_seed": config.random_seed,
-            "post_selection_partition_count": config.post_selection_partition_count,
+            "source_metadata_partition_count": partition_count,
         },
         "input": {
+            "source_metadata_dir": str(source_metadata_dir),
             "like_file_count": len(like_paths),
             "first_like_file_timestamp": like_file_timestamps[0].isoformat(),
             "last_like_file_timestamp": like_file_timestamps[-1].isoformat(),
-            "post_file_count": len(post_paths),
-            "first_post_file_timestamp": post_file_timestamps[0].isoformat(),
-            "last_post_file_timestamp": post_file_timestamps[-1].isoformat(),
-            "post_source_stats": membership_stats["post_source_stats"],
+            "post_file_count": len(source_artifact.post_snapshot.file_uris),
+            "post_source_stats": source_artifact.summary["index"]["root_source_stats"],
         },
         "outputs": {
             "like_sources_file": like_sources_path.name,
-            "post_sources_file": post_sources_path.name,
             "candidate_query_counts_file": candidate_query_counts_path.name,
             "queries_file": queries_path.name,
             "query_positives_file": query_positives_path.name,
@@ -822,7 +860,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                 "stage: query_selection",
                 f"runtime_seconds: {runtime_seconds:.2f}",
                 f"input_like_files: {len(like_paths)}",
-                f"input_post_files: {len(post_paths)}",
+                f"source_metadata_dir: {source_metadata_dir}",
+                f"input_post_files: {len(source_artifact.post_snapshot.file_uris)}",
                 f"queries: {queries_df.height}",
                 f"query_positives: {positives_df.height}",
                 "provisional_query_positives: "
@@ -832,7 +871,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                 "positives_absent_from_post_snapshot: "
                 f"{stats['positive_filter_totals']['missing_post_positive_count']}",
                 f"like_sources_file: {like_sources_path.name}",
-                f"post_sources_file: {post_sources_path.name}",
                 f"candidate_query_counts_file: {candidate_query_counts_path.name}",
                 f"queries_file: {queries_path.name}",
                 f"query_positives_file: {query_positives_path.name}",
@@ -851,7 +889,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "output_dir": out_dir,
         "artifacts": {
             "like_sources_path": str(like_sources_path),
-            "post_sources_path": str(post_sources_path),
+            "source_metadata_path": str(source_artifact.bundle_path),
             "queries_path": str(queries_path),
             "query_positives_path": str(query_positives_path),
         },

@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 
 import torch
 
-from utils.matrix_ranking import MatrixBatchScores
+from engagement_prediction.training.ranking import MatrixBatchScores
 
 
 def _load_checkpoint(checkpoint_path: Path) -> Dict[str, Any]:

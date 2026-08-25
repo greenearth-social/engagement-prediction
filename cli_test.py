@@ -1,11 +1,21 @@
 from pathlib import Path
+import base64
+import struct
 import textwrap
 from datetime import datetime, timezone
+import zlib
 
+import numpy as np
 import polars as pl
 import pytest
 
 import cli
+
+
+def _encoded_test_embedding(value: float) -> list[dict[str, str]]:
+    payload = struct.pack("<384f", *([value] * 384))
+    encoded = base64.b85encode(zlib.compress(payload)).decode()
+    return [{"key": "all_MiniLM_L12_v2", "value": encoded}]
 
 
 @pytest.mark.parametrize(
@@ -72,6 +82,7 @@ def test_merge_args_with_config_rejects_unknown_keys(tmp_path, argv):
         "--likes-start",
         "--likes-end",
         "--bst-political-batch-negatives",
+        "--post-selection-partition-count",
     ],
 )
 def test_obsolete_negative_sampling_flags_are_rejected(flag):
@@ -81,27 +92,79 @@ def test_obsolete_negative_sampling_flags_are_rejected(flag):
     assert flag.removeprefix("--").replace("-", "_") not in cli.DEFAULTS
 
 
-def test_post_selection_args_merge_from_cli_and_config(tmp_path):
+def test_source_metadata_args_merge_from_cli_and_config(tmp_path):
     parser = cli.build_parser()
     raw = parser.parse_args([
         "--random-candidate-sampling-fraction", "0.2",
-        "--post-selection-partition-count", "64",
+        "--source-metadata-partition-count", "64",
     ])
     merged = cli._merge_args_with_config(raw)
 
     assert merged.random_candidate_sampling_fraction == 0.2
-    assert merged.post_selection_partition_count == 64
+    assert merged.source_metadata_partition_count == 64
 
     config_path = Path(tmp_path) / "post_selection.yml"
     config_path.write_text(
         "random_candidate_sampling_fraction: 0.3\n"
-        "post_selection_partition_count: 32\n"
+        "source_metadata_partition_count: 32\n"
     )
     raw = parser.parse_args(["--config", str(config_path)])
     merged = cli._merge_args_with_config(raw)
 
     assert merged.random_candidate_sampling_fraction == 0.3
-    assert merged.post_selection_partition_count == 32
+    assert merged.source_metadata_partition_count == 32
+
+
+def test_negative_selection_args_merge_from_cli_and_defaults():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--negative-candidates-per-hour", "250",
+        "--min-likes-for-popular-candidate", "20",
+        "--popular-candidate-fraction", "0.25",
+        "--max-candidate-age-hours", "12",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    assert merged.negative_candidates_per_hour == 250
+    assert merged.min_likes_for_popular_candidate == 20
+    assert merged.popular_candidate_fraction == 0.25
+    assert merged.max_candidate_age_hours == 12
+
+
+def test_post_liker_history_args_merge_from_cli():
+    merged = cli._merge_args_with_config(
+        cli.build_parser().parse_args([
+            "--post-liker-history-partition-count",
+            "64",
+        ])
+    )
+
+    assert merged.post_liker_history_partition_count == 64
+
+
+def test_author_statistics_args_merge_from_cli():
+    merged = cli._merge_args_with_config(
+        cli.build_parser().parse_args([
+            "--author-statistics-partition-count",
+            "64",
+        ])
+    )
+
+    assert merged.author_statistics_partition_count == 64
+
+
+def test_dataset_hydration_args_merge_from_cli():
+    merged = cli._merge_args_with_config(
+        cli.build_parser().parse_args([
+            "--embedding-source-batch-size",
+            "32",
+            "--min-author-training-feature-count",
+            "75",
+        ])
+    )
+
+    assert merged.embedding_source_batch_size == 32
+    assert merged.min_author_training_feature_count == 75
 
 
 def test_query_sampling_args_replace_user_sampling_args(tmp_path):
@@ -120,7 +183,7 @@ def test_query_sampling_args_replace_user_sampling_args(tmp_path):
     assert merged.max_train_query_hours == 123
     assert merged.max_eval_query_hours_per_split == 45
     assert merged.max_positives_per_user_hour == 24
-    assert cli.DEFAULTS["max_hours_per_user_per_split"] == 64
+    assert cli.DEFAULTS["max_hours_per_user_per_split"] == 16
     assert cli.DEFAULTS["max_positives_per_user_hour"] == 32
 
     with pytest.raises(SystemExit):
@@ -143,20 +206,34 @@ def test_query_sampling_defaults():
     merged = cli._merge_args_with_config(cli.build_parser().parse_args([]))
 
     assert merged.unseen_user_fraction == 0.10
-    assert merged.max_hours_per_user_per_split == 64
+    assert merged.max_hours_per_user_per_split == 16
     assert merged.max_train_query_hours is None
     assert merged.max_eval_query_hours_per_split is None
     assert merged.max_positives_per_user_hour == 32
     assert merged.max_history_posts_per_query == 64
-    assert merged.user_history_partition_count == 32
+    assert merged.user_history_partition_count == 16
     assert merged.random_candidate_sampling_fraction == 0.10
-    assert merged.post_selection_partition_count == 32
+    assert merged.source_metadata_partition_count == 16
+    assert merged.negative_candidates_per_hour == 1000
+    assert merged.min_likes_for_popular_candidate == 10
+    assert merged.popular_candidate_fraction == 0.50
+    assert merged.max_candidate_age_hours == 24
+    assert merged.post_liker_history_partition_count == 16
+    assert merged.author_statistics_partition_count == 16
+    assert merged.embedding_source_batch_size == 64
+    assert merged.min_author_training_feature_count == 50
 
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(["--max-prior-likes", "64"])
+    for removed_flag in (
+        "--min-author-post-count",
+        "--min-author-received-like-count",
+    ):
+        with pytest.raises(SystemExit):
+            cli.build_parser().parse_args([removed_flag, "1"])
 
 
-def test_post_selection_cannot_continue_into_legacy_training(tmp_path):
+def test_dataset_hydration_cannot_continue_into_training(tmp_path):
     parser = cli.build_parser()
     merged = cli._merge_args_with_config(parser.parse_args([]))
     merged.output_dir = str(tmp_path)
@@ -167,7 +244,7 @@ def test_post_selection_cannot_continue_into_legacy_training(tmp_path):
         pipeline_run_id="run",
     )
 
-    with pytest.raises(ValueError, match="--stop-after post_selection"):
+    with pytest.raises(ValueError, match="--stop-after dataset_hydration"):
         cli.cmd__run_all_exec(merged, ctx)
 
 
@@ -201,6 +278,66 @@ def test_new_pipeline_can_stop_after_post_selection():
     cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
 
 
+def test_new_pipeline_can_stop_after_negative_selection():
+    args = cli._merge_args_with_config(
+        cli.build_parser().parse_args(["--stop-after", "negative_selection"])
+    )
+    stage_order = cli._get_stage_order_for_model_type(cli._get_train_key(args.model_type))
+    start_idx, stop_idx, _ = cli._get_stage_folder_and_start_stop_indices(
+        stage_order,
+        args.start_from,
+        args.stop_after,
+        cli._get_train_key(args.model_type),
+    )
+
+    cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
+
+
+def test_new_pipeline_can_stop_after_post_liker_history():
+    args = cli._merge_args_with_config(
+        cli.build_parser().parse_args(["--stop-after", "post_liker_history"])
+    )
+    stage_order = cli._get_stage_order_for_model_type(cli._get_train_key(args.model_type))
+    start_idx, stop_idx, _ = cli._get_stage_folder_and_start_stop_indices(
+        stage_order,
+        args.start_from,
+        args.stop_after,
+        cli._get_train_key(args.model_type),
+    )
+
+    cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
+
+
+def test_new_pipeline_can_stop_after_author_statistics():
+    args = cli._merge_args_with_config(
+        cli.build_parser().parse_args(["--stop-after", "author_statistics"])
+    )
+    stage_order = cli._get_stage_order_for_model_type(cli._get_train_key(args.model_type))
+    start_idx, stop_idx, _ = cli._get_stage_folder_and_start_stop_indices(
+        stage_order,
+        args.start_from,
+        args.stop_after,
+        cli._get_train_key(args.model_type),
+    )
+
+    cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
+
+
+def test_new_pipeline_can_stop_after_dataset_hydration():
+    args = cli._merge_args_with_config(
+        cli.build_parser().parse_args(["--stop-after", "dataset_hydration"])
+    )
+    stage_order = cli._get_stage_order_for_model_type(cli._get_train_key(args.model_type))
+    start_idx, stop_idx, _ = cli._get_stage_folder_and_start_stop_indices(
+        stage_order,
+        args.start_from,
+        args.stop_after,
+        cli._get_train_key(args.model_type),
+    )
+
+    cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
+
+
 def test_new_pipeline_runs_query_selection_through_user_history(tmp_path, monkeypatch):
     likes_path = Path(tmp_path) / "likes.parquet"
     pl.DataFrame({
@@ -220,66 +357,6 @@ def test_new_pipeline_runs_query_selection_through_user_history(tmp_path, monkey
             "2026-01-01T11:00:00Z",
         ],
         "did": ["author-one", "author-two"],
-    }).write_parquet(posts_path)
-
-    def list_sources(*, blob_prefix, **kwargs):
-        if blob_prefix == "bsky_likes":
-            return [str(likes_path)], [datetime(2026, 1, 1, 8, tzinfo=timezone.utc)]
-        assert blob_prefix == "bsky_posts"
-        return [str(posts_path)], [datetime(2026, 1, 1, 8, tzinfo=timezone.utc)]
-
-    monkeypatch.setattr(
-        "engagement_prediction.data.ingex.list_ingex_parquet_files",
-        list_sources,
-    )
-    args = cli._merge_args_with_config(cli.build_parser().parse_args([
-        "--stop-after", "user_history",
-        "--posts-start", "2026-01-01T00:00:00Z",
-        "--posts-end", "2026-01-02T00:00:00Z",
-        "--train-start", "2026-01-01T10:00:00Z",
-        "--val-start", "2026-01-01T20:00:00Z",
-        "--unseen-user-fraction", "0",
-        "--user-history-partition-count", "2",
-        "--post-selection-partition-count", "2",
-    ]))
-    output_root = Path(tmp_path) / "output"
-    output_root.mkdir()
-    args.output_dir = str(output_root)
-    args._argv = ["--stop-after", "user_history"]
-    context = cli.Context(
-        run_dir=output_root / "runs" / "run",
-        artifacts_dir=output_root / "artifacts",
-        runs_dir=output_root / "runs",
-        pipeline_run_id="run",
-    )
-
-    assert cli.cmd__run_all_exec(args, context) == 0
-    assert context.get_artifact_dir("query_selection") is not None
-    history_dir = context.get_artifact_dir("user_history")
-    assert history_dir is not None
-    assert list(history_dir.glob("query_histories_*"))
-
-
-def test_new_pipeline_runs_query_selection_through_post_selection(tmp_path, monkeypatch):
-    likes_path = Path(tmp_path) / "likes.parquet"
-    pl.DataFrame({
-        "did": ["u1", "u1", "u1"],
-        "subject_uri": ["history", "target-one", "target-two"],
-        "record_created_at": [
-            "2026-01-01T09:00:00Z",
-            "2026-01-01T10:05:00Z",
-            "2026-01-01T12:05:00Z",
-        ],
-    }).write_parquet(likes_path)
-    posts_path = Path(tmp_path) / "posts.parquet"
-    pl.DataFrame({
-        "at_uri": ["history", "target-one", "target-two"],
-        "record_created_at": [
-            "2026-01-01T08:00:00Z",
-            "2026-01-01T09:00:00Z",
-            "2026-01-01T11:00:00Z",
-        ],
-        "did": ["author-one", "author-two", "author-three"],
     }).write_parquet(posts_path)
     replies_path = Path(tmp_path) / "replies.parquet"
     pl.DataFrame({
@@ -301,20 +378,100 @@ def test_new_pipeline_runs_query_selection_through_post_selection(tmp_path, monk
         list_sources,
     )
     args = cli._merge_args_with_config(cli.build_parser().parse_args([
-        "--stop-after", "post_selection",
+        "--stop-after", "user_history",
         "--posts-start", "2026-01-01T00:00:00Z",
         "--posts-end", "2026-01-02T00:00:00Z",
         "--train-start", "2026-01-01T10:00:00Z",
         "--val-start", "2026-01-01T20:00:00Z",
         "--unseen-user-fraction", "0",
         "--user-history-partition-count", "2",
-        "--post-selection-partition-count", "2",
-        "--random-candidate-sampling-fraction", "0",
+        "--source-metadata-partition-count", "2",
     ]))
     output_root = Path(tmp_path) / "output"
     output_root.mkdir()
     args.output_dir = str(output_root)
-    args._argv = ["--stop-after", "post_selection"]
+    args._argv = ["--stop-after", "user_history"]
+    context = cli.Context(
+        run_dir=output_root / "runs" / "run",
+        artifacts_dir=output_root / "artifacts",
+        runs_dir=output_root / "runs",
+        pipeline_run_id="run",
+    )
+
+    assert cli.cmd__run_all_exec(args, context) == 0
+    assert context.get_artifact_dir("query_selection") is not None
+    history_dir = context.get_artifact_dir("user_history")
+    assert history_dir is not None
+    assert list(history_dir.glob("query_histories_*"))
+
+
+def test_new_pipeline_runs_query_selection_through_dataset_hydration(tmp_path, monkeypatch):
+    likes_path = Path(tmp_path) / "likes.parquet"
+    pl.DataFrame({
+        "did": ["u1", "u1", "u1"],
+        "subject_uri": ["history", "target-one", "target-two"],
+        "record_created_at": [
+            "2026-01-01T09:00:00Z",
+            "2026-01-01T10:05:00Z",
+            "2026-01-01T12:05:00Z",
+        ],
+    }).write_parquet(likes_path)
+    posts_path = Path(tmp_path) / "posts.parquet"
+    pl.DataFrame({
+        "at_uri": ["history", "target-one", "target-two"],
+        "record_created_at": [
+            "2026-01-01T08:00:00Z",
+            "2026-01-01T09:00:00Z",
+            "2026-01-01T11:00:00Z",
+        ],
+        "did": ["author-one", "author-two", "author-three"],
+        "embeddings": [
+            _encoded_test_embedding(1.0),
+            _encoded_test_embedding(2.0),
+            _encoded_test_embedding(3.0),
+        ],
+    }).write_parquet(posts_path)
+    replies_path = Path(tmp_path) / "replies.parquet"
+    pl.DataFrame({
+        "at_uri": ["unused-reply"],
+        "record_created_at": ["2026-01-01T08:30:00Z"],
+        "did": ["reply-author"],
+        "embeddings": [_encoded_test_embedding(4.0)],
+    }).write_parquet(replies_path)
+
+    def list_sources(*, blob_prefix, **kwargs):
+        if blob_prefix == "bsky_likes":
+            return [str(likes_path)], [datetime(2026, 1, 1, 8, tzinfo=timezone.utc)]
+        if blob_prefix == "bsky_posts":
+            return [str(posts_path)], [datetime(2026, 1, 1, 8, tzinfo=timezone.utc)]
+        assert blob_prefix == "bsky_replies"
+        return [str(replies_path)], [datetime(2026, 1, 1, 8, tzinfo=timezone.utc)]
+
+    monkeypatch.setattr(
+        "engagement_prediction.data.ingex.list_ingex_parquet_files",
+        list_sources,
+    )
+    args = cli._merge_args_with_config(cli.build_parser().parse_args([
+        "--stop-after", "dataset_hydration",
+        "--posts-start", "2026-01-01T00:00:00Z",
+        "--posts-end", "2026-01-02T00:00:00Z",
+        "--train-start", "2026-01-01T10:00:00Z",
+        "--val-start", "2026-01-01T20:00:00Z",
+        "--unseen-user-fraction", "0",
+        "--user-history-partition-count", "2",
+        "--source-metadata-partition-count", "2",
+        "--random-candidate-sampling-fraction", "1",
+        "--negative-candidates-per-hour", "2",
+        "--min-likes-for-popular-candidate", "0",
+        "--popular-candidate-fraction", "0",
+        "--post-liker-history-partition-count", "2",
+        "--author-statistics-partition-count", "2",
+        "--min-author-training-feature-count", "1",
+    ]))
+    output_root = Path(tmp_path) / "output"
+    output_root.mkdir()
+    args.output_dir = str(output_root)
+    args._argv = ["--stop-after", "dataset_hydration"]
     context = cli.Context(
         run_dir=output_root / "runs" / "run",
         artifacts_dir=output_root / "artifacts",
@@ -329,9 +486,57 @@ def test_new_pipeline_runs_query_selection_through_post_selection(tmp_path, monk
         post_selection_dir / "post_universe_*" / "posts" / "*.parquet"
     ).collect()
     assert set(posts["subject_uri"]) == {"history", "target-one", "target-two"}
+    negative_selection_dir = context.get_artifact_dir("negative_selection")
+    assert negative_selection_dir is not None
+    hourly_candidates = pl.scan_parquet(
+        negative_selection_dir
+        / "negative_candidates_*"
+        / "hourly_candidates"
+        / "*.parquet"
+    ).collect()
+    assert hourly_candidates.group_by("query_hour").len()["len"].to_list() == [2, 2]
+    post_liker_history_dir = context.get_artifact_dir("post_liker_history")
+    assert post_liker_history_dir is not None
+    post_liker_posts = pl.scan_parquet(
+        post_liker_history_dir
+        / "post_liker_histories_*"
+        / "post_liker_posts"
+        / "*.parquet"
+    ).collect()
+    assert set(post_liker_posts["subject_uri"]) == {
+        "history",
+        "target-one",
+        "target-two",
+    }
+    author_statistics_dir = context.get_artifact_dir("author_statistics")
+    assert author_statistics_dir is not None
+    author_stats = pl.scan_parquet(
+        author_statistics_dir
+        / "author_statistics_*"
+        / "author_statistics"
+        / "*.parquet"
+    ).collect()
+    assert set(author_stats["author_did"]) == {
+        "author-one",
+        "author-two",
+        "author-three",
+        "reply-author",
+    }
+    assert "author_idx" not in author_stats.columns
+    dataset_hydration_dir = context.get_artifact_dir("dataset_hydration")
+    assert dataset_hydration_dir is not None
+    hydrated_bundle = next(dataset_hydration_dir.glob("hydrated_training_data_*"))
+    embeddings = np.load(hydrated_bundle / "embeddings.npy", mmap_mode="r")
+    assert embeddings.shape == (3, 384)
+    authors = pl.scan_parquet(hydrated_bundle / "authors" / "*.parquet").collect()
+    assert authors.select("author_did", "author_idx").to_dicts() == [
+        {"author_did": "author-one", "author_idx": 2},
+        {"author_did": "author-three", "author_idx": 3},
+        {"author_did": "author-two", "author_idx": 4},
+    ]
 
 
-def test_direct_legacy_training_requires_both_explicit_pins():
+def test_direct_mlp_training_remains_blocked():
     args = cli._merge_args_with_config(
         cli.build_parser().parse_args(["--start-from", "train", "--stop-after", "train"])
     )
@@ -342,12 +547,80 @@ def test_direct_legacy_training_requires_both_explicit_pins():
         args.stop_after,
         cli._get_train_key(args.model_type),
     )
-    with pytest.raises(ValueError, match="explicit --prior-01-get-data"):
+    with pytest.raises(ValueError, match="not yet wired to the Stage 7"):
         cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
 
-    args.prior_01_get_data = "get"
-    args.prior_02_user_history = "history"
+
+def test_native_bst_training_can_stop_after_training():
+    args = cli._merge_args_with_config(cli.build_parser().parse_args([
+        "--model-type", "bst-ranker",
+        "--stop-after", "train_bst_ranker",
+    ]))
+    train_key = cli._get_train_key(args.model_type)
+    stage_order = cli._get_stage_order_for_model_type(train_key)
+    start_idx, stop_idx, _ = cli._get_stage_folder_and_start_stop_indices(
+        stage_order,
+        args.start_from,
+        args.stop_after,
+        train_key,
+    )
+
     cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
+
+
+def test_native_bst_sequential_run_executes_stages_zero_through_eight(
+    tmp_path,
+    monkeypatch,
+):
+    args = cli._merge_args_with_config(cli.build_parser().parse_args([
+        "--model-type", "bst-ranker",
+        "--stop-after", "train_bst_ranker",
+    ]))
+    args.output_dir = str(tmp_path)
+    context = cli.Context(
+        run_dir=Path(tmp_path) / "runs" / "run",
+        artifacts_dir=Path(tmp_path) / "artifacts",
+        runs_dir=Path(tmp_path) / "runs",
+        pipeline_run_id="run",
+    )
+    executed = []
+    monkeypatch.setattr(cli, "pin_lineage_aligned_inputs", lambda *args: None)
+    monkeypatch.setattr(
+        cli.reg,
+        "run_stage",
+        lambda stage_key, context, args: executed.append(stage_key),
+    )
+
+    assert cli.cmd__run_all_exec(args, context) == 0
+    assert executed == [
+        "source_metadata",
+        "query_selection",
+        "user_history",
+        "post_selection",
+        "negative_selection",
+        "post_liker_history",
+        "author_statistics",
+        "dataset_hydration",
+        "train_bst_ranker",
+    ]
+
+
+def test_native_bst_training_cannot_continue_into_legacy_evaluation():
+    args = cli._merge_args_with_config(cli.build_parser().parse_args([
+        "--model-type", "bst-ranker",
+        "--stop-after", "evaluate",
+    ]))
+    train_key = cli._get_train_key(args.model_type)
+    stage_order = cli._get_stage_order_for_model_type(train_key)
+    start_idx, stop_idx, _ = cli._get_stage_folder_and_start_stop_indices(
+        stage_order,
+        args.start_from,
+        args.stop_after,
+        train_key,
+    )
+
+    with pytest.raises(ValueError, match="--stop-after train_bst_ranker"):
+        cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
 
 
 def test_background_effective_config_preserves_no_post_encoder(tmp_path):
@@ -555,13 +828,13 @@ def test_bst_ranker_rejects_non_positive_listwise_training_controls(flag, messag
         cli._validate_bst_config(merged)
 
 
-def test_bst_ranker_requires_author_embedding_table():
+def test_bst_ranker_always_accepts_stage7_author_indices():
     parser = cli.build_parser()
     raw = parser.parse_args(["--model-type", "bst-ranker", "--prediction-hidden-dims", "144", "72"])
     merged = cli._merge_args_with_config(raw)
 
-    with pytest.raises(ValueError, match="use-author-embedding-table"):
-        cli._validate_bst_config(merged)
+    assert merged.use_author_embedding_table is False
+    cli._validate_bst_config(merged)
 
 
 def test_bst_ranker_requires_prediction_hidden_dims():
@@ -715,8 +988,10 @@ def test_merge_args_with_config_accepts_prior_pins(tmp_path):
         textwrap.dedent(
             """
             prior_01_query_selection: 20260100_000000_feedface
-            prior_01_get_data: 20260101_000000_deadbeef
             prior_02_user_history: 20260102_000000_cafebabe
+            prior_04_negative_selection: 20260104_000000_baadf00d
+            prior_06_author_statistics: 20260106_000000_decafbad
+            prior_07_dataset_hydration: 20260107_000000_abcd1234
             """
         ).strip()
         + "\n"
@@ -727,5 +1002,17 @@ def test_merge_args_with_config_accepts_prior_pins(tmp_path):
     merged = cli._merge_args_with_config(raw)
 
     assert merged.prior_01_query_selection == "20260100_000000_feedface"
-    assert merged.prior_01_get_data == "20260101_000000_deadbeef"
     assert merged.prior_02_user_history == "20260102_000000_cafebabe"
+    assert merged.prior_04_negative_selection == "20260104_000000_baadf00d"
+    assert merged.prior_06_author_statistics == "20260106_000000_decafbad"
+    assert merged.prior_07_dataset_hydration == "20260107_000000_abcd1234"
+
+
+def test_removed_legacy_training_pin_is_rejected():
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["--prior-01-get-data", "legacy"])
+
+
+def test_removed_skip_embeddings_setting_is_rejected():
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["--skip-embeddings"])

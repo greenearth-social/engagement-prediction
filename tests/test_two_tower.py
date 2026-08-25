@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 # Import from module with numeric prefix
 stage_train_two_tower = importlib.import_module("utils.03_train.stage_train_two_tower")
-matrix_ranking = importlib.import_module("utils.matrix_ranking")
+matrix_ranking = importlib.import_module("engagement_prediction.training.ranking")
 PostTower = stage_train_two_tower.PostTower
 TwoTowerModel = stage_train_two_tower.TwoTowerModel
 ProjectedPostFeatureEncoder = stage_train_two_tower.ProjectedPostFeatureEncoder
@@ -42,11 +42,10 @@ def test_rank_metric_sums_for_batch_matches_macro_rank_metrics():
     assert user_count == 2
     assert metrics["dcg@1"] == pytest.approx(0.5)
     assert metrics["ndcg@1"] == pytest.approx(0.5)
-    assert metrics["recall@1"] == pytest.approx(0.25)
     assert metrics["dcg@2"] == pytest.approx((1.0 + discount_2 + discount_2) / 2.0)
     assert metrics["ndcg@2"] == pytest.approx((1.0 + discount_2) / 2.0)
-    assert metrics["recall@2"] == pytest.approx(1.0)
     assert metrics["mean_average_precision"] == pytest.approx(0.75)
+    assert not any("recall" in key for key in metrics)
 
 
 def test_baseline_rank_metrics_use_expected_random_order_value():
@@ -66,10 +65,9 @@ def test_baseline_rank_metrics_use_expected_random_order_value():
     assert user_count == 2
     assert metrics["dcg@1"] == pytest.approx((0.5 + 0.25) / 2.0)
     assert metrics["ndcg@1"] == pytest.approx((0.5 + 0.25) / 2.0)
-    assert metrics["recall@1"] == pytest.approx(0.25)
     assert metrics["dcg@3"] == pytest.approx((0.5 * discount_sum_3 + 0.25 * discount_sum_3) / 2.0)
     assert metrics["ndcg@3"] == pytest.approx((row_1_ndcg_3 + row_2_ndcg_3) / 2.0)
-    assert metrics["recall@3"] == pytest.approx(0.75)
+    assert not any("recall" in key for key in metrics)
 
 
 class DummyTwoTowerForEpoch(nn.Module):
@@ -126,7 +124,6 @@ def test_evaluate_two_tower_model_reports_auc_and_average_precision():
     assert metrics["loss"] == pytest.approx(0.0)
     assert metrics["zero_history_rank_metric_user_count"] == 0
     assert metrics["zero_history_ndcg@1"] == pytest.approx(0.0)
-    assert metrics["zero_history_recall@1"] == pytest.approx(0.0)
     assert metrics["zero_history_mean_average_precision"] == pytest.approx(0.0)
     assert result["ranking_rows"] == []
 
@@ -197,7 +194,6 @@ def test_evaluate_matrix_scorer_reports_zero_history_subset_metrics():
     assert metrics["zero_history_rank_metric_user_count"] == 2
     assert metrics["zero_history_dcg@1"] == pytest.approx(1.0)
     assert metrics["zero_history_ndcg@1"] == pytest.approx(1.0)
-    assert metrics["zero_history_recall@1"] == pytest.approx(1.0)
     assert metrics["zero_history_mean_average_precision"] == pytest.approx(1.0)
 
 
@@ -284,7 +280,6 @@ def test_run_matrix_epoch_accumulates_zero_history_metrics_across_batches():
 
     assert metrics["zero_history_rank_metric_user_count"] == 2
     assert metrics["zero_history_ndcg@1"] == pytest.approx(1.0)
-    assert metrics["zero_history_recall@1"] == pytest.approx(1.0)
     assert metrics["zero_history_mean_average_precision"] == pytest.approx(1.0)
 
 
@@ -331,9 +326,8 @@ def test_ranking_rows_for_batch_reports_per_user_matrix_metrics():
     assert rows[0]["positive_rank_min"] == pytest.approx(1.0)
     assert rows[0]["positive_rank_mean"] == pytest.approx(1.5)
     assert rows[0]["ndcg@1"] == pytest.approx(1.0)
-    assert rows[0]["recall@1"] == pytest.approx(0.5)
     assert rows[0]["ndcg@2"] == pytest.approx(1.0)
-    assert rows[0]["recall@2"] == pytest.approx(1.0)
+    assert not any("recall" in key for key in rows[0])
     assert rows[0]["average_precision"] == pytest.approx(1.0)
     assert rows[0]["auc_roc"] == pytest.approx(1.0)
     assert rows[1]["did"] == "u2"
@@ -420,9 +414,6 @@ def test_run_matrix_epoch_accumulates_baseline_metric_user_count(monkeypatch):
             f"ndcg@{k}": float(user_count)
             for k in metrics_top_ks
         } | {
-            f"recall@{k}": float(user_count)
-            for k in metrics_top_ks
-        } | {
             "mean_average_precision": float(user_count),
         }, user_count
 
@@ -447,8 +438,6 @@ def test_run_matrix_epoch_accumulates_baseline_metric_user_count(monkeypatch):
         "dcg@2": pytest.approx(1.0),
         "ndcg@1": pytest.approx(1.0),
         "ndcg@2": pytest.approx(1.0),
-        "recall@1": pytest.approx(1.0),
-        "recall@2": pytest.approx(1.0),
         "mean_average_precision": pytest.approx(1.0),
     }
 

@@ -9,8 +9,8 @@ Runs the engagement prediction artifact pipeline.
 Note: The historical `run-all` subcommand is now optional (kept for backwards compatibility).
 
 Usage examples:
-    python cli.py --config config.yml --stop-after post_selection
-    python cli.py run-all --config config.yml --stop-after post_selection
+    python cli.py --config config.yml --stop-after dataset_hydration
+    python cli.py run-all --config config.yml --stop-after dataset_hydration
 """
 
 import argparse
@@ -45,7 +45,7 @@ from engagement_prediction.pipeline.core import (
 CLI_FILE_DIR = Path(__file__).parent
 
 TRAIN_PLACEHOLDER = 'train_placeholder'
-STAGE_ORDER = ['query_selection', 'user_history', 'post_selection', TRAIN_PLACEHOLDER, 'evaluate']
+STAGE_ORDER = ['source_metadata', 'query_selection', 'user_history', 'post_selection', 'negative_selection', 'post_liker_history', 'author_statistics', 'dataset_hydration', TRAIN_PLACEHOLDER, 'evaluate']
 VALID_USER_ENCODERS_BY_MODEL_TYPE: Dict[str, Tuple[str, ...]] = {
     "mlp": ("summarized", "full_transformer", "cross_attention"),
     "two-tower": ("full_transformer", "cross_attention"),
@@ -57,13 +57,14 @@ DEFAULTS: Dict[str, Any] = {
     "debug": False,
     "random_seed": 42,
     "embedding_model": "all_MiniLM_L12_v2",
-    "skip_embeddings": False,
-    # Stage 1: Query selection
+    # Stage 00: Canonical source metadata
     "gcs_bucket": 'greenearth-471522-ingex-extract-stage',
     "posts_start": None,
     "posts_end": None,
-    "unseen_user_fraction": 0.10,
-    "max_hours_per_user_per_split": 64,
+    "source_metadata_partition_count": 16,
+    # Stage 1: Query selection
+    "unseen_user_fraction": 0.1,
+    "max_hours_per_user_per_split": 16,
     "max_train_query_hours": None,
     "max_eval_query_hours_per_split": None,
     "max_positives_per_user_hour": 32,
@@ -76,7 +77,18 @@ DEFAULTS: Dict[str, Any] = {
     "user_history_partition_count": 16,
     # Stage 3: Post selection
     "random_candidate_sampling_fraction": 0.1,
-    "post_selection_partition_count": 16,
+    # Stage 4: Popularity-aware negative selection
+    "negative_candidates_per_hour": 1000,
+    "min_likes_for_popular_candidate": 10,
+    "popular_candidate_fraction": 0.50,
+    "max_candidate_age_hours": 24,
+    # Stage 5: Post-liker history extraction
+    "post_liker_history_partition_count": 16,
+    # Stage 6: Training-only author statistics
+    "author_statistics_partition_count": 16,
+    # Stage 7: Dataset hydration
+    "embedding_source_batch_size": 64,
+    "min_author_training_feature_count": 50,
     # Stage 3 (train) - Model architecture
     "user_summarization": "mean",  # MLP user-history summarization: mean, ema, linear_recency
     "ema_alpha": 0.1,  # EMA smoothing factor (only used when user_summarization=ema)
@@ -151,9 +163,14 @@ DEFAULTS: Dict[str, Any] = {
     "pick_prior": False,
     # Prior pins (optional): may be a stage_run_id (dir name under artifacts/<stage>/)
     # or a path (absolute, or relative to --output-dir).
+    "prior_00_source_metadata": None,
     "prior_01_query_selection": None,
-    "prior_01_get_data": None,
     "prior_02_user_history": None,
+    "prior_03_post_selection": None,
+    "prior_04_negative_selection": None,
+    "prior_05_post_liker_history": None,
+    "prior_06_author_statistics": None,
+    "prior_07_dataset_hydration": None,
     "prior_03_train": None,
     # Execution behavior
     # Default is foreground execution (recommended for ClearML remote execution).
@@ -541,8 +558,6 @@ def _get_train_key(model_type: str) -> str:
 
 
 def _validate_bst_config(args: argparse.Namespace) -> None:
-    if not bool(args.use_author_embedding_table):
-        raise ValueError("--use-author-embedding-table is required when --model-type is 'bst-ranker'.")
     if args.prediction_hidden_dims is None:
         raise ValueError("--prediction-hidden-dims is required when --model-type is 'bst-ranker'.")
 
@@ -565,6 +580,8 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
     batch_size = int(args.batch_size)
     bst_max_train_batches_per_epoch = args.bst_max_train_batches_per_epoch
     bst_popularity_projection_dim = int(args.bst_popularity_projection_dim)
+    author_embedding_dim = int(args.author_embedding_dim)
+    author_unknown_dropout_rate = float(args.author_unknown_dropout_rate)
     if model_dim <= 0:
         raise ValueError("--bst-model-dim must be positive.")
     if content_projection_dim <= 0:
@@ -587,6 +604,10 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
         raise ValueError("--bst-max-train-batches-per-epoch must be positive when provided.")
     if bst_popularity_projection_dim <= 0:
         raise ValueError("--bst-popularity-projection-dim must be positive.")
+    if author_embedding_dim <= 0:
+        raise ValueError("--author-embedding-dim must be positive for the BST ranker.")
+    if not 0.0 <= author_unknown_dropout_rate < 1.0:
+        raise ValueError("--author-unknown-dropout-rate must be in [0, 1) for the BST ranker.")
 
 
 def _get_stage_order_for_model_type(train_key: str) -> List[str]:
@@ -636,20 +657,23 @@ def _validate_data_pipeline_boundary(
     start_idx: int,
     stop_idx: int,
 ) -> None:
-    post_selection_idx = stage_order.index("post_selection")
-    if start_idx <= post_selection_idx < stop_idx:
-        raise ValueError(
-            "post_selection cannot yet continue into unchanged training stages. "
-            "Run the new data pipeline with --stop-after post_selection."
-        )
+    dataset_hydration_idx = stage_order.index("dataset_hydration")
     train_idx = next(idx for idx, key in enumerate(stage_order) if key.startswith("train_"))
+    train_key = stage_order[train_idx]
     evaluate_idx = stage_order.index("evaluate")
-    if start_idx == train_idx and (
-        args.prior_01_get_data is None or args.prior_02_user_history is None
-    ):
+    if train_key != "train_bst_ranker" and start_idx <= dataset_hydration_idx < stop_idx:
         raise ValueError(
-            "Direct legacy training requires explicit --prior-01-get-data and "
-            "--prior-02-user-history pins."
+            "MLP and two-tower training cannot yet consume dataset_hydration. "
+            "Run the new data pipeline with --stop-after dataset_hydration."
+        )
+    if train_key != "train_bst_ranker" and start_idx == train_idx:
+        raise ValueError(
+            "MLP and two-tower training are not yet wired to the Stage 7 hydrated dataset."
+        )
+    if train_key == "train_bst_ranker" and start_idx <= train_idx < stop_idx:
+        raise ValueError(
+            "Native BST training cannot yet continue into legacy evaluation. "
+            "Run with --stop-after train_bst_ranker."
         )
     if start_idx == evaluate_idx and args.prior_03_train is None:
         raise ValueError("Direct legacy evaluation requires an explicit --prior-03-train pin.")
@@ -662,17 +686,17 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     output_root = Path(args.output_dir).resolve()
 
     # Apply non-interactive prior pins (paths or stage_run_ids).
+    prior_00_source_metadata = _resolve_prior_spec(
+        args.prior_00_source_metadata,
+        output_root=output_root,
+        artifacts_dir=artifacts_dir,
+        stage_folder="00_source_metadata",
+    )
     prior_01_query_selection = _resolve_prior_spec(
         args.prior_01_query_selection,
         output_root=output_root,
         artifacts_dir=artifacts_dir,
         stage_folder="01_query_selection",
-    )
-    prior_01_get_data = _resolve_prior_spec(
-        args.prior_01_get_data,
-        output_root=output_root,
-        artifacts_dir=artifacts_dir,
-        stage_folder="01_get_data",
     )
     prior_02_user_history = _resolve_prior_spec(
         args.prior_02_user_history,
@@ -680,18 +704,58 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
         artifacts_dir=artifacts_dir,
         stage_folder="02_user_history",
     )
+    prior_03_post_selection = _resolve_prior_spec(
+        args.prior_03_post_selection,
+        output_root=output_root,
+        artifacts_dir=artifacts_dir,
+        stage_folder="03_post_selection",
+    )
+    prior_04_negative_selection = _resolve_prior_spec(
+        args.prior_04_negative_selection,
+        output_root=output_root,
+        artifacts_dir=artifacts_dir,
+        stage_folder="04_negative_selection",
+    )
+    prior_05_post_liker_history = _resolve_prior_spec(
+        args.prior_05_post_liker_history,
+        output_root=output_root,
+        artifacts_dir=artifacts_dir,
+        stage_folder="05_post_liker_history",
+    )
+    prior_06_author_statistics = _resolve_prior_spec(
+        args.prior_06_author_statistics,
+        output_root=output_root,
+        artifacts_dir=artifacts_dir,
+        stage_folder="06_author_statistics",
+    )
+    prior_07_dataset_hydration = _resolve_prior_spec(
+        args.prior_07_dataset_hydration,
+        output_root=output_root,
+        artifacts_dir=artifacts_dir,
+        stage_folder="07_dataset_hydration",
+    )
     prior_03_train = _resolve_prior_spec(
         args.prior_03_train,
         output_root=output_root,
         artifacts_dir=artifacts_dir,
         stage_folder="03_train",
     )
+    if prior_00_source_metadata is not None:
+        ctx.prior_outputs["00_source_metadata"] = prior_00_source_metadata
     if prior_01_query_selection is not None:
         ctx.prior_outputs["01_query_selection"] = prior_01_query_selection
-    if prior_01_get_data is not None:
-        ctx.prior_outputs["01_get_data"] = prior_01_get_data
     if prior_02_user_history is not None:
         ctx.prior_outputs["02_user_history"] = prior_02_user_history
+    if prior_03_post_selection is not None:
+        ctx.prior_outputs["03_post_selection"] = prior_03_post_selection
+    if prior_04_negative_selection is not None:
+        ctx.prior_outputs["04_negative_selection"] = prior_04_negative_selection
+    if prior_05_post_liker_history is not None:
+        ctx.prior_outputs["05_post_liker_history"] = prior_05_post_liker_history
+    if prior_06_author_statistics is not None:
+        ctx.prior_outputs["06_author_statistics"] = prior_06_author_statistics
+    if prior_07_dataset_hydration is not None:
+        ctx.prior_outputs["07_dataset_hydration"] = prior_07_dataset_hydration
     if prior_03_train is not None:
         ctx.prior_outputs["03_train"] = prior_03_train
     validate_explicit_prior_pin_consistency(ctx)
@@ -764,17 +828,22 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
             if idx < start_idx or idx > stop_idx:
                 continue
             # Before running, offer prior selection for this stage's dependency (if any)
-            if key != 'query_selection':
+            if idx > 0:
                 prev_key = stage_order[idx - 1]
                 if stage_folder[prev_key] not in ctx.prior_outputs:
                     _maybe_choose_prior(prev_key)
             label_map = {
+                'source_metadata': "Stage 00: Build reusable source metadata…",
                 'query_selection': "Stage 1: Select user-hour queries…",
                 'user_history': "Stage 2: Generate user history…",
                 'post_selection': "Stage 3: Select post universe…",
-                'train_mlp': "Legacy training: Train model (MLP)…",
-                'train_two_tower': "Legacy training: Train model (Two-Tower)…",
-                'train_bst_ranker': "Legacy training: Train model (BST Ranker)…",
+                'negative_selection': "Stage 4: Select hourly negative candidates…",
+                'post_liker_history': "Stage 5: Extract post-liker histories…",
+                'author_statistics': "Stage 6: Build author statistics…",
+                'dataset_hydration': "Stage 7: Hydrate the model-training dataset…",
+                'train_mlp': "Training: Train model (MLP)…",
+                'train_two_tower': "Training: Train model (Two-Tower)…",
+                'train_bst_ranker': "Stage 8: Train BST ranker…",
                 'evaluate': "Legacy evaluation: Evaluate model…",
             }
             label = label_map.get(key, f"Stage {idx+1}: {key}…")
@@ -833,6 +902,9 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="UTC start of the common Ingex posts, replies, and likes window (inclusive)")
     _add_arg_with_default(p_all, "--posts-end", type=str, default=argparse.SUPPRESS,
                           help_text="UTC end of the common Ingex posts, replies, and likes window (exclusive)")
+    _add_arg_with_default(p_all, "--source-metadata-partition-count", type=int,
+                          default=argparse.SUPPRESS,
+                          help_text="Stable URI-hash partition count owned by the Stage 00 metadata index")
     _add_arg_with_default(p_all, "--unseen-user-fraction", type=float, default=argparse.SUPPRESS,
                           help_text="Stable fraction of users reserved for unseen-user evaluation")
     _add_arg_with_default(p_all, "--max-hours-per-user-per-split", type=int, default=argparse.SUPPRESS,
@@ -858,8 +930,6 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Random seed for splitting")
     _add_arg_with_default(p_all, "--embedding-model", type=str, choices=["all_MiniLM_L6_v2", "all_MiniLM_L12_v2"],
                           default=argparse.SUPPRESS, help_text="SentenceTransformers model for embeddings")
-    _add_arg_with_default(p_all, "--skip-embeddings", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
-                          help_text="Skip embedding validation/memmap write in Stage 1 (faster iteration; later stages that need embeddings will fail)")
     # Stage 1 split / Stage 2 options
     _add_arg_with_default(p_all, "--max-history-posts-per-query", type=int, default=argparse.SUPPRESS,
                           help_text="Maximum recent like events retained in each Stage 2 query history")
@@ -869,9 +939,34 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--random-candidate-sampling-fraction", type=float,
                           default=argparse.SUPPRESS,
                           help_text="Stable fraction of unique posts retained in the random candidate reservoir")
-    _add_arg_with_default(p_all, "--post-selection-partition-count", type=int,
+    # Stage 4 popularity-aware negative selection
+    _add_arg_with_default(p_all, "--negative-candidates-per-hour", type=int,
                           default=argparse.SUPPRESS,
-                          help_text="Stable URI-hash partition count used to bound Stage 1/3 post processing")
+                          help_text="Target shared negative-candidate count for each selected query hour")
+    _add_arg_with_default(p_all, "--min-likes-for-popular-candidate", type=int,
+                          default=argparse.SUPPRESS,
+                          help_text="Minimum strictly prior like count for the popular candidate method")
+    _add_arg_with_default(p_all, "--popular-candidate-fraction", type=float,
+                          default=argparse.SUPPRESS,
+                          help_text="Desired fraction of each hourly pool selected by the popular method")
+    _add_arg_with_default(p_all, "--max-candidate-age-hours", type=int,
+                          default=argparse.SUPPRESS,
+                          help_text="Number of creation-hour buckets in which a post remains candidate-eligible")
+    # Stage 5 post-liker history extraction
+    _add_arg_with_default(p_all, "--post-liker-history-partition-count", type=int,
+                          default=argparse.SUPPRESS,
+                          help_text="Stable URI-hash partition count used to bound Stage 5 liker-event processing")
+    # Stage 6 training-only author statistics
+    _add_arg_with_default(p_all, "--author-statistics-partition-count", type=int,
+                          default=argparse.SUPPRESS,
+                          help_text="Stable hash partition count used to bound Stage 6 post and author aggregation")
+    # Stage 7 dataset hydration
+    _add_arg_with_default(p_all, "--embedding-source-batch-size", type=int,
+                          default=argparse.SUPPRESS,
+                          help_text="Raw post/reply files processed per Stage 7 embedding scan")
+    _add_arg_with_default(p_all, "--min-author-training-feature-count", type=int,
+                          default=argparse.SUPPRESS,
+                          help_text="Minimum final training-feature occurrences required for a dedicated author index")
     _add_arg_with_default(p_all, "--train-start", type=str, default=argparse.SUPPRESS,
                           help_text="UTC start of target eligibility and the training split")
     _add_arg_with_default(p_all, "--val-start", type=str, default=argparse.SUPPRESS,
@@ -996,7 +1091,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--disable-progress", action="store_true", default=argparse.SUPPRESS,
                           help_text="Disable progress bars during training")
     _add_arg_with_default(p_all, "--metrics-top-ks", type=int, nargs="+", default=argparse.SUPPRESS,
-                          help_text="Values of K to use for training metrics: NDCG@K, Recall@K, etc")
+                          help_text="Values of K to use for training NDCG@K metrics")
     # Stage 3 (train) - DataLoader settings
     _add_arg_with_default(p_all, "--num-dataloader-workers", type=int, default=argparse.SUPPRESS,
                           help_text="Number of DataLoader worker processes")
@@ -1027,19 +1122,29 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="(Deprecated) Always enabled during sequential run-all")
     # Selective reruns and prior pinning
     _add_arg_with_default(p_all, "--start-from", type=str,
-                          choices=["query_selection", "user_history", "post_selection", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "evaluate"],
+                          choices=["source_metadata", "query_selection", "user_history", "post_selection", "negative_selection", "post_liker_history", "author_statistics", "dataset_hydration", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Begin execution at this stage")
     _add_arg_with_default(p_all, "--stop-after", type=str,
-                          choices=["query_selection", "user_history", "post_selection", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "evaluate"],
+                          choices=["source_metadata", "query_selection", "user_history", "post_selection", "negative_selection", "post_liker_history", "author_statistics", "dataset_hydration", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "evaluate"],
                           default=argparse.SUPPRESS, help_text="Stop after this stage completes")
     _add_arg_with_default(p_all, "--pick-prior", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help_text="If multiple prior outputs exist, prompt to pick (foreground only)")
+    _add_arg_with_default(p_all, "--prior-00-source-metadata", type=str, default=argparse.SUPPRESS,
+                          help_text="Pin prior Stage 00 (00_source_metadata) artifact dir by stage_run_id or path")
     _add_arg_with_default(p_all, "--prior-01-query-selection", type=str, default=argparse.SUPPRESS,
                           help_text="Pin prior Stage 1 (01_query_selection) artifact dir by stage_run_id or path")
-    _add_arg_with_default(p_all, "--prior-01-get-data", type=str, default=argparse.SUPPRESS,
-                          help_text="Pin legacy Stage 1 (01_get_data) artifact dir by stage_run_id or path")
     _add_arg_with_default(p_all, "--prior-02-user-history", type=str, default=argparse.SUPPRESS,
-                          help_text="Pin Stage 2 (02_user_history) for a direct post-selection rerun, or a legacy Stage 2 for direct training")
+                          help_text="Pin Stage 2 (02_user_history) for a direct post-selection rerun")
+    _add_arg_with_default(p_all, "--prior-03-post-selection", type=str, default=argparse.SUPPRESS,
+                          help_text="Pin Stage 3 (03_post_selection) for a direct negative-selection rerun")
+    _add_arg_with_default(p_all, "--prior-04-negative-selection", type=str, default=argparse.SUPPRESS,
+                          help_text="Pin Stage 4 (04_negative_selection) for a direct post-liker-history rerun")
+    _add_arg_with_default(p_all, "--prior-05-post-liker-history", type=str, default=argparse.SUPPRESS,
+                          help_text="Pin Stage 5 (05_post_liker_history) for a direct author-statistics rerun")
+    _add_arg_with_default(p_all, "--prior-06-author-statistics", type=str, default=argparse.SUPPRESS,
+                          help_text="Pin Stage 6 (06_author_statistics) for a direct dataset-hydration rerun")
+    _add_arg_with_default(p_all, "--prior-07-dataset-hydration", type=str, default=argparse.SUPPRESS,
+                          help_text="Pin Stage 7 (07_dataset_hydration) for a direct BST-training rerun")
     _add_arg_with_default(p_all, "--prior-03-train", type=str, default=argparse.SUPPRESS,
                           help_text="Pin prior Stage 3 (03_train) artifact dir by stage_run_id or path (used by eval)")
     # Execution behavior

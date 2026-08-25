@@ -43,8 +43,8 @@ from utils.dataloaders import (
     get_author_table_num_rows,
     load_bucketed_training_data,
 )
-from utils.author_features import ProjectedPostFeatureEncoder
-from utils.matrix_ranking import (
+from engagement_prediction.models.common import ProjectedPostFeatureEncoder
+from engagement_prediction.training.ranking import (
     evaluate_matrix_model,
     log_final_classification_metrics,
     run_matrix_epoch,
@@ -326,16 +326,10 @@ def _log_epoch_metrics(
         experiment_tracker.log_scalar(f"NDCG@{k}", f"Train NDCG@{k}", float(train_metrics[f"ndcg@{k}"]), iteration)
         experiment_tracker.log_scalar(f"NDCG@{k}", f"Validation NDCG@{k}", float(val_metrics[f"ndcg@{k}"]), iteration)
         experiment_tracker.log_scalar(f"NDCG@{k}", f"Validation Unseen Users NDCG@{k}", float(val_unseen_metrics[f"ndcg@{k}"]), iteration)
-        experiment_tracker.log_scalar(f"Recall@{k}", f"Train Recall@{k}", float(train_metrics[f"recall@{k}"]), iteration)
-        experiment_tracker.log_scalar(f"Recall@{k}", f"Validation Recall@{k}", float(val_metrics[f"recall@{k}"]), iteration)
-        experiment_tracker.log_scalar(f"Recall@{k}", f"Validation Unseen Users Recall@{k}", float(val_unseen_metrics[f"recall@{k}"]), iteration)
         if calc_baseline_metrics:
             experiment_tracker.log_scalar(f"Baseline NDCG@{k}", f"Train Baseline NDCG@{k}", float(train_baseline_metrics[f"ndcg@{k}"]), iteration)
             experiment_tracker.log_scalar(f"Baseline NDCG@{k}", f"Validation Baseline NDCG@{k}", float(val_baseline_metrics[f"ndcg@{k}"]), iteration)
             experiment_tracker.log_scalar(f"Baseline NDCG@{k}", f"Validation Unseen Users Baseline NDCG@{k}", float(val_unseen_baseline_metrics[f"ndcg@{k}"]), iteration)
-            experiment_tracker.log_scalar(f"Baseline Recall@{k}", f"Train Baseline Recall@{k}", float(train_baseline_metrics[f"recall@{k}"]), iteration)
-            experiment_tracker.log_scalar(f"Baseline Recall@{k}", f"Validation Baseline Recall@{k}", float(val_baseline_metrics[f"recall@{k}"]), iteration)
-            experiment_tracker.log_scalar(f"Baseline Recall@{k}", f"Validation Unseen Users Baseline Recall@{k}", float(val_unseen_baseline_metrics[f"recall@{k}"]), iteration)
 
 
 def train_mlp_model(

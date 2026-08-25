@@ -71,21 +71,46 @@ def test_history_cap_keeps_64_most_recent_and_reports_truncation():
     assert stats["train"]["truncated_history_count"] == 1
 
 
-def test_history_keeps_duplicates_and_uses_subject_uri_tie_breaker():
+def test_history_deduplicates_exact_events_and_keeps_distinct_relikes():
     query_hour = datetime(2026, 1, 2, tzinfo=UTC)
     tied = query_hour - timedelta(hours=1)
+    earlier = tied - timedelta(minutes=1)
     histories, history_post_uris, _ = user_history.build_query_histories_for_partition(
         _queries([query_hour]),
         _likes([
             ("u1", "p-b", tied),
             ("u1", "p-a", tied),
             ("u1", "p-a", tied),
+            ("u1", "p-a", earlier),
         ]),
         max_history_posts_per_query=64,
     )
 
-    assert histories["history_subject_uris"][0].to_list() == ["p-a", "p-a", "p-b"]
+    assert histories["history_subject_uris"][0].to_list() == ["p-a", "p-b", "p-a"]
+    assert histories["history_like_created_ats"][0].to_list() == [tied, tied, earlier]
     assert history_post_uris["subject_uri"].to_list() == ["p-a", "p-b"]
+
+
+def test_exact_duplicates_do_not_consume_history_cap_slots():
+    query_hour = datetime(2026, 1, 4, tzinfo=UTC)
+    newest = query_hour - timedelta(minutes=1)
+    rows = [("u1", "duplicate", newest)] * 10 + [
+        ("u1", f"p{offset:02d}", query_hour - timedelta(hours=offset + 1))
+        for offset in range(64)
+    ]
+
+    histories, _, stats = user_history.build_query_histories_for_partition(
+        _queries([query_hour]),
+        _likes(rows),
+        max_history_posts_per_query=64,
+    )
+
+    retained = histories["history_subject_uris"][0].to_list()
+    assert len(retained) == 64
+    assert retained.count("duplicate") == 1
+    assert "p62" in retained
+    assert "p63" not in retained
+    assert stats["train"]["truncated_history_count"] == 1
 
 
 def test_history_post_uris_exclude_likes_unused_by_every_query():

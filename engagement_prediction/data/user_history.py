@@ -69,6 +69,8 @@ def history_post_partition_expr(partition_count: int) -> pl.Expr:
 
 
 def validate_queries_schema(queries_lf: pl.LazyFrame) -> None:
+    """Validate the Stage 1 query contract before scanning raw history likes."""
+
     schema = queries_lf.collect_schema()
     if schema.names() != QUERY_COLUMNS:
         raise ValueError(f"Unexpected queries columns: {schema.names()}")
@@ -84,6 +86,8 @@ def validate_queries_schema(queries_lf: pl.LazyFrame) -> None:
 
 
 def empty_likes() -> pl.DataFrame:
+    """Return an empty frame with the normalized like schema Stage 2 expects."""
+
     return pl.DataFrame(
         schema={
             "did": pl.String,
@@ -94,10 +98,14 @@ def empty_likes() -> pl.DataFrame:
 
 
 def _history_frame(rows: list[dict[str, Any]]) -> pl.DataFrame:
+    """Construct a typed history frame, including the empty-row case."""
+
     return pl.from_dicts(rows, schema=HISTORY_SCHEMA)
 
 
 def history_post_uri_frame(subject_uris: set[str]) -> pl.DataFrame:
+    """Convert a partition-local URI set into a deterministic typed shard."""
+
     return pl.DataFrame(
         {
             "subject_uri": pl.Series(sorted(subject_uris), dtype=pl.String),
@@ -132,13 +140,20 @@ def build_query_histories_for_partition(
             f"Partition likes are missing required columns: {', '.join(sorted(missing_like_columns))}"
         )
 
-    sorted_likes = likes_df.select(
-        pl.col("did").cast(pl.String),
-        pl.col("subject_uri").cast(pl.String),
-        pl.col("like_created_at").cast(UTC_DATETIME),
-    ).sort(
-        ["did", "like_created_at", "subject_uri"],
-        descending=[False, False, True],
+    # Collapse exact repeated source events within this already-bounded user
+    # partition before applying as-of cutoffs or the history cap. Re-likes of
+    # the same post at different timestamps remain distinct history events.
+    sorted_likes = (
+        likes_df.select(
+            pl.col("did").cast(pl.String),
+            pl.col("subject_uri").cast(pl.String),
+            pl.col("like_created_at").cast(UTC_DATETIME),
+        )
+        .unique(subset=["did", "subject_uri", "like_created_at"])
+        .sort(
+            ["did", "like_created_at", "subject_uri"],
+            descending=[False, False, True],
+        )
     )
     likes_by_user: dict[str, list[tuple[datetime, str]]] = {}
     for did, subject_uri, like_created_at in sorted_likes.iter_rows():
@@ -158,6 +173,8 @@ def build_query_histories_for_partition(
         split = query["split"]
         user_likes = likes_by_user.get(did, [])
         like_times = like_times_by_user.get(did, [])
+        # bisect_left enforces the as-of rule: likes exactly at query_hour are
+        # excluded along with all later activity.
         eligible_count = bisect_left(like_times, query_hour)
         selected = user_likes[max(0, eligible_count - max_history_posts_per_query):eligible_count]
         selected.reverse()
@@ -209,6 +226,8 @@ def validate_partition_artifact(
     history_df: pl.DataFrame,
     max_history_posts_per_query: int,
 ) -> None:
+    """Validate one user partition's exact keys, alignment, cap, and ordering."""
+
     if history_df.columns != HISTORY_COLUMNS:
         raise ValueError(f"Unexpected query history columns: {history_df.columns}")
     if history_df.schema != pl.Schema(HISTORY_SCHEMA):
@@ -240,6 +259,8 @@ def validate_partition_artifact(
 def merge_partition_stats(
     partition_stats: list[dict[str, dict[str, int]]],
 ) -> dict[str, dict[str, int]]:
+    """Add per-split counters emitted by independently processed partitions."""
+
     merged: dict[str, dict[str, int]] = {}
     for stats in partition_stats:
         for split, values in stats.items():
@@ -250,6 +271,8 @@ def merge_partition_stats(
 
 
 def partition_parquet_paths(dataset_path: Path, partition_id: int) -> list[Path]:
+    """Return physical files for one DID-hash partition."""
+
     partition_dir = Path(dataset_path) / f"_user_partition={partition_id}"
     return sorted(partition_dir.rglob("*.parquet")) if partition_dir.exists() else []
 
@@ -269,6 +292,8 @@ def validate_history_post_uri_partition(
     partition_id: int,
     partition_count: int,
 ) -> None:
+    """Validate schema, uniqueness, ordering, and URI-hash placement."""
+
     if history_post_uris_df.columns != HISTORY_POST_URI_COLUMNS:
         raise ValueError(
             f"Unexpected history post URI columns: {history_post_uris_df.columns}"

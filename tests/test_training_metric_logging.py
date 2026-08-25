@@ -112,7 +112,7 @@ def test_train_mlp_model_logs_epoch_metrics_to_tracker(tmp_path):
 
     assert len(results["history"]["train_ndcg@1"]) == 2
     assert results["primary_metric_name"] == "ndcg@1"
-    assert len(tracker.calls) == 48
+    assert len(tracker.calls) == 30
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train Loss")] == [1, 2]
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Loss")] == [1, 2]
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Unseen Users Loss")] == [1, 2]
@@ -171,7 +171,7 @@ def test_train_two_tower_model_logs_epoch_metrics_to_tracker(tmp_path):
     assert (tmp_path / "two_tower_best.pth").exists()
     assert (tmp_path / "engagement_user_tower_best.pt").exists()
     assert (tmp_path / "engagement_post_tower_best.pt").exists()
-    assert len(tracker.calls) == 84
+    assert len(tracker.calls) == 54
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train Loss")] == [1, 2]
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Loss")] == [1, 2]
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Unseen Users Loss")] == [1, 2]
@@ -184,20 +184,10 @@ def test_train_two_tower_model_logs_epoch_metrics_to_tracker(tmp_path):
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train NDCG@2")] == [1, 2]
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation NDCG@2")] == [1, 2]
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Unseen Users NDCG@2")] == [1, 2]
-    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train Recall@1")] == [1, 2]
-    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Recall@1")] == [1, 2]
-    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Unseen Users Recall@1")] == [1, 2]
-    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train Recall@2")] == [1, 2]
-    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Recall@2")] == [1, 2]
-    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Unseen Users Recall@2")] == [1, 2]
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train Baseline NDCG@1")] == [1]
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Baseline NDCG@1")] == [1]
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Unseen Users Baseline NDCG@1")] == [1]
-    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train Baseline Recall@1")] == [1]
-    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Baseline Recall@1")] == [1]
-    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Unseen Users Baseline Recall@1")] == [1]
     assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Train Zero-History NDCG@1")] == [1, 2]
-    assert [call["iteration"] for call in _scalar_calls_by_series(tracker.calls, "Validation Zero-History Recall@2")] == [1, 2]
     zero_history_count_calls = _scalar_calls_by_series(tracker.calls, "Validation Unseen Users Zero-History User Count")
     assert [call["iteration"] for call in zero_history_count_calls] == [1, 2]
     assert [call["value"] for call in zero_history_count_calls] == [0.0, 0.0]
@@ -273,7 +263,6 @@ def test_two_tower_stage_info_metric_lines_include_final_classification_metrics(
             "zero_history_rank_metric_user_count": 3,
             "zero_history_dcg@1": 0.90,
             "zero_history_ndcg@1": 0.40,
-            "zero_history_recall@1": 0.30,
             "zero_history_mean_average_precision": 0.60,
         },
         "val": {"auc_roc": None, "classification_average_precision": float("nan")},
@@ -285,7 +274,6 @@ def test_two_tower_stage_info_metric_lines_include_final_classification_metrics(
         "train_classification_average_precision: 0.5000",
         "train_zero_history_rank_metric_user_count: 3",
         "train_zero_history_ndcg@1: 0.4000",
-        "train_zero_history_recall@1: 0.3000",
         "train_zero_history_mean_average_precision: 0.6000",
         "holdout_unseen_users_auc_roc: 0.8000",
     ]

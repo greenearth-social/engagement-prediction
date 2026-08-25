@@ -14,12 +14,17 @@ from .core import ROOT, Context, load_run_callable
 
 # Stage specs: stage_key -> (relative_file_path_from_root, stage_folder_name)
 STAGE_SPECS: Dict[str, Tuple[str, str]] = {
+    'source_metadata': ("engagement_prediction/stages/source_metadata.py",       "00_source_metadata"),
     'query_selection': ("engagement_prediction/stages/query_selection.py",     "01_query_selection"),
     'user_history':    ("engagement_prediction/stages/user_history.py",        "02_user_history"),
     'post_selection':  ("engagement_prediction/stages/post_selection.py",      "03_post_selection"),
+    'negative_selection': ("engagement_prediction/stages/negative_selection.py", "04_negative_selection"),
+    'post_liker_history': ("engagement_prediction/stages/post_liker_history.py", "05_post_liker_history"),
+    'author_statistics': ("engagement_prediction/stages/author_statistics.py",   "06_author_statistics"),
+    'dataset_hydration': ("engagement_prediction/stages/dataset_hydration.py",   "07_dataset_hydration"),
     'train_mlp':       ("utils/03_train/stage_train_mlp.py",                    "03_train"),
     'train_two_tower': ("utils/03_train/stage_train_two_tower.py",              "03_train"),
-    'train_bst_ranker': ("utils/03_train/stage_train_bst_ranker.py",            "03_train"),
+    'train_bst_ranker': ("engagement_prediction/stages/train_bst_ranker.py",   "08_train_bst_ranker"),
     'evaluate':        ("utils/04_evaluate/stage_evaluate.py",                  "04_evaluate"),
 }
 

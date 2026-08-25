@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 import logging
 from pathlib import Path
 import time
@@ -10,8 +9,8 @@ from typing import Any, Sequence
 
 import polars as pl
 
-from engagement_prediction.data import ingex
 from engagement_prediction.data import post_selection as post_data
+from engagement_prediction.data import source_metadata
 from engagement_prediction.data.parquet import read_parquet_parts, sink_partitioned_parquet
 
 
@@ -33,51 +32,6 @@ INTERNAL_POSITIVE_SCHEMA = {
     "subject_uri": pl.String,
     "like_created_at": post_data.UTC_DATETIME,
 }
-MEMBERSHIP_POST_SCHEMA = {
-    "subject_uri": pl.String,
-    "_post_row_valid": pl.Boolean,
-}
-
-
-def _merge_numeric_stats(stats: list[dict[str, int]]) -> dict[str, int]:
-    merged: dict[str, int] = {}
-    for values in stats:
-        for key, value in values.items():
-            merged[key] = merged.get(key, 0) + int(value)
-    return merged
-
-
-def materialize_post_rows(
-    *,
-    post_paths: list[str],
-    posts_start: datetime,
-    posts_end: datetime,
-    partition_count: int,
-    output_path: Path,
-    logger: logging.Logger,
-) -> None:
-    """Normalize and route post rows by URI for bounded membership checks."""
-    started = time.monotonic()
-    logger.info(
-        "Scanning and stream-sinking %s post source files into URI partitions",
-        f"{len(post_paths):,}",
-    )
-    post_rows_lf = post_data.normalize_posts(
-        ingex.scan_parquet_files(post_paths),
-        posts_start=posts_start,
-        posts_end=posts_end,
-        is_reply=False,
-    ).select(list(MEMBERSHIP_POST_SCHEMA)).with_columns(
-        post_data.post_partition_expr(partition_count)
-    )
-    sink_partitioned_parquet(
-        post_rows_lf,
-        output_path=output_path,
-        key="_post_partition",
-    )
-    logger.info("Finished partitioning post source rows in %.1fs", time.monotonic() - started)
-
-
 def materialize_provisional_positive_rows(
     *,
     positive_rows_lf: pl.LazyFrame,
@@ -104,6 +58,8 @@ def materialize_provisional_positive_rows(
 
 
 def _deduplicate_positive_rows(positive_rows_df: pl.DataFrame) -> pl.DataFrame:
+    """Keep the earliest like for each provisional query/post key."""
+
     if positive_rows_df.is_empty():
         return pl.DataFrame(schema=INTERNAL_POSITIVE_SCHEMA)
     return (
@@ -120,6 +76,8 @@ def _add_split_counts(
     df: pl.DataFrame,
     field_name: str,
 ) -> None:
+    """Accumulate one numeric field from a partition into per-split totals."""
+
     if df.is_empty():
         return
     for split, count in df.group_by("split").len().iter_rows():
@@ -127,31 +85,10 @@ def _add_split_counts(
         split_stats[field_name] = split_stats.get(field_name, 0) + int(count)
 
 
-def _select_valid_post_keys(post_rows_df: pl.DataFrame) -> tuple[pl.DataFrame, dict[str, int]]:
-    invalid_row_count = post_rows_df.filter(~pl.col("_post_row_valid")).height
-    valid_rows_df = post_rows_df.filter(pl.col("_post_row_valid")).select("subject_uri")
-    duplicate_counts_df = valid_rows_df.group_by("subject_uri").len()
-    duplicate_uri_count = duplicate_counts_df.filter(pl.col("len") > 1).height
-    duplicate_row_count = int(
-        duplicate_counts_df.select(
-            (pl.col("len") - 1).clip(lower_bound=0).sum()
-        ).item()
-        or 0
-    )
-    unique_posts_df = valid_rows_df.unique().sort("subject_uri")
-    return unique_posts_df, {
-        "post_source_row_count": post_rows_df.height,
-        "invalid_post_row_count": invalid_row_count,
-        "duplicate_post_row_count": duplicate_row_count,
-        "duplicate_post_uri_count": duplicate_uri_count,
-        "unique_valid_post_count": unique_posts_df.height,
-    }
-
-
 def filter_positive_partitions(
     *,
     provisional_positive_rows_path: Path,
-    post_rows_path: Path,
+    post_metadata_path: Path,
     eligible_positive_rows_path: Path,
     partition_count: int,
     splits: Sequence[str],
@@ -168,7 +105,6 @@ def filter_positive_partitions(
         }
         for split in splits
     }
-    post_stats: list[dict[str, int]] = []
     started = time.monotonic()
     logger.info("Beginning bounded post-membership checks across %s partitions", partition_count)
 
@@ -182,12 +118,12 @@ def filter_positive_partitions(
             empty=pl.DataFrame(schema=INTERNAL_POSITIVE_SCHEMA),
         )
         deduplicated_df = _deduplicate_positive_rows(positive_rows_df)
-        normalized_posts_df = read_parquet_parts(
-            post_data.partition_parquet_paths(post_rows_path, partition_id),
-            empty=pl.DataFrame(schema=MEMBERSHIP_POST_SCHEMA),
+        metadata_part = post_metadata_path / f"part-{partition_id:05d}.parquet"
+        metadata_df = read_parquet_parts(
+            [metadata_part] if metadata_part.exists() else [],
+            empty=source_metadata.empty_frame(source_metadata.POST_METADATA_SCHEMA),
         )
-        unique_posts_df, partition_post_stats = _select_valid_post_keys(normalized_posts_df)
-        post_stats.append(partition_post_stats)
+        unique_posts_df = metadata_df.filter(~pl.col("is_reply")).select("subject_uri")
         eligible_df = deduplicated_df.join(
             unique_posts_df.select("subject_uri"),
             on="subject_uri",
@@ -229,12 +165,13 @@ def filter_positive_partitions(
         )
     logger.info("Finished post-membership checks in %.1fs", time.monotonic() - started)
     return {
-        "post_source_stats": _merge_numeric_stats(post_stats),
         "positive_filter_stats_by_split": positive_stats,
     }
 
 
 def scan_eligible_positive_rows(path: Path) -> pl.LazyFrame:
+    """Scan all membership-filtered positive partitions as one lazy relation."""
+
     paths = sorted(Path(path).glob("*.parquet"))
     if not paths:
         raise FileNotFoundError(f"No eligible positive Parquet shards found in {path}")

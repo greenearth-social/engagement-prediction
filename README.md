@@ -2,11 +2,17 @@
 
 This repo trains and evaluates engagement rankers for Bluesky posts. The artifact pipeline is being migrated to production-shaped user-hour queries:
 
-1. `01_query_selection`: load Ingex likes, select bounded `(user, hour)` queries, and retain positive posts found in the selected `bsky_posts` snapshot.
+0. `00_source_metadata`: scan exact root/reply snapshots once and publish canonical URI metadata.
+1. `01_query_selection`: load Ingex likes, select bounded `(user, hour)` queries, and retain positives backed by canonical root metadata.
 2. `02_user_history`: select the bounded as-of like history for every query.
 3. `03_post_selection`: resolve required roots and replies and collect a bounded random root-post candidate reservoir.
+4. `04_negative_selection`: calculate as-of candidate popularity and select shared hourly negative pools.
+5. `05_post_liker_history`: extract complete timestamped liker-event histories for selected posts.
+6. `06_author_statistics`: build unfiltered pre-validation statistics for every author represented by roots or replies.
+7. `07_dataset_hydration`: hydrate selected posts, build the training-exposure author vocabulary, write the content-embedding memmap, and publish the permanent model-training tables.
+8. `08_train_bst_ranker`: fit training-only popularity normalization and train the canonical BST directly from Stage 7.
 
-Post selection is currently the explicit new-pipeline boundary. Run the new data path with `--stop-after post_selection`; it cannot yet continue into unchanged training. Direct legacy training reruns require explicit aligned `01_get_data` and legacy `02_user_history` pins.
+Native BST training is active through Stage 8. Legacy MLP/two-tower training, legacy evaluation, comparison, and serving export are not yet connected to the new dataset contract.
 
 ## Setup
 
@@ -45,21 +51,30 @@ Tests use the `*_test.py` naming convention and live next to the code they cover
 
 ## Repository Layout
 
-- `cli.py`: unified pipeline CLI. `run-all` is implicit, so both invocation forms are accepted; the new data path currently requires `--stop-after post_selection`.
-- `compare.py`: checkpoint-backed ranker comparison CLI.
+- `cli.py`: unified pipeline CLI. `run-all` is implicit, so both invocation forms are accepted.
+- `compare.py`: checkpoint-backed ranker comparison code, temporarily unavailable until it consumes Stage 7.
+- `engagement_prediction/stages/source_metadata.py`: active Stage 00 canonical source-metadata indexing.
 - `engagement_prediction/stages/query_selection.py`: active Stage 1 user-hour query selection.
 - `engagement_prediction/stages/user_history.py`: active Stage 2 orchestration.
 - `engagement_prediction/stages/post_selection.py`: active Stage 3 post-universe orchestration.
+- `engagement_prediction/stages/negative_selection.py`: active Stage 4 popularity-aware negative selection orchestration.
+- `engagement_prediction/stages/post_liker_history.py`: active Stage 5 post-liker event extraction orchestration.
+- `engagement_prediction/stages/author_statistics.py`: active Stage 6 training-only author statistics orchestration.
+- `engagement_prediction/stages/dataset_hydration.py`: active Stage 7 dataset-hydration orchestration.
+- `engagement_prediction/stages/train_bst_ranker.py`: active Stage 8 native BST-training orchestration.
+- `engagement_prediction/training/bst_ranker.py`: reusable native listwise BST training loop.
+- `engagement_prediction/training/ranking.py`: shared matrix-ranking metrics and ranking-row helpers.
 - `engagement_prediction/data/ingex.py`: reusable Ingex access and exact source-file manifests.
-- `engagement_prediction/data/`: Parquet loading plus reusable like, history, and post transformations.
-- `utils/01_get_data/stage_get_data.py`: unregistered legacy Stage 1 retained while downstream stages still consume its artifacts.
-- `utils/02_user_history/stage_generate_user_history.py`: unregistered legacy Stage 2 retained for pinned legacy training artifacts.
+- `engagement_prediction/data/source_metadata.py`: canonical root/reply normalization, deduplication, precedence, and URI partitioning.
+- `engagement_prediction/data/datasets.py`: native bucketed dataset and sampler for the Stage 7 contract.
+- `engagement_prediction/data/`: Parquet loading plus reusable like, history, post, and hydration transformations.
+- `utils/01_get_data/stage_get_data.py`: unregistered legacy Stage 1 source retained for reference only.
+- `utils/02_user_history/stage_generate_user_history.py`: unregistered legacy Stage 2 source retained for reference only.
 - `utils/03_train/stage_train_mlp.py`: legacy MLP matrix ranker.
 - `utils/03_train/stage_train_two_tower.py`: legacy two-tower matrix ranker.
-- `utils/03_train/stage_train_bst_ranker.py`: legacy BST heavy ranker.
+- `utils/03_train/stage_train_bst_ranker.py`: unregistered legacy BST implementation retained for old-checkpoint compatibility.
 - `utils/04_evaluate/stage_evaluate.py`: legacy holdout evaluation from compact ranking-row artifacts.
 - `utils/dataloaders.py`: bucketed listwise datasets, samplers, and shared user encoders.
-- `utils/matrix_ranking.py`: shared matrix ranking metrics, final metric logging, and ranking-row writers.
 - `utils/ranking_adapters.py`: `.pth` checkpoint adapters for compare-rankers.
 - `engagement_prediction/pipeline/{core.py,dependencies.py,registry.py}`: artifact directories, lineage, dependency resolution, and stage registry.
 
@@ -68,13 +83,13 @@ Tests use the `*_test.py` naming convention and live next to the code they cover
 The CLI merges defaults, an optional YAML/JSON config, and explicit command-line flags. CLI flags win over config values.
 
 ```bash
-python cli.py --config config.yml --stop-after post_selection
+python cli.py --config config.yml --model-type bst-ranker --stop-after train_bst_ranker
 ```
 
 For foreground local iteration:
 
 ```bash
-python cli.py --config config.yml --stop-after post_selection --background false --experiment-tracker none
+python cli.py --config config.yml --model-type bst-ranker --stop-after train_bst_ranker --background false --experiment-tracker none
 ```
 
 ### Output Layout
@@ -86,9 +101,24 @@ By default, outputs are written under `outputs/` in two coordinated views:
 
 Each stage writes `manifest.json`, `resolved_config.json`, `stage.log`, and `stage_info.txt` when it completes.
 
+### Stage 00: Source Metadata
+
+Stage 00 owns the exact `bsky_posts` and `bsky_replies` snapshots for the common half-open `[posts_start, posts_end)` source window. It normalizes narrow metadata, deduplicates each source by URI using latest creation time and ascending-author tie-breaking, applies root precedence to cross-source collisions, and publishes stable URI-hash partitions.
+
+Common config:
+
+```yaml
+gcs_bucket: "greenearth-471522-ingex-extract-prod"
+posts_start: "2026-06-20T00:00:00Z"
+posts_end: "2026-06-24T00:00:00Z"
+source_metadata_partition_count: 16
+```
+
+The atomic `source_metadata_*` bundle contains `post_metadata/` with `subject_uri`, UTC `post_created_at`, `author_did`, and `is_reply`, plus exact `post_sources_*.json` and `reply_sources_*.json` manifests. Each URI appears exactly once. Stages 1, 3, and 6 read this index instead of rescanning raw metadata; Stage 7 reuses the manifests to find embedding payloads in the authoritative raw files.
+
 ### Stage 1: Query Selection
 
-Stage 1 reads Ingex likes and posts from GCS and writes production-shaped user-hour queries plus positive posts found in the selected `bsky_posts` snapshot.
+Stage 1 reads Ingex likes and writes production-shaped user-hour queries plus positives found among Stage 00 canonical root rows. It does not list or scan raw posts or replies.
 
 Common config keys:
 
@@ -105,7 +135,7 @@ max_hours_per_user_per_split: 64
 max_train_query_hours: null
 max_eval_query_hours_per_split: null
 max_positives_per_user_hour: 32
-post_selection_partition_count: 256
+source_metadata_partition_count: 16
 random_seed: 42
 ```
 
@@ -115,11 +145,11 @@ Important Stage 1 behavior:
 - Seen users produce `train`, `val`, and `holdout_seen_users` queries. Unseen users produce only `val_unseen_users` and `holdout_unseen_users` queries.
 - Query-hours are hash-sampled independently of their positive counts. Each user contributes at most 64 query-hours per split by default.
 - Training and each evaluation split can be capped directly with query-hour budgets. The global caps default to no limit for the first slice.
-- Sampling caps are applied provisionally using all valid likes. Stage 1 then deduplicates positives within each selected user-hour and retains only URIs present in valid `bsky_posts` rows.
+- Sampling caps are applied provisionally using all valid likes. Stage 1 then deduplicates positives within each selected user-hour and retains only URIs present as roots in Stage 00.
 - Positive counts are recomputed after post filtering. Selected hours with no retained positives or more than 32 retained positives are discarded without backfill; an hour with exactly 32 is retained.
 - There is no minimum-likes eligibility filter.
 
-Primary artifacts are `queries_*.parquet`, keyed by `(did, query_hour)`, and `query_positives_*.parquet`, keyed by `(did, query_hour, subject_uri)`. Stage 1 records the exact Ingex like-file snapshot in `like_sources_*.json` for Stage 2 and the exact membership-check post snapshot in `post_sources_*.json`. Both snapshots use the common half-open `[posts_start, posts_end)` source window.
+Primary artifacts are `queries_*.parquet`, keyed by `(did, query_hour)`, and `query_positives_*.parquet`, keyed by `(did, query_hour, subject_uri)`. Stage 1 records the exact Ingex like-file snapshot in `like_sources_*.json`; root/reply snapshot ownership remains with Stage 00. All snapshots use the common half-open `[posts_start, posts_end)` source window.
 
 All source and split boundaries must be UTC and hour-aligned. `posts_start <= train_start < val_start`, and the validation and optional holdout boundaries must remain ordered and fall within the source window. Likes at `posts_start` are available for later history construction, while only likes at or after `train_start` can become targets. Likes and post rows at `posts_end` are excluded. Setting `posts_start == train_start` is valid, but provides no pre-training history warm-up; production datasets should normally use `posts_start < train_start`.
 
@@ -132,9 +162,9 @@ The history artifact includes:
 - `history_subject_uris`: prior liked post URIs, sorted most-recent first.
 - `history_like_created_ats`: aligned UTC like timestamps.
 
-Every Stage 1 query has exactly one row, including explicit empty histories. Only likes strictly before the start of `query_hour` are eligible. Histories use all valid source likes from queried users, not only selected target likes, and preserve duplicate source events.
+Every Stage 1 query has exactly one row, including explicit empty histories. Only likes strictly before the start of `query_hour` are eligible. Histories use all valid source likes from queried users, not only selected target likes. Exact duplicate `(did, subject_uri, like_created_at)` source events are collapsed within each user partition before the as-of cutoff and history cap; re-likes at different timestamps remain distinct.
 
-Stage 2 also publishes the partitioned `history_post_uris_*` dataset. It contains one globally unique, non-null `subject_uri` for every post retained in at least one query history. Duplicate source events remain duplicated in `query_histories_*`; only this compact metadata-lookup artifact is deduplicated.
+Stage 2 also publishes the partitioned `history_post_uris_*` dataset. It contains one globally unique, non-null `subject_uri` for every post retained in at least one query history.
 
 Common config:
 
@@ -143,19 +173,16 @@ max_history_posts_per_query: 64
 user_history_partition_count: 256
 ```
 
-The source history window begins at `posts_start`, using the exact Stage 1 `like_sources_*.json` snapshot. Set `posts_start` earlier than `train_start` when training queries need a warm-up period. Stage 2 performs no post or reply lookup: unresolved URIs and duplicate raw events remain in its aligned lists for Stage 3 to resolve later.
+The source history window begins at `posts_start`, using the exact Stage 1 `like_sources_*.json` snapshot. Set `posts_start` earlier than `train_start` when training queries need a warm-up period. Stage 2 performs no post or reply lookup: unresolved URIs remain in its aligned lists for Stage 3 to resolve later.
 
 ### Stage 3: Post Selection
 
-Stage 3 combines unique Stage 1 positive URIs with Stage 2 `history_post_uris_*`, then resolves them against root posts and replies from the common source window. It reuses Stage 1's exact root-post snapshot and records an exact `bsky_replies` snapshot. Required posts are retained whenever metadata exists, independently of candidate sampling.
+Stage 3 combines unique Stage 1 positive URIs with Stage 2 `history_post_uris_*`, then resolves them directly against Stage 00 canonical metadata. Required posts are retained whenever metadata exists, independently of candidate sampling. Stage 3 does not list, scan, normalize, or repartition raw roots and replies.
 
 Common config:
 
 ```yaml
-posts_start: "2026-06-20T00:00:00Z"
-posts_end: "2026-06-24T00:00:00Z"
 random_candidate_sampling_fraction: 0.10
-post_selection_partition_count: 256
 ```
 
 The random reservoir uses a stable URI hash and is approximate rather than exactly sized. Candidates are drawn only from root posts. Replies can enter the universe only when required by at least one retained history; they never become positive labels or candidate posts. If a URI occurs in both source types, root metadata takes precedence. Missing or reply-only positives fail the stage, while unresolved history URIs are reported without rewriting Stage 2 history lists.
@@ -167,17 +194,111 @@ Stage 3 atomically publishes `post_universe_*`, containing separate partitioned 
 - `candidate_sources/`: unique `random` reservoir memberships.
 - `missing_required_posts/`: required URIs for which valid post metadata was not found.
 
-Exact `bsky_posts` and `bsky_replies` source-file manifests are stored in the same bundle. Popularity, post-liker histories, query-specific negative selection, and non-model feed-policy rules are deferred to later work.
+Exact Stage 00 `bsky_posts` and `bsky_replies` source-file manifests are copied into the same bundle for self-contained provenance. Post-liker histories and non-model feed-policy rules are deferred to later work.
 
-### Legacy Training
+### Stage 4: Popularity-Aware Negative Selection
 
-The unchanged training stages still use legacy `01_get_data` and legacy `02_user_history` artifacts. They do not yet consume `queries_*` or `query_histories_*`.
-The legacy ranker history contract includes `prior_like_age_hours_at_bucket_start`, embedding indices, author indices, and target-hour popularity lists.
+Stage 4 uses the unique root posts in Stage 3 `candidate_sources/` as its bounded reservoir and constructs one shared negative pool for each distinct Stage 1 query hour. It reuses Stage 1's exact like-file snapshot rather than relisting Ingex data.
+
+Common config:
+
+```yaml
+negative_candidates_per_hour: 1000
+min_likes_for_popular_candidate: 10
+popular_candidate_fraction: 0.50
+max_candidate_age_hours: 24
+```
+
+For each candidate and query hour, `prior_like_count` counts valid raw like rows strictly before the start of that hour. Likes at the boundary and future likes are excluded, duplicate source rows count independently, and posts without prior likes receive zero. A post is eligible in its UTC creation-hour bucket and the following 23 buckets by default.
+
+Stage 4 first selects the desired popular quota from posts with at least the configured number of prior likes. It then selects uniformly from every remaining eligible post until the hour reaches its target. The random method may therefore select another post that also meets the popularity threshold. Both methods use stable, source-specific hash ranks, and hours with fewer eligible posts report a shortfall rather than sampling with replacement.
+
+The atomically published `negative_candidates_*` bundle contains:
+
+- `hourly_candidates/`: unique `(query_hour, subject_uri)` rows with `selection_source` and `prior_like_count`.
+- `negative_post_uris/`: the globally unique selected post URIs needed by later enrichment.
+- `like_sources_*.json`: the exact Stage 1 source snapshot used for popularity.
+
+The full candidate-hour popularity matrix is internal staging and is removed after successful publication. These pools are shared across users; later model-ready assembly must treat a user's known positive as positive and omit it from that user's negatives.
+
+### Stage 5: Post-Liker History
+
+Stage 5 constructs the exact selected post universe from resolved Stage 3 positive/history requirements plus Stage 4 final negatives. Unresolved histories and Stage 3 reservoir posts that were not selected as negatives are excluded.
+
+Common config:
+
+```yaml
+post_liker_history_partition_count: 32
+```
+
+Stage 5 reuses the exact Stage 1 `bsky_likes` snapshot copied into Stage 4; it never relists Ingex files. It scans every valid like in the common source window and retains matching events from all users, independently of query, cohort, target, and user-history sampling. Duplicate source rows remain separate events, and no extraction-time event cap is applied.
+
+The atomically published `post_liker_histories_*` bundle contains:
+
+- `post_liker_events/`: `subject_uri`, raw `liker_did`, and UTC `like_created_at` event rows.
+- `post_liker_posts/`: one row per selected post with positive/history/negative role flags, exact event count, and nullable first/last event timestamps.
+- `like_sources_*.json`: the exact Stage 1 source snapshot used for extraction.
+
+Later model-ready assembly will enforce `like_created_at < query_hour`, take the most recent configured replay cap, map raw DIDs through a training-supported PAD/UNK vocabulary, and calculate a time-decayed pooled liker embedding. Keeping Stage 5 complete and query-independent allows replay caps and decay settings to change without rescanning Ingex.
+
+### Stage 6: Author Statistics
+
+Stage 6 builds descriptive statistics from all Stage 00 canonical roots/replies and raw received-like events in the half-open `[posts_start, val_start)` window. This includes pre-training warm-up activity but excludes validation and holdout activity. It reads the full Stage 00 metadata index and the exact Stage 1 like snapshot without rescanning raw metadata or restricting itself to sampled Stage 3 posts or Stage 5 selected-post events.
+
+Common config:
+
+```yaml
+author_statistics_partition_count: 32
+```
+
+Stage 00 has already applied metadata deduplication and root precedence. Stage 6 filters those canonical rows to the support window, while every matching raw like row counts independently. Every in-window author is published; Stage 6 does not decide which authors receive embedding rows.
+
+The atomically published `author_statistics_*` bundle contains:
+
+- `author_statistics/`: one row per author with root/reply post counts, raw received-like counts, liked-post count, mean/median/maximum likes per post, and authored-record timestamp bounds.
+- `post_sources_*.json`, `reply_sources_*.json`, and `like_sources_*.json`: the exact aligned source snapshots used by the stage.
+
+These full-support-window statistics are model-independent and remain joinable by `author_did`. They must not be joined directly as query-time model features because an early training query would see later training activity; future author features need as-of construction.
+
+### Stage 7: Dataset Hydration
+
+Stage 7 validates the complete Stage 00-6 lineage and reuses Stage 00's exact post/reply snapshots plus the recorded like snapshot without relisting Ingex. It hydrates exactly the Stage 5 selected universe: positives, resolved histories, and final Stage 4 negatives. For each URI it selects the latest source row containing a finite configured-model embedding of the expected dimension while preserving Stage 3's authoritative creation time, author, and root/reply metadata. An older duplicate source row may supply the embedding when the newer canonical metadata row has no valid configured-model payload.
+
+Stage 7 loads the narrow selected-URI lookup once, then scans raw post and reply files in bounded batches controlled by `embedding_source_batch_size` (default `64`). Each batch first discovers files and URIs without reading embedding payloads, then stream-writes only selected payload rows into URI partitions. The final memmap is still assembled one URI partition at a time.
+
+After missing-embedding filtering and zero-positive query attrition, Stage 7 counts final training-feature exposure by author. Each retained training positive relation, retained history event, and hourly negative row counts once; validation and holdout rows never contribute. Authors with at least `min_author_training_feature_count` occurrences (default `50`) receive deterministic dense indices starting at 2. All remaining authors map to `1=UNK`, while `0=PAD` remains reserved.
+
+The atomically published `hydrated_training_data_*` bundle contains:
+
+- `embeddings.npy`: an exact-sized `Float32[N, embedding_dim]` NumPy memmap.
+- `posts/`: the dense embedding index, creation metadata, PAD/UNK-aware author index, and selected-post role flags for each hydrated URI.
+- `queries/` and `query_positives/`: surviving Stage 1 queries and their hydrated positive labels.
+- `query_histories/`: aligned URI, like-time, embedding-index, author-index, and as-of-like-count lists.
+- `hourly_negative_candidates/`: hydrated Stage 4 candidates and their selection source.
+- `authors/`: the Stage 7 vocabulary with dense `author_idx` plus total and positive/history/negative training-feature counts.
+- exact copied `post_sources_*`, `reply_sources_*`, and `like_sources_*` manifests.
+
+Rows without a valid embedding are removed without backfilling. Their individual history events and negative candidates disappear; positive labels disappear individually, and only queries left with no positive are dropped. Popularity is recomputed from all Stage 5 raw liker events with the strict `like_created_at < query_hour` rule. Stage 4 negative counts must agree exactly.
+
+`engagement_prediction.data.datasets.HydratedBucketedEngagementDataset` consumes this bundle directly. It opens the memmap read-only, batches queries sharing one hour, unions the users' positives with the shared hourly negatives, deduplicates candidates by URI, and emits padded history vectors, author indices, relative ages, as-of popularity, candidate features, IDs, and the user-by-candidate label matrix. It does not construct legacy `likes_core`, `posts_core`, or `history_posts` frames.
+
+Rerun Stage 7 directly with an aligned Stage 6 artifact:
+
+```bash
+python cli.py --config config.yml \
+  --start-from dataset_hydration \
+  --stop-after dataset_hydration \
+  --prior-06-author-statistics 20260816_120000_a7b8c9d0
+```
+
+### Stage 8: Native BST Training
+
+Stage 8 consumes `HydratedBucketedEngagementDataset` directly. It trains on `train`, validates on `val`, and selects checkpoints using unseen-user validation NDCG from `val_unseen_users`. Training batches shuffle user-hours and resample their bounded negative pool each epoch; validation is deterministic. Holdout splits are not loaded during training. BST training does not compute or report MAP; NDCG is its ranking metric. Each split's random baseline is logged at epoch 0 in the same ClearML metric series as learned epochs 1 and later.
 
 Shared training options:
 
 ```yaml
-model_type: "two-tower" # mlp, two-tower, or bst-ranker
+model_type: "bst-ranker"
 max_history_len: 64
 epochs: 100
 batch_size: 128
@@ -191,51 +312,12 @@ dataloader_prefetch_factor: 1
 dataloader_persistent_workers: false
 ```
 
-#### MLP
-
-The MLP path scores the full user-by-candidate matrix for each hour bucket. It supports `summarized`, `full_transformer`, and `cross_attention` user encoders.
-
-```bash
-python cli.py --model-type mlp --user-encoder summarized --stop-after train
-```
-
-Useful options:
-
-- `--hidden-dims`
-- `--dropout-rate-mlp`
-- `--user-summarization mean|ema|linear_recency`
-- `--ema-alpha`
-
-#### Two-Tower
-
-The two-tower path independently encodes users and candidate posts, then scores with a dot product over the shared embedding space. It supports `full_transformer` and `cross_attention` user encoders.
-
-```bash
-python cli.py --model-type two-tower --user-encoder cross_attention --stop-after train
-```
-
-Useful options:
-
-- `--shared-dim`
-- `--user-hidden-dim`
-- `--post-hidden-dim`
-- `--num-attention-heads`
-- `--num-attention-layers`
-- `--l2-normalize-embeddings`
-- `--similarity-temperature`
-- `--use-author-embedding-table`
-
-Two-tower training writes checkpoint files, `training_config.json`, `training_results.json`, TorchScript tower artifacts, a serving manifest, and holdout ranking rows under `eval/`.
-
-#### BST Ranker
-
-The BST ranker fuses content embeddings, author embeddings, time-delta buckets, and a candidate-aware transformer. It currently requires author embeddings.
+The BST ranker always fuses content embeddings, Stage 7 author indices, time-delta buckets, optional as-of popularity, and a candidate-aware transformer. The legacy `use_author_embedding_table` switch does not disable authors for this model.
 
 ```bash
 python cli.py --model-type bst-ranker \
-  --use-author-embedding-table \
   --prediction-hidden-dims 64 32 16 \
-  --stop-after train
+  --stop-after train_bst_ranker
 ```
 
 BST training uses matrix ranking over same-hour candidate sets with additional sampled negatives. It requires `bst_num_transformer_layers: 1` because it uses the optimized one-layer matrix scorer.
@@ -256,7 +338,11 @@ Useful options:
 - `--bst-use-popularity-feature` / `--no-bst-use-popularity-feature`
 - `--bst-popularity-projection-dim`
 
-Current branch note: BST training writes train/validation metrics and checkpoints, but legacy evaluation expects holdout ranking-row artifacts. Until BST holdout ranking rows are wired in, use `--stop-after train` for BST runs and compare checkpoints with `compare-rankers`.
+Popularity normalization is fit once from training-only model inputs. Retained history events keep their multiplicity; positive and negative candidates are deduplicated by `(query_hour, subject_uri)`. Stage 8 stores the fitted `log1p` mean/std and observation counts in JSON and in the checkpoint.
+
+The `08_train_bst_ranker/<stage_run_id>/` artifact contains `checkpoints/bst_ranker_best.pth`, `model_config.json`, `training_config.json`, `popularity_stats.json`, `training_results.json`, an exact copy of `authors/`, and an optional training-history plot. The checkpoint is attached to ClearML as an ordinary artifact; Stage 8 does not publish an OutputModel, TorchScript file, or serving manifest. `--no-save-model` and `--no-plots` remain supported.
+
+MLP and two-tower training remain blocked until they consume Stage 7 natively.
 
 ### Legacy Evaluation
 
@@ -267,13 +353,7 @@ Legacy evaluation consumes holdout ranking rows from legacy training:
 03_train/<stage_run_id>/eval/holdout_seen_users_ranking_rows.parquet
 ```
 
-Run the full pipeline for MLP or two-tower:
-
-```bash
-python cli.py --model-type two-tower --user-encoder cross_attention
-```
-
-Or evaluate a pinned training output:
+Evaluate an existing pinned training output:
 
 ```bash
 python cli.py --start-from evaluate --prior-03-train 20260620_120000_train_two_tower
@@ -287,40 +367,20 @@ Useful options:
 
 ## Compare Rankers
 
-`compare-rankers` evaluates saved `.pth` checkpoints on shared bucketed candidate sets without rerunning training.
-
-```bash
-python cli.py compare-rankers \
-  --output-dir /mnt/data/dave/outputs \
-  --prior-01-get-data 20260617_205310_fec862c8 \
-  --prior-02-user-history 20260618_095653_14c6b8fc \
-  --model tt:two-tower:/path/to/two_tower.pth \
-  --model bst:bst-ranker:/path/to/bst_ranker.pth \
-  --splits val val_unseen_users holdout_unseen_users \
-  --metrics-top-ks 30 \
-  --batch-size 256 \
-  --device cuda
-```
-
-Compare outputs are written under `artifacts/compare_rankers/<stage_run_id>/`:
-
-- `metrics.json`
-- `metrics.csv`
-- `model_specs.json`
-- `stage_info.txt`
-- `stage.log`
-
-Current compare-rankers assumptions:
-
-- Model specs use `name:type:path`.
-- Supported types are `two-tower` and `bst-ranker`.
-- Compared checkpoints must use author embeddings.
-- If compared checkpoints use different `max_history_len` values, pass `--max-history-len` to choose the evaluation history length.
-- BST checkpoints are scored with the optimized one-layer matrix scorer.
+`compare-rankers` is temporarily unavailable because its legacy Stage 1/2 input path has been retired and it has not yet been rewired to Stage 7. Its checkpoint-backed implementation remains in the repository for that subsequent integration.
 
 ## Selective Reruns And Prior Pins
 
 Use `--start-from`, `--stop-after`, and prior pins to reuse artifacts:
+
+```bash
+python cli.py --config config.yml \
+  --start-from query_selection \
+  --stop-after query_selection \
+  --prior-00-source-metadata 20260810_120000_00112233
+```
+
+Stage 1 validates that the pinned Stage 00 bucket and source window match its configuration. All rewritten downstream stages require Stage 00 lineage; artifacts created before Stage 00 was introduced must be regenerated.
 
 ```bash
 python cli.py --config config.yml \
@@ -338,23 +398,74 @@ python cli.py --config config.yml \
   --prior-02-user-history 20260812_120000_d4c3b2a1
 ```
 
-The Stage 2 manifest supplies and validates the aligned `01_query_selection` ancestor.
+The Stage 2 manifest supplies and validates the aligned Stage 00 and Stage 1 ancestors.
 
-Direct legacy training requires both aligned legacy pins:
+Rerun Stage 4 directly from an existing Stage 3 artifact:
 
 ```bash
 python cli.py --config config.yml \
-  --start-from train \
-  --stop-after train \
-  --prior-01-get-data 20260617_205310_fec862c8 \
-  --prior-02-user-history 20260618_095653_14c6b8fc
+  --start-from negative_selection \
+  --stop-after negative_selection \
+  --prior-03-post-selection 20260813_120000_c3d4e5f6
 ```
+
+The Stage 3 manifest supplies and validates the aligned Stage 00 through Stage 2 ancestors.
+
+Rerun Stage 5 directly from an existing Stage 4 artifact:
+
+```bash
+python cli.py --config config.yml \
+  --start-from post_liker_history \
+  --stop-after post_liker_history \
+  --prior-04-negative-selection 20260814_120000_e5f6a7b8
+```
+
+The Stage 4 manifest supplies and validates the aligned Stage 00 through Stage 3 ancestors.
+
+Rerun Stage 6 directly from an existing Stage 5 artifact:
+
+```bash
+python cli.py --config config.yml \
+  --start-from author_statistics \
+  --stop-after author_statistics \
+  --prior-05-post-liker-history 20260815_120000_f6a7b8c9
+```
+
+The Stage 5 manifest supplies and validates the aligned Stage 00 through Stage 4 ancestors.
+
+Rerun Stage 7 directly from an existing Stage 6 artifact:
+
+```bash
+python cli.py --config config.yml \
+  --start-from dataset_hydration \
+  --stop-after dataset_hydration \
+  --prior-06-author-statistics 20260816_120000_a7b8c9d0
+```
+
+The Stage 6 manifest supplies and validates the aligned Stage 00 through Stage 5 ancestors.
+
+Rerun Stage 8 directly from an aligned Stage 7 artifact:
+
+```bash
+python cli.py --config config.yml \
+  --model-type bst-ranker \
+  --start-from train_bst_ranker \
+  --stop-after train_bst_ranker \
+  --prior-07-dataset-hydration 20260817_120000_b8c9d0e1
+```
+
+The Stage 7 manifest supplies and validates the complete Stage 00 through Stage 6 ancestry.
 
 Accepted stage aliases:
 
+- `source_metadata`
 - `query_selection`
 - `user_history`
 - `post_selection`
+- `negative_selection`
+- `post_liker_history`
+- `author_statistics`
+- `dataset_hydration`
 - `train`, `train_mlp`, `train_two_tower`, `train_bst_ranker`
 - `evaluate`
 
@@ -367,13 +478,13 @@ By default, `config.yml` may set `background: true`. In background mode, the CLI
 Run in the foreground while iterating:
 
 ```bash
-python cli.py --config config.yml --stop-after post_selection --background false
+python cli.py --config config.yml --model-type bst-ranker --stop-after train_bst_ranker --background false
 ```
 
 ## Development Notes
 
-- Treat `03_post_selection` as the explicit new-pipeline boundary until later data stages and training are rewritten for its artifact contract.
-- Use `utils/matrix_ranking.py` for matrix ranking metrics and ranking-row writes.
+- Treat `08_train_bst_ranker` as the explicit new-pipeline boundary until native evaluation is connected.
+- Use `engagement_prediction/training/ranking.py` for matrix ranking metrics and ranking-row writes.
 - Use `utils/ranking_adapters.py` when adding checkpoint-backed comparison support.
 - Avoid adding new training paths without registering them in `engagement_prediction/pipeline/registry.py` and documenting their artifact contract here.
 

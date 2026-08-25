@@ -1,19 +1,12 @@
 """Tests for the BST heavy ranker model components."""
-import importlib
 
 import pytest
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
 
 
-stage_train_bst_ranker = importlib.import_module("utils.03_train.stage_train_bst_ranker")
-BSTRanker = stage_train_bst_ranker.BSTRanker
-LinearPredictionHead = stage_train_bst_ranker.LinearPredictionHead
-ProjectedPostFeatureEncoder = stage_train_bst_ranker.ProjectedPostFeatureEncoder
-_compute_bst_listwise_loss_and_preds = stage_train_bst_ranker._compute_bst_listwise_loss_and_preds
-run_bst_listwise_epoch = stage_train_bst_ranker.run_bst_listwise_epoch
-train_bst_ranker_model = stage_train_bst_ranker.train_bst_ranker_model
+from engagement_prediction.models.bst_ranker import BSTRanker
+from engagement_prediction.models.common import LinearPredictionHead, ProjectedPostFeatureEncoder
 
 DEFAULT_TIME_DELTA_BUCKET_BOUNDARIES_HOURS = [1.0, 3.0, 6.0, 12.0, 24.0, 72.0, 168.0, 720.0, 2160.0]
 
@@ -125,38 +118,22 @@ def _expected_matrix_scores(model: BSTRanker, batch: dict[str, torch.Tensor]) ->
     return model(**kwargs).reshape(num_users, num_candidates)
 
 
-def _listwise_batch() -> dict[str, torch.Tensor]:
+def _mixed_zero_history_batch() -> dict[str, torch.Tensor]:
+    batch = {key: value.clone() for key, value in _batch().items()}
+    batch["history_mask"][1] = False
+    return batch
+
+
+def _empty_history_batch() -> dict[str, torch.Tensor]:
     batch = _batch()
+    num_users = batch["history_embeddings"].shape[0]
     return {
         **batch,
-        "label_matrix": torch.tensor([[1.0, 0.0], [1.0, 1.0]], dtype=torch.float32),
+        "history_embeddings": torch.empty((num_users, 0, 4), dtype=torch.float32),
+        "history_mask": torch.empty((num_users, 0), dtype=torch.bool),
+        "history_time_deltas_hours": torch.empty((num_users, 0), dtype=torch.float32),
+        "history_author_indices": torch.empty((num_users, 0), dtype=torch.long),
     }
-
-
-class _SingleBatchDataset(Dataset):
-    def __init__(self, batch: dict[str, torch.Tensor]) -> None:
-        self.batch = batch
-
-    def __len__(self) -> int:
-        return 1
-
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        return self.batch
-
-
-class _RecordingTracker:
-    def __init__(self) -> None:
-        self.calls = []
-
-    def log_scalar(self, title: str, series: str, value: float, iteration: int) -> None:
-        self.calls.append(
-            {
-                "title": title,
-                "series": series,
-                "value": value,
-                "iteration": iteration,
-            }
-        )
 
 
 def test_bst_ranker_forward_transformer_shape_and_builtin_transformer_encoder():
@@ -184,6 +161,19 @@ def test_bst_ranker_forward_returns_raw_logits():
     assert logits.dtype == torch.float32
 
 
+def test_bst_ranker_zero_history_rows_use_empty_history_token():
+    model = _make_model()
+    batch = _mixed_zero_history_batch()
+
+    scores = model.score_candidate_matrix_one_layer(**batch)
+    scores.sum().backward()
+
+    assert torch.isfinite(scores).all()
+    assert model.empty_history_token.grad is not None
+    assert torch.isfinite(model.empty_history_token.grad).all()
+    assert model.empty_history_token.grad.abs().sum() > 0
+
+
 @pytest.mark.parametrize("norm_first", [False, True])
 def test_bst_ranker_score_candidate_matrix_one_layer_matches_repeated_path(norm_first):
     model = _make_model(norm_first=norm_first)
@@ -195,6 +185,19 @@ def test_bst_ranker_score_candidate_matrix_one_layer_matches_repeated_path(norm_
         scores = model.score_candidate_matrix_one_layer(**batch)
 
     assert scores.shape == (2, 2)
+    torch.testing.assert_close(scores, expected, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("norm_first", [False, True])
+def test_bst_ranker_zero_history_matrix_scorer_matches_repeated_path(norm_first):
+    model = _make_model(norm_first=norm_first)
+    model.eval()
+    batch = _mixed_zero_history_batch()
+
+    with torch.inference_mode():
+        expected = _expected_matrix_scores(model, batch)
+        scores = model.score_candidate_matrix_one_layer(**batch)
+
     torch.testing.assert_close(scores, expected, atol=1e-6, rtol=1e-6)
 
 
@@ -377,6 +380,26 @@ def test_bst_ranker_supports_candidate_only_sequence_with_zero_delta_bucket():
     assert output.shape == (2,)
 
 
+def test_bst_ranker_score_candidate_matrix_supports_zero_length_history():
+    model = _make_model()
+    model.eval()
+    batch = _empty_history_batch()
+
+    with torch.inference_mode():
+        expected = _expected_matrix_scores(model, batch)
+        scores = model.score_candidate_matrix(
+            batch["history_embeddings"],
+            batch["history_mask"],
+            batch["history_time_deltas_hours"],
+            batch["candidate_post_embeddings"],
+            batch["history_author_indices"],
+            batch["candidate_post_author_idx"],
+        )
+
+    assert torch.isfinite(scores).all()
+    torch.testing.assert_close(scores, expected, atol=1e-6, rtol=1e-6)
+
+
 def test_bst_ranker_gradients_flow_through_post_time_transformer_and_head_parameters():
     model = _make_model()
     batch = _batch()
@@ -471,6 +494,38 @@ def test_bst_ranker_torchscript_exports_matrix_scorer():
     torch.testing.assert_close(scripted_scores, expected, atol=1e-5, rtol=1e-5)
 
 
+def test_bst_ranker_torchscript_save_load_preserves_zero_history_paths(tmp_path):
+    model = _make_model().eval()
+    batch = _mixed_zero_history_batch()
+    model_path = tmp_path / "ranker.pt"
+
+    with torch.inference_mode():
+        eager_output = model(**batch)
+        eager_scores = model.score_candidate_matrix_one_layer(**batch)
+        scripted_model = torch.jit.script(model)
+        scripted_model.save(str(model_path))
+        loaded_model = torch.jit.load(str(model_path)).eval()
+        loaded_output = loaded_model(
+            batch["history_embeddings"],
+            batch["history_mask"],
+            batch["history_time_deltas_hours"],
+            batch["candidate_post_embeddings"],
+            batch["history_author_indices"],
+            batch["candidate_post_author_idx"],
+        )
+        loaded_scores = loaded_model.score_candidate_matrix(
+            batch["history_embeddings"],
+            batch["history_mask"],
+            batch["history_time_deltas_hours"],
+            batch["candidate_post_embeddings"],
+            batch["history_author_indices"],
+            batch["candidate_post_author_idx"],
+        )
+
+    torch.testing.assert_close(loaded_output, eager_output, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(loaded_scores, eager_scores, atol=1e-5, rtol=1e-5)
+
+
 def test_bst_ranker_torchscript_supports_popularity_features():
     model = _make_model(use_popularity_feature=True).eval()
     batch = _batch_with_popularity()
@@ -521,160 +576,3 @@ def test_bst_ranker_rejects_invalid_prediction_head_output_shape():
 
     with pytest.raises(RuntimeError, match="prediction_head"):
         model(**batch)
-
-
-def test_compute_bst_listwise_loss_and_preds_returns_finite_multi_positive_loss_and_gradients():
-    model = _make_model()
-    batch = _listwise_batch()
-
-    loss, scores, labels = _compute_bst_listwise_loss_and_preds(model, batch, "cpu")
-    loss.backward()
-
-    assert loss.shape == ()
-    assert torch.isfinite(loss)
-    assert scores.shape == (2, 2)
-    assert labels.tolist() == [[1.0, 0.0], [1.0, 1.0]]
-    grad_sum = sum(
-        param.grad.abs().sum()
-        for param in model.parameters()
-        if param.grad is not None
-    )
-    assert grad_sum > 0
-
-
-def test_run_bst_listwise_epoch_computes_rank_metrics():
-    model = _make_model()
-    model.eval()
-    loader = DataLoader(_SingleBatchDataset(_listwise_batch()), batch_size=None, shuffle=False)
-
-    loss, metrics, baseline_metrics = run_bst_listwise_epoch(
-        train=False,
-        split_name="Validation",
-        model=model,
-        device="cpu",
-        dataloader=loader,
-        optimizer=None,
-        disable_progress=True,
-        gradient_clip_max_norm=1.0,
-        metrics_top_ks=[1, 2],
-        calc_baseline_metrics=True,
-    )
-
-    assert loss >= 0.0
-    assert metrics["loss"] == loss
-    assert metrics["rank_metric_user_count"] == 2
-    for metric_name in ("ndcg@1", "recall@1", "ndcg@2", "recall@2", "mean_average_precision"):
-        assert metric_name in metrics
-        assert 0.0 <= metrics[metric_name] <= 1.0
-    assert baseline_metrics["ndcg@1"] == pytest.approx(0.75)
-    assert baseline_metrics["recall@1"] == pytest.approx(0.5)
-    assert baseline_metrics["ndcg@2"] == pytest.approx(0.9077324383928644)
-    assert baseline_metrics["recall@2"] == pytest.approx(1.0)
-
-
-def test_run_bst_listwise_epoch_reports_zero_history_metrics():
-    model = _make_model()
-    model.eval()
-    batch = {
-        key: value.clone() if isinstance(value, torch.Tensor) else value
-        for key, value in _listwise_batch().items()
-    }
-    batch["history_mask"][1] = False
-    loader = DataLoader(_SingleBatchDataset(batch), batch_size=None, shuffle=False)
-
-    _, metrics, _ = run_bst_listwise_epoch(
-        train=False,
-        split_name="Validation",
-        model=model,
-        device="cpu",
-        dataloader=loader,
-        optimizer=None,
-        disable_progress=True,
-        gradient_clip_max_norm=1.0,
-        metrics_top_ks=[1, 2],
-        calc_baseline_metrics=False,
-    )
-
-    assert metrics["zero_history_rank_metric_user_count"] == 1
-    assert metrics["zero_history_ndcg@1"] == pytest.approx(1.0)
-    assert metrics["zero_history_recall@1"] == pytest.approx(0.5)
-    assert metrics["zero_history_ndcg@2"] == pytest.approx(1.0)
-    assert metrics["zero_history_recall@2"] == pytest.approx(1.0)
-    assert metrics["zero_history_mean_average_precision"] == pytest.approx(1.0)
-
-
-def test_train_bst_ranker_model_uses_val_unseen_ndcg_for_listwise_primary_metric_and_checkpoint(
-    tmp_path,
-    monkeypatch,
-):
-    torch.manual_seed(0)
-    model = _make_model()
-    loader = DataLoader(_SingleBatchDataset(_listwise_batch()), batch_size=None, shuffle=False)
-    val_unseen_ndcg_values = [0.25, 0.75, 0.5]
-    val_unseen_call_count = 0
-    calc_baseline_metrics_calls = []
-    tracker = _RecordingTracker()
-
-    def fake_run_bst_listwise_epoch(**kwargs):
-        nonlocal val_unseen_call_count
-        calc_baseline_metrics_calls.append(kwargs["calc_baseline_metrics"])
-        split_name = kwargs["split_name"]
-        if split_name == "Validation Unseen Users":
-            ndcg = val_unseen_ndcg_values[val_unseen_call_count]
-            val_unseen_call_count += 1
-        elif split_name == "Validation":
-            ndcg = 0.2
-        else:
-            ndcg = 0.1
-        return (
-            1.0,
-            {
-                "loss": 1.0,
-                "ndcg@1": ndcg,
-                "recall@1": ndcg,
-                "mean_average_precision": ndcg,
-                "rank_metric_user_count": 2,
-            },
-            {
-                "ndcg@1": 0.4,
-                "recall@1": 0.5,
-            },
-        )
-
-    monkeypatch.setattr(stage_train_bst_ranker, "run_bst_listwise_epoch", fake_run_bst_listwise_epoch)
-
-    results = train_bst_ranker_model(
-        model=model,
-        train_loader=loader,
-        val_loader=loader,
-        val_unseen_loader=loader,
-        device="cpu",
-        epochs=3,
-        learning_rate=1e-3,
-        weight_decay=0.0,
-        patience=10,
-        early_stopping_min_delta=0.0,
-        checkpoints_dir=tmp_path,
-        disable_progress=True,
-        lr_scheduler_factor=0.5,
-        lr_scheduler_patience=2,
-        gradient_clip_max_norm=1.0,
-        metrics_top_ks=[1],
-        experiment_tracker=tracker,
-    )
-
-    assert results["primary_metric_name"] == "val_unseen_ndcg@1"
-    assert results["history"]["val_unseen_ndcg@1"] == val_unseen_ndcg_values
-    assert results["best_val_metric"] == 0.75
-    assert (tmp_path / "bst_ranker_best.pth").exists()
-    assert calc_baseline_metrics_calls == [True, True, True, False, False, False, False, False, False]
-    for series in (
-        "Train Baseline NDCG@1",
-        "Validation Baseline NDCG@1",
-        "Validation Unseen Users Baseline NDCG@1",
-        "Train Baseline Recall@1",
-        "Validation Baseline Recall@1",
-        "Validation Unseen Users Baseline Recall@1",
-    ):
-        matching_calls = [call for call in tracker.calls if call["series"] == series]
-        assert [call["iteration"] for call in matching_calls] == [1]

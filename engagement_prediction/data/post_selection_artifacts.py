@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 import logging
 from pathlib import Path
 import time
@@ -10,38 +9,32 @@ from typing import Any, Protocol
 
 import polars as pl
 
-from engagement_prediction.data import ingex
 from engagement_prediction.data import post_selection as post_data
 from engagement_prediction.data.parquet import read_parquet_parts, sink_partitioned_parquet
 
 
 class PostSelectionConfig(Protocol):
-    posts_start: datetime
-    posts_end: datetime
+    """Structural settings required by the Stage 3 artifact helpers."""
+
     random_candidate_sampling_fraction: float
-    post_selection_partition_count: int
     random_seed: int
 
 
 def _write_if_not_empty(df: pl.DataFrame, path: Path) -> None:
+    """Avoid creating arbitrary empty partition files during bounded writes."""
+
     if not df.is_empty():
         df.write_parquet(path, compression="zstd")
 
 
 def _ensure_nonempty_dataset(path: Path, schema: dict[str, pl.DataType]) -> None:
+    """Guarantee a schema-bearing Parquet file for a logically empty dataset."""
+
     if not list(path.rglob("*.parquet")):
         post_data.empty_frame(schema).write_parquet(
             path / "part-00000.parquet",
             compression="zstd",
         )
-
-
-def _merge_numeric_stats(stats: list[dict[str, int]]) -> dict[str, int]:
-    merged: dict[str, int] = {}
-    for values in stats:
-        for key, value in values.items():
-            merged[key] = merged.get(key, 0) + int(value)
-    return merged
 
 
 def materialize_required_rows(
@@ -79,54 +72,16 @@ def materialize_required_rows(
     )
 
 
-def materialize_source_rows(
-    *,
-    post_paths: list[str],
-    reply_paths: list[str],
-    config: PostSelectionConfig,
-    normalized_posts_path: Path,
-    normalized_replies_path: Path,
-    logger: logging.Logger,
-) -> None:
-    """Normalize and URI-partition exact root-post and reply snapshots."""
-    for label, paths, output_path, is_reply in (
-        ("root-post", post_paths, normalized_posts_path, False),
-        ("reply", reply_paths, normalized_replies_path, True),
-    ):
-        started = time.monotonic()
-        logger.info(
-            "Scanning and stream-sinking %s %s source files into URI partitions",
-            f"{len(paths):,}",
-            label,
-        )
-        normalized_lf = post_data.normalize_posts(
-            ingex.scan_parquet_files(paths),
-            posts_start=config.posts_start,
-            posts_end=config.posts_end,
-            is_reply=is_reply,
-        ).with_columns(post_data.post_partition_expr(config.post_selection_partition_count))
-        sink_partitioned_parquet(
-            normalized_lf,
-            output_path=output_path,
-            key="_post_partition",
-        )
-        logger.info(
-            "Finished partitioning %s source rows in %.1fs",
-            label,
-            time.monotonic() - started,
-        )
-
-
 def process_uri_partitions(
     *,
     required_rows_path: Path,
-    normalized_posts_path: Path,
-    normalized_replies_path: Path,
+    post_metadata_path: Path,
     posts_path: Path,
     required_posts_path: Path,
     candidate_sources_path: Path,
     missing_required_posts_path: Path,
     config: PostSelectionConfig,
+    partition_count: int,
     logger: logging.Logger,
 ) -> dict[str, Any]:
     """Resolve, validate, and write one public URI partition at a time."""
@@ -138,8 +93,6 @@ def process_uri_partitions(
     ):
         path.mkdir(parents=True, exist_ok=False)
 
-    root_stats: list[dict[str, int]] = []
-    reply_stats: list[dict[str, int]] = []
     required_counts = {
         "required_post_count": 0,
         "positive_required_post_count": 0,
@@ -165,52 +118,38 @@ def process_uri_partitions(
     processing_started = time.monotonic()
     logger.info(
         "Beginning bounded processing of %s URI partitions",
-        config.post_selection_partition_count,
+        partition_count,
     )
 
-    for partition_id in range(config.post_selection_partition_count):
+    for partition_id in range(partition_count):
         partition_started = time.monotonic()
         logger.info(
             "Processing URI partition %s/%s",
             partition_id + 1,
-            config.post_selection_partition_count,
+            partition_count,
         )
         required_rows_df = read_parquet_parts(
             post_data.partition_parquet_paths(required_rows_path, partition_id),
             empty=post_data.empty_frame(post_data.REQUIRED_POST_SCHEMA),
         )
-        # de-duped required posts [subject_uri, is_positive, is_history]
+        # Collapse multiple positive/history references to one role row.
         required_posts_df = post_data.build_required_posts(required_rows_df)
-        normalized_root_df = read_parquet_parts(
-            post_data.partition_parquet_paths(normalized_posts_path, partition_id),
-            empty=post_data.empty_frame(post_data.NORMALIZED_POST_SCHEMA),
+        metadata_file = post_metadata_path / f"part-{partition_id:05d}.parquet"
+        resolved_posts_df = read_parquet_parts(
+            [metadata_file] if metadata_file.exists() else [],
+            empty=post_data.empty_frame(post_data.POST_SCHEMA),
         )
-        normalized_reply_df = read_parquet_parts(
-            post_data.partition_parquet_paths(normalized_replies_path, partition_id),
-            empty=post_data.empty_frame(post_data.NORMALIZED_POST_SCHEMA),
-        )
-        # de-duped raw posts and replies
-        root_posts_df, partition_root_stats = post_data.select_latest_post_rows(
-            normalized_root_df
-        )
-        reply_posts_df, partition_reply_stats = post_data.select_latest_post_rows(
-            normalized_reply_df
-        )
-        root_stats.append(partition_root_stats)
-        reply_stats.append(partition_reply_stats)
-        # handle posts that are in both root and reply dfs, combine [subject_uri, post_created_at, author_did, is_reply]
-        resolved_posts_df, overlap_count = post_data.resolve_root_and_reply_posts(
-            root_posts_df,
-            reply_posts_df,
-        )
+        root_posts_df = resolved_posts_df.filter(~pl.col("is_reply"))
+        reply_posts_df = resolved_posts_df.filter(pl.col("is_reply"))
 
-        # [subject_uri, post_created_at, author_did, is_reply, is_positive, is_history]
+        # Required rows inherit authoritative metadata. Missing histories are
+        # reported, while missing or reply-only positives violate Stage 1's
+        # root-positive contract and stop publication.
         required_found_with_metadata_df = resolved_posts_df.join(
             required_posts_df,
             on="subject_uri",
             how="inner",
         )
-        # [subject_uri, is_positive, is_history]
         found_required_df = required_found_with_metadata_df.select(
             post_data.REQUIRED_POST_COLUMNS
         )
@@ -236,7 +175,8 @@ def process_uri_partitions(
                 config.random_seed,
             )
         )
-        # [subject_uri, post_created_at, author_did, is_reply]
+        # The public posts table is the union of resolved requirements and the
+        # deterministic random root reservoir; overlapping URIs appear once.
         required_found_posts_df = required_found_with_metadata_df.select(
             post_data.POST_COLUMNS
         )
@@ -256,7 +196,7 @@ def process_uri_partitions(
             candidate_sources_df=candidate_sources_df,
             missing_required_posts_df=missing_required_df,
             partition_id=partition_id,
-            partition_count=config.post_selection_partition_count,
+            partition_count=partition_count,
         )
         _write_if_not_empty(
             posts_df,
@@ -307,7 +247,6 @@ def process_uri_partitions(
                 pl.col("is_history") & pl.col("is_reply")
             ).height
         )
-        required_counts["root_reply_overlap_count"] += overlap_count
         output_counts["post_count"] += posts_df.height
         output_counts["root_post_count"] += posts_df.filter(
             ~pl.col("is_reply")
@@ -319,16 +258,15 @@ def process_uri_partitions(
         output_counts["random_candidate_count"] += candidate_sources_df.height
         logger.info(
             "Resolved URI partition %s/%s in %.1fs: roots=%s replies=%s "
-            "required=%s missing_history=%s random=%s overlaps=%s",
+            "required=%s missing_history=%s random=%s",
             partition_id + 1,
-            config.post_selection_partition_count,
+            partition_count,
             time.monotonic() - partition_started,
             f"{root_posts_df.height:,}",
             f"{reply_posts_df.height:,}",
             f"{required_posts_df.height:,}",
             f"{missing_required_df.height:,}",
             f"{random_posts_df.height:,}",
-            f"{overlap_count:,}",
         )
 
     logger.info(
@@ -343,8 +281,6 @@ def process_uri_partitions(
     ):
         _ensure_nonempty_dataset(path, schema)
     return {
-        "root_source_stats": _merge_numeric_stats(root_stats),
-        "reply_source_stats": _merge_numeric_stats(reply_stats),
         "required_post_stats": required_counts,
         "output_stats": output_counts,
     }

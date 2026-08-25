@@ -196,7 +196,7 @@ def test_compare_rankers_rejects_config(tmp_path):
         cli.cmd_compare_rankers(raw)
 
 
-def test_compare_rankers_evaluates_models_and_writes_metrics(tmp_path, monkeypatch):
+def test_compare_rankers_is_blocked_until_stage7_is_connected(tmp_path, monkeypatch):
     output_root = tmp_path / "outputs"
     artifacts_dir = output_root / "artifacts"
     get_data_dir = _make_stage_output(artifacts_dir, "01_get_data", "20260101_000000_get")
@@ -212,7 +212,7 @@ def test_compare_rankers_evaluates_models_and_writes_metrics(tmp_path, monkeypat
     _write_compare_checkpoint(bst_checkpoint, _compare_checkpoint_config(max_history_len=9))
 
     import utils.dataloaders as dataloaders
-    import utils.matrix_ranking as matrix_ranking
+    import engagement_prediction.training.ranking as matrix_ranking
     import utils.ranking_adapters as ranking_adapters
 
     created_datasets = []
@@ -308,8 +308,6 @@ def test_compare_rankers_evaluates_models_and_writes_metrics(tmp_path, monkeypat
     raw = parser.parse_args([
         "compare-rankers",
         "--output-dir", str(output_root),
-        "--prior-01-get-data", str(get_data_dir),
-        "--prior-02-user-history", str(history_dir),
         "--model", f"tt:two-tower:{two_tower_checkpoint}",
         "--model", f"bst:bst-ranker:{bst_checkpoint}",
         "--splits", "val", "empty",
@@ -321,26 +319,5 @@ def test_compare_rankers_evaluates_models_and_writes_metrics(tmp_path, monkeypat
         "--bst-candidate-chunk-size", "17",
     ])
 
-    assert cli.cmd_compare_rankers(raw) == 0
-
-    assert created_datasets == [
-        {"split": "val", "use_author_embedding_table": True, "use_popularity_feature": False, "max_history_len": 5, "embed_dim": 2},
-        {"split": "empty", "use_author_embedding_table": True, "use_popularity_feature": False, "max_history_len": 5, "embed_dim": 2},
-    ]
-    assert len(eval_calls) == 2
-    assert all(call["device"] == "cpu" for call in eval_calls)
-    assert isinstance(eval_calls[0]["adapter"], FakeTwoTowerAdapter)
-    assert isinstance(eval_calls[1]["adapter"], FakeBstAdapter)
-    assert eval_calls[1]["adapter"].candidate_chunk_size == 17
-
-    compare_dirs = list((artifacts_dir / "compare_rankers").iterdir())
-    assert len(compare_dirs) == 1
-    out_dir = compare_dirs[0]
-    metrics_summary = json.loads((out_dir / "metrics.json").read_text())
-    assert metrics_summary["skipped_splits"] == ["empty"]
-    assert metrics_summary["max_history_len"] == 5
-    assert set(metrics_summary["metrics"].keys()) == {"tt", "bst"}
-    assert set(metrics_summary["metrics"]["tt"].keys()) == {"val"}
-    assert (out_dir / "metrics.csv").read_text().startswith("model_name,model_type,checkpoint_path,split,metric,value\n")
-    assert json.loads((out_dir / "model_specs.json").read_text())[0]["name"] == "tt"
-    assert "stage: compare_rankers" in (out_dir / "stage_info.txt").read_text()
+    with pytest.raises(SystemExit, match="07_dataset_hydration"):
+        cli.cmd_compare_rankers(raw)
