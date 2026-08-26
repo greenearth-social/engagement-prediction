@@ -12,16 +12,22 @@ def test_readme_describes_current_pipeline_and_new_ranker_surface():
     assert "engagement_prediction/stages/author_statistics.py" in readme
     assert "engagement_prediction/stages/dataset_hydration.py" in readme
     assert "engagement_prediction/stages/train_bst_ranker.py" in readme
+    assert "engagement_prediction/stages/train_two_tower.py" in readme
     assert "engagement_prediction/data/datasets.py" in readme
     assert "engagement_prediction/data/ingex.py" in readme
     assert "engagement_prediction/data/source_metadata.py" in readme
     assert "utils/02_user_history/stage_generate_user_history.py" in readme
     assert "engagement_prediction/training/bst_ranker.py" in readme
+    assert "engagement_prediction/training/two_tower.py" in readme
+    assert "engagement_prediction/models/two_tower.py" in readme
     assert "utils/04_evaluate/stage_evaluate.py" in readme
     assert "engagement_prediction/pipeline/{core.py,dependencies.py,registry.py}" in readme
     assert "utils/pipeline/registry.py" not in readme
     assert "compare-rankers" in readme
     assert "--model-type bst-ranker" in readme
+    assert "--model-type two-tower" in readme
+    assert "--output-embedding-dim" in readme
+    assert "08_train_two_tower" in readme
     assert "hourly_candidates/" in readme
     assert "post_metadata/" in readme
     assert "--prior-00-source-metadata" in readme

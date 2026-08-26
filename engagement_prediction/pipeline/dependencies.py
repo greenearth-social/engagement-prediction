@@ -6,14 +6,16 @@ Helpers for resolving lineage-aligned stage artifacts.
 This module keeps the provenance logic out of ``cli.py`` so the CLI stays
 focused on argument handling and stage orchestration.
 
-The active BST pipeline continues through native model training:
+The active pipelines continue through native model training:
 
 00_source_metadata -> 01_query_selection -> 02_user_history -> 03_post_selection
 -> 04_negative_selection -> 05_post_liker_history -> 06_author_statistics
 -> 07_dataset_hydration -> 08_train_bst_ranker
 
-Legacy MLP/two-tower training remains disconnected. Existing legacy training
-artifacts may still be evaluated explicitly.
+or ``07_dataset_hydration -> 08_train_two_tower``.
+
+Legacy MLP training remains disconnected. Existing legacy training artifacts
+may still be evaluated explicitly.
 """
 
 from __future__ import annotations
@@ -61,6 +63,8 @@ def get_stage_input_folders() -> Dict[str, List[str]]:
         dependencies["07_dataset_hydration"] = ["06_author_statistics"]
     if "08_train_bst_ranker" in registered_folders:
         dependencies["08_train_bst_ranker"] = ["07_dataset_hydration"]
+    if "08_train_two_tower" in registered_folders:
+        dependencies["08_train_two_tower"] = ["07_dataset_hydration"]
     if "03_train" in registered_folders:
         dependencies["03_train"] = []
     if "04_evaluate" in registered_folders:
@@ -365,9 +369,9 @@ def pin_lineage_aligned_inputs(ctx: Context, stage_key: str, stage_folder_map: D
     implementation and any downstream helpers read the same lineage-aligned
     artifact set.
     """
-    if stage_key in {"train_mlp", "train_two_tower"}:
+    if stage_key == "train_mlp":
         raise ValueError(
-            "MLP and two-tower training are not yet wired to 07_dataset_hydration."
+            "MLP training is not yet wired to 07_dataset_hydration."
         )
     if stage_key == "evaluate":
         return

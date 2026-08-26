@@ -172,6 +172,7 @@ def _args(*, save_model: bool, plots: bool) -> SimpleNamespace:
         max_history_len=2,
         bst_additional_batch_negatives=2,
         batch_size=2,
+        eval_batch_size=3,
         num_dataloader_workers=0,
         dataloader_pin_memory=False,
         dataloader_persistent_workers=False,
@@ -239,6 +240,17 @@ def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
         return create_loader(**kwargs)
 
     monkeypatch.setattr(train_bst_ranker, "_create_loader", record_loader)
+    final_metrics = train_bst_ranker._final_metrics
+    final_metric_loader_batch_sizes = {}
+
+    def record_final_metrics(**kwargs):
+        final_metric_loader_batch_sizes.update({
+            split: loader.batch_sampler.batch_size
+            for split, loader in kwargs["loaders"].items()
+        })
+        return final_metrics(**kwargs)
+
+    monkeypatch.setattr(train_bst_ranker, "_final_metrics", record_final_metrics)
 
     result = train_bst_ranker.run(
         _context(tmp_path, tracker),
@@ -354,6 +366,25 @@ def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
         "bst_ranker_best_checkpoint",
     }.issubset({name for name, _ in tracker.file_artifacts})
     assert len(loader_calls) == 3
+    assert [call["batch_size"] for call in loader_calls] == [2, 3, 3]
+    assert [call["shuffle"] for call in loader_calls] == [True, False, False]
+    assert [call["resample_candidates_each_epoch"] for call in loader_calls] == [
+        True,
+        False,
+        False,
+    ]
+    training_config = json.loads(
+        (output_dir / "training_config.json").read_text()
+    )
+    assert training_config["batch_size"] == 2
+    assert training_config["eval_batch_size"] == 3
+    assert summary["parameters"]["batch_size"] == 2
+    assert summary["parameters"]["eval_batch_size"] == 3
+    assert final_metric_loader_batch_sizes == {
+        "train": 2,
+        "val": 3,
+        "val_unseen_users": 3,
+    }
 
 
 def test_stage8_ignores_no_save_model_and_respects_no_plots(tmp_path, monkeypatch):

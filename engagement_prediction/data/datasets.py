@@ -74,7 +74,8 @@ class HydratedBucketedEngagementDataset(Dataset):
         *,
         split: str,
         max_history_len: int,
-        bst_additional_batch_negatives: Optional[int],
+        additional_batch_negatives: Optional[int] = None,
+        bst_additional_batch_negatives: Optional[int] = None,
         seed: int,
         logger: Optional[logging.Logger],
     ):
@@ -82,8 +83,21 @@ class HydratedBucketedEngagementDataset(Dataset):
 
         if max_history_len <= 0:
             raise ValueError("max_history_len must be positive")
-        if bst_additional_batch_negatives is not None and bst_additional_batch_negatives <= 0:
-            raise ValueError("bst_additional_batch_negatives must be positive when provided")
+        if (
+            additional_batch_negatives is not None
+            and bst_additional_batch_negatives is not None
+        ):
+            raise ValueError(
+                "Pass only additional_batch_negatives; "
+                "bst_additional_batch_negatives is retained for existing BST callers"
+            )
+        negative_cap = (
+            additional_batch_negatives
+            if additional_batch_negatives is not None
+            else bst_additional_batch_negatives
+        )
+        if negative_cap is not None and negative_cap <= 0:
+            raise ValueError("additional_batch_negatives must be positive when provided")
 
         stage7_path = Path(stage7_path)
         bundle_path = (
@@ -124,9 +138,9 @@ class HydratedBucketedEngagementDataset(Dataset):
         self.bundle_path = bundle_path
         self.loader_index_path = loader_index_path
         self.max_history_len = int(max_history_len)
-        self.bst_additional_batch_negatives = (
-            int(bst_additional_batch_negatives)
-            if bst_additional_batch_negatives is not None
+        self.additional_batch_negatives = (
+            int(negative_cap)
+            if negative_cap is not None
             else None
         )
         self.seed = int(seed)
@@ -314,7 +328,9 @@ class HydratedBucketedEngagementDataset(Dataset):
     def _history_tensors(
         self,
         row_indices: np.ndarray,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        *,
+        include_bst_features: bool,
+    ) -> dict[str, torch.Tensor]:
         """Gather and pad all ragged histories with one vectorized operation."""
 
         batch_size = int(row_indices.size)
@@ -329,8 +345,9 @@ class HydratedBucketedEngagementDataset(Dataset):
         )
         mask = np.zeros((batch_size, self.max_history_len), dtype=bool)
         author_indices = np.zeros((batch_size, self.max_history_len), dtype=np.int64)
-        time_deltas = np.zeros((batch_size, self.max_history_len), dtype=np.float32)
-        prior_counts = np.zeros((batch_size, self.max_history_len), dtype=np.int64)
+        if include_bst_features:
+            time_deltas = np.zeros((batch_size, self.max_history_len), dtype=np.float32)
+            prior_counts = np.zeros((batch_size, self.max_history_len), dtype=np.int64)
 
         total_items = int(lengths.sum())
         if total_items:
@@ -350,29 +367,34 @@ class HydratedBucketedEngagementDataset(Dataset):
             author_indices[batch_rows, history_positions] = np.asarray(
                 self._array("post_author_idx")[history_emb_indices], dtype=np.int64
             )
-            liked_at_us = np.asarray(
-                self._array("history_like_created_at_us")[source_positions],
-                dtype=np.int64,
-            )
-            query_hours_us = np.asarray(
-                self._array("query_hours_us")[row_indices], dtype=np.int64
-            )
-            elapsed_us = np.maximum(query_hours_us[batch_rows] - liked_at_us, 0)
-            time_deltas[batch_rows, history_positions] = (
-                elapsed_us.astype(np.float64) / MICROSECONDS_PER_HOUR
-            ).astype(np.float32)
-            prior_counts[batch_rows, history_positions] = np.asarray(
-                self._array("history_prior_like_counts")[source_positions],
-                dtype=np.int64,
-            )
+            if include_bst_features:
+                liked_at_us = np.asarray(
+                    self._array("history_like_created_at_us")[source_positions],
+                    dtype=np.int64,
+                )
+                query_hours_us = np.asarray(
+                    self._array("query_hours_us")[row_indices], dtype=np.int64
+                )
+                elapsed_us = np.maximum(query_hours_us[batch_rows] - liked_at_us, 0)
+                time_deltas[batch_rows, history_positions] = (
+                    elapsed_us.astype(np.float64) / MICROSECONDS_PER_HOUR
+                ).astype(np.float32)
+                prior_counts[batch_rows, history_positions] = np.asarray(
+                    self._array("history_prior_like_counts")[source_positions],
+                    dtype=np.int64,
+                )
 
-        return (
-            torch.from_numpy(padded_embeddings),
-            torch.from_numpy(mask),
-            torch.from_numpy(author_indices),
-            torch.from_numpy(time_deltas),
-            torch.from_numpy(prior_counts),
-        )
+        tensors = {
+            "history_embeddings": torch.from_numpy(padded_embeddings),
+            "history_mask": torch.from_numpy(mask),
+            "history_author_indices": torch.from_numpy(author_indices),
+        }
+        if include_bst_features:
+            tensors.update({
+                "history_time_deltas_hours": torch.from_numpy(time_deltas),
+                "history_prior_cumulative_likes": torch.from_numpy(prior_counts),
+            })
+        return tensors
 
     def _negative_positions(
         self,
@@ -391,7 +413,7 @@ class HydratedBucketedEngagementDataset(Dataset):
         start = int(negative_offsets[hour_idx])
         end = int(negative_offsets[hour_idx + 1])
         count = end - start
-        cap = self.bst_additional_batch_negatives
+        cap = self.additional_batch_negatives
         if cap is None or count <= cap:
             return np.arange(start, end, dtype=np.int64)
 
@@ -411,6 +433,7 @@ class HydratedBucketedEngagementDataset(Dataset):
         items: Sequence[tuple[int, int]],
         *,
         include_metadata: bool,
+        include_bst_features: bool,
     ) -> dict[str, Any]:
         """Build one hour-homogeneous listwise batch and its label matrix."""
 
@@ -428,23 +451,30 @@ class HydratedBucketedEngagementDataset(Dataset):
         if np.any(query_hours != query_hour_us):
             raise ValueError("Bucketed batches must contain one query hour")
 
-        history_tensors = self._history_tensors(row_indices)
+        history_tensors = self._history_tensors(
+            row_indices,
+            include_bst_features=include_bst_features,
+        )
         positive_offsets = self._array("positive_offsets")
         positive_emb_indices = self._array("positive_emb_indices")
-        positive_prior_counts = self._array("positive_prior_like_counts")
+        positive_prior_counts = (
+            self._array("positive_prior_like_counts") if include_bst_features else None
+        )
 
         candidate_emb_indices: list[int] = []
         candidate_prior_counts: list[int] = []
         candidate_index: dict[int, int] = {}
         positive_indices_by_row: list[list[int]] = []
 
-        def add_candidate(emb_idx: int, prior_like_count: int) -> int:
+        def add_candidate(emb_idx: int, prior_like_count: Optional[int] = None) -> int:
             candidate_idx = candidate_index.get(emb_idx)
             if candidate_idx is None:
                 candidate_idx = len(candidate_emb_indices)
                 candidate_index[emb_idx] = candidate_idx
                 candidate_emb_indices.append(emb_idx)
-                candidate_prior_counts.append(prior_like_count)
+                if include_bst_features:
+                    assert prior_like_count is not None
+                    candidate_prior_counts.append(prior_like_count)
             return candidate_idx
 
         # Positives enter first, preserving query order and each query's URI
@@ -456,7 +486,10 @@ class HydratedBucketedEngagementDataset(Dataset):
             for source_idx in range(start, end):
                 emb_idx = int(positive_emb_indices[source_idx])
                 candidate_idx = add_candidate(
-                    emb_idx, int(positive_prior_counts[source_idx])
+                    emb_idx,
+                    int(positive_prior_counts[source_idx])
+                    if positive_prior_counts is not None
+                    else None,
                 )
                 row_positive_indices.append(candidate_idx)
             positive_indices_by_row.append(row_positive_indices)
@@ -467,11 +500,15 @@ class HydratedBucketedEngagementDataset(Dataset):
             epoch=epoch,
         )
         negative_emb_indices = self._array("negative_emb_indices")
-        negative_prior_counts = self._array("negative_prior_like_counts")
+        negative_prior_counts = (
+            self._array("negative_prior_like_counts") if include_bst_features else None
+        )
         for source_idx in negative_positions:
             add_candidate(
                 int(negative_emb_indices[source_idx]),
-                int(negative_prior_counts[source_idx]),
+                int(negative_prior_counts[source_idx])
+                if negative_prior_counts is not None
+                else None,
             )
 
         candidate_emb_array = np.asarray(candidate_emb_indices, dtype=np.int64)
@@ -486,11 +523,7 @@ class HydratedBucketedEngagementDataset(Dataset):
                 labels[batch_row, row_positive_indices] = 1.0
 
         batch = {
-            "history_embeddings": history_tensors[0],
-            "history_mask": history_tensors[1],
-            "history_author_indices": history_tensors[2],
-            "history_time_deltas_hours": history_tensors[3],
-            "history_prior_cumulative_likes": history_tensors[4],
+            **history_tensors,
             "candidate_post_embeddings": torch.from_numpy(candidate_embeddings),
             "candidate_post_author_idx": torch.from_numpy(
                 np.asarray(
@@ -498,43 +531,48 @@ class HydratedBucketedEngagementDataset(Dataset):
                     dtype=np.int64,
                 ).copy()
             ),
-            "candidate_prior_cumulative_likes": torch.tensor(
-                candidate_prior_counts, dtype=torch.float32
-            ),
             "label_matrix": labels,
         }
+        if include_bst_features:
+            batch["candidate_prior_cumulative_likes"] = torch.tensor(
+                candidate_prior_counts, dtype=torch.float32
+            )
         if not include_metadata:
             return batch
-
-        post_created_at_us = np.asarray(
-            self._array("post_created_at_us")[candidate_emb_array], dtype=np.int64
-        )
-        creation_hour_us = (
-            post_created_at_us // MICROSECONDS_PER_HOUR
-        ) * MICROSECONDS_PER_HOUR
-        candidate_ages = np.maximum(query_hour_us - creation_hour_us, 0).astype(
-            np.float64
-        ) / MICROSECONDS_PER_HOUR
 
         self._ensure_identifier_tables_open()
         assert self._query_dids is not None
         assert self._post_uris is not None
         query_hour = _datetime_from_epoch_us(query_hour_us)
         batch.update({
-            "candidate_post_age_hours": torch.from_numpy(
-                candidate_ages.astype(np.float32)
-            ),
             "user_id": self._query_dids.take(row_indices),
             "candidate_post_id": self._post_uris.take(candidate_emb_array),
             "query_hour": query_hour,
             "bucket": query_hour,
         })
+        if include_bst_features:
+            post_created_at_us = np.asarray(
+                self._array("post_created_at_us")[candidate_emb_array], dtype=np.int64
+            )
+            creation_hour_us = (
+                post_created_at_us // MICROSECONDS_PER_HOUR
+            ) * MICROSECONDS_PER_HOUR
+            candidate_ages = np.maximum(query_hour_us - creation_hour_us, 0).astype(
+                np.float64
+            ) / MICROSECONDS_PER_HOUR
+            batch["candidate_post_age_hours"] = torch.from_numpy(
+                candidate_ages.astype(np.float32)
+            )
         return batch
 
     def collate_batch(self, items: Sequence[tuple[int, int]]) -> dict[str, Any]:
         """Build the full native batch, including identifiers and auxiliary age."""
 
-        return self._collate_batch(items, include_metadata=True)
+        return self._collate_batch(
+            items,
+            include_metadata=True,
+            include_bst_features=True,
+        )
 
     def collate_tensor_batch(
         self,
@@ -542,7 +580,23 @@ class HydratedBucketedEngagementDataset(Dataset):
     ) -> dict[str, torch.Tensor]:
         """Build the tensor-only batch consumed by canonical model training."""
 
-        return self._collate_batch(items, include_metadata=False)
+        return self._collate_batch(
+            items,
+            include_metadata=False,
+            include_bst_features=True,
+        )
+
+    def collate_two_tower_batch(
+        self,
+        items: Sequence[tuple[int, int]],
+    ) -> dict[str, torch.Tensor]:
+        """Build the canonical two-tower batch without BST-only features."""
+
+        return self._collate_batch(
+            items,
+            include_metadata=False,
+            include_bst_features=False,
+        )
 
 
 class HydratedBucketedBatchSampler(Sampler[list[Any]]):
@@ -654,6 +708,7 @@ def create_hydrated_data_loader(
     seed: int,
     resample_candidates_each_epoch: bool,
     tensor_only: bool = False,
+    tensor_batch_kind: str = "bst",
 ) -> DataLoader:
     """Wrap the native Stage 7 dataset in its hour-aware PyTorch DataLoader.
 
@@ -664,6 +719,10 @@ def create_hydrated_data_loader(
 
     if num_workers < 0:
         raise ValueError("num_workers must be nonnegative")
+    if tensor_batch_kind not in {"bst", "two_tower"}:
+        raise ValueError("tensor_batch_kind must be 'bst' or 'two_tower'")
+    if not tensor_only and tensor_batch_kind != "bst":
+        raise ValueError("tensor_batch_kind requires tensor_only=True")
     worker_options: dict[str, Any] = {
         "num_workers": int(num_workers),
         "pin_memory": bool(pin_memory),
@@ -684,7 +743,11 @@ def create_hydrated_data_loader(
             resample_candidates_each_epoch=resample_candidates_each_epoch,
         ),
         collate_fn=(
-            dataset.collate_tensor_batch if tensor_only else dataset.collate_batch
+            dataset.collate_two_tower_batch
+            if tensor_only and tensor_batch_kind == "two_tower"
+            else dataset.collate_tensor_batch
+            if tensor_only
+            else dataset.collate_batch
         ),
         **worker_options,
     )

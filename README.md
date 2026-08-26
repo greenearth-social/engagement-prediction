@@ -10,9 +10,9 @@ This repo trains and evaluates engagement rankers for Bluesky posts. The artifac
 5. `05_post_liker_history`: extract complete timestamped liker-event histories for selected posts.
 6. `06_author_statistics`: build unfiltered pre-validation statistics for every author represented by roots or replies.
 7. `07_dataset_hydration`: hydrate selected posts, build the training-exposure author vocabulary, write the content-embedding memmap, and publish permanent model-training tables plus a compact loader index.
-8. `08_train_bst_ranker`: fit training-only popularity normalization and train the canonical BST directly from Stage 7.
+8. Train a canonical model directly from Stage 7: `08_train_bst_ranker` or `08_train_two_tower`.
 
-Native BST training is active through Stage 8. Legacy MLP/two-tower training, legacy evaluation, comparison, and serving export are not yet connected to the new dataset contract.
+Native BST and two-tower training are active through Stage 8. Legacy MLP training, legacy evaluation, and comparison are not yet connected to the new dataset contract.
 
 ## Setup
 
@@ -62,7 +62,10 @@ Tests use the `*_test.py` naming convention and live next to the code they cover
 - `engagement_prediction/stages/author_statistics.py`: active Stage 6 training-only author statistics orchestration.
 - `engagement_prediction/stages/dataset_hydration.py`: active Stage 7 dataset-hydration orchestration.
 - `engagement_prediction/stages/train_bst_ranker.py`: active Stage 8 native BST-training orchestration.
+- `engagement_prediction/stages/train_two_tower.py`: active Stage 8 native two-tower-training orchestration.
 - `engagement_prediction/training/bst_ranker.py`: reusable native listwise BST training loop.
+- `engagement_prediction/training/two_tower.py`: reusable native listwise two-tower training loop.
+- `engagement_prediction/models/two_tower.py`: canonical author-aware cross-attention user and post towers.
 - `engagement_prediction/training/ranking.py`: shared matrix-ranking metrics and ranking-row helpers.
 - `engagement_prediction/data/ingex.py`: reusable Ingex access and exact source-file manifests.
 - `engagement_prediction/data/source_metadata.py`: canonical root/reply normalization, deduplication, precedence, and URI partitioning.
@@ -349,7 +352,26 @@ The `08_train_bst_ranker/<stage_run_id>/` artifact contains `checkpoints/bst_ran
 
 After final evaluation, Stage 8 registers `ranker.pt` once as the ClearML OutputModel named `ranker` and uploads `ranker_author_idx.parquet` as the ordinary `author_idx_mapping` artifact expected by the model-promotion tooling. When both uploads succeed, it writes and uploads `checkpoints/ranker_serving_manifest.json` with `ranker_clearml_model_id`, `ranker_uri`, and `clearml_task_id`. ClearML publication is best-effort: upload failures are reported but leave the validated local model artifacts intact, and Stage 8 does not create an incomplete serving manifest. With `--experiment-tracker none`, the local model and author map are still produced but no serving manifest is written.
 
-MLP and two-tower training remain blocked until they consume Stage 7 natively.
+### Stage 8: Native Two-Tower Training
+
+The canonical two-tower model consumes the Stage 7 loader index directly. It uses an author-aware, cross-attention-only user encoder and a learned post projection. Both towers always emit L2-normalized vectors, and exact history times, popularity, and candidate ages are not model inputs. Empty histories use a learned token, while history position carries the newest-first recency signal.
+
+```bash
+python cli.py --config config.yml \
+  --model-type two-tower \
+  --output-embedding-dim 128 \
+  --stop-after train_two_tower
+```
+
+Training uses every Stage 4 hourly negative retained in Stage 7. It uses `batch_size` for training and final train metrics, `eval_batch_size` for both validation splits, and unseen-user validation NDCG for checkpoint selection. Random NDCG baselines share the regular ClearML metric series at epoch 0. The fixed canonical architecture does not use `--user-encoder` or the legacy `shared_dim` configuration; legacy post-encoder, L2-normalization, and author-table toggles are normalized to their mandatory enabled state in resolved two-tower configurations.
+
+Useful options include `--output-embedding-dim` (default `128`), `--user-hidden-dim`, `--post-hidden-dim`, `--content-projection-dim`, `--author-projection-dim`, `--author-embedding-dim`, `--dropout-rate-two-tower`, and `--similarity-temperature`.
+
+The `08_train_two_tower/<stage_run_id>/` artifact contains `checkpoints/two_tower_best.pth`, `checkpoints/engagement_user_tower.pt`, `checkpoints/engagement_post_tower.pt`, `two_tower_author_idx.parquet`, model/training/results JSON, an exact copy of `authors/`, and an optional training plot. Every new best refreshes both local TorchScript towers and verifies eager/script parity, output shapes, finiteness, unit norms, and combined scores. Canonical training always writes these artifacts; `--no-save-model` has no effect.
+
+After final evaluation, the towers are registered once as the ClearML OutputModels `engagement_user_tower` and `engagement_post_tower`, and the author map is uploaded as `author_idx_mapping`. A successful complete upload writes `checkpoints/two_tower_serving_manifest.json`, including `output_embedding_dim` and the post-tower model ID as `embedding_space_id`. Remote publication is best-effort and never invalidates the verified local outputs. Deploying a non-128-dimensional model requires a coordinated Elasticsearch index migration and full post re-embedding.
+
+MLP training remains blocked until it consumes Stage 7 natively.
 
 ### Legacy Evaluation
 
@@ -463,6 +485,16 @@ python cli.py --config config.yml \
 
 The Stage 7 manifest supplies and validates the complete Stage 00 through Stage 6 ancestry.
 
+For two-tower training, use the same Stage 7 pin with the two-tower stage:
+
+```bash
+python cli.py --config config.yml \
+  --model-type two-tower \
+  --start-from train_two_tower \
+  --stop-after train_two_tower \
+  --prior-07-dataset-hydration 20260817_120000_b8c9d0e1
+```
+
 Accepted stage aliases:
 
 - `source_metadata`
@@ -490,7 +522,7 @@ python cli.py --config config.yml --model-type bst-ranker --stop-after train_bst
 
 ## Development Notes
 
-- Treat `08_train_bst_ranker` as the explicit new-pipeline boundary until native evaluation is connected.
+- Treat `08_train_bst_ranker` and `08_train_two_tower` as the explicit new-pipeline boundaries until native evaluation is connected.
 - Use `engagement_prediction/training/ranking.py` for matrix ranking metrics and ranking-row writes.
 - Use `utils/ranking_adapters.py` when adding checkpoint-backed comparison support.
 - Avoid adding new training paths without registering them in `engagement_prediction/pipeline/registry.py` and documenting their artifact contract here.

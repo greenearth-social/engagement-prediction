@@ -572,6 +572,23 @@ def test_native_bst_training_can_stop_after_training():
     cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
 
 
+def test_native_two_tower_training_can_stop_after_training():
+    args = cli._merge_args_with_config(cli.build_parser().parse_args([
+        "--model-type", "two-tower",
+        "--stop-after", "train_two_tower",
+    ]))
+    train_key = cli._get_train_key(args.model_type)
+    stage_order = cli._get_stage_order_for_model_type(train_key)
+    start_idx, stop_idx, _ = cli._get_stage_folder_and_start_stop_indices(
+        stage_order,
+        args.start_from,
+        args.stop_after,
+        train_key,
+    )
+
+    cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
+
+
 def test_native_bst_sequential_run_executes_stages_zero_through_eight(
     tmp_path,
     monkeypatch,
@@ -609,6 +626,43 @@ def test_native_bst_sequential_run_executes_stages_zero_through_eight(
     ]
 
 
+def test_native_two_tower_sequential_run_executes_stages_zero_through_eight(
+    tmp_path,
+    monkeypatch,
+):
+    args = cli._merge_args_with_config(cli.build_parser().parse_args([
+        "--model-type", "two-tower",
+        "--stop-after", "train_two_tower",
+    ]))
+    args.output_dir = str(tmp_path)
+    context = cli.Context(
+        run_dir=Path(tmp_path) / "runs" / "run",
+        artifacts_dir=Path(tmp_path) / "artifacts",
+        runs_dir=Path(tmp_path) / "runs",
+        pipeline_run_id="run",
+    )
+    executed = []
+    monkeypatch.setattr(cli, "pin_lineage_aligned_inputs", lambda *args: None)
+    monkeypatch.setattr(
+        cli.reg,
+        "run_stage",
+        lambda stage_key, context, args: executed.append(stage_key),
+    )
+
+    assert cli.cmd__run_all_exec(args, context) == 0
+    assert executed == [
+        "source_metadata",
+        "query_selection",
+        "user_history",
+        "post_selection",
+        "negative_selection",
+        "post_liker_history",
+        "author_statistics",
+        "dataset_hydration",
+        "train_two_tower",
+    ]
+
+
 def test_native_bst_training_cannot_continue_into_legacy_evaluation():
     args = cli._merge_args_with_config(cli.build_parser().parse_args([
         "--model-type", "bst-ranker",
@@ -624,6 +678,24 @@ def test_native_bst_training_cannot_continue_into_legacy_evaluation():
     )
 
     with pytest.raises(ValueError, match="--stop-after train_bst_ranker"):
+        cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
+
+
+def test_native_two_tower_training_cannot_continue_into_legacy_evaluation():
+    args = cli._merge_args_with_config(cli.build_parser().parse_args([
+        "--model-type", "two-tower",
+        "--stop-after", "evaluate",
+    ]))
+    train_key = cli._get_train_key(args.model_type)
+    stage_order = cli._get_stage_order_for_model_type(train_key)
+    start_idx, stop_idx, _ = cli._get_stage_folder_and_start_stop_indices(
+        stage_order,
+        args.start_from,
+        args.stop_after,
+        train_key,
+    )
+
+    with pytest.raises(ValueError, match="--stop-after train_two_tower"):
         cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
 
 
@@ -661,20 +733,60 @@ def test_mlp_allows_cross_attention_user_encoder():
     assert merged.user_encoder in cli.VALID_USER_ENCODERS_BY_MODEL_TYPE[merged.model_type]
 
 
-def test_two_tower_rejects_summarized_user_encoder_before_running_stages(tmp_path):
+def test_two_tower_uses_fixed_encoder_and_output_dimension_default():
     parser = cli.build_parser()
     raw = parser.parse_args(["--model-type", "two-tower", "--user-encoder", "summarized"])
     merged = cli._merge_args_with_config(raw)
-    merged.output_dir = str(tmp_path)
-    ctx = cli.Context(
-        run_dir=Path(tmp_path) / "runs" / "run",
-        artifacts_dir=Path(tmp_path) / "artifacts",
-        runs_dir=Path(tmp_path) / "runs",
-        pipeline_run_id="run",
-    )
 
-    with pytest.raises(ValueError, match="user-encoder 'summarized'"):
-        cli.cmd__run_all_exec(merged, ctx)
+    assert "two-tower" not in cli.VALID_USER_ENCODERS_BY_MODEL_TYPE
+    assert merged.output_embedding_dim == 128
+    cli._validate_two_tower_config(merged)
+
+
+@pytest.mark.parametrize(
+    ("flag", "message"),
+    [
+        ("--output-embedding-dim", "output-embedding-dim"),
+        ("--user-hidden-dim", "user-hidden-dim"),
+        ("--post-hidden-dim", "post-hidden-dim"),
+        ("--max-history-len", "max-history-len"),
+        ("--batch-size", "batch-size"),
+        ("--eval-batch-size", "eval-batch-size"),
+    ],
+)
+def test_two_tower_rejects_non_positive_dimensions(flag, message):
+    parser = cli.build_parser()
+    merged = cli._merge_args_with_config(parser.parse_args([
+        "--model-type", "two-tower",
+        flag, "0",
+    ]))
+
+    with pytest.raises(ValueError, match=message):
+        cli._validate_two_tower_config(merged)
+
+
+def test_canonical_cli_removes_shared_dim():
+    parser = cli.build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--shared-dim", "64"])
+    assert "shared_dim" not in cli.DEFAULTS
+
+
+def test_two_tower_fixed_architecture_overrides_legacy_disable_flags():
+    parser = cli.build_parser()
+    merged = cli._merge_args_with_config(parser.parse_args([
+        "--model-type", "two-tower",
+        "--user-encoder", "full_transformer",
+        "--no-post-encoder",
+        "--no-l2-normalize-embeddings",
+        "--no-use-author-embedding-table",
+    ]))
+
+    assert merged.user_encoder == "cross_attention"
+    assert merged.use_post_encoder is True
+    assert merged.l2_normalize_embeddings is True
+    assert merged.use_author_embedding_table is True
 
 
 def test_mlp_allows_author_embedding_table():
@@ -791,6 +903,7 @@ def test_bst_ranker_training_defaults():
 
     assert merged.bst_additional_batch_negatives == 64
     assert merged.batch_size == cli.DEFAULTS["batch_size"]
+    assert merged.eval_batch_size == 128
     assert merged.bst_max_train_batches_per_epoch is None
     assert merged.bst_use_popularity_feature is True
     assert merged.bst_popularity_projection_dim == 8
@@ -815,6 +928,7 @@ def test_bst_ranker_requires_one_transformer_layer():
     [
         ("--bst-additional-batch-negatives", "bst-additional-batch-negatives"),
         ("--batch-size", "batch-size"),
+        ("--eval-batch-size", "eval-batch-size"),
         ("--bst-max-train-batches-per-epoch", "bst-max-train-batches-per-epoch"),
         ("--bst-popularity-projection-dim", "bst-popularity-projection-dim"),
     ],
@@ -829,6 +943,19 @@ def test_bst_ranker_rejects_non_positive_listwise_training_controls(flag, messag
     merged = cli._merge_args_with_config(raw)
 
     with pytest.raises(ValueError, match=message):
+        cli._validate_bst_config(merged)
+
+
+def test_bst_ranker_rejects_negative_eval_batch_size():
+    parser = cli.build_parser()
+    raw = parser.parse_args([
+        "--model-type", "bst-ranker",
+        "--use-author-embedding-table",
+        "--eval-batch-size", "-1",
+    ])
+    merged = cli._merge_args_with_config(raw)
+
+    with pytest.raises(ValueError, match="eval-batch-size"):
         cli._validate_bst_config(merged)
 
 

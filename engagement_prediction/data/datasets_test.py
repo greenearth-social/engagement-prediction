@@ -3,6 +3,7 @@ import pickle
 
 import numpy as np
 import polars as pl
+import pytest
 import torch
 
 from engagement_prediction.data import dataset_hydration, datasets as datasets_module
@@ -217,6 +218,156 @@ def test_tensor_only_loader_uses_tensor_collation_without_opening_arrow_tables(t
     assert "bucket" not in batch
     assert dataset._post_uris is None
     assert dataset._query_dids is None
+
+
+def test_two_tower_collation_uses_all_hourly_negatives_and_skips_bst_features(
+    tmp_path,
+    monkeypatch,
+):
+    dataset = HydratedBucketedEngagementDataset(
+        _bundle(tmp_path, many_negatives=True),
+        split="train",
+        max_history_len=2,
+        additional_batch_negatives=None,
+        seed=7,
+        logger=None,
+    )
+    accessed_arrays = []
+    original_array = dataset._array
+
+    def record_array(name):
+        accessed_arrays.append(name)
+        return original_array(name)
+
+    monkeypatch.setattr(dataset, "_array", record_array)
+
+    batch = dataset.collate_two_tower_batch([dataset[0], dataset[1]])
+
+    assert set(batch) == {
+        "history_embeddings",
+        "history_mask",
+        "history_author_indices",
+        "candidate_post_embeddings",
+        "candidate_post_author_idx",
+        "label_matrix",
+    }
+    assert batch["candidate_post_embeddings"].shape == (10, 2)
+    assert batch["history_embeddings"].shape == (2, 2, 2)
+    assert batch["history_mask"].tolist() == [[True, True], [False, False]]
+    torch.testing.assert_close(
+        batch["candidate_post_embeddings"],
+        torch.tensor([
+            [float(index), float(-index)]
+            for index in (1, 2, *range(5, 13))
+        ]),
+    )
+    assert batch["label_matrix"].tolist() == [
+        [1, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+    ]
+    assert not {
+        "history_like_created_at_us",
+        "history_prior_like_counts",
+        "positive_prior_like_counts",
+        "negative_prior_like_counts",
+        "post_created_at_us",
+    }.intersection(accessed_arrays)
+    assert dataset._post_uris is None
+    assert dataset._query_dids is None
+    assert all(isinstance(value, torch.Tensor) for value in batch.values())
+
+
+def test_two_tower_tensor_loader_routes_to_canonical_collation(tmp_path):
+    dataset = HydratedBucketedEngagementDataset(
+        _bundle(tmp_path),
+        split="train",
+        max_history_len=2,
+        additional_batch_negatives=None,
+        seed=7,
+        logger=None,
+    )
+    loader = create_hydrated_data_loader(
+        dataset,
+        batch_size=2,
+        shuffle=False,
+        drop_last=False,
+        num_workers=0,
+        pin_memory=False,
+        persistent_workers=False,
+        prefetch_factor=1,
+        seed=7,
+        resample_candidates_each_epoch=False,
+        tensor_only=True,
+        tensor_batch_kind="two_tower",
+    )
+
+    batch = next(iter(loader))
+
+    assert set(batch) == {
+        "history_embeddings",
+        "history_mask",
+        "history_author_indices",
+        "candidate_post_embeddings",
+        "candidate_post_author_idx",
+        "label_matrix",
+    }
+    torch.testing.assert_close(
+        batch["candidate_post_embeddings"],
+        torch.tensor([[1.0, -1.0], [2.0, -2.0], [5.0, -5.0]]),
+    )
+    assert batch["label_matrix"].tolist() == [[1, 1, 0], [0, 1, 0]]
+    assert dataset._post_uris is None
+    assert dataset._query_dids is None
+
+
+def test_generic_negative_cap_preserves_seeded_epoch_resampling(tmp_path):
+    dataset = HydratedBucketedEngagementDataset(
+        _bundle(tmp_path, many_negatives=True),
+        split="train",
+        max_history_len=2,
+        additional_batch_negatives=1,
+        seed=11,
+        logger=None,
+    )
+    sampler = HydratedBucketedBatchSampler(
+        dataset,
+        batch_size=2,
+        shuffle=False,
+        drop_last=False,
+        seed=11,
+        resample_candidates_each_epoch=True,
+    )
+
+    first_refs = next(iter(sampler))
+    second_refs = next(iter(sampler))
+    first = dataset.collate_two_tower_batch(first_refs)["candidate_post_embeddings"]
+    second = dataset.collate_two_tower_batch(second_refs)["candidate_post_embeddings"]
+    sampler.set_evaluation_mode()
+    evaluation_a = dataset.collate_two_tower_batch(next(iter(sampler)))[
+        "candidate_post_embeddings"
+    ]
+    evaluation_b = dataset.collate_two_tower_batch(next(iter(sampler)))[
+        "candidate_post_embeddings"
+    ]
+
+    assert not torch.equal(first, second)
+    torch.testing.assert_close(evaluation_a, evaluation_b)
+    torch.testing.assert_close(evaluation_a, first)
+
+
+def test_dataset_rejects_both_generic_and_legacy_negative_caps(tmp_path):
+    bundle = _bundle(tmp_path)
+
+    with pytest.raises(ValueError, match="Pass only additional_batch_negatives"):
+        HydratedBucketedEngagementDataset(
+            bundle,
+            split="train",
+            max_history_len=2,
+            additional_batch_negatives=1,
+            bst_additional_batch_negatives=1,
+            seed=7,
+            logger=None,
+        )
 
 
 def test_dataset_pickle_excludes_open_mappings_and_large_python_state(tmp_path):

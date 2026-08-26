@@ -48,7 +48,6 @@ TRAIN_PLACEHOLDER = 'train_placeholder'
 STAGE_ORDER = ['source_metadata', 'query_selection', 'user_history', 'post_selection', 'negative_selection', 'post_liker_history', 'author_statistics', 'dataset_hydration', TRAIN_PLACEHOLDER, 'evaluate']
 VALID_USER_ENCODERS_BY_MODEL_TYPE: Dict[str, Tuple[str, ...]] = {
     "mlp": ("summarized", "full_transformer", "cross_attention"),
-    "two-tower": ("full_transformer", "cross_attention"),
 }
 
 # Central default map for all run-all parameters
@@ -95,9 +94,9 @@ DEFAULTS: Dict[str, Any] = {
     "ema_alpha": 0.1,  # EMA smoothing factor (only used when user_summarization=ema)
     "user_encoder": "summarized",  # User encoder type: must be explicitly specified and compatible with model_type
     "model_type": "mlp",
-    "shared_dim": 128,
+    "output_embedding_dim": 128,
     "user_hidden_dim": 256,
-    "user_output_dim": 128,  # Output dim for MLPModel's user encoder in full_transformer mode; separate from shared_dim used in TwoTower
+    "user_output_dim": 128,  # Output dim for MLPModel's full-transformer user encoder.
     "use_post_encoder": True,  # True means using a transformation on the post embedding (e.g. single layer neural net). False uses the post embedding directly.
     "post_hidden_dim": 256,
     "num_attention_heads": 4,
@@ -154,7 +153,7 @@ DEFAULTS: Dict[str, Any] = {
     # Stage 3 (train) - Training optimization
     "gradient_clip_max_norm": 1.0,
     # Stage 4 (eval)
-    "eval_batch_size": 8192,
+    "eval_batch_size": 128,
     "eval_holdout_type": "unseen_users",
     "skip_modules": None,  # Comma-separated eval module names to skip (None = run all)
     # Selection/prior behavior
@@ -264,10 +263,22 @@ def _merge_args_with_config(raw_args: argparse.Namespace) -> argparse.Namespace:
         merged.update(config_data)
     merged.update({k: v for k, v in args_dict.items() if k not in ("command", "func")})
     final_ns = argparse.Namespace(**merged)
+    _apply_canonical_model_contract(final_ns)
     # Preserve argparse-injected metadata
     setattr(final_ns, "command", command)
     setattr(final_ns, "func", func)
     return final_ns
+
+
+def _apply_canonical_model_contract(args: argparse.Namespace) -> argparse.Namespace:
+    """Keep fixed canonical architecture flags truthful in resolved configs."""
+
+    if getattr(args, "model_type", None) == "two-tower":
+        args.user_encoder = "cross_attention"
+        args.use_post_encoder = True
+        args.l2_normalize_embeddings = True
+        args.use_author_embedding_table = True
+    return args
 
 
 def _build_effective_config_for_background_run(
@@ -482,7 +493,7 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     )
     # ClearML remote execution can override parameters on the server/UI.
     # Connect args and rehydrate a Namespace so downstream code sees the updated values.
-    args = tracker.connect_args(args, "Args")
+    args = _apply_canonical_model_contract(tracker.connect_args(args, "Args"))
 
     output_root = _resolve_run_dir(args, run_timestamp=run_timestamp)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -579,6 +590,7 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
     num_transformer_layers = int(args.bst_num_transformer_layers)
     bst_additional_batch_negatives = int(args.bst_additional_batch_negatives)
     batch_size = int(args.batch_size)
+    eval_batch_size = int(args.eval_batch_size)
     bst_max_train_batches_per_epoch = args.bst_max_train_batches_per_epoch
     bst_popularity_projection_dim = int(args.bst_popularity_projection_dim)
     author_embedding_dim = int(args.author_embedding_dim)
@@ -601,6 +613,8 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
         raise ValueError("--bst-additional-batch-negatives must be positive.")
     if batch_size <= 0:
         raise ValueError("--batch-size must be positive.")
+    if eval_batch_size <= 0:
+        raise ValueError("--eval-batch-size must be positive.")
     if bst_max_train_batches_per_epoch is not None and int(bst_max_train_batches_per_epoch) <= 0:
         raise ValueError("--bst-max-train-batches-per-epoch must be positive when provided.")
     if bst_popularity_projection_dim <= 0:
@@ -609,6 +623,33 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
         raise ValueError("--author-embedding-dim must be positive for the BST ranker.")
     if not 0.0 <= author_unknown_dropout_rate < 1.0:
         raise ValueError("--author-unknown-dropout-rate must be in [0, 1) for the BST ranker.")
+
+
+def _validate_two_tower_config(args: argparse.Namespace) -> None:
+    """Validate the fixed canonical cross-attention two-tower contract."""
+
+    positive_dimensions = {
+        "--output-embedding-dim": args.output_embedding_dim,
+        "--user-hidden-dim": args.user_hidden_dim,
+        "--post-hidden-dim": args.post_hidden_dim,
+        "--max-history-len": args.max_history_len,
+        "--author-embedding-dim": args.author_embedding_dim,
+        "--content-projection-dim": args.content_projection_dim,
+        "--author-projection-dim": args.author_projection_dim,
+        "--batch-size": args.batch_size,
+        "--eval-batch-size": args.eval_batch_size,
+    }
+    for flag, value in positive_dimensions.items():
+        if int(value) <= 0:
+            raise ValueError(f"{flag} must be positive for the two-tower model.")
+    if not 0.0 <= float(args.dropout_rate_two_tower) < 1.0:
+        raise ValueError("--dropout-rate-two-tower must be in [0, 1).")
+    if float(args.similarity_temperature) <= 0.0:
+        raise ValueError("--similarity-temperature must be positive.")
+    if not 0.0 <= float(args.author_unknown_dropout_rate) < 1.0:
+        raise ValueError(
+            "--author-unknown-dropout-rate must be in [0, 1) for the two-tower model."
+        )
 
 
 def _get_stage_order_for_model_type(train_key: str) -> List[str]:
@@ -662,19 +703,21 @@ def _validate_data_pipeline_boundary(
     train_idx = next(idx for idx, key in enumerate(stage_order) if key.startswith("train_"))
     train_key = stage_order[train_idx]
     evaluate_idx = stage_order.index("evaluate")
-    if train_key != "train_bst_ranker" and start_idx <= dataset_hydration_idx < stop_idx:
+    native_train_keys = {"train_bst_ranker", "train_two_tower"}
+    if train_key not in native_train_keys and start_idx <= dataset_hydration_idx < stop_idx:
         raise ValueError(
-            "MLP and two-tower training cannot yet consume dataset_hydration. "
+            "MLP training cannot yet consume dataset_hydration. "
             "Run the new data pipeline with --stop-after dataset_hydration."
         )
-    if train_key != "train_bst_ranker" and start_idx == train_idx:
+    if train_key not in native_train_keys and start_idx == train_idx:
         raise ValueError(
-            "MLP and two-tower training are not yet wired to the Stage 7 hydrated dataset."
+            "MLP training is not yet wired to the Stage 7 hydrated dataset."
         )
-    if train_key == "train_bst_ranker" and start_idx <= train_idx < stop_idx:
+    if train_key in native_train_keys and start_idx <= train_idx < stop_idx:
+        model_label = "BST" if train_key == "train_bst_ranker" else "two-tower"
         raise ValueError(
-            "Native BST training cannot yet continue into legacy evaluation. "
-            "Run with --stop-after train_bst_ranker."
+            f"Native {model_label} training cannot yet continue into legacy evaluation. "
+            f"Run with --stop-after {train_key}."
         )
     if start_idx == evaluate_idx and args.prior_03_train is None:
         raise ValueError("Direct legacy evaluation requires an explicit --prior-03-train pin.")
@@ -783,6 +826,8 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
             raise ValueError("--author-unknown-dropout-rate must be in [0, 1).")
     if model_type == "bst-ranker":
         _validate_bst_config(args)
+    elif model_type == "two-tower":
+        _validate_two_tower_config(args)
 
     # Override train stage key if --model-type is specified
     train_key = _get_train_key(model_type)
@@ -843,7 +888,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
                 'author_statistics': "Stage 6: Build author statistics…",
                 'dataset_hydration': "Stage 7: Hydrate the model-training dataset…",
                 'train_mlp': "Training: Train model (MLP)…",
-                'train_two_tower': "Training: Train model (Two-Tower)…",
+                'train_two_tower': "Stage 8: Train two-tower model…",
                 'train_bst_ranker': "Stage 8: Train BST ranker…",
                 'evaluate': "Legacy evaluation: Evaluate model…",
             }
@@ -988,12 +1033,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--ema-alpha", type=float, default=argparse.SUPPRESS,
                           help_text="EMA smoothing factor (0,1]. Higher = more weight on recent likes. Only used when --user-summarization=ema")
     _add_arg_with_default(p_all, "--user-encoder", type=str, choices=["summarized", "full_transformer", "cross_attention"],
-                          default=argparse.SUPPRESS, help_text="User encoder type (summarized, full_transformer, or cross_attention).")
+                          default=argparse.SUPPRESS, help_text="Legacy MLP user encoder type (summarized, full_transformer, or cross_attention)")
     _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower", "bst-ranker"],
                           default=argparse.SUPPRESS, help_text="Model architecture: mlp, two-tower, or bst-ranker")
     # Two-tower specific options
-    _add_arg_with_default(p_all, "--shared-dim", type=int, default=argparse.SUPPRESS,
-                          help_text="Two-tower shared embedding dimension")
+    _add_arg_with_default(p_all, "--output-embedding-dim", type=int, default=argparse.SUPPRESS,
+                          help_text="Canonical two-tower user/post output embedding dimension")
     _add_arg_with_default(p_all, "--user-hidden-dim", type=int, default=argparse.SUPPRESS,
                           help_text="User encoder hidden dimension")
     _add_arg_with_default(p_all, "--user-output-dim", type=int, default=argparse.SUPPRESS,
@@ -1091,7 +1136,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--no-plots", action="store_true", default=argparse.SUPPRESS,
                           help_text="Disable training plots")
     _add_arg_with_default(p_all, "--no-save-model", action="store_true", default=argparse.SUPPRESS,
-                          help_text="Skip model checkpoints for legacy trainers (ignored by canonical BST Stage 8)")
+                          help_text="Skip model checkpoints for legacy trainers (ignored by canonical Stage 8 trainers)")
     _add_arg_with_default(p_all, "--disable-progress", action="store_true", default=argparse.SUPPRESS,
                           help_text="Disable progress bars during training")
     _add_arg_with_default(p_all, "--metrics-top-ks", type=int, nargs="+", default=argparse.SUPPRESS,
@@ -1148,7 +1193,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--prior-06-author-statistics", type=str, default=argparse.SUPPRESS,
                           help_text="Pin Stage 6 (06_author_statistics) for a direct dataset-hydration rerun")
     _add_arg_with_default(p_all, "--prior-07-dataset-hydration", type=str, default=argparse.SUPPRESS,
-                          help_text="Pin Stage 7 (07_dataset_hydration) for a direct BST-training rerun")
+                          help_text="Pin Stage 7 (07_dataset_hydration) for a direct native-training rerun")
     _add_arg_with_default(p_all, "--prior-03-train", type=str, default=argparse.SUPPRESS,
                           help_text="Pin prior Stage 3 (03_train) artifact dir by stage_run_id or path (used by eval)")
     # Execution behavior

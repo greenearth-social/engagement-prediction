@@ -23,7 +23,7 @@ STAGE_SPECS: Dict[str, Tuple[str, str]] = {
     'author_statistics': ("engagement_prediction/stages/author_statistics.py",   "06_author_statistics"),
     'dataset_hydration': ("engagement_prediction/stages/dataset_hydration.py",   "07_dataset_hydration"),
     'train_mlp':       ("utils/03_train/stage_train_mlp.py",                    "03_train"),
-    'train_two_tower': ("utils/03_train/stage_train_two_tower.py",              "03_train"),
+    'train_two_tower': ("engagement_prediction/stages/train_two_tower.py",     "08_train_two_tower"),
     'train_bst_ranker': ("engagement_prediction/stages/train_bst_ranker.py",   "08_train_bst_ranker"),
     'evaluate':        ("utils/04_evaluate/stage_evaluate.py",                  "04_evaluate"),
 }
