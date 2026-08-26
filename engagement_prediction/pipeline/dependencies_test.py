@@ -41,10 +41,8 @@ def test_get_stage_folder_to_keys_is_derived_from_registry():
         "05_post_liker_history": ("post_liker_history",),
         "06_author_statistics": ("author_statistics",),
         "07_dataset_hydration": ("dataset_hydration",),
-        "03_train": ("train_mlp",),
         "08_train_bst_ranker": ("train_bst_ranker",),
         "08_train_two_tower": ("train_two_tower",),
-        "04_evaluate": ("evaluate",),
     }
 
 
@@ -60,8 +58,6 @@ def test_get_stage_input_folders_is_derived_from_stage_order():
         "07_dataset_hydration": ["06_author_statistics"],
         "08_train_bst_ranker": ["07_dataset_hydration"],
         "08_train_two_tower": ["07_dataset_hydration"],
-        "03_train": [],
-        "04_evaluate": [],
     }
 
 

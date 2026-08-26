@@ -21,7 +21,7 @@ from engagement_prediction.data import (
 )
 from engagement_prediction.pipeline.core import Context
 from engagement_prediction.pipeline.lineage import resolve_recorded_stage_lineage
-from utils.helpers import get_stage_logger
+from engagement_prediction.pipeline.logging import get_stage_logger
 
 
 QUERY_KEY = ["did", "query_hour"]

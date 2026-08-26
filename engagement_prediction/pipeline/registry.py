@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
-"""
-Pipeline registry: maps stage keys to single-file stage implementations and
-their output folder names. Stages are loaded by absolute file path to avoid
-Python import constraints on numeric folder names.
+"""Map canonical stage keys to entrypoint files and artifact-folder names.
+
+Stages remain loaded by absolute file path to preserve the pipeline's existing
+execution contract.
 """
 
 from pathlib import Path
@@ -22,10 +22,8 @@ STAGE_SPECS: Dict[str, Tuple[str, str]] = {
     'post_liker_history': ("engagement_prediction/stages/post_liker_history.py", "05_post_liker_history"),
     'author_statistics': ("engagement_prediction/stages/author_statistics.py",   "06_author_statistics"),
     'dataset_hydration': ("engagement_prediction/stages/dataset_hydration.py",   "07_dataset_hydration"),
-    'train_mlp':       ("utils/03_train/stage_train_mlp.py",                    "03_train"),
     'train_two_tower': ("engagement_prediction/stages/train_two_tower.py",     "08_train_two_tower"),
     'train_bst_ranker': ("engagement_prediction/stages/train_bst_ranker.py",   "08_train_bst_ranker"),
-    'evaluate':        ("utils/04_evaluate/stage_evaluate.py",                  "04_evaluate"),
 }
 
 

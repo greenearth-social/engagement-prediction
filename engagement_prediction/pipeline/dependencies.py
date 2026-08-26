@@ -13,9 +13,6 @@ The active pipelines continue through native model training:
 -> 07_dataset_hydration -> 08_train_bst_ranker
 
 or ``07_dataset_hydration -> 08_train_two_tower``.
-
-Legacy MLP training remains disconnected. Existing legacy training artifacts
-may still be evaluated explicitly.
 """
 
 from __future__ import annotations
@@ -65,10 +62,6 @@ def get_stage_input_folders() -> Dict[str, List[str]]:
         dependencies["08_train_bst_ranker"] = ["07_dataset_hydration"]
     if "08_train_two_tower" in registered_folders:
         dependencies["08_train_two_tower"] = ["07_dataset_hydration"]
-    if "03_train" in registered_folders:
-        dependencies["03_train"] = []
-    if "04_evaluate" in registered_folders:
-        dependencies["04_evaluate"] = []
     return dependencies
 
 
@@ -369,13 +362,6 @@ def pin_lineage_aligned_inputs(ctx: Context, stage_key: str, stage_folder_map: D
     implementation and any downstream helpers read the same lineage-aligned
     artifact set.
     """
-    if stage_key == "train_mlp":
-        raise ValueError(
-            "MLP training is not yet wired to 07_dataset_hydration."
-        )
-    if stage_key == "evaluate":
-        return
-
     consumer_stage_folder = stage_folder_map[stage_key]
     resolved = resolve_stage_dependencies_for_run(
         ctx=ctx,

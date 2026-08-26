@@ -1,3 +1,5 @@
+"""Tests for the externally consumed input-data helpers."""
+
 import base64
 import struct
 import zlib

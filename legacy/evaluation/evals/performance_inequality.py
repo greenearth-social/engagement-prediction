@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-Performance Inequality Evaluation Module
+Archived Performance Inequality Evaluation Module
 
 This module characterizes between-user inequalities in model performance metrics
 by computing Gini coefficients and generating Lorenz curves.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-Evaluation Modules Framework for Engagement Prediction Pipeline
+Archived evaluation modules framework for legacy ranking-row artifacts.
 
 This module provides:
 - EvalContext: Standardized data structure passed to all evaluation modules

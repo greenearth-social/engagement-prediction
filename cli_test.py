@@ -237,109 +237,40 @@ def test_query_sampling_defaults():
             cli.build_parser().parse_args([removed_flag, "1"])
 
 
-def test_dataset_hydration_cannot_continue_into_training(tmp_path):
-    parser = cli.build_parser()
-    merged = cli._merge_args_with_config(parser.parse_args([]))
-    merged.output_dir = str(tmp_path)
-    ctx = cli.Context(
-        run_dir=Path(tmp_path) / "runs" / "run",
-        artifacts_dir=Path(tmp_path) / "artifacts",
-        runs_dir=Path(tmp_path) / "runs",
-        pipeline_run_id="run",
-    )
+def test_bst_ranker_is_the_default_model():
+    args = cli._merge_args_with_config(cli.build_parser().parse_args([]))
 
-    with pytest.raises(ValueError, match="--stop-after dataset_hydration"):
-        cli.cmd__run_all_exec(merged, ctx)
+    assert args.model_type == "bst-ranker"
+    assert cli._get_train_key(args.model_type) == "train_bst_ranker"
+    assert cli._get_stage_order_for_model_type("train_bst_ranker")[-1] == "train_bst_ranker"
 
 
-def test_new_pipeline_can_stop_after_user_history():
+@pytest.mark.parametrize(
+    "stop_after",
+    [
+        "user_history",
+        "post_selection",
+        "negative_selection",
+        "post_liker_history",
+        "author_statistics",
+        "dataset_hydration",
+    ],
+)
+def test_new_pipeline_can_stop_after_data_stage(stop_after):
     args = cli._merge_args_with_config(
-        cli.build_parser().parse_args(["--stop-after", "user_history"])
+        cli.build_parser().parse_args(["--stop-after", stop_after])
     )
-    stage_order = cli._get_stage_order_for_model_type(cli._get_train_key(args.model_type))
-    start_idx, stop_idx, _ = cli._get_stage_folder_and_start_stop_indices(
+    train_key = cli._get_train_key(args.model_type)
+    stage_order = cli._get_stage_order_for_model_type(train_key)
+    _start_idx, stop_idx, includes_train = cli._get_stage_folder_and_start_stop_indices(
         stage_order,
         args.start_from,
         args.stop_after,
-        cli._get_train_key(args.model_type),
+        train_key,
     )
 
-    cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
-
-
-def test_new_pipeline_can_stop_after_post_selection():
-    args = cli._merge_args_with_config(
-        cli.build_parser().parse_args(["--stop-after", "post_selection"])
-    )
-    stage_order = cli._get_stage_order_for_model_type(cli._get_train_key(args.model_type))
-    start_idx, stop_idx, _ = cli._get_stage_folder_and_start_stop_indices(
-        stage_order,
-        args.start_from,
-        args.stop_after,
-        cli._get_train_key(args.model_type),
-    )
-
-    cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
-
-
-def test_new_pipeline_can_stop_after_negative_selection():
-    args = cli._merge_args_with_config(
-        cli.build_parser().parse_args(["--stop-after", "negative_selection"])
-    )
-    stage_order = cli._get_stage_order_for_model_type(cli._get_train_key(args.model_type))
-    start_idx, stop_idx, _ = cli._get_stage_folder_and_start_stop_indices(
-        stage_order,
-        args.start_from,
-        args.stop_after,
-        cli._get_train_key(args.model_type),
-    )
-
-    cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
-
-
-def test_new_pipeline_can_stop_after_post_liker_history():
-    args = cli._merge_args_with_config(
-        cli.build_parser().parse_args(["--stop-after", "post_liker_history"])
-    )
-    stage_order = cli._get_stage_order_for_model_type(cli._get_train_key(args.model_type))
-    start_idx, stop_idx, _ = cli._get_stage_folder_and_start_stop_indices(
-        stage_order,
-        args.start_from,
-        args.stop_after,
-        cli._get_train_key(args.model_type),
-    )
-
-    cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
-
-
-def test_new_pipeline_can_stop_after_author_statistics():
-    args = cli._merge_args_with_config(
-        cli.build_parser().parse_args(["--stop-after", "author_statistics"])
-    )
-    stage_order = cli._get_stage_order_for_model_type(cli._get_train_key(args.model_type))
-    start_idx, stop_idx, _ = cli._get_stage_folder_and_start_stop_indices(
-        stage_order,
-        args.start_from,
-        args.stop_after,
-        cli._get_train_key(args.model_type),
-    )
-
-    cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
-
-
-def test_new_pipeline_can_stop_after_dataset_hydration():
-    args = cli._merge_args_with_config(
-        cli.build_parser().parse_args(["--stop-after", "dataset_hydration"])
-    )
-    stage_order = cli._get_stage_order_for_model_type(cli._get_train_key(args.model_type))
-    start_idx, stop_idx, _ = cli._get_stage_folder_and_start_stop_indices(
-        stage_order,
-        args.start_from,
-        args.stop_after,
-        cli._get_train_key(args.model_type),
-    )
-
-    cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
+    assert stage_order[stop_idx] == stop_after
+    assert includes_train is False
 
 
 def test_new_pipeline_runs_query_selection_through_user_history(tmp_path, monkeypatch):
@@ -540,53 +471,30 @@ def test_new_pipeline_runs_query_selection_through_dataset_hydration(tmp_path, m
     ]
 
 
-def test_direct_mlp_training_remains_blocked():
-    args = cli._merge_args_with_config(
-        cli.build_parser().parse_args(["--start-from", "train", "--stop-after", "train"])
-    )
-    stage_order = cli._get_stage_order_for_model_type(cli._get_train_key(args.model_type))
-    start_idx, stop_idx, _ = cli._get_stage_folder_and_start_stop_indices(
-        stage_order,
-        args.start_from,
-        args.stop_after,
-        cli._get_train_key(args.model_type),
-    )
-    with pytest.raises(ValueError, match="not yet wired to the Stage 7"):
-        cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
-
-
-def test_native_bst_training_can_stop_after_training():
+@pytest.mark.parametrize(
+    ("model_type", "train_stage"),
+    [
+        ("bst-ranker", "train_bst_ranker"),
+        ("two-tower", "train_two_tower"),
+    ],
+)
+def test_canonical_model_can_stop_after_its_training_stage(model_type, train_stage):
     args = cli._merge_args_with_config(cli.build_parser().parse_args([
-        "--model-type", "bst-ranker",
-        "--stop-after", "train_bst_ranker",
+        "--model-type", model_type,
+        "--stop-after", train_stage,
     ]))
     train_key = cli._get_train_key(args.model_type)
     stage_order = cli._get_stage_order_for_model_type(train_key)
-    start_idx, stop_idx, _ = cli._get_stage_folder_and_start_stop_indices(
+    _start_idx, stop_idx, includes_train = cli._get_stage_folder_and_start_stop_indices(
         stage_order,
         args.start_from,
         args.stop_after,
         train_key,
     )
 
-    cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
-
-
-def test_native_two_tower_training_can_stop_after_training():
-    args = cli._merge_args_with_config(cli.build_parser().parse_args([
-        "--model-type", "two-tower",
-        "--stop-after", "train_two_tower",
-    ]))
-    train_key = cli._get_train_key(args.model_type)
-    stage_order = cli._get_stage_order_for_model_type(train_key)
-    start_idx, stop_idx, _ = cli._get_stage_folder_and_start_stop_indices(
-        stage_order,
-        args.start_from,
-        args.stop_after,
-        train_key,
-    )
-
-    cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
+    assert train_key == train_stage
+    assert stage_order[stop_idx] == train_stage
+    assert includes_train is True
 
 
 def test_native_bst_sequential_run_executes_stages_zero_through_eight(
@@ -663,82 +571,11 @@ def test_native_two_tower_sequential_run_executes_stages_zero_through_eight(
     ]
 
 
-def test_native_bst_training_cannot_continue_into_legacy_evaluation():
-    args = cli._merge_args_with_config(cli.build_parser().parse_args([
-        "--model-type", "bst-ranker",
-        "--stop-after", "evaluate",
-    ]))
-    train_key = cli._get_train_key(args.model_type)
-    stage_order = cli._get_stage_order_for_model_type(train_key)
-    start_idx, stop_idx, _ = cli._get_stage_folder_and_start_stop_indices(
-        stage_order,
-        args.start_from,
-        args.stop_after,
-        train_key,
-    )
-
-    with pytest.raises(ValueError, match="--stop-after train_bst_ranker"):
-        cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
-
-
-def test_native_two_tower_training_cannot_continue_into_legacy_evaluation():
-    args = cli._merge_args_with_config(cli.build_parser().parse_args([
-        "--model-type", "two-tower",
-        "--stop-after", "evaluate",
-    ]))
-    train_key = cli._get_train_key(args.model_type)
-    stage_order = cli._get_stage_order_for_model_type(train_key)
-    start_idx, stop_idx, _ = cli._get_stage_folder_and_start_stop_indices(
-        stage_order,
-        args.start_from,
-        args.stop_after,
-        train_key,
-    )
-
-    with pytest.raises(ValueError, match="--stop-after train_two_tower"):
-        cli._validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
-
-
-def test_background_effective_config_preserves_no_post_encoder(tmp_path):
-    parser = cli.build_parser()
-    raw = parser.parse_args(["--no-post-encoder"])
-    merged = cli._merge_args_with_config(raw)
-
-    output_root = Path(tmp_path) / "out"
-    run_dir = output_root / "runs" / "run"
-    initial_log = run_dir / "run-all.log"
-    cfg = cli._build_effective_config_for_background_run(
-        merged, output_root=output_root, initial_log=initial_log
-    )
-
-    assert cfg["use_post_encoder"] is False
-    assert cfg["background"] is False
-    assert cfg["output_dir"] == str(output_root.resolve())
-    assert cfg["_initial_log"] == str(initial_log)
-
-
-def test_merge_args_with_config_defaults_l2_normalize_embeddings_to_false():
-    parser = cli.build_parser()
-    raw = parser.parse_args([])
-    merged = cli._merge_args_with_config(raw)
-
-    assert merged.l2_normalize_embeddings is False
-
-
-def test_mlp_allows_cross_attention_user_encoder():
-    parser = cli.build_parser()
-    raw = parser.parse_args(["--model-type", "mlp", "--user-encoder", "cross_attention"])
-    merged = cli._merge_args_with_config(raw)
-
-    assert merged.user_encoder in cli.VALID_USER_ENCODERS_BY_MODEL_TYPE[merged.model_type]
-
-
 def test_two_tower_uses_fixed_encoder_and_output_dimension_default():
     parser = cli.build_parser()
-    raw = parser.parse_args(["--model-type", "two-tower", "--user-encoder", "summarized"])
+    raw = parser.parse_args(["--model-type", "two-tower"])
     merged = cli._merge_args_with_config(raw)
 
-    assert "two-tower" not in cli.VALID_USER_ENCODERS_BY_MODEL_TYPE
     assert merged.output_embedding_dim == 128
     cli._validate_two_tower_config(merged)
 
@@ -773,34 +610,50 @@ def test_canonical_cli_removes_shared_dim():
     assert "shared_dim" not in cli.DEFAULTS
 
 
-def test_two_tower_fixed_architecture_overrides_legacy_disable_flags():
-    parser = cli.build_parser()
-    merged = cli._merge_args_with_config(parser.parse_args([
-        "--model-type", "two-tower",
-        "--user-encoder", "full_transformer",
-        "--no-post-encoder",
-        "--no-l2-normalize-embeddings",
-        "--no-use-author-embedding-table",
-    ]))
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--model-type", "mlp"],
+        ["--start-from", "train_mlp"],
+        ["--stop-after", "evaluate"],
+        ["--user-summarization", "mean"],
+        ["--ema-alpha", "0.1"],
+        ["--user-encoder", "cross_attention"],
+        ["--user-output-dim", "128"],
+        ["--post-encoder"],
+        ["--num-attention-heads", "4"],
+        ["--num-attention-layers", "2"],
+        ["--attention-dropout", "0.1"],
+        ["--l2-normalize-embeddings"],
+        ["--use-author-embedding-table"],
+        ["--min-author-support", "20"],
+        ["--weight-decay-mlp", "0.1"],
+        ["--hidden-dims", "64"],
+        ["--dropout-rate-mlp", "0.5"],
+        ["--prediction-posts-per-user", "1"],
+        ["--no-save-model"],
+        ["--eval-holdout-type", "unseen_users"],
+        ["--skip-modules", "cold_start_curves"],
+        ["--prior-03-train", "legacy"],
+        ["--max-memory-gb", "10"],
+        ["--max-memory-pct", "0.5"],
+        ["--memory-check", "full"],
+        ["--global-topic-k", "10"],
+        ["--debug"],
+    ],
+)
+def test_removed_legacy_cli_surfaces_are_rejected(argv):
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(argv)
 
-    assert merged.user_encoder == "cross_attention"
-    assert merged.use_post_encoder is True
-    assert merged.l2_normalize_embeddings is True
-    assert merged.use_author_embedding_table is True
 
+def test_removed_mlp_config_is_rejected(tmp_path):
+    config_path = Path(tmp_path) / "mlp.yml"
+    config_path.write_text("model_type: mlp\n")
+    raw = cli.build_parser().parse_args(["--config", str(config_path)])
 
-def test_mlp_allows_author_embedding_table():
-    parser = cli.build_parser()
-    raw = parser.parse_args([
-        "--model-type", "mlp",
-        "--user-encoder", "summarized",
-        "--use-author-embedding-table",
-        "--author-embedding-dim", "8",
-    ])
-    merged = cli._merge_args_with_config(raw)
-
-    assert merged.use_author_embedding_table is True
-    assert merged.model_type == "mlp"
+    with pytest.raises(ValueError, match="Unknown model_type.*mlp"):
+        cli._merge_args_with_config(raw)
 
 
 def test_bst_ranker_model_type_maps_train_alias():
@@ -809,7 +662,6 @@ def test_bst_ranker_model_type_maps_train_alias():
         "--model-type", "bst-ranker",
         "--start-from", "train",
         "--stop-after", "train",
-        "--use-author-embedding-table",
         "--prediction-hidden-dims", "144", "72",
     ])
     merged = cli._merge_args_with_config(raw)
@@ -836,7 +688,6 @@ def test_bst_ranker_explicit_train_stage_names_parse():
         "--model-type", "bst-ranker",
         "--start-from", "train_bst_ranker",
         "--stop-after", "train_bst_ranker",
-        "--use-author-embedding-table",
         "--prediction-hidden-dims", "144", "72",
     ])
     merged = cli._merge_args_with_config(raw)
@@ -851,7 +702,6 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
         textwrap.dedent(
             """
             model_type: bst-ranker
-            use_author_embedding_table: true
             bst_model_dim: 96
             content_projection_dim: 80
             author_projection_dim: 24
@@ -897,7 +747,6 @@ def test_bst_ranker_training_defaults():
     parser = cli.build_parser()
     raw = parser.parse_args([
         "--model-type", "bst-ranker",
-        "--use-author-embedding-table",
     ])
     merged = cli._merge_args_with_config(raw)
 
@@ -914,7 +763,6 @@ def test_bst_ranker_requires_one_transformer_layer():
     parser = cli.build_parser()
     raw = parser.parse_args([
         "--model-type", "bst-ranker",
-        "--use-author-embedding-table",
         "--bst-num-transformer-layers", "2",
     ])
     merged = cli._merge_args_with_config(raw)
@@ -937,7 +785,6 @@ def test_bst_ranker_rejects_non_positive_listwise_training_controls(flag, messag
     parser = cli.build_parser()
     raw = parser.parse_args([
         "--model-type", "bst-ranker",
-        "--use-author-embedding-table",
         flag, "0",
     ])
     merged = cli._merge_args_with_config(raw)
@@ -950,7 +797,6 @@ def test_bst_ranker_rejects_negative_eval_batch_size():
     parser = cli.build_parser()
     raw = parser.parse_args([
         "--model-type", "bst-ranker",
-        "--use-author-embedding-table",
         "--eval-batch-size", "-1",
     ])
     merged = cli._merge_args_with_config(raw)
@@ -959,18 +805,18 @@ def test_bst_ranker_rejects_negative_eval_batch_size():
         cli._validate_bst_config(merged)
 
 
-def test_bst_ranker_always_accepts_stage7_author_indices():
+def test_bst_ranker_uses_stage7_author_indices_without_a_feature_flag():
     parser = cli.build_parser()
     raw = parser.parse_args(["--model-type", "bst-ranker", "--prediction-hidden-dims", "144", "72"])
     merged = cli._merge_args_with_config(raw)
 
-    assert merged.use_author_embedding_table is False
+    assert not hasattr(merged, "use_author_embedding_table")
     cli._validate_bst_config(merged)
 
 
 def test_bst_ranker_requires_prediction_hidden_dims():
     parser = cli.build_parser()
-    raw = parser.parse_args(["--model-type", "bst-ranker", "--use-author-embedding-table"])
+    raw = parser.parse_args(["--model-type", "bst-ranker"])
     merged = cli._merge_args_with_config(raw)
     merged.prediction_hidden_dims = None
 
@@ -982,7 +828,6 @@ def test_bst_ranker_accepts_explicit_empty_prediction_hidden_dims():
     parser = cli.build_parser()
     raw = parser.parse_args([
         "--model-type", "bst-ranker",
-        "--use-author-embedding-table",
         "--prediction-hidden-dims",
     ])
     merged = cli._merge_args_with_config(raw)
@@ -1002,7 +847,6 @@ def test_bst_ranker_validates_projection_dims(arg_name, error_match):
     parser = cli.build_parser()
     raw = parser.parse_args([
         "--model-type", "bst-ranker",
-        "--use-author-embedding-table",
         "--prediction-hidden-dims", "144", "72",
     ])
     merged = cli._merge_args_with_config(raw)
@@ -1016,7 +860,6 @@ def test_bst_ranker_validates_transformer_head_divisibility():
     parser = cli.build_parser()
     raw = parser.parse_args([
         "--model-type", "bst-ranker",
-        "--use-author-embedding-table",
         "--bst-time-embedding-dim", "15",
         "--prediction-hidden-dims", "144", "72",
     ])
@@ -1024,74 +867,6 @@ def test_bst_ranker_validates_transformer_head_divisibility():
 
     with pytest.raises(ValueError, match="divisible"):
         cli._validate_bst_config(merged)
-
-
-def test_min_author_support_must_be_positive_even_without_author_table(tmp_path):
-    parser = cli.build_parser()
-    raw = parser.parse_args(["--min-author-support", "0", "--stop-after", "query_selection"])
-    merged = cli._merge_args_with_config(raw)
-    merged.output_dir = str(tmp_path)
-    ctx = cli.Context(
-        run_dir=Path(tmp_path) / "runs" / "run",
-        artifacts_dir=Path(tmp_path) / "artifacts",
-        runs_dir=Path(tmp_path) / "runs",
-        pipeline_run_id="run",
-    )
-
-    with pytest.raises(ValueError, match="min-author-support"):
-        cli.cmd__run_all_exec(merged, ctx)
-
-
-def test_background_effective_config_preserves_no_l2_normalize_embeddings(tmp_path):
-    parser = cli.build_parser()
-    raw = parser.parse_args(["--no-l2-normalize-embeddings"])
-    merged = cli._merge_args_with_config(raw)
-
-    output_root = Path(tmp_path) / "out"
-    run_dir = output_root / "runs" / "run"
-    initial_log = run_dir / "run-all.log"
-    cfg = cli._build_effective_config_for_background_run(
-        merged, output_root=output_root, initial_log=initial_log
-    )
-
-    assert cfg["l2_normalize_embeddings"] is False
-
-
-def test_background_effective_config_allows_cli_to_override_config_to_default(tmp_path):
-    # Config disables post encoder, CLI re-enables it (even though True is the DEFAULTS value).
-    config_path = Path(tmp_path) / "config.yml"
-    config_path.write_text("use_post_encoder: false\n")
-
-    parser = cli.build_parser()
-    raw = parser.parse_args(["--config", str(config_path), "--post-encoder"])
-    merged = cli._merge_args_with_config(raw)
-
-    output_root = Path(tmp_path) / "out"
-    run_dir = output_root / "runs" / "run"
-    initial_log = run_dir / "run-all.log"
-    cfg = cli._build_effective_config_for_background_run(
-        merged, output_root=output_root, initial_log=initial_log
-    )
-
-    assert cfg["use_post_encoder"] is True
-
-
-def test_background_effective_config_allows_cli_to_override_config_to_default_l2_normalization(tmp_path):
-    config_path = Path(tmp_path) / "config.yml"
-    config_path.write_text("l2_normalize_embeddings: false\n")
-
-    parser = cli.build_parser()
-    raw = parser.parse_args(["--config", str(config_path), "--l2-normalize-embeddings"])
-    merged = cli._merge_args_with_config(raw)
-
-    output_root = Path(tmp_path) / "out"
-    run_dir = output_root / "runs" / "run"
-    initial_log = run_dir / "run-all.log"
-    cfg = cli._build_effective_config_for_background_run(
-        merged, output_root=output_root, initial_log=initial_log
-    )
-
-    assert cfg["l2_normalize_embeddings"] is True
 
 
 @pytest.mark.parametrize(
@@ -1118,9 +893,12 @@ def test_merge_args_with_config_accepts_prior_pins(tmp_path):
     config_path.write_text(
         textwrap.dedent(
             """
+            prior_00_source_metadata: 20260100_000000_source00
             prior_01_query_selection: 20260100_000000_feedface
             prior_02_user_history: 20260102_000000_cafebabe
+            prior_03_post_selection: 20260103_000000_postface
             prior_04_negative_selection: 20260104_000000_baadf00d
+            prior_05_post_liker_history: 20260105_000000_liker00
             prior_06_author_statistics: 20260106_000000_decafbad
             prior_07_dataset_hydration: 20260107_000000_abcd1234
             """
@@ -1132,11 +910,70 @@ def test_merge_args_with_config_accepts_prior_pins(tmp_path):
     raw = parser.parse_args(["--config", str(config_path)])
     merged = cli._merge_args_with_config(raw)
 
+    assert merged.prior_00_source_metadata == "20260100_000000_source00"
     assert merged.prior_01_query_selection == "20260100_000000_feedface"
     assert merged.prior_02_user_history == "20260102_000000_cafebabe"
+    assert merged.prior_03_post_selection == "20260103_000000_postface"
     assert merged.prior_04_negative_selection == "20260104_000000_baadf00d"
+    assert merged.prior_05_post_liker_history == "20260105_000000_liker00"
     assert merged.prior_06_author_statistics == "20260106_000000_decafbad"
     assert merged.prior_07_dataset_hydration == "20260107_000000_abcd1234"
+
+
+@pytest.mark.parametrize(
+    "stage_folder",
+    [
+        "00_source_metadata",
+        "01_query_selection",
+        "02_user_history",
+        "03_post_selection",
+        "04_negative_selection",
+        "05_post_liker_history",
+        "06_author_statistics",
+        "07_dataset_hydration",
+    ],
+)
+def test_resolve_prior_spec_resolves_canonical_stage_run_id(tmp_path, stage_folder):
+    output_root = Path(tmp_path) / "out"
+    artifacts_dir = output_root / "artifacts"
+    target = artifacts_dir / stage_folder / "20260101_000000_abcd1234"
+    target.mkdir(parents=True)
+
+    resolved = cli._resolve_prior_spec(
+        target.name,
+        output_root=output_root,
+        artifacts_dir=artifacts_dir,
+        stage_folder=stage_folder,
+    )
+
+    assert resolved == target.resolve()
+
+
+def test_resolve_prior_spec_resolves_relative_path_against_output_root(tmp_path):
+    output_root = Path(tmp_path) / "out"
+    artifacts_dir = output_root / "artifacts"
+    target = output_root / "some" / "custom_prior"
+    target.mkdir(parents=True)
+
+    resolved = cli._resolve_prior_spec(
+        "some/custom_prior",
+        output_root=output_root,
+        artifacts_dir=artifacts_dir,
+        stage_folder="02_user_history",
+    )
+
+    assert resolved == target.resolve()
+
+
+def test_resolve_prior_spec_raises_if_missing(tmp_path):
+    output_root = Path(tmp_path) / "out"
+    with pytest.raises(FileNotFoundError, match="01_query_selection"):
+        cli._resolve_prior_spec(
+            "does_not_exist",
+            output_root=output_root,
+            artifacts_dir=output_root / "artifacts",
+            stage_folder="01_query_selection",
+        )
 
 
 def test_removed_legacy_training_pin_is_rejected():

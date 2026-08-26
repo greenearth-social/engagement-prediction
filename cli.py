@@ -45,15 +45,11 @@ from engagement_prediction.pipeline.core import (
 CLI_FILE_DIR = Path(__file__).parent
 
 TRAIN_PLACEHOLDER = 'train_placeholder'
-STAGE_ORDER = ['source_metadata', 'query_selection', 'user_history', 'post_selection', 'negative_selection', 'post_liker_history', 'author_statistics', 'dataset_hydration', TRAIN_PLACEHOLDER, 'evaluate']
-VALID_USER_ENCODERS_BY_MODEL_TYPE: Dict[str, Tuple[str, ...]] = {
-    "mlp": ("summarized", "full_transformer", "cross_attention"),
-}
+STAGE_ORDER = ['source_metadata', 'query_selection', 'user_history', 'post_selection', 'negative_selection', 'post_liker_history', 'author_statistics', 'dataset_hydration', TRAIN_PLACEHOLDER]
 
 # Central default map for all run-all parameters
 DEFAULTS: Dict[str, Any] = {
     "output_dir": None,
-    "debug": False,
     "random_seed": 42,
     "embedding_model": "all_MiniLM_L12_v2",
     # Stage 00: Canonical source metadata
@@ -71,7 +67,7 @@ DEFAULTS: Dict[str, Any] = {
     "val_start": None,
     "holdout_start": None,
     "holdout_end": None,
-    # Stage 2: User histroy
+    # Stage 2: User history
     "max_history_posts_per_query": 64,
     "user_history_partition_count": 16,
     # Stage 3: Post selection
@@ -89,30 +85,18 @@ DEFAULTS: Dict[str, Any] = {
     "embedding_source_batch_size": 64,
     "embedding_partition_worker_count": 4,
     "min_author_training_feature_count": 50,
-    # Stage 3 (train) - Model architecture
-    "user_summarization": "mean",  # MLP user-history summarization: mean, ema, linear_recency
-    "ema_alpha": 0.1,  # EMA smoothing factor (only used when user_summarization=ema)
-    "user_encoder": "summarized",  # User encoder type: must be explicitly specified and compatible with model_type
-    "model_type": "mlp",
+    # Stage 8: Model architecture
+    "model_type": "bst-ranker",
     "output_embedding_dim": 128,
     "user_hidden_dim": 256,
-    "user_output_dim": 128,  # Output dim for MLPModel's full-transformer user encoder.
-    "use_post_encoder": True,  # True means using a transformation on the post embedding (e.g. single layer neural net). False uses the post embedding directly.
     "post_hidden_dim": 256,
-    "num_attention_heads": 4,
-    "num_attention_layers": 2,
     "max_history_len": 20,
-    "attention_dropout": 0.1,  # Dropout rate for attention-based user encoders
-    "l2_normalize_embeddings": False,
     "similarity_temperature": 1.0,
-    "use_author_embedding_table": False,
     "author_embedding_dim": 16,
-    "min_author_support": 20,
     "author_unknown_dropout_rate": 0.3,
     "epochs": 300,
     "batch_size": 64,
     "learning_rate": 0.001,
-    "weight_decay_mlp": 0.1,
     "weight_decay_two_tower": 0.01,
     "content_projection_dim": 128,
     "author_projection_dim": 32,
@@ -130,32 +114,26 @@ DEFAULTS: Dict[str, Any] = {
     "bst_max_train_batches_per_epoch": None,
     "bst_use_popularity_feature": True,
     "bst_popularity_projection_dim": 8,
-    "hidden_dims": [64, 32, 16],
-    "dropout_rate_mlp": 0.5,
     "dropout_rate_two_tower": 0.1,
-    "prediction_posts_per_user": 1,
     "device": None,
     "patience": 50,
     "early_stopping_min_delta": 0.002,
     "run_tag": None,  # Optional tag appended to training output directory name
     "no_plots": False,
-    "no_save_model": False,
     "disable_progress": False,  # Disable progress bars during training
     "metrics_top_ks": [30],
-    # Stage 3 (train) - DataLoader settings
+    # Stage 8 - DataLoader settings
     "num_dataloader_workers": 4,
     "dataloader_pin_memory": True,
     "dataloader_persistent_workers": True,
     "dataloader_prefetch_factor": 2,
-    # Stage 3 (train) - Learning rate scheduler
+    # Stage 8 - Learning rate scheduler
     "lr_scheduler_factor": 0.5,
     "lr_scheduler_patience": 5,
-    # Stage 3 (train) - Training optimization
+    # Stage 8 - Training optimization
     "gradient_clip_max_norm": 1.0,
-    # Stage 4 (eval)
+    # Validation
     "eval_batch_size": 128,
-    "eval_holdout_type": "unseen_users",
-    "skip_modules": None,  # Comma-separated eval module names to skip (None = run all)
     # Selection/prior behavior
     "use_latest": False,
     "start_from": None,
@@ -171,7 +149,6 @@ DEFAULTS: Dict[str, Any] = {
     "prior_05_post_liker_history": None,
     "prior_06_author_statistics": None,
     "prior_07_dataset_hydration": None,
-    "prior_03_train": None,
     # Execution behavior
     # Default is foreground execution (recommended for ClearML remote execution).
     "background": False,
@@ -262,23 +239,16 @@ def _merge_args_with_config(raw_args: argparse.Namespace) -> argparse.Namespace:
             raise ValueError(f"Unknown config keys: {', '.join(sorted(unknown_keys))}")
         merged.update(config_data)
     merged.update({k: v for k, v in args_dict.items() if k not in ("command", "func")})
+    if merged["model_type"] not in {"bst-ranker", "two-tower"}:
+        raise ValueError(
+            f"Unknown model_type: {merged['model_type']!r}. "
+            "Choose 'bst-ranker' or 'two-tower'."
+        )
     final_ns = argparse.Namespace(**merged)
-    _apply_canonical_model_contract(final_ns)
     # Preserve argparse-injected metadata
     setattr(final_ns, "command", command)
     setattr(final_ns, "func", func)
     return final_ns
-
-
-def _apply_canonical_model_contract(args: argparse.Namespace) -> argparse.Namespace:
-    """Keep fixed canonical architecture flags truthful in resolved configs."""
-
-    if getattr(args, "model_type", None) == "two-tower":
-        args.user_encoder = "cross_attention"
-        args.use_post_encoder = True
-        args.l2_normalize_embeddings = True
-        args.use_author_embedding_table = True
-    return args
 
 
 def _build_effective_config_for_background_run(
@@ -287,8 +257,7 @@ def _build_effective_config_for_background_run(
     """Materialize an effective config to re-invoke run-all in the background.
 
     We prefer passing a config file rather than reconstructing CLI flags from
-    argparse dest names, since some args intentionally use a different flag name
-    (e.g. `use_post_encoder` is controlled via `--post-encoder/--no-post-encoder`).
+    argparse destination names.
     """
     cfg: Dict[str, Any] = {k: getattr(args, k) for k in DEFAULTS.keys()}
     cfg["output_dir"] = str(Path(output_root).resolve())
@@ -412,7 +381,6 @@ def cmd_run_all(args: argparse.Namespace) -> int:
         args.stop_after,
         train_key,
     )
-    _validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
 
     # Store the single timestamp in Context; for background runs we pass it via env.
     run_timestamp = (os.environ.get("ENGAGEMENT_RUN_TIMESTAMP") or "").strip() or generate_run_timestamp()
@@ -493,7 +461,7 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     )
     # ClearML remote execution can override parameters on the server/UI.
     # Connect args and rehydrate a Namespace so downstream code sees the updated values.
-    args = _apply_canonical_model_contract(tracker.connect_args(args, "Args"))
+    args = tracker.connect_args(args, "Args")
 
     output_root = _resolve_run_dir(args, run_timestamp=run_timestamp)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -558,10 +526,7 @@ def cmd_run_all(args: argparse.Namespace) -> int:
 
 
 def _get_train_key(model_type: str) -> str:
-    # Do not default to MLP if model name is not recognized - raise error instead
-    if model_type == 'mlp':
-        return 'train_mlp'
-    elif model_type == 'two-tower':
+    if model_type == 'two-tower':
         return 'train_two_tower'
     elif model_type == 'bst-ranker':
         return 'train_bst_ranker'
@@ -693,36 +658,6 @@ def _get_stage_folder_and_start_stop_indices(
     return start_idx, stop_idx, includes_train
 
 
-def _validate_data_pipeline_boundary(
-    args: argparse.Namespace,
-    stage_order: List[str],
-    start_idx: int,
-    stop_idx: int,
-) -> None:
-    dataset_hydration_idx = stage_order.index("dataset_hydration")
-    train_idx = next(idx for idx, key in enumerate(stage_order) if key.startswith("train_"))
-    train_key = stage_order[train_idx]
-    evaluate_idx = stage_order.index("evaluate")
-    native_train_keys = {"train_bst_ranker", "train_two_tower"}
-    if train_key not in native_train_keys and start_idx <= dataset_hydration_idx < stop_idx:
-        raise ValueError(
-            "MLP training cannot yet consume dataset_hydration. "
-            "Run the new data pipeline with --stop-after dataset_hydration."
-        )
-    if train_key not in native_train_keys and start_idx == train_idx:
-        raise ValueError(
-            "MLP training is not yet wired to the Stage 7 hydrated dataset."
-        )
-    if train_key in native_train_keys and start_idx <= train_idx < stop_idx:
-        model_label = "BST" if train_key == "train_bst_ranker" else "two-tower"
-        raise ValueError(
-            f"Native {model_label} training cannot yet continue into legacy evaluation. "
-            f"Run with --stop-after {train_key}."
-        )
-    if start_idx == evaluate_idx and args.prior_03_train is None:
-        raise ValueError("Direct legacy evaluation requires an explicit --prior-03-train pin.")
-
-
 def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     """Execute the modular pipeline stages in the foreground sequentially."""
     run_dir = Path(ctx.run_dir).resolve()
@@ -778,12 +713,6 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
         artifacts_dir=artifacts_dir,
         stage_folder="07_dataset_hydration",
     )
-    prior_03_train = _resolve_prior_spec(
-        args.prior_03_train,
-        output_root=output_root,
-        artifacts_dir=artifacts_dir,
-        stage_folder="03_train",
-    )
     if prior_00_source_metadata is not None:
         ctx.prior_outputs["00_source_metadata"] = prior_00_source_metadata
     if prior_01_query_selection is not None:
@@ -800,30 +729,10 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
         ctx.prior_outputs["06_author_statistics"] = prior_06_author_statistics
     if prior_07_dataset_hydration is not None:
         ctx.prior_outputs["07_dataset_hydration"] = prior_07_dataset_hydration
-    if prior_03_train is not None:
-        ctx.prior_outputs["03_train"] = prior_03_train
     validate_explicit_prior_pin_consistency(ctx)
     
     model_type = args.model_type
 
-    # --- Validation for --user-encoder ---
-    user_encoder = args.user_encoder
-    if model_type in VALID_USER_ENCODERS_BY_MODEL_TYPE:
-        allowed = VALID_USER_ENCODERS_BY_MODEL_TYPE[model_type]
-        if user_encoder not in allowed:
-            raise ValueError(
-                f"--user-encoder '{user_encoder}' is not valid for --model-type '{model_type}'. "
-                + f"Allowed values: {allowed}"
-            )
-
-    use_author_embedding_table = bool(args.use_author_embedding_table)
-    if int(args.min_author_support) < 1:
-        raise ValueError("--min-author-support must be >= 1.")
-    if use_author_embedding_table:
-        if int(args.author_embedding_dim) <= 0:
-            raise ValueError("--author-embedding-dim must be positive.")
-        if not 0.0 <= float(args.author_unknown_dropout_rate) < 1.0:
-            raise ValueError("--author-unknown-dropout-rate must be in [0, 1).")
     if model_type == "bst-ranker":
         _validate_bst_config(args)
     elif model_type == "two-tower":
@@ -839,7 +748,6 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
         args.stop_after,
         train_key
     )
-    _validate_data_pipeline_boundary(args, stage_order, start_idx, stop_idx)
 
     # Optional interactive chooser (foreground only)
     def _maybe_choose_prior(stage_key: str):
@@ -887,10 +795,8 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
                 'post_liker_history': "Stage 5: Extract post-liker histories…",
                 'author_statistics': "Stage 6: Build author statistics…",
                 'dataset_hydration': "Stage 7: Hydrate the model-training dataset…",
-                'train_mlp': "Training: Train model (MLP)…",
                 'train_two_tower': "Stage 8: Train two-tower model…",
                 'train_bst_ranker': "Stage 8: Train BST ranker…",
-                'evaluate': "Legacy evaluation: Evaluate model…",
             }
             label = label_map.get(key, f"Stage {idx+1}: {key}…")
             print(f"\n[{idx+1}/{len(stage_order)}] ▶️  {label}")
@@ -961,17 +867,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Optional independent query-hour cap for each evaluation split")
     _add_arg_with_default(p_all, "--max-positives-per-user-hour", type=int, default=argparse.SUPPRESS,
                           help_text="Discard selected user-hours with more than this many retained root-post positives")
-    _add_arg_with_default(p_all, "--max-memory-gb", type=float, default=argparse.SUPPRESS,
-                          help_text="Maximum memory to use in GB (None = auto based on available RAM)")
-    _add_arg_with_default(p_all, "--max-memory-pct", type=float, default=argparse.SUPPRESS,
-                          help_text="Maximum percentage of available RAM to use (default: 0.75)")
-    _add_arg_with_default(p_all, "--memory-check", type=str, choices=["full", "ignore", "skip"],
-                          default=argparse.SUPPRESS,
-                          help_text="Memory check mode: full (enforce limits), ignore (log only), skip (no estimation)")
     _add_arg_with_default(p_all, "--output-dir", type=str, default=argparse.SUPPRESS,
                           help_text="Optional explicit run directory root")
-    _add_arg_with_default(p_all, "--debug", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
-                          help_text="Enable verbose debug logging for Stage 1")
     _add_arg_with_default(p_all, "--random-seed", type=int, default=argparse.SUPPRESS,
                           help_text="Random seed for splitting")
     _add_arg_with_default(p_all, "--embedding-model", type=str, choices=["all_MiniLM_L6_v2", "all_MiniLM_L12_v2"],
@@ -1024,50 +921,22 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="ISO date string for start of seen-users holdout window. Non-holdout users' rows at/after this date become holdout_seen_users. Must be after val-start.")
     _add_arg_with_default(p_all, "--holdout-end", type=str, default=argparse.SUPPRESS,
                           help_text="ISO date string for end of holdout window. Applies to both holdout_seen_users and holdout_unseen_users. Rows at/after this date get split=None. Default: no upper bound.")
-    _add_arg_with_default(p_all, "--global-topic-k", type=int, default=argparse.SUPPRESS,
-                          help_text="Number of global topics")
-    # Stage 3 (train) user summarization + model selection
-    _add_arg_with_default(p_all, "--user-summarization", type=str, choices=["mean", "ema", "linear_recency"],
-                          default=argparse.SUPPRESS,
-                          help_text="User-history summarization strategy for MLP (mean, ema, linear_recency)")
-    _add_arg_with_default(p_all, "--ema-alpha", type=float, default=argparse.SUPPRESS,
-                          help_text="EMA smoothing factor (0,1]. Higher = more weight on recent likes. Only used when --user-summarization=ema")
-    _add_arg_with_default(p_all, "--user-encoder", type=str, choices=["summarized", "full_transformer", "cross_attention"],
-                          default=argparse.SUPPRESS, help_text="Legacy MLP user encoder type (summarized, full_transformer, or cross_attention)")
-    _add_arg_with_default(p_all, "--model-type", type=str, choices=["mlp", "two-tower", "bst-ranker"],
-                          default=argparse.SUPPRESS, help_text="Model architecture: mlp, two-tower, or bst-ranker")
+    # Stage 8 model selection
+    _add_arg_with_default(p_all, "--model-type", type=str, choices=["two-tower", "bst-ranker"],
+                          default=argparse.SUPPRESS, help_text="Model architecture: two-tower or bst-ranker")
     # Two-tower specific options
     _add_arg_with_default(p_all, "--output-embedding-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Canonical two-tower user/post output embedding dimension")
     _add_arg_with_default(p_all, "--user-hidden-dim", type=int, default=argparse.SUPPRESS,
                           help_text="User encoder hidden dimension")
-    _add_arg_with_default(p_all, "--user-output-dim", type=int, default=argparse.SUPPRESS,
-                          help_text="User encoder output dimension")
     _add_arg_with_default(p_all, "--post-hidden-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower post encoder hidden dimension")
-    _add_arg_with_default(p_all, "--post-encoder", key="use_post_encoder", dest="use_post_encoder",
-                          action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
-                          help_text="Enable or disable a neural post-tower encoder. Use --post-encoder to enable, --no-post-encoder to disable")
-    _add_arg_with_default(p_all, "--num-attention-heads", type=int, default=argparse.SUPPRESS,
-                          help_text="Two-tower attention heads")
-    _add_arg_with_default(p_all, "--num-attention-layers", type=int, default=argparse.SUPPRESS,
-                          help_text="Two-tower attention layers")
     _add_arg_with_default(p_all, "--max-history-len", type=int, default=argparse.SUPPRESS,
                           help_text="Max user history length")
-    _add_arg_with_default(p_all, "--attention-dropout", type=float, default=argparse.SUPPRESS,
-                          help_text="Dropout rate for attention-based user encoders")
-    _add_arg_with_default(p_all, "--l2-normalize-embeddings", dest="l2_normalize_embeddings",
-                          action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
-                          help_text="Enable or disable L2 normalization on two-tower user/post embeddings before similarity scoring")
     _add_arg_with_default(p_all, "--similarity-temperature", type=float, default=argparse.SUPPRESS,
                           help_text="Temperature used to scale cosine-similarity logits in the two-tower model")
-    _add_arg_with_default(p_all, "--use-author-embedding-table",
-                          action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
-                          help_text="Enable a trainable author embedding table for history and candidate posts")
     _add_arg_with_default(p_all, "--author-embedding-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Embedding dimension for the trainable author embedding table")
-    _add_arg_with_default(p_all, "--min-author-support", type=int, default=argparse.SUPPRESS,
-                          help_text="Minimum train-history author occurrence count required for a dedicated embedding row")
     _add_arg_with_default(p_all, "--author-unknown-dropout-rate", type=float, default=argparse.SUPPRESS,
                           help_text="Training-time probability of replacing a supported history author with the UNK row")
     # Ranker shared options
@@ -1106,25 +975,17 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Enable or disable BST prior-cumulative-like popularity features")
     _add_arg_with_default(p_all, "--bst-popularity-projection-dim", type=int, default=argparse.SUPPRESS,
                           help_text="BST popularity feature projection dimension")
-    # Stage 3 options (shared)
+    # Stage 8 options (shared)
     _add_arg_with_default(p_all, "--epochs", type=int, default=argparse.SUPPRESS,
                           help_text="Training epochs")
     _add_arg_with_default(p_all, "--batch-size", type=int, default=argparse.SUPPRESS,
                           help_text="Training batch size")
     _add_arg_with_default(p_all, "--learning-rate", type=float, default=argparse.SUPPRESS,
                           help_text="Learning rate")
-    _add_arg_with_default(p_all, "--weight-decay-mlp", type=float, default=argparse.SUPPRESS,
-                          help_text="Weight decay for MLP model")
     _add_arg_with_default(p_all, "--weight-decay-two-tower", type=float, default=argparse.SUPPRESS,
                           help_text="Weight decay for two tower model")
-    _add_arg_with_default(p_all, "--hidden-dims", type=int, nargs="+", default=argparse.SUPPRESS,
-                          help_text="Hidden layer sizes")
-    _add_arg_with_default(p_all, "--dropout-rate-mlp", type=float, default=argparse.SUPPRESS,
-                          help_text="Dropout rate for MLP model")
     _add_arg_with_default(p_all, "--dropout-rate-two-tower", type=float, default=argparse.SUPPRESS,
                           help_text="Dropout rate for two tower model")
-    _add_arg_with_default(p_all, "--prediction-posts-per-user", type=float, default=argparse.SUPPRESS,
-                          help_text="Prediction posts per user")
     _add_arg_with_default(p_all, "--device", type=str, choices=["cpu", "cuda"], default=argparse.SUPPRESS,
                           help_text="Device for training")
     _add_arg_with_default(p_all, "--patience", type=int, default=argparse.SUPPRESS,
@@ -1132,16 +993,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--early-stopping-min-delta", type=float, default=argparse.SUPPRESS,
                           help_text="Minimum absolute validation primary-metric improvement required to reset early stopping patience")
     _add_arg_with_default(p_all, "--run-tag", type=str, default=argparse.SUPPRESS,
-                          help_text="Tag appended to training output directory name (e.g. mlp_summarized_mean)")
+                          help_text="Tag appended to the training output directory name")
     _add_arg_with_default(p_all, "--no-plots", action="store_true", default=argparse.SUPPRESS,
                           help_text="Disable training plots")
-    _add_arg_with_default(p_all, "--no-save-model", action="store_true", default=argparse.SUPPRESS,
-                          help_text="Skip model checkpoints for legacy trainers (ignored by canonical Stage 8 trainers)")
     _add_arg_with_default(p_all, "--disable-progress", action="store_true", default=argparse.SUPPRESS,
                           help_text="Disable progress bars during training")
     _add_arg_with_default(p_all, "--metrics-top-ks", type=int, nargs="+", default=argparse.SUPPRESS,
                           help_text="Values of K to use for training NDCG@K metrics")
-    # Stage 3 (train) - DataLoader settings
+    # Stage 8 - DataLoader settings
     _add_arg_with_default(p_all, "--num-dataloader-workers", type=int, default=argparse.SUPPRESS,
                           help_text="Number of DataLoader worker processes")
     _add_arg_with_default(p_all, "--dataloader-pin-memory", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
@@ -1150,31 +1009,26 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Keep DataLoader workers alive between epochs")
     _add_arg_with_default(p_all, "--dataloader-prefetch-factor", type=int, default=argparse.SUPPRESS,
                           help_text="Number of batches to prefetch per DataLoader worker")
-    # Stage 3 (train) - Learning rate scheduler
+    # Stage 8 - Learning rate scheduler
     _add_arg_with_default(p_all, "--lr-scheduler-factor", type=float, default=argparse.SUPPRESS,
                           help_text="Factor by which to reduce learning rate")
     _add_arg_with_default(p_all, "--lr-scheduler-patience", type=int, default=argparse.SUPPRESS,
                           help_text="Number of epochs with no improvement before reducing LR")
-    # Stage 3 (train) - Training optimization
+    # Stage 8 - Training optimization
     _add_arg_with_default(p_all, "--gradient-clip-max-norm", type=float, default=argparse.SUPPRESS,
                           help_text="Maximum gradient norm for clipping")
-    # Stage 4 options (subset)
+    # Validation
     _add_arg_with_default(p_all, "--eval-batch-size", type=int, default=argparse.SUPPRESS,
                           help_text="Batch size for evaluation")
-    _add_arg_with_default(p_all, "--eval-holdout-type", type=str, default=argparse.SUPPRESS,
-                          choices=["unseen_users", "seen_users"],
-                          help_text="Which holdout set to use for evaluation: unseen_users (user-split) or seen_users (temporal after val period)")
-    _add_arg_with_default(p_all, "--skip-modules", type=str, default=argparse.SUPPRESS,
-                          help_text="Comma-separated list of evaluation module names to skip (e.g. cold_start_curves,performance_inequality)")
     # Selection behavior
     _add_arg_with_default(p_all, "--use-latest", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help_text="(Deprecated) Always enabled during sequential run-all")
     # Selective reruns and prior pinning
     _add_arg_with_default(p_all, "--start-from", type=str,
-                          choices=["source_metadata", "query_selection", "user_history", "post_selection", "negative_selection", "post_liker_history", "author_statistics", "dataset_hydration", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "evaluate"],
+                          choices=["source_metadata", "query_selection", "user_history", "post_selection", "negative_selection", "post_liker_history", "author_statistics", "dataset_hydration", "train", "train_two_tower", "train_bst_ranker"],
                           default=argparse.SUPPRESS, help_text="Begin execution at this stage")
     _add_arg_with_default(p_all, "--stop-after", type=str,
-                          choices=["source_metadata", "query_selection", "user_history", "post_selection", "negative_selection", "post_liker_history", "author_statistics", "dataset_hydration", "train", "train_mlp", "train_two_tower", "train_bst_ranker", "evaluate"],
+                          choices=["source_metadata", "query_selection", "user_history", "post_selection", "negative_selection", "post_liker_history", "author_statistics", "dataset_hydration", "train", "train_two_tower", "train_bst_ranker"],
                           default=argparse.SUPPRESS, help_text="Stop after this stage completes")
     _add_arg_with_default(p_all, "--pick-prior", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help_text="If multiple prior outputs exist, prompt to pick (foreground only)")
@@ -1194,8 +1048,6 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Pin Stage 6 (06_author_statistics) for a direct dataset-hydration rerun")
     _add_arg_with_default(p_all, "--prior-07-dataset-hydration", type=str, default=argparse.SUPPRESS,
                           help_text="Pin Stage 7 (07_dataset_hydration) for a direct native-training rerun")
-    _add_arg_with_default(p_all, "--prior-03-train", type=str, default=argparse.SUPPRESS,
-                          help_text="Pin prior Stage 3 (03_train) artifact dir by stage_run_id or path (used by eval)")
     # Execution behavior
     _add_arg_with_default(p_all, "--background", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help_text="Run in background with nohup (default: foreground)")

@@ -11,7 +11,7 @@ from engagement_prediction.data.parquet import scan_parquet_artifact
 from engagement_prediction.pipeline import registry
 from engagement_prediction.pipeline.core import Context
 from engagement_prediction.stages import negative_selection as stage
-from utils import helpers
+from engagement_prediction.pipeline import logging as pipeline_logging
 
 
 UTC = timezone.utc
@@ -198,7 +198,7 @@ def _context(tmp_path: Path, stage3_dir: Path, suffix: str) -> Context:
 
 
 def _reset_stage_logger() -> None:
-    logger = helpers._stage_loggers.pop("04_NEGATIVE_SELECTION", None)
+    logger = pipeline_logging._stage_loggers.pop("04_NEGATIVE_SELECTION", None)
     if logger is not None:
         for handler in logger.handlers:
             handler.close()

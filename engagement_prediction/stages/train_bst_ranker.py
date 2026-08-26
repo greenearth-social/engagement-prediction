@@ -35,7 +35,12 @@ from engagement_prediction.training.bst_publication import (
 from engagement_prediction.training.popularity import fit_popularity_normalization
 from engagement_prediction.training.reporting import write_bst_training_history_plot
 from shared.input_data_helpers import AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
-from utils.helpers import clear_cuda_memory, get_device, get_stage_logger, set_random_seeds
+from engagement_prediction.pipeline.logging import get_stage_logger
+from engagement_prediction.training.runtime import (
+    clear_cuda_memory,
+    get_device,
+    set_random_seeds,
+)
 
 
 STAGE_FOLDER = "08_train_bst_ranker"

@@ -23,7 +23,7 @@ from typing import Any, Dict
 
 from engagement_prediction.data import ingex, source_metadata_artifacts
 from engagement_prediction.pipeline.core import Context
-from utils.helpers import get_stage_logger
+from engagement_prediction.pipeline.logging import get_stage_logger
 
 
 @dataclass(frozen=True)

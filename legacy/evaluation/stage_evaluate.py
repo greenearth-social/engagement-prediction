@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 
 """
-Stage 4: Evaluate a trained model using modular evaluation framework.
+Archived evaluator for legacy Stage 3 ranking-row artifacts.
 
 This stage orchestrates the evaluation pipeline by:
 1. Loading holdout ranking rows from Stage 3 (03_train)
 2. Computing user metadata from those rows
 3. Creating an EvalContext and running all discovered evaluation modules
 
-Evaluation modules are auto-discovered from utils/04_evaluate/evals/ and each
+Evaluation modules are auto-discovered from legacy/evaluation/evals/ and each
 produces its own set of artifacts (plots, CSVs, JSON summaries).
 
 Inputs (from prior pipeline stages):
@@ -30,41 +30,8 @@ from typing import Any, Dict, Optional
 import pandas as pd
 
 from engagement_prediction.pipeline.core import Context, generate_run_timestamp
-from utils.helpers import get_stage_logger, log_operation_start
-
-# ---------------------------------------------------------------------------
-# Import evaluation framework
-# ---------------------------------------------------------------------------
-# We use importlib with sys.modules registration to avoid issues with the
-# numeric directory name (04_evaluate is not a valid Python identifier).
-import sys
-import importlib.util
-
-
-def _import_evals_module():
-    """Import the evals package from the numeric directory.
-
-    We set ``submodule_search_locations`` so that the sub-modules
-    (cold_start_curves, performance_inequality, …) can use relative imports
-    like ``from . import EvalContext``.
-    """
-    evals_dir = Path(__file__).parent / 'evals'
-    evals_init = evals_dir / '__init__.py'
-    spec = importlib.util.spec_from_file_location(
-        'utils._evals',
-        evals_init,
-        submodule_search_locations=[str(evals_dir)],
-    )
-    evals = importlib.util.module_from_spec(spec)
-    sys.modules['utils._evals'] = evals  # Register before exec so dataclasses resolve
-    spec.loader.exec_module(evals)
-    return evals
-
-
-_evals = _import_evals_module()
-EvalContext = _evals.EvalContext
-discover_modules = _evals.discover_modules
-run_all_modules = _evals.run_all_modules
+from engagement_prediction.pipeline.logging import get_stage_logger, log_operation_start
+from legacy.evaluation.evals import EvalContext, run_all_modules
 
 STAGE_LOG_NAME = 'STAGE_04_EVALUATE'
 
@@ -75,25 +42,23 @@ STAGE_LOG_NAME = 'STAGE_04_EVALUATE'
 
 def resolve_train_output(
     context: Context,
+    *,
+    prior_03_train: Optional[str | Path],
 ) -> Path:
+    """Resolve the explicitly supplied legacy ``03_train`` artifact.
+
+    This archived evaluator is deliberately detached from active pipeline
+    discovery. It never searches for the latest training run and never consumes
+    an artifact merely because it was produced earlier in the current process.
     """
-    Locate the training stage output directory.
-
-    Tries same-session artifacts (``train_mlp`` / ``train_two_tower``) first,
-    then falls back to filesystem scanning under ``03_train/``.
-
-    Returns:
-        Path to the training stage timestamp directory.
-
-    Raises:
-        FileNotFoundError: If no training output can be found.
-    """
-    for stage_key in ("train_mlp", "train_two_tower"):
-        art_dir = context.get_artifact_dir(stage_key)
-        if art_dir is not None and Path(art_dir).exists():
-            return context.record_prior_input("03_train", art_dir)
-
-    return context.resolve_prior_output("03_train", prior_path=context.prior_outputs.get("03_train"))
+    if prior_03_train is None or not str(prior_03_train).strip():
+        raise ValueError(
+            "Archived evaluation requires an explicit prior_03_train artifact path"
+        )
+    return context.resolve_prior_output(
+        "03_train",
+        prior_path=Path(prior_03_train).expanduser(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +116,10 @@ def run(context: Context, args) -> Dict[str, Any]:
         skip_modules = [m.strip() for m in skip_modules.split(',')]
 
     # Resolve training output (inputs)
-    train_dir = resolve_train_output(context)
+    train_dir = resolve_train_output(
+        context,
+        prior_03_train=getattr(args, "prior_03_train", None),
+    )
     train_eval_dir = train_dir / 'eval'
 
     # Canonical stage output

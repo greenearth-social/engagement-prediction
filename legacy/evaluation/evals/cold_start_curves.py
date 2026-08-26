@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-Cold Start Curves Evaluation Module
+Archived Cold Start Curves Evaluation Module
 
 This module analyzes how model performance varies with the amount of user
 history available at the time each prediction was made (the "cold start" problem).

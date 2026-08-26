@@ -151,7 +151,7 @@ class ProjectedPostFeatureEncoder(nn.Module):
 
 
 class LinearPredictionHead(nn.Module):
-    """Apply a configurable MLP and return one scalar logit per input row."""
+    """Apply a configurable feed-forward head and return one logit per input row."""
 
     def __init__(
         self,

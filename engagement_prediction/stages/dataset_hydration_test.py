@@ -22,7 +22,7 @@ from engagement_prediction.data import user_history
 from engagement_prediction.data.parquet import scan_parquet_artifact
 from engagement_prediction.pipeline import registry
 from engagement_prediction.pipeline.core import Context
-from utils import helpers
+from engagement_prediction.pipeline import logging as pipeline_logging
 
 
 UTC = timezone.utc
@@ -279,7 +279,7 @@ def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
         "publish_embeddings_and_post_metadata",
         publish_after_releasing_intermediates,
     )
-    logger = helpers._stage_loggers.pop("07_DATASET_HYDRATION", None)
+    logger = pipeline_logging._stage_loggers.pop("07_DATASET_HYDRATION", None)
     if logger:
         for handler in logger.handlers:
             handler.close()
@@ -379,7 +379,7 @@ def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
 
 def test_stage_failure_retains_partial_diagnostics_without_publishing(tmp_path, monkeypatch):
     stage6 = _upstream(tmp_path)
-    logger = helpers._stage_loggers.pop("07_DATASET_HYDRATION", None)
+    logger = pipeline_logging._stage_loggers.pop("07_DATASET_HYDRATION", None)
     if logger:
         for handler in logger.handlers:
             handler.close()
@@ -426,7 +426,7 @@ def test_stage_failure_retains_partial_diagnostics_without_publishing(tmp_path, 
 
 def test_loader_index_failure_keeps_outer_bundle_partial(tmp_path, monkeypatch):
     stage6 = _upstream(tmp_path)
-    logger = helpers._stage_loggers.pop("07_DATASET_HYDRATION", None)
+    logger = pipeline_logging._stage_loggers.pop("07_DATASET_HYDRATION", None)
     if logger:
         for handler in logger.handlers:
             handler.close()

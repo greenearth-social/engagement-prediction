@@ -36,7 +36,7 @@ from engagement_prediction.data.source_metadata_artifacts import (
 from engagement_prediction.pipeline.core import Context
 from engagement_prediction.pipeline.lineage import resolve_recorded_stage_lineage
 from shared.input_data_helpers import get_embedding_dim_for_known_model
-from utils.helpers import get_stage_logger
+from engagement_prediction.pipeline.logging import get_stage_logger
 
 
 def _load_parameter(stage_dir: Path, name: str) -> int:

@@ -21,7 +21,7 @@ from engagement_prediction.data.parquet import find_artifact_path, scan_parquet_
 from engagement_prediction.data.source_metadata_artifacts import load_source_metadata_artifact
 from engagement_prediction.pipeline.core import Context
 from engagement_prediction.pipeline.lineage import resolve_recorded_stage_lineage
-from utils.helpers import get_stage_logger
+from engagement_prediction.pipeline.logging import get_stage_logger
 
 
 @dataclass(frozen=True)

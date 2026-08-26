@@ -1,0 +1,101 @@
+########## high-level ##########
+background: true
+output_dir: "/mnt/data/dave/outputs/"
+experiment_tracker: "clearml"
+start_from: "train"
+stop_after: "train"
+prior_01_get_data: "20260812_155501_33f1ec47"
+prior_02_user_history: "20260812_234153_150b9bda"
+memory_check: "skip"
+gcs_bucket: "greenearth-471522-ingex-extract-prod"
+
+# ########## 01_query_selection ##########
+# posts_start: "2026-07-08"
+# posts_end: "2026-08-08"
+# likes_start: "2026-07-08"
+# likes_end: "2026-08-08"
+# train_start: "2026-07-08"
+# val_start: "2026-08-01"
+# holdout_start: "2026-08-05"
+# max_train_query_hours: 5000000
+# max_eval_query_hours_per_split: 500000
+
+########## 01_get_data ##########
+gcs_bucket: "greenearth-471522-ingex-extract-prod"
+posts_start: "2026-06-28"
+posts_end: "2026-07-28"
+likes_start: "2026-06-28"
+likes_end: "2026-07-28"
+train_start: "2026-06-26"
+val_start: "2026-07-21"
+holdout_start: "2026-07-25"
+max_trainval_users: 1000000
+max_unseen_eval_users: 100000
+max_likes_per_user: 100
+negative_samples_per_hour: 1000
+min_likes_per_negative_post: 10
+initial_negative_sampling_pct: 0.3
+min_likes_per_user: 0
+political_negative_samples_per_hour: 1000
+
+########## 02_user_history ##########
+max_prior_likes: 64
+# generate_post_liker_history: true
+# min_post_liker_user_support: 1
+
+######### 03_train ##########
+## general modeling params ## 
+model_type: "bst-ranker"
+max_history_len: 64
+
+## training params ##
+epochs: 100
+learning_rate: 3e-4
+patience: 10
+early_stopping_min_delta: 0.0025
+lr_scheduler_patience: 2
+
+## training memory params ##
+batch_size: 256
+num_dataloader_workers: 4
+dataloader_pin_memory: true
+dataloader_prefetch_factor: 1
+dataloader_persistent_workers: false
+
+## author embeddings ##
+use_author_embedding_table: true
+author_embedding_dim: 16
+min_author_support: 50
+author_unknown_dropout_rate: 0.25
+author_projection_dim: 48
+
+content_projection_dim: 192
+
+#### BST specific ####
+bst_model_dim: 192
+bst_transformer_ff_dim: 384
+bst_additional_batch_negatives: 64
+bst_political_batch_negatives: 48
+prediction_hidden_dims: [64, 32, 16]
+
+bst_use_popularity_feature: true
+bst_popularity_projection_dim: 8
+
+# bst_use_post_liker_user_pooling: true
+# # bst_user_id_only_prepend_target_user_token: true
+# bst_post_liker_user_embedding_dim: 16
+# bst_post_liker_projection_dim: 96
+# bst_target_user_projection_dim: 96
+# bst_post_liker_user_dropout_rate: 0.2
+# bst_target_user_dropout_rate: 0.2
+# bst_post_liker_pooling_tau_hours: 24
+
+# # two-tower specific ##
+# user_encoder: "cross_attention"         # ["summarized", "full_transformer", "cross_attention"]
+# post_hidden_dim: 128
+# shared_dim: 128
+# user_hidden_dim: 128
+# dropout_rate_two_tower: 0.3
+# weight_decay_two_tower: 0.05
+# similarity_temperature: 0.1
+# l2_normalize_embeddings: true

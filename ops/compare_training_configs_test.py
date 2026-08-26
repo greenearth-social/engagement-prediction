@@ -1,3 +1,5 @@
+"""Tests for the training-configuration comparison command."""
+
 import json
 
 from ops import compare_training_configs
