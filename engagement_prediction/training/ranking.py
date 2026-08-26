@@ -64,6 +64,125 @@ def empty_rank_metric_sums(
     return metric_sums
 
 
+def empty_ndcg_metric_tensor_sums(
+    metrics_top_ks: list[int],
+    *,
+    device: torch.device | str,
+) -> Dict[str, torch.Tensor]:
+    """Create device-side NDCG accumulators for synchronization-free epochs."""
+    metric_sums = {
+        f"dcg@{k}": torch.zeros((), device=device, dtype=torch.float64)
+        for k in metrics_top_ks
+    }
+    metric_sums.update(
+        {
+            f"ndcg@{k}": torch.zeros((), device=device, dtype=torch.float64)
+            for k in metrics_top_ks
+        }
+    )
+    return metric_sums
+
+
+def calc_baseline_ndcg_tensor_sums_for_batch(
+    unranked_labels: torch.Tensor,
+    metrics_top_ks: list[int],
+) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+    """Return random-order NDCG sums without transferring values to Python."""
+    if unranked_labels.dim() != 2:
+        raise RuntimeError("unranked_labels must have shape [num_users, num_candidates]")
+    if unranked_labels.size(1) == 0:
+        raise RuntimeError("unranked_labels must contain at least one candidate")
+
+    with torch.no_grad():
+        labels = unranked_labels.to(dtype=torch.float32)
+        total_relevant = labels.sum(dim=1)
+        eligible = total_relevant > 0
+        eligible_total_relevant = total_relevant[eligible]
+        num_candidates = labels.size(1)
+        max_k = min(max(metrics_top_ks), num_candidates)
+        discounts = 1.0 / torch.log2(
+            torch.arange(max_k, device=labels.device, dtype=torch.float32) + 2.0
+        )
+        cumulative_discounts = discounts.cumsum(dim=0)
+        relevant_probability = eligible_total_relevant / float(num_candidates)
+        metric_sums: Dict[str, torch.Tensor] = {}
+        for k in metrics_top_ks:
+            k_eff = min(k, num_candidates)
+            dcg = relevant_probability * cumulative_discounts[k_eff - 1]
+            ideal_counts = eligible_total_relevant.clamp(max=k_eff).to(dtype=torch.long)
+            idcg = cumulative_discounts[ideal_counts - 1].clamp(min=1.0e-12)
+            metric_sums[f"dcg@{k}"] = dcg.sum().to(dtype=torch.float64)
+            metric_sums[f"ndcg@{k}"] = (dcg / idcg).sum().to(dtype=torch.float64)
+        return metric_sums, eligible.sum().to(dtype=torch.int64)
+
+
+def topk_ranked_labels_for_scores(
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+    metrics_top_ks: list[int],
+) -> torch.Tensor:
+    """Gather only the ranked label prefix needed by the requested metrics.
+
+    As with the prior non-stable ``argsort``, ordering among exact score ties is
+    unspecified. Tie-free inputs produce the same prefix as a full descending
+    sort.
+    """
+    if scores.dim() != 2 or labels.dim() != 2:
+        raise RuntimeError("scores and labels must have shape [num_users, num_candidates]")
+    if scores.shape != labels.shape:
+        raise RuntimeError("scores and labels must have matching shapes")
+    if scores.size(1) == 0:
+        raise RuntimeError("scores and labels must contain at least one candidate")
+    max_k = min(max(metrics_top_ks), scores.size(1))
+    ranked_indices = torch.topk(
+        scores.detach(),
+        k=max_k,
+        dim=1,
+        largest=True,
+        sorted=True,
+    ).indices
+    return torch.gather(labels, dim=1, index=ranked_indices)
+
+
+def ndcg_metric_tensor_sums_for_batch(
+    top_ranked_labels: torch.Tensor,
+    total_relevant: torch.Tensor,
+    metrics_top_ks: list[int],
+    *,
+    row_mask: Optional[torch.Tensor] = None,
+) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+    """Return exact NDCG sums from a top-K label prefix, entirely on-device."""
+    if top_ranked_labels.dim() != 2:
+        raise RuntimeError("top_ranked_labels must have shape [num_users, max_k]")
+    if total_relevant.dim() != 1 or total_relevant.size(0) != top_ranked_labels.size(0):
+        raise RuntimeError("total_relevant must have shape [num_users]")
+
+    with torch.no_grad():
+        ranked_labels = top_ranked_labels.to(dtype=torch.float32)
+        total_relevant = total_relevant.to(device=ranked_labels.device, dtype=torch.float32)
+        eligible = total_relevant > 0
+        if row_mask is not None:
+            if row_mask.dim() != 1 or row_mask.size(0) != ranked_labels.size(0):
+                raise RuntimeError("row_mask must have shape [num_users]")
+            eligible = eligible & row_mask.to(device=ranked_labels.device, dtype=torch.bool)
+        ranked_labels = ranked_labels[eligible]
+        eligible_total_relevant = total_relevant[eligible]
+        max_k = ranked_labels.size(1)
+        discounts = 1.0 / torch.log2(
+            torch.arange(max_k, device=ranked_labels.device, dtype=torch.float32) + 2.0
+        )
+        cumulative_discounts = discounts.cumsum(dim=0)
+        metric_sums: Dict[str, torch.Tensor] = {}
+        for k in metrics_top_ks:
+            k_eff = min(k, max_k)
+            dcg = (ranked_labels[:, :k_eff] * discounts[:k_eff]).sum(dim=1)
+            ideal_counts = eligible_total_relevant.clamp(max=k_eff).to(dtype=torch.long)
+            idcg = cumulative_discounts[ideal_counts - 1].clamp(min=1.0e-12)
+            metric_sums[f"dcg@{k}"] = dcg.sum().to(dtype=torch.float64)
+            metric_sums[f"ndcg@{k}"] = (dcg / idcg).sum().to(dtype=torch.float64)
+        return metric_sums, eligible.sum().to(dtype=torch.int64)
+
+
 def calc_baseline_rank_metrics_for_batch(
     unranked_labels: torch.Tensor,
     metrics_top_ks: list[int],

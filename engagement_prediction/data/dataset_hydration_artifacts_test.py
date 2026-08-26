@@ -30,7 +30,7 @@ def _embedding(values: list[float]) -> list[dict[str, str]]:
     return [{"key": "all_MiniLM_L12_v2", "value": _compressed(values)}]
 
 
-def test_embedding_source_batching_loads_keys_once_and_writes_only_selected_payloads(
+def test_embedding_source_batching_scans_each_file_once_and_writes_only_selected_payloads(
     tmp_path,
     monkeypatch,
 ):
@@ -136,19 +136,16 @@ def test_embedding_source_batching_loads_keys_once_and_writes_only_selected_payl
 
     assert selected_metadata_scans == [selected_metadata_path]
     assert source_scans == [
-        (
-            [str(selected_source_path), str(unselected_source_path)],
-            "_embedding_source_path",
-        ),
-        ([str(selected_source_path)], None),
-        ([str(other_unselected_source_path)], "_embedding_source_path"),
+        ([str(selected_source_path), str(unselected_source_path)], None),
+        ([str(other_unselected_source_path)], None),
     ]
-    assert len(routed_inputs) == 1
+    assert len(routed_inputs) == 2
     assert "embeddings" in routed_inputs[0].columns
     assert routed_inputs[0].get_column("subject_uri").to_list() == [
         "selected",
         "selected",
     ]
+    assert routed_inputs[1].is_empty()
 
     selected_rows = scan_parquet_artifact(output_path).collect()
     assert selected_rows.get_column("subject_uri").to_list() == [
@@ -158,10 +155,8 @@ def test_embedding_source_batching_loads_keys_once_and_writes_only_selected_payl
     assert stats == {
         "embedding_source_file_count": 3,
         "embedding_source_batch_count": 2,
-        "matched_embedding_source_file_count": 1,
-        "narrow_embedding_source_row_count": 4,
-        "matched_embedding_source_uri_occurrence_count": 1,
-        "matched_embedding_source_row_count": 2,
+        "payload_embedding_source_file_count": 3,
+        "selected_embedding_source_row_count": 2,
     }
     assert not temporary_routes_root.exists()
 

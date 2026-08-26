@@ -169,9 +169,11 @@ class BSTRanker(nn.Module):
             )
 
         has_history = history_mask.any(dim=1)
-        if bool(has_history.all().item()):
-            return history_input, history_mask
-
+        # Always express empty-history injection as tensor operations. A Python
+        # branch on has_history.all().item() stalls the host until CUDA has
+        # finished the preceding model work on every batch. On an all-nonempty
+        # batch the token now receives a zero gradient instead of no gradient;
+        # model outputs remain identical.
         inject = ~has_history
         inject_float = inject.to(dtype=history_input.dtype).reshape(batch_size, 1, 1)
         history_input = history_input.clone()
@@ -294,11 +296,15 @@ class BSTRanker(nn.Module):
 
     def _candidate_token_self_attention(
         self,
-        layer: nn.TransformerEncoderLayer,
         history_input: torch.Tensor,
         history_mask: torch.Tensor,
         candidate_input: torch.Tensor,
     ) -> torch.Tensor:
+        # Resolve the layer from this module instead of accepting it as a typed
+        # argument. TorchScript otherwise binds the helper to the first
+        # concrete TransformerEncoderLayer compiled in the process, which
+        # prevents later best-checkpoint exports with a different model shape.
+        layer = self.transformer_encoder.layers[0]
         self_attn = layer.self_attn
         num_users, max_history_len, embed_dim = history_input.shape
         num_candidates = int(candidate_input.size(0))
@@ -347,9 +353,9 @@ class BSTRanker(nn.Module):
 
     def _candidate_token_feed_forward(
         self,
-        layer: nn.TransformerEncoderLayer,
         candidate_state: torch.Tensor,
     ) -> torch.Tensor:
+        layer = self.transformer_encoder.layers[0]
         hidden = F.linear(candidate_state, layer.linear1.weight, layer.linear1.bias)
         hidden = F.gelu(hidden)
         hidden = F.dropout(hidden, p=self.dropout_rate, training=self.training)
@@ -485,7 +491,6 @@ class BSTRanker(nn.Module):
             )
             attention_output = F.dropout(
                 self._candidate_token_self_attention(
-                    layer,
                     normed_history_input,
                     history_mask,
                     normed_candidate_input,
@@ -502,12 +507,15 @@ class BSTRanker(nn.Module):
                 layer.norm2.eps,
             )
             candidate_state = candidate_state + self._candidate_token_feed_forward(
-                layer,
                 normed_candidate_state,
             )
         else:
             attention_output = F.dropout(
-                self._candidate_token_self_attention(layer, history_input, history_mask, candidate_input),
+                self._candidate_token_self_attention(
+                    history_input,
+                    history_mask,
+                    candidate_input,
+                ),
                 p=self.dropout_rate,
                 training=self.training,
             )
@@ -519,7 +527,7 @@ class BSTRanker(nn.Module):
                 layer.norm1.eps,
             )
             candidate_state = F.layer_norm(
-                candidate_state + self._candidate_token_feed_forward(layer, candidate_state),
+                candidate_state + self._candidate_token_feed_forward(candidate_state),
                 [self.transformer_input_dim],
                 layer.norm2.weight,
                 layer.norm2.bias,

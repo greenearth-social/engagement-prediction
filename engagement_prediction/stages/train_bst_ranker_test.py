@@ -19,16 +19,28 @@ from engagement_prediction.stages import train_bst_ranker
 
 
 class _RecordingTracker:
-    def __init__(self):
+    def __init__(self, *, task_id="task-1", manifest_uploaded=True):
+        self.id = task_id
+        self.manifest_uploaded = manifest_uploaded
         self.scalar_calls = []
-        self.artifacts = []
+        self.file_artifacts = []
+        self.model_artifacts = []
 
     def log_scalar(self, title, series, value, iteration):
         self.scalar_calls.append((title, series, value, iteration))
 
     def log_file_artifact(self, name, path):
-        self.artifacts.append((name, Path(path)))
+        self.file_artifacts.append((name, Path(path)))
+        if name == "ranker_serving_manifest":
+            return self.manifest_uploaded
         return True
+
+    def log_artifact(self, name, path):
+        self.model_artifacts.append((name, Path(path)))
+        return {
+            "model_id": "model-1",
+            "uri": "gs://models/task/models/ranker.pt",
+        }
 
 
 def _write_dataset(bundle: Path, name: str, frame: pl.DataFrame) -> None:
@@ -239,6 +251,7 @@ def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
     model_config = json.loads((output_dir / "model_config.json").read_text())
     popularity = json.loads((output_dir / "popularity_stats.json").read_text())
     training_results = json.loads((output_dir / "training_results.json").read_text())
+    summary = json.loads((output_dir / "summary.json").read_text())
     assert popularity["history_observation_count"] == 2
     assert popularity["candidate_observation_count"] == 3
     assert checkpoint["metadata"]["model_config"] == model_config
@@ -259,13 +272,34 @@ def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
     assert "mean_average_precision" not in json.dumps(checkpoint["baseline_metrics"])
     assert (output_dir / "training_history.png").stat().st_size > 0
     assert list((output_dir / "authors").glob("*.parquet"))
-    assert not list(output_dir.rglob("*.pt"))
-    assert not list(output_dir.rglob("*serving_manifest*"))
+    torchscript_path = output_dir / "checkpoints" / "ranker.pt"
+    author_map_path = output_dir / "ranker_author_idx.parquet"
+    manifest_path = output_dir / "checkpoints" / "ranker_serving_manifest.json"
+    assert torchscript_path.stat().st_size > 0
+    assert pl.read_parquet(author_map_path).select(
+        "author_did", "author_idx"
+    ).to_dicts() == [
+        {"author_did": "a2", "author_idx": 2},
+        {"author_did": "a3", "author_idx": 3},
+        {"author_did": "a4", "author_idx": 4},
+        {"author_did": "a5", "author_idx": 5},
+    ]
+    assert json.loads(manifest_path.read_text()) == {
+        "ranker_clearml_model_id": "model-1",
+        "ranker_uri": "gs://models/task/models/ranker.pt",
+        "clearml_task_id": "task-1",
+    }
+    assert training_results["torchscript_export"]["export_count"] == 1
+    assert training_results["torchscript_export"]["exported_best_epochs"] == [1]
+    assert "path" not in training_results["torchscript_export"]["exports"][0]
+    assert training_results["clearml_publication"]["status"] == "complete"
+    assert summary["outputs"]["torchscript_path"] == str(torchscript_path)
+    assert result["artifacts"]["torchscript_path"] == str(torchscript_path)
+    assert result["artifacts"]["ranker_author_idx_path"] == str(author_map_path)
+    assert result["artifacts"]["serving_manifest_path"] == str(manifest_path)
 
     reloaded_a = BSTRanker(**model_config["constructor_args"])
-    reloaded_b = BSTRanker(**model_config["constructor_args"])
     reloaded_a.load_state_dict(checkpoint["model_state_dict"])
-    reloaded_b.load_state_dict(checkpoint["model_state_dict"])
     dataset = HydratedBucketedEngagementDataset(
         bundle,
         split="train",
@@ -275,8 +309,9 @@ def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
         logger=None,
     )
     batch = dataset.collate_batch([dataset[0], dataset[1]])
+    scripted_model = torch.jit.load(str(torchscript_path)).eval()
     with torch.inference_mode():
-        scores_a = reloaded_a.score_candidate_matrix_one_layer(
+        scores_a = reloaded_a.score_candidate_matrix(
             history_embeddings=batch["history_embeddings"],
             history_mask=batch["history_mask"],
             history_time_deltas_hours=batch["history_time_deltas_hours"],
@@ -286,17 +321,17 @@ def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
             history_prior_cumulative_likes=batch["history_prior_cumulative_likes"],
             candidate_prior_cumulative_likes=batch["candidate_prior_cumulative_likes"],
         )
-        scores_b = reloaded_b.score_candidate_matrix_one_layer(
-            history_embeddings=batch["history_embeddings"],
-            history_mask=batch["history_mask"],
-            history_time_deltas_hours=batch["history_time_deltas_hours"],
-            candidate_post_embeddings=batch["candidate_post_embeddings"],
-            history_author_indices=batch["history_author_indices"],
-            candidate_post_author_idx=batch["candidate_post_author_idx"],
-            history_prior_cumulative_likes=batch["history_prior_cumulative_likes"],
-            candidate_prior_cumulative_likes=batch["candidate_prior_cumulative_likes"],
+        scores_b = scripted_model.score_candidate_matrix(
+            batch["history_embeddings"],
+            batch["history_mask"],
+            batch["history_time_deltas_hours"],
+            batch["candidate_post_embeddings"],
+            batch["history_author_indices"],
+            batch["candidate_post_author_idx"],
+            batch["history_prior_cumulative_likes"],
+            batch["candidate_prior_cumulative_likes"],
         )
-    torch.testing.assert_close(scores_a, scores_b)
+    assert torch.equal(scores_a, scores_b)
     for series in (
         "Train NDCG@1",
         "Validation NDCG@1",
@@ -312,11 +347,16 @@ def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
         "MAP" in title or "MAP" in series
         for title, series, _, _ in tracker.scalar_calls
     )
-    assert "bst_ranker_best_checkpoint" in {name for name, _ in tracker.artifacts}
+    assert tracker.model_artifacts == [("ranker", torchscript_path)]
+    assert {
+        "author_idx_mapping",
+        "ranker_serving_manifest",
+        "bst_ranker_best_checkpoint",
+    }.issubset({name for name, _ in tracker.file_artifacts})
     assert len(loader_calls) == 3
 
 
-def test_stage8_respects_no_save_model_and_no_plots(tmp_path, monkeypatch):
+def test_stage8_ignores_no_save_model_and_respects_no_plots(tmp_path, monkeypatch):
     stage7_dir, _ = _stage7_fixture(tmp_path)
     monkeypatch.setattr(
         train_bst_ranker,
@@ -324,15 +364,61 @@ def test_stage8_respects_no_save_model_and_no_plots(tmp_path, monkeypatch):
         lambda *args, **kwargs: {"07_dataset_hydration": stage7_dir},
     )
 
+    tracker = _RecordingTracker(task_id="")
     result = train_bst_ranker.run(
-        _context(tmp_path, _RecordingTracker()),
+        _context(tmp_path, tracker),
         _args(save_model=False, plots=False),
     )
 
     output_dir = Path(result["output_dir"])
-    assert result["artifacts"]["checkpoint_path"] is None
-    assert not (output_dir / "checkpoints").exists()
+    assert (output_dir / "checkpoints" / "bst_ranker_best.pth").is_file()
+    assert (output_dir / "checkpoints" / "ranker.pt").is_file()
+    assert (output_dir / "ranker_author_idx.parquet").is_file()
+    assert result["artifacts"]["serving_manifest_path"] is None
+    training_config = json.loads(
+        (output_dir / "training_config.json").read_text()
+    )
+    assert "save_model" not in training_config
+    assert "no_save_model_requested_but_ignored" not in training_config
     assert not (output_dir / "training_history.png").exists()
+    assert tracker.model_artifacts == []
+    assert tracker.file_artifacts == []
+    training_results = json.loads((output_dir / "training_results.json").read_text())
+    summary = json.loads((output_dir / "summary.json").read_text())
+    assert training_results["clearml_publication"]["status"] == "not_configured"
+    assert summary["clearml_publication"]["status"] == "not_configured"
+    assert "clearml_publication_status: not_configured" in (
+        output_dir / "stage_info.txt"
+    ).read_text()
+
+
+def test_stage8_keeps_local_manifest_when_manifest_upload_fails(tmp_path, monkeypatch):
+    stage7_dir, _ = _stage7_fixture(tmp_path)
+    monkeypatch.setattr(
+        train_bst_ranker,
+        "resolve_recorded_stage_lineage",
+        lambda *args, **kwargs: {"07_dataset_hydration": stage7_dir},
+    )
+    tracker = _RecordingTracker(manifest_uploaded=False)
+
+    result = train_bst_ranker.run(
+        _context(tmp_path, tracker),
+        _args(save_model=True, plots=False),
+    )
+
+    output_dir = Path(result["output_dir"])
+    manifest_path = output_dir / "checkpoints" / "ranker_serving_manifest.json"
+    assert manifest_path.is_file()
+    assert result["artifacts"]["serving_manifest_path"] == str(manifest_path)
+    assert result["clearml_publication"]["status"] == "incomplete"
+    assert result["clearml_publication"]["manifest_uploaded"] is False
+    training_results = json.loads((output_dir / "training_results.json").read_text())
+    summary = json.loads((output_dir / "summary.json").read_text())
+    assert training_results["clearml_publication"]["status"] == "incomplete"
+    assert summary["clearml_publication"]["status"] == "incomplete"
+    assert "clearml_publication_status: incomplete" in (
+        output_dir / "stage_info.txt"
+    ).read_text()
 
 
 def test_stage8_requires_every_training_split(tmp_path, monkeypatch):

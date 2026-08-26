@@ -203,34 +203,6 @@ def normalize_embedding_source_rows(
     )
 
 
-def normalize_embedding_source_keys(
-    source_lf: pl.LazyFrame,
-    *,
-    posts_start: datetime,
-    posts_end: datetime,
-    is_reply: bool,
-    source_path_column: str | None = None,
-) -> pl.LazyFrame:
-    """Normalize source keys without reading the embedding payload column.
-
-    ``source_path_column`` retains Polars' file-provenance column so a batch
-    scan can identify which physical files need a second, payload-bearing
-    pass. The root/reply flag remains part of the shared normalization call,
-    even though the narrow output needs only URI and optional provenance.
-    """
-
-    normalized_lf = post_selection.normalize_posts(
-        source_lf,
-        posts_start=posts_start,
-        posts_end=posts_end,
-        is_reply=is_reply,
-        passthrough_columns=(source_path_column,) if source_path_column else (),
-    ).filter(pl.col("_post_row_valid"))
-    if source_path_column is None:
-        return normalized_lf.select("subject_uri")
-    return normalized_lf.select("subject_uri", source_path_column)
-
-
 def _stable_payload_key(value: Any) -> str:
     """Serialize an embedding payload for deterministic final tie-breaking."""
 

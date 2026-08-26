@@ -24,6 +24,14 @@ from engagement_prediction.training.bst_ranker import (
     run_bst_listwise_epoch,
     train_bst_ranker_model,
 )
+from engagement_prediction.training.bst_export import (
+    export_bst_ranker_checkpoint,
+    validate_bst_ranker_export,
+)
+from engagement_prediction.training.bst_publication import (
+    publish_ranker_to_tracker,
+    write_ranker_author_map,
+)
 from engagement_prediction.training.popularity import fit_popularity_normalization
 from engagement_prediction.training.reporting import write_bst_training_history_plot
 from shared.input_data_helpers import AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
@@ -36,9 +44,15 @@ STAGE_FOLDER = "08_train_bst_ranker"
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
     """Write deterministic JSON and reject nonportable NaN/Infinity values."""
 
-    path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
-    )
+    partial_path = path.with_name(f"{path.name}.partial")
+    try:
+        partial_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+        )
+        partial_path.replace(path)
+    except Exception:
+        partial_path.unlink(missing_ok=True)
+        raise
 
 
 def _load_stage7_summary(stage7_dir: Path) -> Dict[str, Any]:
@@ -115,6 +129,7 @@ def _create_loader(
         prefetch_factor=prefetch_factor,
         seed=random_seed,
         resample_candidates_each_epoch=resample_candidates_each_epoch,
+        tensor_only=True,
     )
 
 
@@ -157,7 +172,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     logger = get_stage_logger("08_TRAIN_BST_RANKER", log_file=out_dir / "stage.log")
     started_at = time.time()
 
-    logger.info("Phase 1/7: resolving and validating Stage 0-7 lineage")
+    logger.info("Phase 1/8: resolving and validating Stage 0-7 lineage")
     lineage = resolve_recorded_stage_lineage(
         context,
         terminal_stage_folder="07_dataset_hydration",
@@ -186,7 +201,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     prefetch_factor = int(args.dataloader_prefetch_factor)
     metrics_top_ks = [int(value) for value in args.metrics_top_ks]
     use_popularity_feature = bool(args.bst_use_popularity_feature)
-    save_model = not bool(args.no_save_model)
     generate_plots = not bool(args.no_plots)
     disable_progress = bool(args.disable_progress)
     max_train_batches = args.bst_max_train_batches_per_epoch
@@ -214,7 +228,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         use_popularity_feature,
     )
 
-    logger.info("Phase 2/7: fitting training-only popularity normalization")
+    logger.info("Phase 2/8: fitting training-only popularity normalization")
     queries_lf = scan_parquet_artifact(bundle_path / "queries")
     positives_lf = scan_parquet_artifact(bundle_path / "query_positives")
     histories_lf = scan_parquet_artifact(bundle_path / "query_histories")
@@ -236,7 +250,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"{popularity_stats.total_observation_count:,}",
     )
 
-    logger.info("Phase 3/7: loading native train, validation, and unseen-validation datasets")
+    logger.info("Phase 3/8: loading native train, validation, and unseen-validation datasets")
     datasets = {
         split: _create_dataset(
             bundle_path=bundle_path,
@@ -351,7 +365,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "dataloader_persistent_workers": persistent_workers,
         "dataloader_prefetch_factor": prefetch_factor,
         "device": device,
-        "save_model": save_model,
         "generate_plots": generate_plots,
     }
     popularity_payload = popularity_stats.to_dict()
@@ -368,13 +381,36 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         raise FileNotFoundError(f"Stage 7 authors artifact is missing: {authors_source_path}")
     shutil.copytree(authors_source_path, authors_path)
 
-    logger.info("Phase 4/7: constructing and training the canonical BST ranker")
+    logger.info(
+        "Phase 4/8: training the canonical BST ranker and exporting every new best"
+    )
     model = BSTRanker(**constructor_args)
-    checkpoints_dir = out_dir / "checkpoints" if save_model else None
+    checkpoints_dir = out_dir / "checkpoints"
+    torchscript_path = checkpoints_dir / "ranker.pt"
     checkpoint_metadata = {
         "model_config": model_config,
         "popularity_stats": popularity_payload,
     }
+    torchscript_exports = []
+
+    def export_best_checkpoint(checkpoint_path: Path) -> None:
+        export = export_bst_ranker_checkpoint(
+            checkpoint_path=checkpoint_path,
+            output_path=torchscript_path,
+            expected_model_config=model_config,
+            expected_popularity_stats=popularity_payload,
+        )
+        torchscript_exports.append(export)
+        logger.info(
+            "Published local BST TorchScript for best epoch %s: path=%s "
+            "size_bytes=%s sha256=%s parity_cases=%s",
+            export["best_epoch"],
+            export["path"],
+            export["size_bytes"],
+            export["sha256"],
+            export["parity"]["case_count"],
+        )
+
     training_results = train_bst_ranker_model(
         model=model,
         train_loader=train_loader,
@@ -394,12 +430,13 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         metrics_top_ks=metrics_top_ks,
         bst_max_train_batches_per_epoch=max_train_batches,
         checkpoint_metadata=checkpoint_metadata,
+        best_checkpoint_callback=export_best_checkpoint,
         experiment_tracker=context.tracker,
         logger=logger,
     )
     trained_model: BSTRanker = training_results["model"]
 
-    logger.info("Phase 5/7: evaluating the reloaded best model deterministically")
+    logger.info("Phase 5/8: evaluating the reloaded best model deterministically")
     train_loader.batch_sampler.set_evaluation_mode(True)
     final_metrics = _final_metrics(
         model=trained_model,
@@ -415,7 +452,63 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         max_train_batches=max_train_batches,
     )
 
-    logger.info("Phase 6/7: writing training results and optional plot")
+    logger.info("Phase 6/8: validating final serving artifacts")
+    checkpoint_path = checkpoints_dir / "bst_ranker_best.pth"
+    if not checkpoint_path.is_file():
+        raise RuntimeError("BST training completed without publishing its best checkpoint")
+    if not torchscript_path.is_file() or not torchscript_exports:
+        raise RuntimeError("BST training completed without publishing its TorchScript model")
+    final_export_validation = validate_bst_ranker_export(
+        checkpoint_path=checkpoint_path,
+        scripted_model_path=torchscript_path,
+        expected_model_config=model_config,
+        expected_popularity_stats=popularity_payload,
+    )
+    if final_export_validation["best_epoch"] != training_results["best_epoch"]:
+        raise RuntimeError("Final BST checkpoint and TorchScript best epochs disagree")
+
+    ranker_author_idx_path = out_dir / "ranker_author_idx.parquet"
+    author_map_stats = write_ranker_author_map(
+        authors_path=authors_path,
+        output_path=ranker_author_idx_path,
+        author_table_num_rows=author_table_num_rows,
+    )
+    logger.info(
+        "Validated final BST serving artifacts: best_epoch=%s ranker_bytes=%s "
+        "author_count=%s",
+        final_export_validation["best_epoch"],
+        final_export_validation["size_bytes"],
+        author_map_stats["author_count"],
+    )
+
+    plot_path = None
+    if generate_plots:
+        plot_path = out_dir / "training_history.png"
+        write_bst_training_history_plot(
+            training_results["history"],
+            plot_path,
+            training_results["best_epoch"],
+        )
+
+    logger.info("Phase 7/8: publishing the final serving set to ClearML")
+    publication_started_at = time.time()
+    serving_manifest_path = checkpoints_dir / "ranker_serving_manifest.json"
+    clearml_publication = publish_ranker_to_tracker(
+        tracker=context.tracker,
+        logger=logger,
+        torchscript_path=torchscript_path,
+        author_map_path=ranker_author_idx_path,
+        manifest_path=serving_manifest_path,
+    )
+    clearml_publication["runtime_seconds"] = time.time() - publication_started_at
+    if clearml_publication["status"] != "complete":
+        logger.warning(
+            "BST ClearML publication is %s; validated local artifacts remain available",
+            clearml_publication["status"],
+        )
+
+    logger.info("Phase 8/8: writing results and attaching reproducibility artifacts")
+    local_pipeline_runtime_seconds = publication_started_at - started_at
     runtime_seconds = time.time() - started_at
     result_payload = {
         "primary_metric_name": training_results["primary_metric_name"],
@@ -431,28 +524,30 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "split_query_counts": {
             split: len(dataset) for split, dataset in datasets.items()
         },
+        "torchscript_export": {
+            "path": str(torchscript_path),
+            "export_count": len(torchscript_exports),
+            "exported_best_epochs": [
+                export["best_epoch"] for export in torchscript_exports
+            ],
+            "exports": [
+                {key: value for key, value in export.items() if key != "path"}
+                for export in torchscript_exports
+            ],
+            "final_validation": final_export_validation,
+        },
+        "author_map": {
+            "path": str(ranker_author_idx_path),
+            **author_map_stats,
+        },
+        "clearml_publication": clearml_publication,
+        "local_pipeline_runtime_seconds": local_pipeline_runtime_seconds,
         "runtime_seconds": runtime_seconds,
     }
     training_results_path = out_dir / "training_results.json"
     _write_json(training_results_path, result_payload)
 
-    plot_path = None
-    if generate_plots:
-        plot_path = out_dir / "training_history.png"
-        write_bst_training_history_plot(
-            training_results["history"],
-            plot_path,
-            training_results["best_epoch"],
-        )
-
-    checkpoint_path = (
-        checkpoints_dir / "bst_ranker_best.pth"
-        if checkpoints_dir is not None
-        else None
-    )
-    if checkpoint_path is not None and not checkpoint_path.exists():
-        raise RuntimeError("BST training completed without publishing its best checkpoint")
-
+    summary_path = out_dir / "summary.json"
     summary = {
         "parameters": training_config,
         "input": {
@@ -464,11 +559,24 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "results": {
             key: value
             for key, value in result_payload.items()
-            if key not in {"training_history", "final_metrics"}
+            if key not in {
+                "training_history",
+                "final_metrics",
+                "torchscript_export",
+                "author_map",
+                "clearml_publication",
+            }
         },
         "final_metrics": final_metrics,
         "outputs": {
-            "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
+            "checkpoint_path": str(checkpoint_path),
+            "torchscript_path": str(torchscript_path),
+            "ranker_author_idx_path": ranker_author_idx_path.name,
+            "serving_manifest_path": (
+                str(serving_manifest_path)
+                if serving_manifest_path.is_file()
+                else None
+            ),
             "model_config_path": model_config_path.name,
             "training_config_path": training_config_path.name,
             "popularity_stats_path": popularity_stats_path.name,
@@ -476,11 +584,15 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "authors_path": authors_path.name,
             "training_plot_path": plot_path.name if plot_path else None,
         },
+        "torchscript_export": result_payload["torchscript_export"],
+        "author_map": result_payload["author_map"],
+        "clearml_publication": clearml_publication,
         "runtime_seconds": runtime_seconds,
     }
-    _write_json(out_dir / "summary.json", summary)
+    _write_json(summary_path, summary)
 
     primary_key = f"ndcg@{metrics_top_ks[0]}"
+    stage_info_path = out_dir / "stage_info.txt"
     stage_info_lines = [
         "stage: train_bst_ranker",
         f"runtime_seconds: {runtime_seconds:.2f}",
@@ -495,24 +607,35 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"best_val_metric: {training_results['best_val_metric']:.6f}",
         f"popularity_log_mean: {popularity_stats.log_mean:.6f}",
         f"popularity_log_std: {popularity_stats.log_std:.6f}",
+        f"torchscript_export_count: {len(torchscript_exports)}",
+        f"torchscript_sha256: {final_export_validation['sha256']}",
+        f"torchscript_size_bytes: {final_export_validation['size_bytes']}",
+        f"ranker_author_count: {author_map_stats['author_count']}",
+        f"clearml_publication_status: {clearml_publication['status']}",
+        f"ranker_clearml_model_id: {clearml_publication['ranker_clearml_model_id']}",
+        f"ranker_uri: {clearml_publication['ranker_uri']}",
+        f"author_map_uploaded: {clearml_publication['author_map_uploaded']}",
+        f"serving_manifest_uploaded: {clearml_publication['manifest_uploaded']}",
+        "clearml_publication_errors: "
+        f"{json.dumps(clearml_publication['errors'], sort_keys=True)}",
     ]
     for split, metrics in final_metrics.items():
         stage_info_lines.extend([
             f"{split}_loss: {metrics['loss']:.6f}",
             f"{split}_{primary_key}: {metrics[primary_key]:.6f}",
         ])
-    (out_dir / "stage_info.txt").write_text("\n".join(stage_info_lines) + "\n")
+    stage_info_path.write_text("\n".join(stage_info_lines) + "\n")
 
-    logger.info("Phase 7/7: attaching reproducibility artifacts to the experiment")
-    if context.tracker is not None:
+    if context.tracker is not None and str(getattr(context.tracker, "id", "") or ""):
         artifact_paths = {
             "bst_model_config": model_config_path,
             "bst_training_config": training_config_path,
             "bst_popularity_stats": popularity_stats_path,
             "bst_training_results": training_results_path,
+            "bst_ranker_best_checkpoint": checkpoint_path,
+            "bst_stage_summary": summary_path,
+            "bst_stage_info": stage_info_path,
         }
-        if checkpoint_path is not None:
-            artifact_paths["bst_ranker_best_checkpoint"] = checkpoint_path
         if plot_path is not None:
             artifact_paths["bst_training_history_plot"] = plot_path
         for name, path in artifact_paths.items():
@@ -530,7 +653,14 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     return {
         "output_dir": out_dir,
         "artifacts": {
-            "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
+            "checkpoint_path": str(checkpoint_path),
+            "torchscript_path": str(torchscript_path),
+            "ranker_author_idx_path": str(ranker_author_idx_path),
+            "serving_manifest_path": (
+                str(serving_manifest_path)
+                if serving_manifest_path.is_file()
+                else None
+            ),
             "model_config_path": str(model_config_path),
             "training_config_path": str(training_config_path),
             "popularity_stats_path": str(popularity_stats_path),
@@ -538,4 +668,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "authors_path": str(authors_path),
             "training_plot_path": str(plot_path) if plot_path else None,
         },
+        "torchscript_export": result_payload["torchscript_export"],
+        "clearml_publication": clearml_publication,
     }

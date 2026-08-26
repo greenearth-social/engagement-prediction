@@ -32,6 +32,7 @@ from typing import Any
 
 import numpy as np
 import polars as pl
+import pyarrow.parquet as pq
 
 from engagement_prediction.data import author_vocabulary
 from engagement_prediction.data import dataset_hydration
@@ -165,13 +166,14 @@ def materialize_selected_embedding_rows(
     source_batch_size: int,
     logger: logging.Logger,
 ) -> dict[str, int]:
-    """Discover and route selected embedding payloads in bounded file batches.
+    """Route selected embedding payloads in one bounded pass per file batch.
 
-    The narrow selected-URI lookup is loaded once. For each source batch, a
-    payload-free pass identifies matching files and keys; a second pass scans
-    those files for encoded embeddings and writes only matching rows. Batch
-    payload routes are deleted after their files are moved into the shared
-    URI-partitioned output.
+    The narrow selected-URI lookup is loaded once. Each source batch is then
+    scanned once with its encoded payloads, semi-joined to those selected keys,
+    and streamed into URI partitions. This keeps memory bounded without the
+    prior discovery pass, which was ineffective when selected URIs appeared in
+    almost every physical source file. Batch payload routes are deleted after
+    their files are moved into the shared URI-partitioned output.
     """
     if source_batch_size <= 0:
         raise ValueError("embedding_source_batch_size must be positive")
@@ -205,10 +207,8 @@ def materialize_selected_embedding_rows(
 
     total_source_files = len(post_paths) + len(reply_paths)
     total_source_batches = 0
-    matched_source_files = 0
-    narrow_source_rows = 0
-    matched_rows = 0
-    matched_uri_occurrences = 0
+    payload_source_files = 0
+    selected_rows = 0
     for label, paths, is_reply in (
         ("root", post_paths, False),
         ("reply", reply_paths, True),
@@ -236,139 +236,65 @@ def materialize_selected_embedding_rows(
                 len(batch_paths),
             )
 
-            # Pass one scans the batch without the large embeddings column.
-            # File provenance lets one small aggregation identify both the
-            # matched files and the exact key set needed by pass two.
-            normalized_keys_lf = dataset_hydration.normalize_embedding_source_keys(
-                ingex.scan_parquet_files(
-                    batch_paths,
-                    include_file_paths="_embedding_source_path",
-                ),
-                posts_start=posts_start,
-                posts_end=posts_end,
-                is_reply=is_reply,
-                source_path_column="_embedding_source_path",
-            )
-            selected_marker_lf = source_keys_df.lazy().with_columns(
-                pl.lit(True).alias("_is_selected")
-            )
-            batch_stats_df = (
-                normalized_keys_lf
-                .join(selected_marker_lf, on="subject_uri", how="left")
-                .with_columns(pl.col("_is_selected").fill_null(False))
-                .group_by("_embedding_source_path")
-                .agg(
-                    pl.len().cast(pl.UInt64).alias("source_row_count"),
-                    pl.col("_is_selected")
-                    .cast(pl.UInt64)
-                    .sum()
-                    .alias("matched_row_count"),
-                    pl.col("subject_uri")
-                    .filter(pl.col("_is_selected"))
-                    .n_unique()
-                    .cast(pl.UInt64)
-                    .alias("matched_uri_count"),
-                    pl.col("subject_uri")
-                    .filter(pl.col("_is_selected"))
-                    .unique()
-                    .sort()
-                    .alias("_matched_uris"),
+            payload_routes_path = temporary_routes_root / f"{batch_name}-payloads"
+            # The semi-join is part of the same streaming plan as the payload
+            # scan and partition sink, so unselected payload rows are read but
+            # never materialized on disk or retained across batches.
+            selected_payloads_lf = (
+                dataset_hydration.normalize_embedding_source_rows(
+                    ingex.scan_parquet_files(batch_paths),
+                    posts_start=posts_start,
+                    posts_end=posts_end,
+                    is_reply=is_reply,
                 )
-                .sort("_embedding_source_path")
-                .collect(engine="streaming")
-            )
-            source_row_count = int(
-                batch_stats_df.get_column("source_row_count").sum() or 0
-            )
-            source_matched_rows = int(
-                batch_stats_df.get_column("matched_row_count").sum() or 0
-            )
-            source_matched_uris = int(
-                batch_stats_df.get_column("matched_uri_count").sum() or 0
-            )
-            matched_paths = (
-                batch_stats_df
-                .filter(pl.col("matched_row_count") > 0)
-                .get_column("_embedding_source_path")
-                .to_list()
-            )
-            matched_keys_df = (
-                batch_stats_df
+                .join(source_keys_df.lazy(), on="subject_uri", how="semi")
                 .select(
-                    pl.col("_matched_uris")
-                    .explode(empty_as_null=True)
-                    .alias("subject_uri")
+                    "subject_uri",
+                    "post_created_at",
+                    "author_did",
+                    "embeddings",
                 )
-                .drop_nulls()
-                .unique()
-                .sort("subject_uri")
+                .with_columns(post_selection.post_partition_expr(partition_count))
             )
-
-            if matched_paths:
-                payload_routes_path = temporary_routes_root / f"{batch_name}-payloads"
-                # Pass two reads several matched files in one Polars scan. The
-                # small batch-local semi-join prevents unselected payload rows
-                # from being written to temporary storage.
-                selected_payloads_lf = (
-                    dataset_hydration.normalize_embedding_source_rows(
-                        ingex.scan_parquet_files(matched_paths),
-                        posts_start=posts_start,
-                        posts_end=posts_end,
-                        is_reply=is_reply,
+            sink_partitioned_parquet(
+                selected_payloads_lf,
+                output_path=payload_routes_path,
+                key="_post_partition",
+            )
+            batch_selected_rows = 0
+            for partition_id in range(partition_count):
+                payload_parts = _partition_paths(payload_routes_path, partition_id)
+                if not payload_parts:
+                    continue
+                partition_dir = output_path / f"partition-{partition_id:05d}"
+                partition_dir.mkdir(parents=True, exist_ok=True)
+                for part_index, payload_part in enumerate(payload_parts):
+                    batch_selected_rows += pq.read_metadata(payload_part).num_rows
+                    payload_part.replace(
+                        partition_dir
+                        / f"{batch_name}-{part_index:05d}.parquet"
                     )
-                    .join(matched_keys_df.lazy(), on="subject_uri", how="semi")
-                    .select(
-                        "subject_uri",
-                        "post_created_at",
-                        "author_did",
-                        "embeddings",
-                    )
-                    .with_columns(post_selection.post_partition_expr(partition_count))
-                )
-                sink_partitioned_parquet(
-                    selected_payloads_lf,
-                    output_path=payload_routes_path,
-                    key="_post_partition",
-                )
-                for partition_id in range(partition_count):
-                    payload_parts = _partition_paths(payload_routes_path, partition_id)
-                    if not payload_parts:
-                        continue
-                    partition_dir = output_path / f"partition-{partition_id:05d}"
-                    partition_dir.mkdir(parents=True, exist_ok=True)
-                    for part_index, payload_part in enumerate(payload_parts):
-                        payload_part.replace(
-                            partition_dir
-                            / f"{batch_name}-{part_index:05d}.parquet"
-                        )
-                shutil.rmtree(payload_routes_path)
+            shutil.rmtree(payload_routes_path)
 
-            narrow_source_rows += source_row_count
-            matched_rows += source_matched_rows
-            matched_uri_occurrences += source_matched_uris
-            matched_source_files += len(matched_paths)
+            payload_source_files += len(batch_paths)
+            selected_rows += batch_selected_rows
             logger.info(
-                "Filtered embedding %s batch %s/%s: files=%s matched_files=%s "
-                "selected_uri_occurrences=%s selected_rows=%s "
-                "matched_rows_so_far=%s",
+                "Filtered embedding %s batch %s/%s in one pass: files=%s "
+                "selected_rows=%s selected_rows_so_far=%s",
                 label,
                 batch_index + 1,
                 batch_count,
                 len(batch_paths),
-                len(matched_paths),
-                f"{source_matched_uris:,}",
-                f"{source_matched_rows:,}",
-                f"{matched_rows:,}",
+                f"{batch_selected_rows:,}",
+                f"{selected_rows:,}",
             )
     if temporary_routes_root.exists():
         temporary_routes_root.rmdir()
     return {
         "embedding_source_file_count": total_source_files,
         "embedding_source_batch_count": total_source_batches,
-        "matched_embedding_source_file_count": matched_source_files,
-        "narrow_embedding_source_row_count": narrow_source_rows,
-        "matched_embedding_source_uri_occurrence_count": matched_uri_occurrences,
-        "matched_embedding_source_row_count": matched_rows,
+        "payload_embedding_source_file_count": payload_source_files,
+        "selected_embedding_source_row_count": selected_rows,
     }
 
 

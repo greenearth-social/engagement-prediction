@@ -88,7 +88,7 @@ DEFAULTS: Dict[str, Any] = {
     "author_statistics_partition_count": 16,
     # Stage 7: Dataset hydration
     "embedding_source_batch_size": 64,
-    "embedding_partition_worker_count": 2,
+    "embedding_partition_worker_count": 4,
     "min_author_training_feature_count": 50,
     # Stage 3 (train) - Model architecture
     "user_summarization": "mean",  # MLP user-history summarization: mean, ema, linear_recency
@@ -111,7 +111,7 @@ DEFAULTS: Dict[str, Any] = {
     "min_author_support": 20,
     "author_unknown_dropout_rate": 0.3,
     "epochs": 300,
-    "batch_size": 256,
+    "batch_size": 64,
     "learning_rate": 0.001,
     "weight_decay_mlp": 0.1,
     "weight_decay_two_tower": 0.01,
@@ -1091,7 +1091,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--no-plots", action="store_true", default=argparse.SUPPRESS,
                           help_text="Disable training plots")
     _add_arg_with_default(p_all, "--no-save-model", action="store_true", default=argparse.SUPPRESS,
-                          help_text="Skip saving model checkpoints")
+                          help_text="Skip model checkpoints for legacy trainers (ignored by canonical BST Stage 8)")
     _add_arg_with_default(p_all, "--disable-progress", action="store_true", default=argparse.SUPPRESS,
                           help_text="Disable progress bars during training")
     _add_arg_with_default(p_all, "--metrics-top-ks", type=int, nargs="+", default=argparse.SUPPRESS,

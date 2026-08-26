@@ -209,7 +209,12 @@ class HydratedBucketedEngagementDataset(Dataset):
         self._close_mappings()
 
     def _ensure_open(self) -> None:
-        """Lazily open read-only mappings, reopening after a PID change."""
+        """Lazily open read-only numeric mappings, reopening after a PID change.
+
+        Arrow identifier tables are opened separately because model training
+        consumes only tensors. Keeping that path independent avoids mapping the
+        URI and DID files in workers that never decode an identifier.
+        """
 
         current_pid = os.getpid()
         if self._owner_pid == current_pid:
@@ -236,6 +241,26 @@ class HydratedBucketedEngagementDataset(Dataset):
                     name,
                     split=self.split,
                 )
+        except Exception:
+            _close_memmap(embeddings)
+            for array in arrays.values():
+                _close_memmap(array)
+            raise
+
+        self._embeddings = embeddings
+        self._arrays = arrays
+        self._owner_pid = current_pid
+
+    def _ensure_identifier_tables_open(self) -> None:
+        """Open the Arrow URI and DID tables only for the full batch contract."""
+
+        self._ensure_open()
+        if self._post_uris is not None and self._query_dids is not None:
+            return
+
+        post_uris: Optional[MemoryMappedUtf8Table] = None
+        query_dids: Optional[MemoryMappedUtf8Table] = None
+        try:
             post_uris = MemoryMappedUtf8Table(
                 self._post_uri_path,
                 batch_offsets=self._post_uri_batch_offsets,
@@ -245,16 +270,14 @@ class HydratedBucketedEngagementDataset(Dataset):
                 batch_offsets=self._query_did_batch_offsets,
             )
         except Exception:
-            _close_memmap(embeddings)
-            for array in arrays.values():
-                _close_memmap(array)
+            if post_uris is not None:
+                post_uris.close()
+            if query_dids is not None:
+                query_dids.close()
             raise
 
-        self._embeddings = embeddings
-        self._arrays = arrays
         self._post_uris = post_uris
         self._query_dids = query_dids
-        self._owner_pid = current_pid
 
     @property
     def embeddings(self) -> np.ndarray:
@@ -383,7 +406,12 @@ class HydratedBucketedEngagementDataset(Dataset):
         selected = np.sort(rng.choice(count, size=cap, replace=False))
         return np.asarray(selected + start, dtype=np.int64)
 
-    def collate_batch(self, items: Sequence[tuple[int, int]]) -> dict[str, Any]:
+    def _collate_batch(
+        self,
+        items: Sequence[tuple[int, int]],
+        *,
+        include_metadata: bool,
+    ) -> dict[str, Any]:
         """Build one hour-homogeneous listwise batch and its label matrix."""
 
         if not items:
@@ -457,20 +485,7 @@ class HydratedBucketedEngagementDataset(Dataset):
             if row_positive_indices:
                 labels[batch_row, row_positive_indices] = 1.0
 
-        post_created_at_us = np.asarray(
-            self._array("post_created_at_us")[candidate_emb_array], dtype=np.int64
-        )
-        creation_hour_us = (
-            post_created_at_us // MICROSECONDS_PER_HOUR
-        ) * MICROSECONDS_PER_HOUR
-        candidate_ages = np.maximum(query_hour_us - creation_hour_us, 0).astype(
-            np.float64
-        ) / MICROSECONDS_PER_HOUR
-
-        assert self._query_dids is not None
-        assert self._post_uris is not None
-        query_hour = _datetime_from_epoch_us(query_hour_us)
-        return {
+        batch = {
             "history_embeddings": history_tensors[0],
             "history_mask": history_tensors[1],
             "history_author_indices": history_tensors[2],
@@ -486,15 +501,48 @@ class HydratedBucketedEngagementDataset(Dataset):
             "candidate_prior_cumulative_likes": torch.tensor(
                 candidate_prior_counts, dtype=torch.float32
             ),
+            "label_matrix": labels,
+        }
+        if not include_metadata:
+            return batch
+
+        post_created_at_us = np.asarray(
+            self._array("post_created_at_us")[candidate_emb_array], dtype=np.int64
+        )
+        creation_hour_us = (
+            post_created_at_us // MICROSECONDS_PER_HOUR
+        ) * MICROSECONDS_PER_HOUR
+        candidate_ages = np.maximum(query_hour_us - creation_hour_us, 0).astype(
+            np.float64
+        ) / MICROSECONDS_PER_HOUR
+
+        self._ensure_identifier_tables_open()
+        assert self._query_dids is not None
+        assert self._post_uris is not None
+        query_hour = _datetime_from_epoch_us(query_hour_us)
+        batch.update({
             "candidate_post_age_hours": torch.from_numpy(
                 candidate_ages.astype(np.float32)
             ),
-            "label_matrix": labels,
             "user_id": self._query_dids.take(row_indices),
             "candidate_post_id": self._post_uris.take(candidate_emb_array),
             "query_hour": query_hour,
             "bucket": query_hour,
-        }
+        })
+        return batch
+
+    def collate_batch(self, items: Sequence[tuple[int, int]]) -> dict[str, Any]:
+        """Build the full native batch, including identifiers and auxiliary age."""
+
+        return self._collate_batch(items, include_metadata=True)
+
+    def collate_tensor_batch(
+        self,
+        items: Sequence[tuple[int, int]],
+    ) -> dict[str, torch.Tensor]:
+        """Build the tensor-only batch consumed by canonical model training."""
+
+        return self._collate_batch(items, include_metadata=False)
 
 
 class HydratedBucketedBatchSampler(Sampler[list[Any]]):
@@ -605,8 +653,14 @@ def create_hydrated_data_loader(
     prefetch_factor: int,
     seed: int,
     resample_candidates_each_epoch: bool,
+    tensor_only: bool = False,
 ) -> DataLoader:
-    """Wrap the native Stage 7 dataset in its hour-aware PyTorch DataLoader."""
+    """Wrap the native Stage 7 dataset in its hour-aware PyTorch DataLoader.
+
+    The default retains the complete native batch contract. Canonical model
+    training can request a tensor-only batch to skip auxiliary candidate ages
+    and Arrow identifier decoding that its hot loop does not consume.
+    """
 
     if num_workers < 0:
         raise ValueError("num_workers must be nonnegative")
@@ -629,6 +683,8 @@ def create_hydrated_data_loader(
             seed=seed,
             resample_candidates_each_epoch=resample_candidates_each_epoch,
         ),
-        collate_fn=dataset.collate_batch,
+        collate_fn=(
+            dataset.collate_tensor_batch if tensor_only else dataset.collate_batch
+        ),
         **worker_options,
     )

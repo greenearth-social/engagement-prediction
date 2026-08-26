@@ -248,6 +248,35 @@ def test_native_stage7_batch_runs_one_optimizer_step(tmp_path):
     assert not torch.equal(before, model.post_feature_encoder.content_projection.weight)
 
 
+def test_bst_epoch_metrics_do_not_require_full_argsort(monkeypatch):
+    model = _model(use_popularity_feature=False)
+    loader = DataLoader(_SingleBatchDataset(_batch()), batch_size=None, shuffle=False)
+
+    def fail_argsort(*args, **kwargs):
+        raise AssertionError("canonical BST metrics should use topk, not full argsort")
+
+    monkeypatch.setattr(torch, "argsort", fail_argsort)
+
+    loss, metrics, baseline_metrics = bst_training.run_bst_listwise_epoch(
+        train=False,
+        split_name="Validation",
+        model=model,
+        device="cpu",
+        dataloader=loader,
+        optimizer=None,
+        disable_progress=True,
+        gradient_clip_max_norm=1.0,
+        metrics_top_ks=[1, 2],
+        calc_baseline_metrics=True,
+        max_batches=None,
+    )
+
+    assert loss >= 0.0
+    assert metrics["rank_metric_user_count"] == 2
+    assert metrics["ndcg@2"] >= 0.0
+    assert baseline_metrics["ndcg@2"] >= 0.0
+
+
 def test_train_bst_logs_epoch_zero_baselines_and_detailed_early_stopping(
     tmp_path,
     monkeypatch,
@@ -256,7 +285,8 @@ def test_train_bst_logs_epoch_zero_baselines_and_detailed_early_stopping(
     model = _model(use_popularity_feature=False)
     loader = DataLoader(_SingleBatchDataset(_batch()), batch_size=None, shuffle=False)
     tracker = _RecordingTracker()
-    unseen_values = iter([0.50, 0.55, 0.56])
+    unseen_values = iter([0.50, 0.45, 0.56])
+    callback_epochs = []
 
     def fake_epoch(**kwargs):
         split_name = kwargs["split_name"]
@@ -271,6 +301,12 @@ def test_train_bst_logs_epoch_zero_baselines_and_detailed_early_stopping(
             "ndcg@1": 0.4,
         }
         return 1.0, metrics, baseline
+
+    def best_checkpoint_callback(checkpoint_path):
+        assert checkpoint_path == tmp_path / "bst_ranker_best.pth"
+        assert checkpoint_path.is_file()
+        assert not (tmp_path / "bst_ranker_best.pth.partial").exists()
+        callback_epochs.append(torch.load(checkpoint_path, weights_only=False)["epoch"])
 
     monkeypatch.setattr(bst_training, "run_bst_listwise_epoch", fake_epoch)
     logger = logging.getLogger("bst-training-test")
@@ -295,6 +331,7 @@ def test_train_bst_logs_epoch_zero_baselines_and_detailed_early_stopping(
         metrics_top_ks=[1],
         bst_max_train_batches_per_epoch=None,
         checkpoint_metadata={"model_config": {"model_dim": 4}},
+        best_checkpoint_callback=best_checkpoint_callback,
         experiment_tracker=tracker,
         logger=logger,
     )
@@ -311,6 +348,7 @@ def test_train_bst_logs_epoch_zero_baselines_and_detailed_early_stopping(
     assert checkpoint["patience_counter"] == 2
     assert checkpoint["best_val_metric"] == pytest.approx(0.56)
     assert checkpoint["metadata"] == {"model_config": {"model_dim": 4}}
+    assert callback_epochs == [1, 3]
     assert results["baseline_metrics"]["train"]["ndcg@1"] == pytest.approx(0.4)
     for series in (
         "Train NDCG@1",
@@ -348,3 +386,66 @@ def test_train_bst_logs_epoch_zero_baselines_and_detailed_early_stopping(
     assert "required_metric=0.600000" in status_lines[-1]
     assert "new_checkpoint_best=True" in status_lines[-1]
     assert "patience_reset=False" in status_lines[-1]
+
+
+def test_save_checkpoint_atomically_replaces_partial_file(tmp_path):
+    checkpoint_path = tmp_path / "bst_ranker_best.pth"
+    partial_path = tmp_path / "bst_ranker_best.pth.partial"
+    checkpoint_path.write_bytes(b"old checkpoint")
+
+    bst_training._save_checkpoint_atomically(
+        checkpoint={"epoch": 2, "tensor": torch.tensor([1.0, 2.0])},
+        checkpoint_path=checkpoint_path,
+    )
+
+    assert checkpoint_path.is_file()
+    assert not partial_path.exists()
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
+    assert checkpoint["epoch"] == 2
+    torch.testing.assert_close(checkpoint["tensor"], torch.tensor([1.0, 2.0]))
+
+
+def test_best_checkpoint_callback_failure_propagates(tmp_path, monkeypatch):
+    model = _model(use_popularity_feature=False)
+    loader = DataLoader(_SingleBatchDataset(_batch()), batch_size=None, shuffle=False)
+
+    def fake_epoch(**kwargs):
+        return (
+            1.0,
+            {"loss": 1.0, "ndcg@1": 0.5, "rank_metric_user_count": 2},
+            {"dcg@1": 0.4, "ndcg@1": 0.4},
+        )
+
+    def fail_callback(checkpoint_path):
+        assert checkpoint_path.is_file()
+        raise RuntimeError("export failed")
+
+    monkeypatch.setattr(bst_training, "run_bst_listwise_epoch", fake_epoch)
+
+    with pytest.raises(RuntimeError, match="export failed"):
+        bst_training.train_bst_ranker_model(
+            model=model,
+            train_loader=loader,
+            val_loader=loader,
+            val_unseen_loader=loader,
+            device="cpu",
+            epochs=2,
+            learning_rate=1.0e-3,
+            weight_decay=0.0,
+            patience=2,
+            early_stopping_min_delta=0.0,
+            checkpoints_dir=tmp_path,
+            disable_progress=True,
+            lr_scheduler_factor=0.5,
+            lr_scheduler_patience=1,
+            gradient_clip_max_norm=1.0,
+            metrics_top_ks=[1],
+            bst_max_train_batches_per_epoch=None,
+            checkpoint_metadata={},
+            best_checkpoint_callback=fail_callback,
+            experiment_tracker=None,
+            logger=logging.getLogger("bst-training-callback-failure-test"),
+        )
+
+    assert (tmp_path / "bst_ranker_best.pth").is_file()
+    assert not (tmp_path / "bst_ranker_best.pth.partial").exists()

@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -15,13 +15,13 @@ from tqdm import tqdm
 from engagement_prediction.models.bst_ranker import BSTRanker
 from engagement_prediction.training.ranking import (
     MatrixBatchScores,
-    calc_baseline_rank_metrics_for_batch,
-    empty_rank_metric_sums,
+    calc_baseline_ndcg_tensor_sums_for_batch,
+    empty_ndcg_metric_tensor_sums,
     finalize_rank_metrics,
     finalize_zero_history_rank_metrics,
     log_zero_history_rank_metrics,
-    rank_metric_sums_for_batch,
-    zero_history_rank_metric_sums_for_batch,
+    ndcg_metric_tensor_sums_for_batch,
+    topk_ranked_labels_for_scores,
 )
 
 
@@ -30,11 +30,19 @@ def compute_bst_listwise_loss_and_scores(
     batch: Dict[str, Any],
     device: str,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    label_matrix = batch["label_matrix"]
+    # Native loader batches arrive on the host. Validate them before the
+    # asynchronous CUDA copy so invalid-data detection does not introduce a
+    # device-to-host synchronization into every training step.
+    input_positive_counts = label_matrix.sum(dim=1, keepdim=True)
+    if torch.any(input_positive_counts <= 0):
+        raise RuntimeError("Each user row in label_matrix must contain at least one positive candidate")
+
     history_embeddings = batch["history_embeddings"].to(device, non_blocking=True)
     history_mask = batch["history_mask"].to(device, non_blocking=True)
     history_time_deltas_hours = batch["history_time_deltas_hours"].to(device, non_blocking=True)
     candidate_post_embeddings = batch["candidate_post_embeddings"].to(device, non_blocking=True)
-    labels = batch["label_matrix"].to(device, dtype=torch.float32, non_blocking=True)
+    labels = label_matrix.to(device, dtype=torch.float32, non_blocking=True)
     if "history_author_indices" not in batch or "candidate_post_author_idx" not in batch:
         raise RuntimeError("BST listwise batches must include author index tensors")
     history_author_indices = batch["history_author_indices"].to(device, dtype=torch.long, non_blocking=True)
@@ -59,10 +67,7 @@ def compute_bst_listwise_loss_and_scores(
     )
     if scores.shape != labels.shape:
         raise RuntimeError("Expected BST scores and label_matrix to have matching [num_users, num_candidates] shapes")
-    positive_counts = labels.sum(dim=1, keepdim=True)
-    if torch.any(positive_counts <= 0):
-        raise RuntimeError("Each user row in label_matrix must contain at least one positive candidate")
-
+    positive_counts = input_positive_counts.to(device, dtype=torch.float32, non_blocking=True)
     targets = labels / positive_counts
     loss_per_user = -(targets * F.log_softmax(scores, dim=1)).sum(dim=1)
     return loss_per_user.mean(), scores, labels
@@ -91,21 +96,21 @@ def run_bst_listwise_epoch(
 
     loss_sum = torch.zeros((), device=device)
     batches = 0
-    baseline_metric_sums = empty_rank_metric_sums(
+    baseline_metric_sums = empty_ndcg_metric_tensor_sums(
         metrics_top_ks,
-        include_mean_average_precision=False,
+        device=device,
     )
-    baseline_metric_user_count = 0
-    metric_sums = empty_rank_metric_sums(
+    baseline_metric_user_count = torch.zeros((), device=device, dtype=torch.int64)
+    metric_sums = empty_ndcg_metric_tensor_sums(
         metrics_top_ks,
-        include_mean_average_precision=False,
+        device=device,
     )
-    metric_user_count = 0
-    zero_history_metric_sums = empty_rank_metric_sums(
+    metric_user_count = torch.zeros((), device=device, dtype=torch.int64)
+    zero_history_metric_sums = empty_ndcg_metric_tensor_sums(
         metrics_top_ks,
-        include_mean_average_precision=False,
+        device=device,
     )
-    zero_history_metric_user_count = 0
+    zero_history_metric_user_count = torch.zeros((), device=device, dtype=torch.int64)
     with nullcontext() if train else torch.inference_mode():
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=split_name, leave=False, disable=disable_progress)):
             if max_batches is not None and batch_idx >= max_batches:
@@ -113,29 +118,43 @@ def run_bst_listwise_epoch(
             if train and optimizer is not None:
                 optimizer.zero_grad()
 
+            history_mask = batch.get("history_mask")
+            if history_mask is None or history_mask.dim() != 2:
+                raise RuntimeError("history_mask must have shape [num_users, history_len]")
+            # Compute the metric mask on the host before model inputs move to
+            # CUDA. Only this B-length vector is copied for metrics; the full
+            # BxH history mask is not transferred a second time.
+            zero_history_mask = (~history_mask.any(dim=1)).to(
+                device,
+                dtype=torch.bool,
+                non_blocking=True,
+            )
             loss, scores, labels = compute_bst_listwise_loss_and_scores(model, batch, device)
             if calc_baseline_metrics:
-                baseline_batch_metric_sums, baseline_batch_metric_user_count = calc_baseline_rank_metrics_for_batch(
+                baseline_batch_metric_sums, baseline_batch_metric_user_count = calc_baseline_ndcg_tensor_sums_for_batch(
                     labels,
                     metrics_top_ks,
-                    include_mean_average_precision=False,
                 )
-                baseline_metric_user_count += baseline_batch_metric_user_count
+                baseline_metric_user_count.add_(baseline_batch_metric_user_count)
                 for key, value in baseline_batch_metric_sums.items():
-                    baseline_metric_sums[key] += value
+                    baseline_metric_sums[key].add_(value)
 
-            ranked_indices = torch.argsort(scores.detach(), dim=1, descending=True)
-            ranked_labels = torch.gather(labels, dim=1, index=ranked_indices)
-            batch_metric_sums, batch_metric_user_count = rank_metric_sums_for_batch(
-                ranked_labels,
+            top_ranked_labels = topk_ranked_labels_for_scores(
+                scores,
+                labels,
                 metrics_top_ks,
-                include_mean_average_precision=False,
             )
-            batch_zero_history_metric_sums, batch_zero_history_metric_user_count = zero_history_rank_metric_sums_for_batch(
-                batch,
-                ranked_labels,
+            total_relevant = labels.sum(dim=1)
+            batch_metric_sums, batch_metric_user_count = ndcg_metric_tensor_sums_for_batch(
+                top_ranked_labels,
+                total_relevant,
                 metrics_top_ks,
-                include_mean_average_precision=False,
+            )
+            batch_zero_history_metric_sums, batch_zero_history_metric_user_count = ndcg_metric_tensor_sums_for_batch(
+                top_ranked_labels,
+                total_relevant,
+                metrics_top_ks,
+                row_mask=zero_history_mask,
             )
 
             if train and optimizer is not None:
@@ -145,19 +164,48 @@ def run_bst_listwise_epoch(
 
             loss_sum += loss.detach()
             batches += 1
-            metric_user_count += batch_metric_user_count
+            metric_user_count.add_(batch_metric_user_count)
             for key, value in batch_metric_sums.items():
-                metric_sums[key] += value
-            zero_history_metric_user_count += batch_zero_history_metric_user_count
+                metric_sums[key].add_(value)
+            zero_history_metric_user_count.add_(batch_zero_history_metric_user_count)
             for key, value in batch_zero_history_metric_sums.items():
-                zero_history_metric_sums[key] += value
+                zero_history_metric_sums[key].add_(value)
 
-    loss = (loss_sum / max(batches, 1)).item()
-    baseline_metrics = finalize_rank_metrics(baseline_metric_sums, baseline_metric_user_count)
-    metrics: Dict[str, Any] = finalize_rank_metrics(metric_sums, metric_user_count)
-    metrics.update(finalize_zero_history_rank_metrics(zero_history_metric_sums, zero_history_metric_user_count))
+    # Transfer all epoch statistics together. This is the only metric-related
+    # CUDA synchronization in the epoch, replacing several synchronizations
+    # per batch from Python scalar extraction.
+    metric_names = list(metric_sums)
+    packed_statistics = torch.stack(
+        [
+            loss_sum.to(dtype=torch.float64),
+            baseline_metric_user_count.to(dtype=torch.float64),
+            metric_user_count.to(dtype=torch.float64),
+            zero_history_metric_user_count.to(dtype=torch.float64),
+            *(baseline_metric_sums[name] for name in metric_names),
+            *(metric_sums[name] for name in metric_names),
+            *(zero_history_metric_sums[name] for name in metric_names),
+        ]
+    ).cpu().tolist()
+    loss = float(packed_statistics[0]) / max(batches, 1)
+    baseline_metric_user_count_value = int(packed_statistics[1])
+    metric_user_count_value = int(packed_statistics[2])
+    zero_history_metric_user_count_value = int(packed_statistics[3])
+    cursor = 4
+    baseline_metric_sums_value = dict(zip(metric_names, packed_statistics[cursor : cursor + len(metric_names)]))
+    cursor += len(metric_names)
+    metric_sums_value = dict(zip(metric_names, packed_statistics[cursor : cursor + len(metric_names)]))
+    cursor += len(metric_names)
+    zero_history_metric_sums_value = dict(zip(metric_names, packed_statistics[cursor : cursor + len(metric_names)]))
+    baseline_metrics = finalize_rank_metrics(baseline_metric_sums_value, baseline_metric_user_count_value)
+    metrics: Dict[str, Any] = finalize_rank_metrics(metric_sums_value, metric_user_count_value)
+    metrics.update(
+        finalize_zero_history_rank_metrics(
+            zero_history_metric_sums_value,
+            zero_history_metric_user_count_value,
+        )
+    )
     metrics["loss"] = loss
-    metrics["rank_metric_user_count"] = metric_user_count
+    metrics["rank_metric_user_count"] = metric_user_count_value
     return loss, metrics, baseline_metrics
 
 
@@ -204,6 +252,16 @@ def _append_split_metrics_to_history(
         key = f"{split_name}_{metric_name}"
         metric_value = metrics.get(metric_name)
         history.setdefault(key, []).append(float(metric_value) if metric_value is not None else float("nan"))
+
+
+def _save_checkpoint_atomically(
+    checkpoint: Dict[str, Any],
+    checkpoint_path: Path,
+) -> None:
+    """Publish a complete checkpoint without exposing a partially written file."""
+    partial_path = checkpoint_path.with_name(f"{checkpoint_path.name}.partial")
+    torch.save(checkpoint, partial_path)
+    partial_path.replace(checkpoint_path)
 
 
 def _log_bst_listwise_epoch_metrics(
@@ -301,6 +359,7 @@ def train_bst_ranker_model(
     metrics_top_ks: List[int],
     bst_max_train_batches_per_epoch: Optional[int],
     checkpoint_metadata: Dict[str, Any],
+    best_checkpoint_callback: Optional[Callable[[Path], None]],
     experiment_tracker: Optional[Any],
     logger: logging.Logger,
 ) -> Dict[str, Any]:
@@ -327,6 +386,8 @@ def train_bst_ranker_model(
         raise ValueError("gradient_clip_max_norm must be positive")
     if bst_max_train_batches_per_epoch is not None and bst_max_train_batches_per_epoch <= 0:
         raise ValueError("bst_max_train_batches_per_epoch must be positive when provided")
+    if best_checkpoint_callback is not None and checkpoints_dir is None:
+        raise ValueError("checkpoints_dir is required when best_checkpoint_callback is provided")
     if checkpoints_dir is not None:
         checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
@@ -466,8 +527,9 @@ def train_bst_ranker_model(
             patience_counter += 1
 
         if new_checkpoint_best and checkpoints_dir is not None:
-            torch.save(
-                {
+            checkpoint_path = checkpoints_dir / "bst_ranker_best.pth"
+            _save_checkpoint_atomically(
+                checkpoint={
                     "epoch": epoch_number,
                     "best_epoch": best_epoch,
                     "epochs_completed": epochs_completed,
@@ -482,8 +544,10 @@ def train_bst_ranker_model(
                     "baseline_metrics": baseline_metrics,
                     "metadata": checkpoint_metadata,
                 },
-                checkpoints_dir / "bst_ranker_best.pth",
+                checkpoint_path=checkpoint_path,
             )
+            if best_checkpoint_callback is not None:
+                best_checkpoint_callback(checkpoint_path)
 
         epochs_since_best = (
             epoch_number - best_epoch
@@ -531,8 +595,8 @@ def train_bst_ranker_model(
         if checkpoints_dir is not None:
             # The weights still come from best_epoch; refresh the metadata so
             # the checkpoint also describes how the complete run finished.
-            torch.save(
-                {
+            _save_checkpoint_atomically(
+                checkpoint={
                     "epoch": best_epoch,
                     "best_epoch": best_epoch,
                     "epochs_completed": epochs_completed,
@@ -547,7 +611,7 @@ def train_bst_ranker_model(
                     "baseline_metrics": baseline_metrics,
                     "metadata": checkpoint_metadata,
                 },
-                checkpoints_dir / "bst_ranker_best.pth",
+                checkpoint_path=checkpoints_dir / "bst_ranker_best.pth",
             )
 
     return {

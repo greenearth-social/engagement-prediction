@@ -163,6 +163,62 @@ def test_native_dataset_builds_parity_batch_from_memory_mapped_index(tmp_path):
     )
 
 
+def test_tensor_only_collation_skips_auxiliary_metadata_and_arrow_tables(tmp_path):
+    bundle = _bundle(tmp_path)
+    full_dataset = _dataset(bundle)
+    tensor_dataset = _dataset(bundle)
+
+    full_batch = full_dataset.collate_batch([full_dataset[0], full_dataset[1]])
+    tensor_batch = tensor_dataset.collate_tensor_batch([
+        tensor_dataset[0],
+        tensor_dataset[1],
+    ])
+
+    assert set(tensor_batch) == {
+        "history_embeddings",
+        "history_mask",
+        "history_author_indices",
+        "history_time_deltas_hours",
+        "history_prior_cumulative_likes",
+        "candidate_post_embeddings",
+        "candidate_post_author_idx",
+        "candidate_prior_cumulative_likes",
+        "label_matrix",
+    }
+    assert tensor_dataset._post_uris is None
+    assert tensor_dataset._query_dids is None
+    for key, value in tensor_batch.items():
+        assert isinstance(value, torch.Tensor)
+        torch.testing.assert_close(value, full_batch[key])
+
+
+def test_tensor_only_loader_uses_tensor_collation_without_opening_arrow_tables(tmp_path):
+    dataset = _dataset(_bundle(tmp_path))
+    loader = create_hydrated_data_loader(
+        dataset,
+        batch_size=2,
+        shuffle=False,
+        drop_last=False,
+        num_workers=0,
+        pin_memory=False,
+        persistent_workers=False,
+        prefetch_factor=1,
+        seed=7,
+        resample_candidates_each_epoch=False,
+        tensor_only=True,
+    )
+
+    batch = next(iter(loader))
+
+    assert "candidate_post_age_hours" not in batch
+    assert "user_id" not in batch
+    assert "candidate_post_id" not in batch
+    assert "query_hour" not in batch
+    assert "bucket" not in batch
+    assert dataset._post_uris is None
+    assert dataset._query_dids is None
+
+
 def test_dataset_pickle_excludes_open_mappings_and_large_python_state(tmp_path):
     dataset = _dataset(_bundle(tmp_path))
     expected = dataset.collate_batch([dataset[0], dataset[1]])
@@ -300,6 +356,33 @@ def test_native_pytorch_dataloader_matches_with_zero_and_multiple_workers(tmp_pa
         "candidate_post_age_hours",
         "label_matrix",
     ):
+        torch.testing.assert_close(worker[key], direct[key])
+
+
+def test_tensor_only_dataloader_matches_with_zero_and_multiple_workers(tmp_path):
+    dataset = _dataset(_bundle(tmp_path))
+
+    def load(num_workers):
+        loader = create_hydrated_data_loader(
+            dataset,
+            batch_size=2,
+            shuffle=False,
+            drop_last=False,
+            num_workers=num_workers,
+            pin_memory=False,
+            persistent_workers=False,
+            prefetch_factor=1,
+            seed=7,
+            resample_candidates_each_epoch=False,
+            tensor_only=True,
+        )
+        return next(iter(loader))
+
+    direct = load(0)
+    worker = load(2)
+
+    assert set(worker) == set(direct)
+    for key in direct:
         torch.testing.assert_close(worker[key], direct[key])
 
 

@@ -118,13 +118,16 @@ class ProjectedPostFeatureEncoder(nn.Module):
         author_indices = author_indices.to(device=post_embeddings.device, dtype=torch.long)
         if self.training and self.author_unknown_dropout_rate > 0.0:
             eligible = author_indices > self.author_unk_idx
-            if torch.any(eligible):
-                dropout_mask = torch.rand(author_indices.shape, device=author_indices.device) < self.author_unknown_dropout_rate
-                author_indices = torch.where(
-                    eligible & dropout_mask,
-                    torch.full_like(author_indices, self.author_unk_idx),
-                    author_indices,
-                )
+            # Keep dropout entirely on-device. Branching on torch.any(eligible)
+            # would synchronize CUDA with Python once for every encoder call.
+            # This intentionally draws a mask even for an all-PAD/UNK tensor;
+            # outputs are unchanged, although the later RNG stream advances.
+            dropout_mask = torch.rand(author_indices.shape, device=author_indices.device) < self.author_unknown_dropout_rate
+            author_indices = torch.where(
+                eligible & dropout_mask,
+                torch.full_like(author_indices, self.author_unk_idx),
+                author_indices,
+            )
 
         author_embeddings = self.author_embedding(author_indices)
         content_features = self.content_projection_norm(

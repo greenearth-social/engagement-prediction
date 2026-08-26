@@ -300,11 +300,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         logger=logger,
     )
 
-    # Load selected URI keys once, then discover and read matching payloads in
-    # bounded multi-file batches. Full selected metadata remains partitioned
-    # for the URI-aligned memmap publication in Phase 4.
+    # Load selected URI keys once, then scan and filter payloads in bounded
+    # multi-file batches. Full selected metadata remains partitioned for the
+    # URI-aligned memmap publication in Phase 4.
     logger.info(
-        "Phase 3/10: batched two-pass filtering of exact root/reply snapshots "
+        "Phase 3/10: bounded one-pass filtering of exact root/reply snapshots "
         "to selected embedding rows"
     )
     source_stats = dataset_hydration_artifacts.materialize_selected_embedding_rows(

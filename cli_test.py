@@ -224,7 +224,7 @@ def test_query_sampling_defaults():
     assert merged.post_liker_history_partition_count == 16
     assert merged.author_statistics_partition_count == 16
     assert merged.embedding_source_batch_size == 64
-    assert merged.embedding_partition_worker_count == 2
+    assert merged.embedding_partition_worker_count == 4
     assert merged.min_author_training_feature_count == 50
 
     with pytest.raises(SystemExit):

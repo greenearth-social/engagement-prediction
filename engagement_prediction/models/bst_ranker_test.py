@@ -494,6 +494,37 @@ def test_bst_ranker_torchscript_exports_matrix_scorer():
     torch.testing.assert_close(scripted_scores, expected, atol=1e-5, rtol=1e-5)
 
 
+def test_bst_ranker_can_script_differently_shaped_models_in_one_process():
+    first_model = _make_model().eval()
+    second_model = BSTRanker(
+        post_embedding_dim=2,
+        author_table_num_rows=6,
+        author_embedding_dim=3,
+        content_projection_dim=4,
+        author_projection_dim=2,
+        model_dim=4,
+        time_embedding_dim=2,
+        num_attention_heads=2,
+        num_transformer_layers=1,
+        transformer_ff_dim=8,
+        dropout_rate=0.0,
+        author_unknown_dropout_rate=0.0,
+        norm_first=False,
+        time_delta_bucket_boundaries_hours=[1.0, 6.0, 24.0],
+        prediction_hidden_dims=[4],
+        use_popularity_feature=True,
+        popularity_projection_dim=2,
+        popularity_log_mean=1.0,
+        popularity_log_std=2.0,
+    ).eval()
+
+    first_scripted = torch.jit.script(first_model)
+    second_scripted = torch.jit.script(second_model)
+
+    assert callable(first_scripted.score_candidate_matrix)
+    assert callable(second_scripted.score_candidate_matrix)
+
+
 def test_bst_ranker_torchscript_save_load_preserves_zero_history_paths(tmp_path):
     model = _make_model().eval()
     batch = _mixed_zero_history_batch()
