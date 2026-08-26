@@ -27,6 +27,7 @@ from engagement_prediction.data import author_statistics
 from engagement_prediction.data import dataset_hydration_artifacts
 from engagement_prediction.data import ingex
 from engagement_prediction.data import source_manifests
+from engagement_prediction.data import training_index
 from engagement_prediction.data.parquet import find_artifact_path, load_parquet_from_prior
 from engagement_prediction.data.source_metadata_artifacts import (
     SourceMetadataArtifact,
@@ -138,7 +139,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     if min_author_training_feature_count < 1:
         raise ValueError("min_author_training_feature_count must be at least 1")
 
-    logger.info("Phase 1/9: resolving and validating Stage 00-6 lineage")
+    logger.info("Phase 1/10: resolving and validating Stage 00-6 lineage")
     lineage = resolve_recorded_stage_lineage(
         context,
         terminal_stage_folder="06_author_statistics",
@@ -254,6 +255,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     histories_path = partial_bundle_path / "query_histories"
     negatives_path = partial_bundle_path / "hourly_negative_candidates"
     authors_path = partial_bundle_path / "authors"
+    loader_index_path = partial_bundle_path / "loader_index"
     copied_manifests = []
     for prefix, manifest in (
         ("post_sources", post_snapshot.manifest),
@@ -284,7 +286,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # Stage 5 defines the exact selected URI universe and role flags; Stage 3
     # supplies authoritative creation, author, and root/reply metadata.
-    logger.info("Phase 2/9: preparing Stage 5 selected-post metadata")
+    logger.info("Phase 2/10: preparing Stage 5 selected-post metadata")
     dataset_hydration_artifacts.route_selected_posts(
         post_liker_posts_path=post_liker_posts_path,
         output_path=selected_routes_path,
@@ -302,7 +304,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # bounded multi-file batches. Full selected metadata remains partitioned
     # for the URI-aligned memmap publication in Phase 4.
     logger.info(
-        "Phase 3/9: batched two-pass filtering of exact root/reply snapshots "
+        "Phase 3/10: batched two-pass filtering of exact root/reply snapshots "
         "to selected embedding rows"
     )
     source_stats = dataset_hydration_artifacts.materialize_selected_embedding_rows(
@@ -322,7 +324,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # partition and write NumPy shards. Partition-order concatenation keeps
     # emb_idx dense and aligned with the public posts rows regardless of worker
     # completion order.
-    logger.info("Phase 4/9: selecting vectors and publishing the exact memmap/post index")
+    logger.info("Phase 4/10: selecting vectors and publishing the exact memmap/post index")
     embedding_stats = dataset_hydration_artifacts.write_embedding_shards(
         selected_embedding_rows_path=selected_embedding_rows_path,
         valid_embedding_rows_path=valid_embedding_rows_path,
@@ -352,7 +354,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # Missing embeddings remove individual uses without replacement. Queries
     # are dropped later only if every positive use disappeared.
-    logger.info("Phase 5/9: filtering positive, history, and negative uses by hydrated posts")
+    logger.info("Phase 5/10: filtering positive, history, and negative uses by hydrated posts")
     positive_routes_path = staging_root / "positive_routes"
     history_routes_path = staging_root / "history_routes"
     negative_routes_path = staging_root / "negative_routes"
@@ -381,7 +383,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # Stage 5 events are the source of truth for all roles. Recomputing counts
     # here gives one strict as-of contract and checks Stage 4 negative counts.
-    logger.info("Phase 6/9: calculating strict as-of like counts from Stage 5 events")
+    logger.info("Phase 6/10: calculating strict as-of like counts from Stage 5 events")
     liker_positive_routes = staging_root / "liker_positive_routes"
     liker_history_routes = staging_root / "liker_history_routes"
     liker_negative_routes = staging_root / "liker_negative_routes"
@@ -406,7 +408,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     )
 
     logger.info(
-        "Phase 7/9: building the training-exposure author vocabulary and applying indices"
+        "Phase 7/10: building the training-exposure author vocabulary and applying indices"
     )
     author_exposure_routes_path = staging_root / "author_exposure_routes"
     eligible_author_shards_path = staging_root / "eligible_author_shards"
@@ -450,7 +452,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # Histories were relationalized for filtering. Rebuild their lists using
     # explicit original positions so all feature arrays remain aligned.
-    logger.info("Phase 8/9: rebuilding aligned public query artifacts")
+    logger.info("Phase 8/10: rebuilding aligned public query artifacts")
     query_stats = dataset_hydration_artifacts.publish_query_artifacts(
         queries_lf=queries_lf,
         counted_positives_path=indexed_positives_path,
@@ -475,7 +477,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         )
     )
 
-    logger.info("Phase 9/9: validating and atomically publishing the hydrated bundle")
+    logger.info("Phase 9/10: validating the canonical Parquet and memmap artifacts")
     validation_stats = dataset_hydration_artifacts.validate_public_bundle(
         embeddings_path=embeddings_path,
         posts_path=posts_path,
@@ -486,6 +488,20 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         authors_path=authors_path,
         min_author_training_feature_count=min_author_training_feature_count,
         embedding_dim=embedding_dim,
+    )
+    logger.info(
+        "Phase 10/10: building the compact loader index and atomically publishing the bundle"
+    )
+    loader_index_stats = training_index.build_loader_index(
+        posts_path=posts_path,
+        queries_path=queries_path,
+        query_positives_path=positives_path,
+        query_histories_path=histories_path,
+        hourly_negative_candidates_path=negatives_path,
+        embeddings_path=embeddings_path,
+        authors_path=authors_path,
+        output_path=loader_index_path,
+        logger=logger,
     )
     # A successful validation is the only path that removes diagnostic staging
     # and promotes the public partial directory to its final artifact name.
@@ -528,6 +544,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "queries": query_stats,
         "negatives": negative_stats,
         "public_validation": validation_stats,
+        "loader_index": {
+            **loader_index_stats,
+            "output_path": str(Path(bundle_path.name) / "loader_index"),
+        },
         "outputs": {
             "hydrated_training_data_path": bundle_path.name,
             "embeddings_path": str(Path(bundle_path.name) / "embeddings.npy"),
@@ -537,6 +557,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "query_histories_path": str(Path(bundle_path.name) / "query_histories"),
             "hourly_negative_candidates_path": str(Path(bundle_path.name) / "hourly_negative_candidates"),
             "authors_path": str(Path(bundle_path.name) / "authors"),
+            "loader_index_path": str(Path(bundle_path.name) / "loader_index"),
             **{
                 name: str(Path(bundle_path.name) / path.name)
                 for name, path in manifest_output_paths.items()
@@ -562,6 +583,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             f"retained_positive_count: {query_stats['retained_positive_count']}",
             f"retained_history_item_count: {query_stats['retained_history_item_count']}",
             f"retained_negative_count: {negative_stats['retained_negative_count']}",
+            f"loader_index_format_version: {training_index.FORMAT_VERSION}",
+            f"loader_index_total_bytes: {loader_index_stats['total_bytes']}",
+            f"loader_index_build_time_seconds: {loader_index_stats['build_time_seconds']:.2f}",
             f"hydrated_training_data_path: {bundle_path.name}",
             "embeddings_path: embeddings.npy",
             "posts_path: posts",
@@ -570,6 +594,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "query_histories_path: query_histories",
             "hourly_negative_candidates_path: hourly_negative_candidates",
             "authors_path: authors",
+            "loader_index_path: loader_index",
             *[
                 f"{name}: {path.name}"
                 for name, path in sorted(manifest_output_paths.items())
@@ -577,7 +602,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         ]) + "\n"
     )
     logger.info(
-        "Dataset hydration completed in %.2fs: posts=%s queries=%s positives=%s histories=%s negatives=%s authors=%s",
+        "Dataset hydration completed in %.2fs: posts=%s queries=%s positives=%s histories=%s negatives=%s authors=%s loader_index_bytes=%s",
         runtime_seconds,
         f"{post_stats['hydrated_post_count']:,}",
         f"{query_stats['retained_query_count']:,}",
@@ -585,6 +610,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"{query_stats['retained_history_item_count']:,}",
         f"{negative_stats['retained_negative_count']:,}",
         f"{vocabulary_stats['eligible_author_count']:,}",
+        f"{loader_index_stats['total_bytes']:,}",
     )
     return {
         "output_dir": out_dir,
@@ -597,6 +623,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "query_histories_path": str(bundle_path / "query_histories"),
             "hourly_negative_candidates_path": str(bundle_path / "hourly_negative_candidates"),
             "authors_path": str(bundle_path / "authors"),
+            "loader_index_path": str(bundle_path / "loader_index"),
             **{
                 name: str(path)
                 for name, path in manifest_output_paths.items()

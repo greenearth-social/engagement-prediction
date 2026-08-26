@@ -15,6 +15,7 @@ from engagement_prediction.data.datasets import (
     HydratedBucketedEngagementDataset,
     create_hydrated_data_loader,
 )
+from engagement_prediction.data import training_index
 from engagement_prediction.data.parquet import find_artifact_path, scan_parquet_artifact
 from engagement_prediction.models.bst_ranker import BSTRanker
 from engagement_prediction.pipeline.core import Context
@@ -48,17 +49,25 @@ def _load_stage7_summary(stage7_dir: Path) -> Dict[str, Any]:
         summary = json.loads(summary_path.read_text())
         parameters = summary["parameters"]
         embedding_model = str(parameters["embedding_model"])
-        embedding_dim = int(parameters["embedding_dim"])
-    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError) as exc:
         raise ValueError(
-            f"Stage 7 does not record valid embedding metadata: {summary_path}"
+            f"Stage 7 does not record valid embedding-model metadata: {summary_path}"
         ) from exc
-    if embedding_dim <= 0:
-        raise ValueError("Stage 7 embedding_dim must be positive")
-    return {
-        "embedding_model": embedding_model,
-        "embedding_dim": embedding_dim,
-    }
+    return {"embedding_model": embedding_model}
+
+
+def _require_loader_index(bundle_path: Path) -> Dict[str, Any]:
+    """Fully validate the compact Stage 7 contract before expensive setup."""
+
+    index_path = bundle_path / "loader_index"
+    try:
+        validation = training_index.validate_loader_index(index_path)
+    except (FileNotFoundError, OSError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "Stage 7 loader_index is missing, corrupt, or unsupported; regenerate Stage 7 "
+            "with the current dataset-hydration code"
+        ) from exc
+    return validation
 
 
 def _create_dataset(
@@ -165,6 +174,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     stage7_dir = lineage["07_dataset_hydration"]
     bundle_path = find_artifact_path(stage7_dir, "hydrated_training_data_")
     stage7_metadata = _load_stage7_summary(stage7_dir)
+    loader_index_validation = _require_loader_index(bundle_path)
 
     random_seed = int(args.random_seed)
     max_history_len = int(args.max_history_len)
@@ -240,10 +250,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     }
     embed_dim = datasets["train"].embed_dim
     author_table_num_rows = datasets["train"].author_table_num_rows
-    if embed_dim != stage7_metadata["embedding_dim"]:
-        raise ValueError(
-            "Stage 7 summary embedding_dim does not match embeddings.npy"
-        )
+    if embed_dim != int(loader_index_validation["embedding_dim"]):
+        raise ValueError("Stage 7 dataset embedding dimension does not match loader_index")
+    if author_table_num_rows != int(loader_index_validation["author_table_num_rows"]):
+        raise ValueError("Stage 7 dataset author vocabulary size does not match loader_index")
     for split, dataset in datasets.items():
         if dataset.embed_dim != embed_dim:
             raise ValueError(f"Stage 7 split '{split}' has a different embedding dimension")
@@ -318,6 +328,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     training_config = {
         "stage7_dir": str(stage7_dir),
         "stage7_bundle": str(bundle_path),
+        "loader_index_format_version": int(loader_index_validation["format_version"]),
         "lineage": {
             stage_folder: str(stage_dir)
             for stage_folder, stage_dir in lineage.items()
@@ -389,22 +400,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     trained_model: BSTRanker = training_results["model"]
 
     logger.info("Phase 5/7: evaluating the reloaded best model deterministically")
-    final_train_loader = _create_loader(
-        dataset=datasets["train"],
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor,
-        random_seed=random_seed,
-        resample_candidates_each_epoch=False,
-    )
+    train_loader.batch_sampler.set_evaluation_mode(True)
     final_metrics = _final_metrics(
         model=trained_model,
         device=device,
         loaders={
-            "train": final_train_loader,
+            "train": train_loader,
             "val": val_loader,
             "val_unseen_users": val_unseen_loader,
         },

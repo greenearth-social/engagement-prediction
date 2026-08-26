@@ -17,6 +17,7 @@ from engagement_prediction.data import ingex
 from engagement_prediction.data import negative_selection
 from engagement_prediction.data import post_liker_history
 from engagement_prediction.data import post_selection
+from engagement_prediction.data import training_index
 from engagement_prediction.data import user_history
 from engagement_prediction.data.parquet import scan_parquet_artifact
 from engagement_prediction.pipeline import registry
@@ -340,6 +341,20 @@ def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
         "negative_known_count": 1,
         "negative_unk_count": 0,
     }
+    loader_index_path = Path(result["artifacts"]["loader_index_path"])
+    loader_format = json.loads((loader_index_path / "format.json").read_text())
+    assert loader_format["format_version"] == training_index.FORMAT_VERSION
+    assert summary["loader_index"]["format_version"] == training_index.FORMAT_VERSION
+    assert summary["loader_index"]["splits"]["train"] == {
+        "query_count": 1,
+        "history_count": 1,
+        "positive_count": 1,
+        "hour_count": 1,
+        "negative_count": 1,
+    }
+    assert "loader_index_path: loader_index" in Path(
+        result["output_dir"], "stage_info.txt"
+    ).read_text()
     assert ingex.load_source_manifest(
         Path(result["artifacts"]["post_sources_path"])
     )["blob_prefix"] == "bsky_posts"
@@ -385,6 +400,50 @@ def test_stage_failure_retains_partial_diagnostics_without_publishing(tmp_path, 
     )
 
     with pytest.raises(RuntimeError, match="injected embedding partition failure"):
+        registry.run_stage(
+            "dataset_hydration",
+            context,
+            SimpleNamespace(
+                embedding_model="all_MiniLM_L12_v2",
+                embedding_source_batch_size=64,
+                embedding_partition_worker_count=2,
+                min_author_training_feature_count=1,
+                _argv=["--stop-after", "dataset_hydration"],
+            ),
+        )
+
+    stage7_dirs = list((tmp_path / "artifacts" / "07_dataset_hydration").iterdir())
+    assert len(stage7_dirs) == 1
+    stage7_dir = stage7_dirs[0]
+    assert not (stage7_dir / "manifest.json").exists()
+    assert not [
+        path
+        for path in stage7_dir.glob("hydrated_training_data_*")
+        if not path.name.endswith(".partial")
+    ]
+    assert list(stage7_dir.glob("hydrated_training_data_*.partial"))
+
+
+def test_loader_index_failure_keeps_outer_bundle_partial(tmp_path, monkeypatch):
+    stage6 = _upstream(tmp_path)
+    logger = helpers._stage_loggers.pop("07_DATASET_HYDRATION", None)
+    if logger:
+        for handler in logger.handlers:
+            handler.close()
+    context = Context(
+        run_dir=tmp_path / "runs" / "run",
+        artifacts_dir=tmp_path / "artifacts",
+        runs_dir=tmp_path / "runs",
+        pipeline_run_id="run",
+    )
+    context.prior_outputs["06_author_statistics"] = stage6
+
+    def fail_loader_index(**kwargs):
+        raise RuntimeError("injected loader-index failure")
+
+    monkeypatch.setattr(training_index, "build_loader_index", fail_loader_index)
+
+    with pytest.raises(RuntimeError, match="injected loader-index failure"):
         registry.run_stage(
             "dataset_hydration",
             context,

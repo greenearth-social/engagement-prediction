@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import shutil
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,6 +10,8 @@ import pytest
 import torch
 
 from engagement_prediction.data import dataset_hydration
+from engagement_prediction.data import author_vocabulary
+from engagement_prediction.data import training_index
 from engagement_prediction.data.datasets import HydratedBucketedEngagementDataset
 from engagement_prediction.models.bst_ranker import BSTRanker
 from engagement_prediction.pipeline.core import Context
@@ -32,6 +35,20 @@ def _write_dataset(bundle: Path, name: str, frame: pl.DataFrame) -> None:
     path = bundle / name
     path.mkdir()
     frame.write_parquet(path / "part-00000.parquet")
+
+
+def _build_loader_index(bundle: Path) -> None:
+    training_index.build_loader_index(
+        posts_path=bundle / "posts",
+        queries_path=bundle / "queries",
+        query_positives_path=bundle / "query_positives",
+        query_histories_path=bundle / "query_histories",
+        hourly_negative_candidates_path=bundle / "hourly_negative_candidates",
+        embeddings_path=bundle / "embeddings.npy",
+        authors_path=bundle / "authors",
+        output_path=bundle / "loader_index",
+        logger=None,
+    )
 
 
 def _stage7_fixture(tmp_path: Path) -> tuple[Path, Path]:
@@ -101,9 +118,32 @@ def _stage7_fixture(tmp_path: Path) -> tuple[Path, Path]:
     _write_dataset(bundle, "hourly_negative_candidates", negatives)
     _write_dataset(
         bundle,
-        "authors",
-        pl.DataFrame({"author_idx": [2, 3, 4, 5]}, schema={"author_idx": pl.UInt32}),
+        "posts",
+        pl.DataFrame({
+            "subject_uri": ["p1", "p2", "h1", "n1"],
+            "emb_idx": [0, 1, 2, 3],
+            "post_created_at": [created, created, created, created],
+            "author_did": ["a2", "a3", "a4", "a5"],
+            "author_idx": [2, 3, 4, 5],
+            "is_reply": [False, False, False, False],
+            "is_positive": [True, True, False, False],
+            "is_history": [False, False, True, False],
+            "is_negative": [False, False, False, True],
+        }, schema=dataset_hydration.POST_SCHEMA),
     )
+    _write_dataset(
+        bundle,
+        "authors",
+        pl.DataFrame({
+            "author_did": ["a2", "a3", "a4", "a5"],
+            "author_idx": [2, 3, 4, 5],
+            "training_feature_count": [1, 1, 1, 1],
+            "training_positive_count": [1, 1, 0, 0],
+            "training_history_count": [0, 0, 1, 0],
+            "training_negative_count": [0, 0, 0, 1],
+        }, schema=author_vocabulary.AUTHOR_VOCABULARY_SCHEMA),
+    )
+    _build_loader_index(bundle)
     (stage7_dir / "summary.json").write_text(json.dumps({
         "parameters": {
             "embedding_model": "fixture-model",
@@ -179,6 +219,14 @@ def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
         lambda *args, **kwargs: {"07_dataset_hydration": stage7_dir},
     )
     tracker = _RecordingTracker()
+    create_loader = train_bst_ranker._create_loader
+    loader_calls = []
+
+    def record_loader(**kwargs):
+        loader_calls.append(kwargs)
+        return create_loader(**kwargs)
+
+    monkeypatch.setattr(train_bst_ranker, "_create_loader", record_loader)
 
     result = train_bst_ranker.run(
         _context(tmp_path, tracker),
@@ -265,6 +313,7 @@ def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
         for title, series, _, _ in tracker.scalar_calls
     )
     assert "bst_ranker_best_checkpoint" in {name for name, _ in tracker.artifacts}
+    assert len(loader_calls) == 3
 
 
 def test_stage8_respects_no_save_model_and_no_plots(tmp_path, monkeypatch):
@@ -288,10 +337,17 @@ def test_stage8_respects_no_save_model_and_no_plots(tmp_path, monkeypatch):
 
 def test_stage8_requires_every_training_split(tmp_path, monkeypatch):
     stage7_dir, bundle = _stage7_fixture(tmp_path)
-    queries_path = bundle / "queries" / "part-00000.parquet"
-    pl.read_parquet(queries_path).filter(
-        pl.col("split") != "val_unseen_users"
-    ).write_parquet(queries_path)
+    for artifact_name in ("queries", "query_positives", "query_histories"):
+        artifact_path = bundle / artifact_name / "part-00000.parquet"
+        pl.read_parquet(artifact_path).filter(
+            pl.col("did") != "u4"
+        ).write_parquet(artifact_path)
+    negatives_path = bundle / "hourly_negative_candidates" / "part-00000.parquet"
+    pl.read_parquet(negatives_path).filter(
+        pl.col("query_hour") != datetime(2026, 1, 1, 14, tzinfo=timezone.utc)
+    ).write_parquet(negatives_path)
+    shutil.rmtree(bundle / "loader_index")
+    _build_loader_index(bundle)
     monkeypatch.setattr(
         train_bst_ranker,
         "resolve_recorded_stage_lineage",
@@ -299,6 +355,41 @@ def test_stage8_requires_every_training_split(tmp_path, monkeypatch):
     )
 
     with pytest.raises(ValueError, match="nonempty 'val_unseen_users'"):
+        train_bst_ranker.run(
+            _context(tmp_path, _RecordingTracker()),
+            _args(save_model=False, plots=False),
+        )
+
+
+def test_stage8_rejects_stage7_without_loader_index(tmp_path, monkeypatch):
+    stage7_dir, bundle = _stage7_fixture(tmp_path)
+    shutil.rmtree(bundle / "loader_index")
+    monkeypatch.setattr(
+        train_bst_ranker,
+        "resolve_recorded_stage_lineage",
+        lambda *args, **kwargs: {"07_dataset_hydration": stage7_dir},
+    )
+
+    with pytest.raises(ValueError, match="regenerate Stage 7"):
+        train_bst_ranker.run(
+            _context(tmp_path, _RecordingTracker()),
+            _args(save_model=False, plots=False),
+        )
+
+
+def test_stage8_rejects_unsupported_loader_index_format(tmp_path, monkeypatch):
+    stage7_dir, bundle = _stage7_fixture(tmp_path)
+    format_path = bundle / "loader_index" / "format.json"
+    metadata = json.loads(format_path.read_text())
+    metadata["format_version"] = 0
+    format_path.write_text(json.dumps(metadata))
+    monkeypatch.setattr(
+        train_bst_ranker,
+        "resolve_recorded_stage_lineage",
+        lambda *args, **kwargs: {"07_dataset_hydration": stage7_dir},
+    )
+
+    with pytest.raises(ValueError, match="regenerate Stage 7"):
         train_bst_ranker.run(
             _context(tmp_path, _RecordingTracker()),
             _args(save_model=False, plots=False),

@@ -9,7 +9,7 @@ This repo trains and evaluates engagement rankers for Bluesky posts. The artifac
 4. `04_negative_selection`: calculate as-of candidate popularity and select shared hourly negative pools.
 5. `05_post_liker_history`: extract complete timestamped liker-event histories for selected posts.
 6. `06_author_statistics`: build unfiltered pre-validation statistics for every author represented by roots or replies.
-7. `07_dataset_hydration`: hydrate selected posts, build the training-exposure author vocabulary, write the content-embedding memmap, and publish the permanent model-training tables.
+7. `07_dataset_hydration`: hydrate selected posts, build the training-exposure author vocabulary, write the content-embedding memmap, and publish permanent model-training tables plus a compact loader index.
 8. `08_train_bst_ranker`: fit training-only popularity normalization and train the canonical BST directly from Stage 7.
 
 Native BST training is active through Stage 8. Legacy MLP/two-tower training, legacy evaluation, comparison, and serving export are not yet connected to the new dataset contract.
@@ -66,6 +66,7 @@ Tests use the `*_test.py` naming convention and live next to the code they cover
 - `engagement_prediction/training/ranking.py`: shared matrix-ranking metrics and ranking-row helpers.
 - `engagement_prediction/data/ingex.py`: reusable Ingex access and exact source-file manifests.
 - `engagement_prediction/data/source_metadata.py`: canonical root/reply normalization, deduplication, precedence, and URI partitioning.
+- `engagement_prediction/data/training_index.py`: versioned Stage 7 memory-mapped loader-index construction and validation.
 - `engagement_prediction/data/datasets.py`: native bucketed dataset and sampler for the Stage 7 contract.
 - `engagement_prediction/data/`: Parquet loading plus reusable like, history, post, and hydration transformations.
 - `utils/01_get_data/stage_get_data.py`: unregistered legacy Stage 1 source retained for reference only.
@@ -276,11 +277,15 @@ The atomically published `hydrated_training_data_*` bundle contains:
 - `query_histories/`: aligned URI, like-time, embedding-index, author-index, and as-of-like-count lists.
 - `hourly_negative_candidates/`: hydrated Stage 4 candidates and their selection source.
 - `authors/`: the Stage 7 vocabulary with dense `author_idx` plus total and positive/history/negative training-feature counts.
+- `loader_index/`: a versioned training projection with read-only NumPy memmaps for numeric query, history, positive, negative, and post metadata plus memory-mapped Arrow IPC identifier tables.
 - exact copied `post_sources_*`, `reply_sources_*`, and `like_sources_*` manifests.
 
 Rows without a valid embedding are removed without backfilling. Their individual history events and negative candidates disappear; positive labels disappear individually, and only queries left with no positive are dropped. Popularity is recomputed from all Stage 5 raw liker events with the strict `like_created_at < query_hour` rule. Stage 4 negative counts must agree exactly.
 
-`engagement_prediction.data.datasets.HydratedBucketedEngagementDataset` consumes this bundle directly. It opens the memmap read-only, batches queries sharing one hour, unions the users' positives with the shared hourly negatives, deduplicates candidates by URI, and emits padded history vectors, author indices, relative ages, as-of popularity, candidate features, IDs, and the user-by-candidate label matrix. It does not construct legacy `likes_core`, `posts_core`, or `history_posts` frames.
+`engagement_prediction.data.datasets.HydratedBucketedEngagementDataset` consumes `loader_index/` directly. Numeric arrays, content embeddings, and Arrow identifier tables are opened read-only and lazily in each process. Histories and positives use flattened values plus offset arrays, and hour offsets drive batching without constructing a Python object per query. Each batch unions its users' positives with shared hourly negatives, deduplicates candidates by dense embedding index, and emits the existing padded tensors, identifiers, and user-by-candidate label matrix. It does not construct legacy `likes_core`, `posts_core`, or `history_posts` frames.
+
+The loader-index format is part of the Stage 7 artifact contract. Stage 8 rejects older Stage 7 bundles without a supported `loader_index/`; regenerate Stage 7 rather than constructing a runtime compatibility cache.
+For the current full dataset, expect the uncompressed loader index to add approximately 5.5-6.5 GB to the Stage 7 bundle.
 
 Rerun Stage 7 directly with an aligned Stage 6 artifact:
 
@@ -293,7 +298,7 @@ python cli.py --config config.yml \
 
 ### Stage 8: Native BST Training
 
-Stage 8 consumes `HydratedBucketedEngagementDataset` directly. It trains on `train`, validates on `val`, and selects checkpoints using unseen-user validation NDCG from `val_unseen_users`. Training batches shuffle user-hours and resample their bounded negative pool each epoch; validation is deterministic. Holdout splits are not loaded during training. BST training does not compute or report MAP; NDCG is its ranking metric. Each split's random baseline is logged at epoch 0 in the same ClearML metric series as learned epochs 1 and later.
+Stage 8 consumes the required Stage 7 loader index directly. It trains on `train`, validates on `val`, and selects checkpoints using unseen-user validation NDCG from `val_unseen_users`. Training batches shuffle user-hours and resample their bounded negative pool each epoch; validation is deterministic. The existing train loader switches to deterministic evaluation mode for final metrics instead of creating a second worker pool. Holdout splits are not loaded during training. BST training does not compute or report MAP; NDCG is its ranking metric. Each split's random baseline is logged at epoch 0 in the same ClearML metric series as learned epochs 1 and later.
 
 Shared training options:
 

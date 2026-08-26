@@ -7,7 +7,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from engagement_prediction.data import dataset_hydration
+from engagement_prediction.data import author_vocabulary, dataset_hydration, training_index
 from engagement_prediction.data.datasets import (
     HydratedBucketedEngagementDataset,
     create_hydrated_data_loader,
@@ -135,7 +135,36 @@ def _native_bundle(tmp_path):
         "author_idx": [5],
         "prior_like_count": [10],
     }, schema=dataset_hydration.HOURLY_NEGATIVE_SCHEMA))
-    _write_dataset(bundle, "authors", pl.DataFrame({"author_idx": [2, 3, 4, 5]}))
+    _write_dataset(bundle, "posts", pl.DataFrame({
+        "subject_uri": ["p1", "p2", "h1", "n1"],
+        "emb_idx": [0, 1, 2, 3],
+        "post_created_at": [created, created, created, created],
+        "author_did": ["a2", "a3", "a4", "a5"],
+        "author_idx": [2, 3, 4, 5],
+        "is_reply": [False, False, False, False],
+        "is_positive": [True, True, False, False],
+        "is_history": [False, False, True, False],
+        "is_negative": [False, False, False, True],
+    }, schema=dataset_hydration.POST_SCHEMA))
+    _write_dataset(bundle, "authors", pl.DataFrame({
+        "author_did": ["a2", "a3", "a4", "a5"],
+        "author_idx": [2, 3, 4, 5],
+        "training_feature_count": [1, 1, 1, 1],
+        "training_positive_count": [1, 1, 0, 0],
+        "training_history_count": [0, 0, 1, 0],
+        "training_negative_count": [0, 0, 0, 1],
+    }, schema=author_vocabulary.AUTHOR_VOCABULARY_SCHEMA))
+    training_index.build_loader_index(
+        posts_path=bundle / "posts",
+        queries_path=bundle / "queries",
+        query_positives_path=bundle / "query_positives",
+        query_histories_path=bundle / "query_histories",
+        hourly_negative_candidates_path=bundle / "hourly_negative_candidates",
+        embeddings_path=bundle / "embeddings.npy",
+        authors_path=bundle / "authors",
+        output_path=bundle / "loader_index",
+        logger=None,
+    )
     return bundle
 
 
