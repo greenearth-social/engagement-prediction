@@ -39,6 +39,7 @@ from engagement_prediction.data import dataset_hydration
 from engagement_prediction.data import ingex
 from engagement_prediction.data import post_selection
 from engagement_prediction.data import user_history
+from engagement_prediction.data.author_indices import AUTHOR_UNK_IDX
 from engagement_prediction.data.parquet import (
     read_parquet_parts,
     scan_parquet_artifact,
@@ -580,7 +581,7 @@ def publish_posts_with_author_indices(
         )
         post_count += posts_df.height
         unk_count += posts_df.filter(
-            pl.col("author_idx") == dataset_hydration.AUTHOR_UNK_IDX
+            pl.col("author_idx") == AUTHOR_UNK_IDX
         ).height
     return {
         "hydrated_post_count": post_count,
@@ -1101,7 +1102,7 @@ def attach_author_indices_to_usage(
                 .join(author_indices_df, on="author_did", how="left")
                 .with_columns(
                     pl.col("author_idx")
-                    .fill_null(dataset_hydration.AUTHOR_UNK_IDX)
+                    .fill_null(AUTHOR_UNK_IDX)
                     .cast(pl.UInt32)
                 )
                 .drop("author_did")
@@ -1112,7 +1113,7 @@ def attach_author_indices_to_usage(
             )
             totals[f"{role}_feature_count"] += indexed_df.height
             totals[f"{role}_unk_count"] += indexed_df.filter(
-                pl.col("author_idx") == dataset_hydration.AUTHOR_UNK_IDX
+                pl.col("author_idx") == AUTHOR_UNK_IDX
             ).height
     return totals
 
@@ -1427,7 +1428,7 @@ def summarize_author_index_usage_by_split(
             role_lf.group_by("split")
             .agg(
                 pl.len().alias("feature_count"),
-                (pl.col("author_idx") == dataset_hydration.AUTHOR_UNK_IDX)
+                (pl.col("author_idx") == AUTHOR_UNK_IDX)
                 .sum()
                 .alias("unk_count"),
             )
@@ -1488,7 +1489,7 @@ def validate_public_bundle(
             key=["subject_uri"],
         )
         if posts_df.height and (
-            posts_df.get_column("author_idx").min() < dataset_hydration.AUTHOR_UNK_IDX
+            posts_df.get_column("author_idx").min() < AUTHOR_UNK_IDX
             or posts_df.get_column("author_idx").max() > max_author_idx
         ):
             raise ValueError("Hydrated posts contain an invalid author index")
@@ -1580,7 +1581,7 @@ def validate_public_bundle(
         ).explode(empty_as_null=True).drop_nulls()
         for values in (positive_author_indices, history_author_indices):
             if values.len() and (
-                values.min() < dataset_hydration.AUTHOR_UNK_IDX
+                values.min() < AUTHOR_UNK_IDX
                 or values.max() > max_author_idx
             ):
                 raise ValueError("Hydrated query artifacts contain an invalid author index")
@@ -1629,7 +1630,7 @@ def validate_public_bundle(
         pl.col("author_idx").max().alias("max_author_idx"),
     ).collect(engine="streaming").row(0, named=True)
     if negative_author_stats["min_author_idx"] is not None and (
-        negative_author_stats["min_author_idx"] < dataset_hydration.AUTHOR_UNK_IDX
+        negative_author_stats["min_author_idx"] < AUTHOR_UNK_IDX
         or negative_author_stats["max_author_idx"] > max_author_idx
     ):
         raise ValueError("Hydrated negatives contain an invalid author index")

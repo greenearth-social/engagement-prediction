@@ -7,7 +7,7 @@ from typing import Final, List, Optional
 import torch
 import torch.nn as nn
 
-from shared.input_data_helpers import AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
+from engagement_prediction.data.author_indices import AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
 
 
 class ProjectedPostFeatureEncoder(nn.Module):

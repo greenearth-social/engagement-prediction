@@ -28,6 +28,7 @@ from engagement_prediction.data import dataset_hydration_artifacts
 from engagement_prediction.data import ingex
 from engagement_prediction.data import source_manifests
 from engagement_prediction.data import training_index
+from engagement_prediction.data.embeddings import get_embedding_dim_for_known_model
 from engagement_prediction.data.parquet import find_artifact_path, load_parquet_from_prior
 from engagement_prediction.data.source_metadata_artifacts import (
     SourceMetadataArtifact,
@@ -35,7 +36,6 @@ from engagement_prediction.data.source_metadata_artifacts import (
 )
 from engagement_prediction.pipeline.core import Context
 from engagement_prediction.pipeline.lineage import resolve_recorded_stage_lineage
-from shared.input_data_helpers import get_embedding_dim_for_known_model
 from engagement_prediction.pipeline.logging import get_stage_logger
 
 

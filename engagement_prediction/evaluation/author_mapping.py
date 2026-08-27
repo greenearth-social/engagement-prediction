@@ -12,7 +12,7 @@ import numpy as np
 import polars as pl
 import pyarrow.parquet as pq
 
-from engagement_prediction.data.dataset_hydration import (
+from engagement_prediction.data.author_indices import (
     AUTHOR_PAD_IDX,
     AUTHOR_UNK_IDX,
 )

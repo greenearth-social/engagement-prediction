@@ -12,6 +12,7 @@ from typing import Any, Dict
 import torch
 
 from engagement_prediction.data import training_index
+from engagement_prediction.data.author_indices import AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
 from engagement_prediction.data.datasets import (
     HydratedBucketedEngagementDataset,
     create_hydrated_data_loader,
@@ -20,6 +21,7 @@ from engagement_prediction.data.parquet import find_artifact_path
 from engagement_prediction.models.two_tower import TwoTowerModel
 from engagement_prediction.pipeline.core import Context
 from engagement_prediction.pipeline.lineage import resolve_recorded_stage_lineage
+from engagement_prediction.pipeline.logging import get_stage_logger
 from engagement_prediction.training.reporting import (
     write_two_tower_training_history_plot,
 )
@@ -35,8 +37,6 @@ from engagement_prediction.training.two_tower_publication import (
     publish_two_tower_to_tracker,
     write_two_tower_author_map,
 )
-from shared.input_data_helpers import AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
-from engagement_prediction.pipeline.logging import get_stage_logger
 from engagement_prediction.training.runtime import (
     clear_cuda_memory,
     get_device,

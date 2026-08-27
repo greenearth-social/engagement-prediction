@@ -19,12 +19,11 @@ import numpy as np
 import polars as pl
 
 from engagement_prediction.data import post_selection
-from shared.input_data_helpers import get_expanded_embedding_vector
+from engagement_prediction.data.author_indices import AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
+from engagement_prediction.data.embeddings import get_expanded_embedding_vector
 
 
 UTC_DATETIME = pl.Datetime("us", "UTC")
-AUTHOR_PAD_IDX = 0
-AUTHOR_UNK_IDX = 1
 
 # Public post rows align URI metadata and role flags with ``embeddings.npy``.
 # ``emb_idx`` is dense from zero and addresses one row of that memmap.

@@ -72,6 +72,7 @@ Tests use the `*_test.py` naming convention and live next to the code they cover
 - `engagement_prediction/pipeline/logging.py`: canonical stage logging.
 - `engagement_prediction/training/runtime.py`: shared training device, CUDA cleanup, and seed helpers.
 - `engagement_prediction/data/ingex.py`: reusable Ingex access and exact source-file manifests.
+- `engagement_prediction/data/embeddings.py`: content-embedding model dimensions and raw payload decoding.
 - `engagement_prediction/data/source_metadata.py`: canonical root/reply normalization, deduplication, precedence, and URI partitioning.
 - `engagement_prediction/data/training_index.py`: versioned Stage 7 memory-mapped loader-index construction and validation.
 - `engagement_prediction/data/datasets.py`: native bucketed dataset and sampler for the Stage 7 contract.

@@ -11,15 +11,17 @@ from typing import Any, Dict
 
 import torch
 
+from engagement_prediction.data import training_index
+from engagement_prediction.data.author_indices import AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
 from engagement_prediction.data.datasets import (
     HydratedBucketedEngagementDataset,
     create_hydrated_data_loader,
 )
-from engagement_prediction.data import training_index
 from engagement_prediction.data.parquet import find_artifact_path, scan_parquet_artifact
 from engagement_prediction.models.bst_ranker import BSTRanker
 from engagement_prediction.pipeline.core import Context
 from engagement_prediction.pipeline.lineage import resolve_recorded_stage_lineage
+from engagement_prediction.pipeline.logging import get_stage_logger
 from engagement_prediction.training.bst_ranker import (
     run_bst_listwise_epoch,
     train_bst_ranker_model,
@@ -34,8 +36,6 @@ from engagement_prediction.training.bst_publication import (
 )
 from engagement_prediction.training.popularity import fit_popularity_normalization
 from engagement_prediction.training.reporting import write_bst_training_history_plot
-from shared.input_data_helpers import AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
-from engagement_prediction.pipeline.logging import get_stage_logger
 from engagement_prediction.training.runtime import (
     clear_cuda_memory,
     get_device,
