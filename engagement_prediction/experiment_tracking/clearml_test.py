@@ -1,4 +1,4 @@
-"""Tests for the experiment tracking implementations."""
+"""Tests for the ClearML experiment tracker."""
 
 import sys
 from types import SimpleNamespace

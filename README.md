@@ -68,6 +68,7 @@ Tests use the `*_test.py` naming convention and live next to the code they cover
 - `engagement_prediction/training/two_tower.py`: reusable native listwise two-tower training loop.
 - `engagement_prediction/models/two_tower.py`: canonical author-aware cross-attention user and post towers.
 - `engagement_prediction/training/ranking.py`: shared matrix-ranking metrics and ranking-row helpers.
+- `engagement_prediction/experiment_tracking/`: tracker interface, no-op and ClearML backends, and tracker construction.
 - `engagement_prediction/pipeline/logging.py`: canonical stage logging.
 - `engagement_prediction/training/runtime.py`: shared training device, CUDA cleanup, and seed helpers.
 - `engagement_prediction/data/ingex.py`: reusable Ingex access and exact source-file manifests.

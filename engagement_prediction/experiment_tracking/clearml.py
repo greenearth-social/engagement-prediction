@@ -1,121 +1,16 @@
-#!/usr/bin/env python3
-
-"""
-Experiment tracking abstraction with a ClearML implementation.
-"""
+"""ClearML experiment-tracker implementation."""
 
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Protocol, TYPE_CHECKING, Union
-import os
+from typing import Any, Dict, Iterable, List, Optional, TYPE_CHECKING, Union
+
+from engagement_prediction.experiment_tracking.factory import normalize_params
 
 if TYPE_CHECKING:
     from clearml import Task
-
-
-class ExperimentTracker(Protocol):
-    id: str
-
-    def log_scalar(self, title: str, series: str, value: float, iteration: int) -> None:
-        ...
-
-    def log_artifact(self, name: str, path: Path) -> dict[str, str]:
-        ...
-
-    def log_file_artifact(self, name: str, path: Path) -> bool:
-        ...
-
-    def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
-        ...
-
-    def connect_args(self, args: argparse.Namespace, name: Optional[str] = None) -> argparse.Namespace:
-        ...
-
-    def log_single_value(self, name: str, value: float) -> None:
-        ...
-
-    def log_histogram(
-        self,
-        title: str,
-        series: str,
-        values: Union[
-            List[Union[int, float]],
-            List[List[Union[int, float]]],
-        ],
-        iteration: int = 0,
-        xlabels: Optional[List[str]] = None,
-        xaxis: Optional[str] = None,
-        yaxis: Optional[str] = None,
-        labels: Optional[List[str]] = None,
-        mode: Optional[str] = None,
-    ) -> None:
-        ...
-
-    def log_plot(
-        self,
-        title: str,
-        series: str,
-        figure: Any,
-        iteration: int = 0,
-    ) -> None:
-        ...
-
-    def close(self) -> None:
-        ...
-
-
-class NoOpExperimentTracker:
-    id: str
-
-    def log_scalar(self, title: str, series: str, value: float, iteration: int) -> None:
-        return None
-
-    def log_artifact(self, name: str, path: Path) -> dict[str, str]:
-        return {}
-
-    def log_file_artifact(self, name: str, path: Path) -> bool:
-        return False
-
-    def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
-        return None
-
-    def connect_args(self, args: argparse.Namespace, name: Optional[str] = None) -> argparse.Namespace:
-        return args
-
-    def log_single_value(self, name: str, value: float) -> None:
-        return None
-
-    def log_histogram(
-        self,
-        title: str,
-        series: str,
-        values: Union[
-            List[Union[int, float]],
-            List[List[Union[int, float]]],
-        ],
-        iteration: int = 0,
-        xlabels: Optional[List[str]] = None,
-        xaxis: Optional[str] = None,
-        yaxis: Optional[str] = None,
-        labels: Optional[List[str]] = None,
-        mode: Optional[str] = None,
-    ) -> None:
-        return None
-
-    def log_plot(
-        self,
-        title: str,
-        series: str,
-        figure: Any,
-        iteration: int = 0,
-    ) -> None:
-        return None
-
-    def close(self) -> None:
-        return None
 
 
 class ClearMLExperimentTracker:
@@ -144,7 +39,6 @@ class ClearMLExperimentTracker:
         )
         self._logger = self._task.get_logger()
         self.id = self._task.id
-
 
     @staticmethod
     def _coerce_like(value: Any, template: Any) -> Any:
@@ -226,12 +120,12 @@ class ClearMLExperimentTracker:
         p = Path(path)
         if not p.exists():
             return empty_metadata
-        
+
         # create the OutputModel and upload the file as its weights/artifact
-        
+
         om = OutputModel(
-            task=self._task, 
-            name=name, 
+            task=self._task,
+            name=name,
             framework='pytorch',
             tags=['candidate'],
         )
@@ -320,7 +214,7 @@ class ClearMLExperimentTracker:
         mode: Optional[str] = None,
     ) -> None:
         """Log precomputed histogram or categorical bar values to ClearML.
-        
+
         Args:
             title: Plot title (shown in ClearML UI)
             series: Series name within the plot
@@ -333,9 +227,9 @@ class ClearMLExperimentTracker:
             mode: Optional ClearML bar display mode, such as "group"
         """
         import numpy as np
-        
+
         values_arr = np.asarray(values)
-        
+
         self._logger.report_histogram(
             title=title,
             series=series,
@@ -356,7 +250,7 @@ class ClearMLExperimentTracker:
         iteration: int = 0,
     ) -> None:
         """Log a matplotlib figure to ClearML.
-        
+
         Args:
             title: Plot title
             series: Series name
@@ -373,34 +267,3 @@ class ClearMLExperimentTracker:
 
     def close(self) -> None:
         self._task.close()
-
-
-def normalize_params(params: Dict[str, Any]) -> Dict[str, Any]:
-    def _normalize(value: Any) -> Any:
-        if isinstance(value, Path):
-            return str(value)
-        if isinstance(value, dict):
-            return {k: _normalize(v) for k, v in value.items() if v is not None}
-        if isinstance(value, (list, tuple)):
-            return [_normalize(v) for v in value]
-        return value
-
-    return {k: _normalize(v) for k, v in params.items() if v is not None}
-
-
-def build_experiment_tracker(
-    kind: str,
-    *,
-    project_name: str,
-    task_name: str,
-    tags: Optional[Iterable[str]] = None,
-    model_output_uri: Optional[str] = None,
-) -> ExperimentTracker:
-    if kind == "clearml":
-        return ClearMLExperimentTracker(
-            project_name=project_name,
-            task_name=task_name,
-            tags=tags,
-            model_output_uri=model_output_uri,
-        )
-    return NoOpExperimentTracker()
