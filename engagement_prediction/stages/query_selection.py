@@ -286,11 +286,7 @@ def _prepare_likes(
     return (
         _with_split(
             _with_user_cohort(
-                filtered_lf.filter(
-                    pl.col("did").is_not_null()
-                    & pl.col("subject_uri").is_not_null()
-                    & pl.col("like_created_at").is_not_null()
-                ),
+                filtered_lf,
                 unseen_user_fraction=config.unseen_user_fraction,
                 random_seed=config.random_seed,
             ),

@@ -88,10 +88,6 @@ def materialize_normalized_likes(
             start=source_start,
             end=source_end,
         )
-        .filter(
-            (pl.col("did").str.len_chars() > 0)
-            & (pl.col("subject_uri").str.len_chars() > 0)
-        )
         .select(
             "subject_uri",
             pl.col("did").alias("liker_did"),

@@ -49,6 +49,15 @@ def normalize_likes(likes_lf: pl.LazyFrame) -> pl.LazyFrame:
     )
 
 
+def valid_identifier_expr(column: str) -> pl.Expr:
+    """Accept only non-null identifiers containing a non-whitespace character."""
+
+    identifier = pl.col(column)
+    return identifier.is_not_null() & (
+        identifier.str.strip_chars().str.len_chars() > 0
+    )
+
+
 def prepare_likes(
     likes_lf: pl.LazyFrame,
     *,
@@ -57,8 +66,8 @@ def prepare_likes(
 ) -> pl.LazyFrame:
     """Normalize likes, remove invalid rows, and apply an inclusive/exclusive window."""
     filtered_lf = normalize_likes(likes_lf).filter(
-        pl.col("did").is_not_null()
-        & pl.col("subject_uri").is_not_null()
+        valid_identifier_expr("did")
+        & valid_identifier_expr("subject_uri")
         & pl.col("like_created_at").is_not_null()
     )
     if start is not None:

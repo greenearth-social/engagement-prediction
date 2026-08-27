@@ -74,10 +74,6 @@ def materialize_like_routes(
             start=config.support_start,
             end=config.support_end,
         )
-        .filter(
-            (pl.col("did").str.len_chars() > 0)
-            & (pl.col("subject_uri").str.len_chars() > 0)
-        )
         .select("subject_uri", "like_created_at")
         .with_columns(
             source_metadata.uri_partition_expr(config.source_metadata_partition_count)

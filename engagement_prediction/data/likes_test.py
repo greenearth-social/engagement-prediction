@@ -30,6 +30,22 @@ def test_prepare_likes_normalizes_utc_filters_window_and_invalid_rows():
     assert result.schema["like_created_at"] == pl.Datetime("us", "UTC")
 
 
+def test_prepare_likes_rejects_empty_and_whitespace_only_identifiers():
+    result = likes.prepare_likes(
+        pl.DataFrame({
+            "did": ["valid-user", "", "   ", "valid-user", "valid-user"],
+            "subject_uri": ["valid-post", "valid-post", "valid-post", "", "\t"],
+            "record_created_at": ["2026-01-01T01:00:00Z"] * 5,
+        }).lazy(),
+        start=None,
+        end=None,
+    ).collect()
+
+    assert result.select("did", "subject_uri").to_dicts() == [
+        {"did": "valid-user", "subject_uri": "valid-post"}
+    ]
+
+
 def test_normalize_likes_rejects_missing_or_unsupported_timestamp():
     with pytest.raises(ValueError, match="missing required columns"):
         likes.normalize_likes(pl.DataFrame({"did": ["u"], "subject_uri": ["p"]}).lazy())
