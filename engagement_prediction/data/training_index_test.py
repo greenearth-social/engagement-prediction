@@ -11,6 +11,7 @@ import pyarrow.ipc as ipc
 import pytest
 
 from engagement_prediction.data import dataset_hydration
+from engagement_prediction.data import training_index
 from engagement_prediction.data.training_index import (
     FORMAT_VERSION,
     SPLITS,
@@ -49,11 +50,11 @@ def _hydrated_inputs(tmp_path):
     created = datetime(2026, 1, 1, 11, 30, tzinfo=UTC)
     posts = pl.DataFrame(
         {
-            "subject_uri": ["p2", "p1", "h1", "n1"],
-            "emb_idx": [1, 0, 2, 3],
+            "subject_uri": ["p1", "p2", "h1", "n1"],
+            "emb_idx": [0, 1, 2, 3],
             "post_created_at": [created] * 4,
-            "author_did": ["a3", "a2", "a4", "a5"],
-            "author_idx": [3, 2, 4, 5],
+            "author_did": ["a2", "a3", "a4", "a5"],
+            "author_idx": [2, 3, 4, 5],
             "is_reply": [False] * 4,
             "is_positive": [True, True, False, False],
             "is_history": [False, False, True, False],
@@ -240,6 +241,98 @@ def test_partition_local_fill_preserves_global_query_order(tmp_path):
     ).tolist() == [0, 1]
 
 
+def test_build_reads_contiguous_post_parts_without_global_rewrite(
+    tmp_path,
+    monkeypatch,
+):
+    _, paths = _hydrated_inputs(tmp_path)
+    source_path = paths["posts_path"] / "part-00000.parquet"
+    posts = pl.read_parquet(source_path)
+    source_path.unlink()
+    posts.slice(0, 2).write_parquet(paths["posts_path"] / "part-00000.parquet")
+    posts.slice(2, 2).write_parquet(paths["posts_path"] / "part-00001.parquet")
+
+    sorted_sink_paths = []
+    original_sink_sorted = training_index._sink_sorted
+
+    def recording_sink_sorted(lf, path, columns):
+        sorted_sink_paths.append(path)
+        return original_sink_sorted(lf, path, columns)
+
+    monkeypatch.setattr(training_index, "_sink_sorted", recording_sink_sorted)
+
+    build_loader_index(**paths)
+
+    assert all(path.name != "posts_by_emb_idx.parquet" for path in sorted_sink_paths)
+    metadata = load_loader_index_metadata(paths["output_path"])
+    post_table_meta = metadata["arrow_tables"]["post_uris"]
+    with MemoryMappedUtf8Table(
+        paths["output_path"] / post_table_meta["path"],
+        post_table_meta["batch_offsets"],
+    ) as table:
+        assert table.take([0, 1, 2, 3]) == ["p1", "p2", "h1", "n1"]
+
+
+def test_shared_query_hour_routes_negatives_to_each_split(tmp_path):
+    _, paths = _hydrated_inputs(tmp_path)
+    hour = datetime(2026, 1, 1, 12, tzinfo=UTC)
+    created = datetime(2026, 1, 1, 11, 30, tzinfo=UTC)
+
+    query_path = paths["queries_path"] / "part-00000.parquet"
+    queries = pl.concat([
+        pl.read_parquet(query_path),
+        pl.DataFrame({
+            "did": ["val-user", "unseen-user"],
+            "query_hour": [hour, hour],
+            "user_cohort": ["seen", "unseen"],
+            "split": ["val", "val_unseen_users"],
+            "positive_count": [1, 1],
+        }, schema=dataset_hydration.QUERY_SCHEMA),
+    ])
+    queries.write_parquet(query_path)
+
+    positive_path = paths["query_positives_path"] / "part-00000.parquet"
+    positives = pl.concat([
+        pl.read_parquet(positive_path),
+        pl.DataFrame({
+            "did": ["val-user", "unseen-user"],
+            "query_hour": [hour, hour],
+            "subject_uri": ["p1", "p2"],
+            "like_created_at": [hour, hour],
+            "emb_idx": [0, 1],
+            "post_created_at": [created, created],
+            "author_idx": [2, 3],
+            "prior_like_count": [4, 5],
+        }, schema=dataset_hydration.QUERY_POSITIVE_SCHEMA),
+    ])
+    positives.write_parquet(positive_path)
+
+    history_path = paths["query_histories_path"] / "part-00000.parquet"
+    histories = pl.concat([
+        pl.read_parquet(history_path),
+        pl.DataFrame({
+            "did": ["val-user", "unseen-user"],
+            "query_hour": [hour, hour],
+            "history_subject_uris": [[], []],
+            "history_like_created_ats": [[], []],
+            "history_emb_indices": [[], []],
+            "history_author_indices": [[], []],
+            "history_prior_like_counts": [[], []],
+        }, schema=dataset_hydration.QUERY_HISTORY_SCHEMA),
+    ])
+    histories.write_parquet(history_path)
+
+    build_loader_index(**paths)
+
+    for split in ("val", "val_unseen_users"):
+        assert load_index_array(
+            paths["output_path"], "negative_emb_indices", split=split
+        ).tolist() == [3, 0]
+        assert load_index_array(
+            paths["output_path"], "negative_prior_like_counts", split=split
+        ).tolist() == [10, 4]
+
+
 def test_validator_rejects_corrupt_offsets(tmp_path):
     _, paths = _hydrated_inputs(tmp_path)
     build_loader_index(**paths)
@@ -299,6 +392,18 @@ def test_builder_leaves_partial_output_when_source_integrity_fails(tmp_path):
 
     assert not paths["output_path"].exists()
     assert (bundle / "loader_index.partial").exists()
+
+
+def test_builder_rejects_post_rows_outside_embedding_index_order(tmp_path):
+    _, paths = _hydrated_inputs(tmp_path)
+    posts_path = paths["posts_path"] / "part-00000.parquet"
+    posts = pl.read_parquet(posts_path)
+    pl.concat([posts.slice(1, 1), posts.slice(0, 1), posts.slice(2)]).write_parquet(
+        posts_path
+    )
+
+    with pytest.raises(ValueError, match="Stage 7 partition order"):
+        build_loader_index(**paths)
 
 
 def test_metadata_rejects_missing_and_unsupported_index(tmp_path):

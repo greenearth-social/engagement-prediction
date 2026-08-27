@@ -257,6 +257,23 @@ def test_embedding_shards_are_deterministic_with_parallel_partition_workers(tmp_
     ).get_column("subject_uri").to_list() == ["b"]
 
 
+def test_embedding_shard_copy_validates_values_during_the_copy():
+    destination = np.zeros((2, 2), dtype=np.float32)
+    dataset_hydration_artifacts._copy_finite_embedding_shard(
+        shard=np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+        destination=destination,
+        destination_offset=0,
+    )
+    assert destination.tolist() == [[1.0, 2.0], [3.0, 4.0]]
+
+    with np.testing.assert_raises_regex(ValueError, "non-finite"):
+        dataset_hydration_artifacts._copy_finite_embedding_shard(
+            shard=np.array([[1.0, np.nan]], dtype=np.float32),
+            destination=destination,
+            destination_offset=0,
+        )
+
+
 def test_prior_counts_read_each_usage_partition_once(tmp_path, monkeypatch):
     query_hour = datetime(2026, 1, 1, 2, tzinfo=UTC)
     route_paths = {

@@ -76,15 +76,6 @@ def _json_dump(path: Path, value: dict[str, Any]) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
-def _collect_scalar(lf: pl.LazyFrame, expression: pl.Expr, name: str) -> int:
-    value = lf.select(expression.alias(name)).collect(engine="streaming").item()
-    return int(value or 0)
-
-
-def _row_count(lf: pl.LazyFrame) -> int:
-    return _collect_scalar(lf, pl.len(), "row_count")
-
-
 def _sink_sorted(lf: pl.LazyFrame, path: Path, columns: list[str]) -> None:
     """Stream an externally sortable narrow relation to one temporary file."""
 
@@ -105,6 +96,13 @@ def _iter_parquet_batches(
 ) -> Iterator[pa.RecordBatch]:
     parquet_file = pq.ParquetFile(path)
     yield from parquet_file.iter_batches(columns=columns, batch_size=batch_size)
+
+
+def _parquet_row_count(paths: Path | Sequence[Path]) -> int:
+    """Read exact row counts from Parquet footers without scanning columns."""
+
+    parquet_paths = [Path(paths)] if isinstance(paths, Path) else list(paths)
+    return sum(int(pq.ParquetFile(path).metadata.num_rows) for path in parquet_paths)
 
 
 def _timestamp_values(array: pa.Array) -> np.ndarray:
@@ -410,58 +408,70 @@ def load_index_array(index_path: Path, name: str, split: str | None = None) -> n
 def _write_global_post_index(
     *,
     root: Path,
-    sorted_posts_path: Path,
-    post_count: int,
+    post_parts: Sequence[Path],
     embedding_count: int,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    if post_count != embedding_count:
-        raise ValueError(
-            "Hydrated posts must contain exactly one row per embedding: "
-            f"posts={post_count:,} embeddings={embedding_count:,}"
-        )
+    """Write dense post arrays directly from Stage 7's ordered URI parts.
+
+    Stage 7 assigns embedding ranges by URI-partition order and preserves the
+    matching URI order when it publishes ``posts/part-*.parquet``. Checking
+    every batch against the next expected range retains the old corruption
+    detection without globally sorting and rewriting the complete post table.
+    """
+
     created_path = root / "post_created_at_us.npy"
     author_path = root / "post_author_idx.npy"
     uri_path = root / "post_uris.arrow"
-    created = _allocate_array(created_path, TIMESTAMP_DTYPE, post_count)
-    authors = _allocate_array(author_path, INDEX_DTYPE, post_count)
+    created = _allocate_array(created_path, TIMESTAMP_DTYPE, embedding_count)
+    authors = _allocate_array(author_path, INDEX_DTYPE, embedding_count)
     position = 0
     last_emb_idx = -1
     with _Utf8IpcWriter(uri_path, "subject_uri") as uri_writer:
-        for batch in _iter_parquet_batches(
-            sorted_posts_path,
-            columns=["subject_uri", "emb_idx", "post_created_at", "author_idx"],
-        ):
-            size = batch.num_rows
-            emb_indices = _integer_values(batch.column("emb_idx"), INDEX_DTYPE)
-            expected = np.arange(position, position + size, dtype=INDEX_DTYPE)
-            if not np.array_equal(emb_indices, expected):
-                raise ValueError("Hydrated post emb_idx values must be unique and dense from zero")
-            if size:
-                last_emb_idx = int(emb_indices[-1])
-            created[position:position + size] = _timestamp_values(batch.column("post_created_at"))
-            authors[position:position + size] = _integer_values(
-                batch.column("author_idx"), INDEX_DTYPE
-            )
-            uri_writer.write(batch.column("subject_uri"))
-            position += size
+        for post_part in post_parts:
+            for batch in _iter_parquet_batches(
+                post_part,
+                columns=["subject_uri", "emb_idx", "post_created_at", "author_idx"],
+            ):
+                size = batch.num_rows
+                emb_indices = _integer_values(batch.column("emb_idx"), INDEX_DTYPE)
+                expected = np.arange(position, position + size, dtype=INDEX_DTYPE)
+                if not np.array_equal(emb_indices, expected):
+                    raise ValueError(
+                        "Hydrated post emb_idx values must be unique and dense from "
+                        "zero in Stage 7 partition order"
+                    )
+                if size:
+                    last_emb_idx = int(emb_indices[-1])
+                created[position:position + size] = _timestamp_values(
+                    batch.column("post_created_at")
+                )
+                authors[position:position + size] = _integer_values(
+                    batch.column("author_idx"), INDEX_DTYPE
+                )
+                uri_writer.write(batch.column("subject_uri"))
+                position += size
         uri_offsets = uri_writer.batch_offsets
     created.flush()
     authors.flush()
     del created, authors
-    if position != post_count or (post_count and last_emb_idx != post_count - 1):
+    if position != embedding_count or (
+        embedding_count and last_emb_idx != embedding_count - 1
+    ):
         raise ValueError("Hydrated post index did not fill the expected dense embedding rows")
     arrays = {
         "post_created_at_us": _array_metadata(
-            root, created_path, TIMESTAMP_DTYPE, post_count
+            root, created_path, TIMESTAMP_DTYPE, embedding_count
         ),
-        "post_author_idx": _array_metadata(root, author_path, INDEX_DTYPE, post_count),
+        "post_author_idx": _array_metadata(
+            root, author_path, INDEX_DTYPE, embedding_count
+        ),
     }
     arrow_tables = {
         "post_uris": _arrow_metadata(
             root,
             uri_path,
             column="subject_uri",
-            row_count=post_count,
+            row_count=embedding_count,
             batch_offsets=uri_offsets,
         )
     }
@@ -511,6 +521,11 @@ def _write_query_core(
 
 def _route_paths(path: Path, partition_id: int) -> list[Path]:
     partition_path = path / f"_source_partition={partition_id}"
+    return sorted(partition_path.rglob("*.parquet")) if partition_path.exists() else []
+
+
+def _split_paths(path: Path, split: str) -> list[Path]:
+    partition_path = path / f"_split_partition={split}"
     return sorted(partition_path.rglob("*.parquet")) if partition_path.exists() else []
 
 
@@ -883,73 +898,130 @@ def _write_hour_and_negatives(
     }
 
 
-def _prepare_split_relations(
+def _prepare_all_split_relations(
     *,
-    split: str,
     working_path: Path,
     queries_with_source_lf: pl.LazyFrame,
     negatives_lf: pl.LazyFrame,
-) -> tuple[Path, Path, Path]:
-    query_path = working_path / f"{split}_queries.parquet"
-    query_routes_path = working_path / f"{split}_query_routes"
-    negative_path = working_path / f"{split}_negatives.parquet"
-    query_map = (
-        queries_with_source_lf.filter(pl.col("split") == split)
-        .select("did", "query_hour", "positive_count", "_source_partition")
-        .sort("query_hour", "did")
-        .with_row_index("_query_idx")
-    )
-    _sink_sorted(
-        query_map,
-        query_path,
-        [
-            "_query_idx",
+) -> dict[str, tuple[Path, Path, Path]]:
+    """Route each raw relation once, then canonicalize bounded split subsets."""
+
+    query_split_routes_path = working_path / "queries_by_split"
+    sink_partitioned_parquet(
+        queries_with_source_lf.select(
             "did",
             "query_hour",
             "positive_count",
+            "split",
             "_source_partition",
-        ],
+        ).with_columns(pl.col("split").alias("_split_partition")),
+        output_path=query_split_routes_path,
+        key="_split_partition",
     )
-    persisted_queries = pl.scan_parquet(query_path)
+
+    prepared: dict[str, tuple[Path, Path, Path]] = {}
+    query_paths: dict[str, Path] = {}
+    query_schema = {
+        "did": pl.String,
+        "query_hour": pl.Datetime("us", "UTC"),
+        "positive_count": pl.UInt32,
+        "split": pl.String,
+        "_source_partition": pl.UInt32,
+    }
+    for split in SPLITS:
+        query_path = working_path / f"{split}_queries.parquet"
+        query_routes_path = working_path / f"{split}_query_routes"
+        split_parts = _split_paths(query_split_routes_path, split)
+        split_queries_lf = (
+            pl.scan_parquet(split_parts)
+            if split_parts
+            else pl.DataFrame(schema=query_schema).lazy()
+        )
+        query_map = (
+            split_queries_lf.select(
+                "did", "query_hour", "positive_count", "_source_partition"
+            )
+            .sort("query_hour", "did")
+            .with_row_index("_query_idx")
+        )
+        _sink_sorted(
+            query_map,
+            query_path,
+            [
+                "_query_idx",
+                "did",
+                "query_hour",
+                "positive_count",
+                "_source_partition",
+            ],
+        )
+        sink_partitioned_parquet(
+            pl.scan_parquet(query_path),
+            output_path=query_routes_path,
+            key="_source_partition",
+        )
+        query_paths[split] = query_path
+        prepared[split] = (
+            query_path,
+            query_routes_path,
+            working_path / f"{split}_negatives.parquet",
+        )
+
+    split_query_hours_lf = pl.concat([
+        pl.scan_parquet(query_paths[split])
+        .select("query_hour")
+        .unique()
+        .with_columns(pl.lit(split).alias("split"))
+        for split in SPLITS
+    ])
+    negative_split_routes_path = working_path / "negatives_by_split"
     sink_partitioned_parquet(
-        persisted_queries,
-        output_path=query_routes_path,
-        key="_source_partition",
+        negatives_lf.join(
+            split_query_hours_lf,
+            on="query_hour",
+            how="inner",
+        ).with_columns(pl.col("split").alias("_split_partition")),
+        output_path=negative_split_routes_path,
+        key="_split_partition",
     )
-    query_hours = persisted_queries.select("query_hour").unique()
-    _sink_sorted(
-        negatives_lf.join(query_hours, on="query_hour", how="semi").sort(
-            "query_hour", "subject_uri"
-        ),
-        negative_path,
-        ["query_hour", "emb_idx", "prior_like_count"],
-    )
-    return query_path, query_routes_path, negative_path
+    negative_schema = {
+        "query_hour": pl.Datetime("us", "UTC"),
+        "subject_uri": pl.String,
+        "emb_idx": pl.UInt32,
+        "prior_like_count": pl.UInt64,
+        "split": pl.String,
+    }
+    for split in SPLITS:
+        negative_path = prepared[split][2]
+        split_parts = _split_paths(negative_split_routes_path, split)
+        split_negatives_lf = (
+            pl.scan_parquet(split_parts)
+            if split_parts
+            else pl.DataFrame(schema=negative_schema).lazy()
+        )
+        _sink_sorted(
+            split_negatives_lf.sort("query_hour", "subject_uri"),
+            negative_path,
+            ["query_hour", "emb_idx", "prior_like_count"],
+        )
+    return prepared
 
 
 def _build_split(
     *,
     root: Path,
     split: str,
-    working_path: Path,
-    queries_with_source_lf: pl.LazyFrame,
-    negatives_lf: pl.LazyFrame,
+    query_path: Path,
+    query_routes_path: Path,
+    negative_path: Path,
     source_part_keys: dict[int, str],
     positive_parts: dict[str, Path],
     history_parts: dict[str, Path],
 ) -> dict[str, Any]:
     split_dir = root / "splits" / split
     split_dir.mkdir(parents=True, exist_ok=False)
-    query_path, query_routes_path, negative_path = _prepare_split_relations(
-        split=split,
-        working_path=working_path,
-        queries_with_source_lf=queries_with_source_lf,
-        negatives_lf=negatives_lf,
-    )
-    query_lf = pl.scan_parquet(query_path)
-    negative_lf = pl.scan_parquet(negative_path)
-    query_count = _row_count(query_lf)
-    negative_count = _row_count(negative_lf)
+    query_count = _parquet_row_count(query_path)
+    negative_count = _parquet_row_count(negative_path)
     arrays, arrow_tables, hour_values, query_offsets = _write_query_core(
         root=root,
         split_dir=split_dir,
@@ -1066,7 +1138,8 @@ def build_loader_index(
         )
     embedding_count, embedding_dim = (int(value) for value in embeddings.shape)
     del embeddings
-    posts_lf = scan_parquet_artifact(Path(posts_path))
+    post_part_map = _artifact_part_map(Path(posts_path))
+    post_parts = [post_part_map[key] for key in sorted(post_part_map)]
     query_parts = _artifact_part_map(Path(queries_path))
     positive_parts = _artifact_part_map(Path(query_positives_path))
     history_parts = _artifact_part_map(Path(query_histories_path))
@@ -1082,8 +1155,12 @@ def build_loader_index(
         query_parts
     )
     negatives_lf = scan_parquet_artifact(Path(hourly_negative_candidates_path))
-    post_count = _row_count(posts_lf)
-    sorted_posts_path = working_path / "posts_by_emb_idx.parquet"
+    post_count = _parquet_row_count(post_parts)
+    if post_count != embedding_count:
+        raise ValueError(
+            "Hydrated posts must contain exactly one row per embedding: "
+            f"posts={post_count:,} embeddings={embedding_count:,}"
+        )
     if logger:
         logger.info(
             "Building loader index v%s: posts=%s embeddings=%s dim=%s",
@@ -1092,15 +1169,9 @@ def build_loader_index(
             f"{embedding_count:,}",
             f"{embedding_dim:,}",
         )
-    _sink_sorted(
-        posts_lf.sort("emb_idx"),
-        sorted_posts_path,
-        ["subject_uri", "emb_idx", "post_created_at", "author_idx"],
-    )
     arrays, arrow_tables = _write_global_post_index(
         root=partial_path,
-        sorted_posts_path=sorted_posts_path,
-        post_count=post_count,
+        post_parts=post_parts,
         embedding_count=embedding_count,
     )
     author_max = (
@@ -1122,15 +1193,23 @@ def build_loader_index(
         "arrow_tables": arrow_tables,
         "splits": {},
     }
+    if logger:
+        logger.info("Routing loader-index queries and negatives once across all splits")
+    split_relations = _prepare_all_split_relations(
+        working_path=working_path,
+        queries_with_source_lf=queries_with_source_lf,
+        negatives_lf=negatives_lf,
+    )
     for split in SPLITS:
         if logger:
             logger.info("Building loader-index split %s", split)
+        query_path, query_routes_path, negative_path = split_relations[split]
         metadata["splits"][split] = _build_split(
             root=partial_path,
             split=split,
-            working_path=working_path,
-            queries_with_source_lf=queries_with_source_lf,
-            negatives_lf=negatives_lf,
+            query_path=query_path,
+            query_routes_path=query_routes_path,
+            negative_path=negative_path,
             source_part_keys=source_part_keys,
             positive_parts=positive_parts,
             history_parts=history_parts,

@@ -48,6 +48,9 @@ from engagement_prediction.data.parquet import (
 )
 
 
+EMBEDDING_COPY_BATCH_SIZE = 8_192
+
+
 def _public_part(path: Path, partition_id: int) -> list[Path]:
     """Return one public URI-partition file, if it exists."""
 
@@ -474,6 +477,35 @@ def write_embedding_shards(
     }
 
 
+def _copy_finite_embedding_shard(
+    *,
+    shard: np.ndarray,
+    destination: np.ndarray,
+    destination_offset: int,
+) -> None:
+    """Validate and copy one shard while its rows are already being read."""
+
+    if (
+        shard.dtype != np.float32
+        or shard.ndim != 2
+        or destination.ndim != 2
+        or shard.shape[1] != destination.shape[1]
+    ):
+        raise ValueError(
+            f"Unexpected embedding shard shape/dtype: {shard.shape} {shard.dtype}"
+        )
+    for start in range(0, shard.shape[0], EMBEDDING_COPY_BATCH_SIZE):
+        end = min(start + EMBEDDING_COPY_BATCH_SIZE, shard.shape[0])
+        # A bounded copy causes each source page to be read once, then reused
+        # for both the finite-value check and the destination write.
+        vectors = np.array(shard[start:end], dtype=np.float32, copy=True)
+        if not np.isfinite(vectors).all():
+            raise ValueError("Embedding shard contains non-finite values")
+        destination[
+            destination_offset + start:destination_offset + end
+        ] = vectors
+
+
 def publish_embeddings_and_post_metadata(
     *,
     selected_metadata_path: Path,
@@ -486,12 +518,13 @@ def publish_embeddings_and_post_metadata(
 ) -> dict[str, int]:
     """Concatenate vector shards and publish their aligned raw-author metadata.
 
-    Each shard is removed after its vectors and post-index rows have been
-    published. This keeps final-memmap growth from overlapping with a complete
-    second copy of the embeddings for the rest of the stage. The matching URI
-    key rows define ``emb_idx`` offsets, while Stage 3 metadata—not potentially
-    older embedding-source metadata—remains authoritative. Author indices are
-    deliberately attached later, after final training-feature support is known.
+    Each shard is validated and removed after its vectors and post-index rows
+    have been published. This keeps final-memmap growth from overlapping with a
+    complete second copy of the embeddings and avoids a later whole-memmap
+    finite-value pass. The matching URI key rows define ``emb_idx`` offsets,
+    while Stage 3 metadata—not potentially older embedding-source metadata—
+    remains authoritative. Author indices are attached later, after final
+    training-feature support is known.
     """
     # Reading only .npy headers gives the exact final shape without loading any
     # shard vectors. Partition order defines dense global emb_idx ranges.
@@ -516,8 +549,13 @@ def publish_embeddings_and_post_metadata(
             shard_path,
             mmap_mode="r",
         )
-        if count:
-            memmap[offset:offset + count] = shard
+        if shard.shape[0] != count:
+            raise ValueError("Embedding shard row count changed during publication")
+        _copy_finite_embedding_shard(
+            shard=shard,
+            destination=memmap,
+            destination_offset=offset,
+        )
         valid_df = pl.read_parquet(
             valid_embedding_rows_path / f"part-{partition_id:05d}.parquet"
         ).select("subject_uri").with_row_index("_local_idx")
@@ -1489,9 +1527,8 @@ def validate_public_bundle(
     mmap = np.load(embeddings_path, mmap_mode="r")
     if mmap.dtype != np.float32 or mmap.ndim != 2 or mmap.shape[1] != embedding_dim:
         raise ValueError(f"Unexpected embeddings memmap shape/dtype: {mmap.shape} {mmap.dtype}")
-    for start in range(0, mmap.shape[0], 8192):
-        if not np.isfinite(mmap[start:start + 8192]).all():
-            raise ValueError("Embeddings memmap contains non-finite values")
+    embedding_count = mmap.shape[0]
+    del mmap
 
     expected_emb_idx = 0
     for part_path in sorted(posts_path.glob("part-*.parquet")):
@@ -1507,21 +1544,19 @@ def validate_public_bundle(
         ):
             raise ValueError("Hydrated posts contain an invalid author index")
         if posts_df.height:
-            index_stats = posts_df.select(
-                pl.col("emb_idx").min().alias("minimum"),
-                pl.col("emb_idx").max().alias("maximum"),
-                pl.col("emb_idx").n_unique().alias("unique_count"),
-            ).row(0, named=True)
-            if (
-                index_stats["minimum"] != expected_emb_idx
-                or index_stats["maximum"] != expected_emb_idx + posts_df.height - 1
-                or index_stats["unique_count"] != posts_df.height
-            ):
+            actual_indices = posts_df.get_column("emb_idx").to_numpy()
+            expected_indices = np.arange(
+                expected_emb_idx,
+                expected_emb_idx + posts_df.height,
+                dtype=actual_indices.dtype,
+            )
+            if not np.array_equal(actual_indices, expected_indices):
                 raise ValueError(
-                    "Hydrated post embedding indices are not dense and memmap-aligned"
+                    "Hydrated post embedding indices are not ordered, dense, and "
+                    "memmap-aligned"
                 )
         expected_emb_idx += posts_df.height
-    if expected_emb_idx != mmap.shape[0]:
+    if expected_emb_idx != embedding_count:
         raise ValueError("Hydrated post rows do not align with the embeddings memmap")
 
     query_part_names = {
@@ -1586,7 +1621,7 @@ def validate_public_bundle(
                 if column == "emb_idx"
                 else frame.get_column(column).explode(empty_as_null=True)
             ).drop_nulls()
-            if values.len() and values.max() >= mmap.shape[0]:
+            if values.len() and values.max() >= embedding_count:
                 raise ValueError("Hydrated query artifacts contain an invalid embedding index")
         positive_author_indices = positives_df.get_column("author_idx")
         history_author_indices = histories_df.get_column(
@@ -1635,7 +1670,7 @@ def validate_public_bundle(
         raise ValueError("Hydrated negatives contain invalid keys or source labels")
     if (
         negative_stats["max_emb_idx"] is not None
-        and negative_stats["max_emb_idx"] >= mmap.shape[0]
+        and negative_stats["max_emb_idx"] >= embedding_count
     ):
         raise ValueError("Hydrated negatives contain an invalid embedding index")
     negative_author_stats = negatives_lf.select(
@@ -1647,7 +1682,6 @@ def validate_public_bundle(
         or negative_author_stats["max_author_idx"] > max_author_idx
     ):
         raise ValueError("Hydrated negatives contain an invalid author index")
-    del mmap
     return {
         **authors_validation,
         "embedding_count": expected_emb_idx,
