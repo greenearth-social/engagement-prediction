@@ -214,12 +214,18 @@ def _with_split(lf: pl.LazyFrame, config: QuerySelectionConfig) -> pl.LazyFrame:
     )
 
 
-def _query_priority_expr(random_seed: int) -> pl.Expr:
-    """Return the stable pseudo-random rank used to sample query hours."""
+_PER_USER_CAP_HASH_NAMESPACE = "query-hour-per-user-cap"
+_SPLIT_CAP_HASH_NAMESPACE = "query-hour-split-cap"
+_PER_USER_PRIORITY_COLUMN = "_per_user_query_priority"
+_SPLIT_PRIORITY_COLUMN = "_split_query_priority"
+
+
+def _query_priority_expr(random_seed: int, *, namespace: str) -> pl.Expr:
+    """Return a stable namespaced pseudo-random rank for one query hour."""
 
     return pl.concat_str(
         [
-            pl.lit("query-hour"),
+            pl.lit(namespace),
             pl.col("did"),
             pl.col("split"),
             pl.col("query_hour").dt.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -233,7 +239,7 @@ def _cap_queries_per_user(queries_lf: pl.LazyFrame, config: QuerySelectionConfig
 
     return (
         queries_lf
-        .sort(["did", "split", "_query_priority", "query_hour"])
+        .sort(["did", "split", _PER_USER_PRIORITY_COLUMN, "query_hour"])
         .group_by(["did", "split"], maintain_order=True)
         .head(config.max_hours_per_user_per_split)
     )
@@ -248,16 +254,15 @@ def _cap_queries_per_split(queries_lf: pl.LazyFrame, config: QuerySelectionConfi
         "user_cohort",
         "split",
         RAW_POSITIVE_COUNT_COLUMN,
-        "_query_priority",
     ]
     train_lf = queries_lf.filter(pl.col("split") == "train").sort(
-        ["_query_priority", "did", "query_hour"]
+        [_SPLIT_PRIORITY_COLUMN, "did", "query_hour"]
     )
     if config.max_train_query_hours is not None:
         train_lf = train_lf.head(config.max_train_query_hours)
 
     eval_lf = queries_lf.filter(pl.col("split") != "train").sort(
-        ["split", "_query_priority", "did", "query_hour"]
+        ["split", _SPLIT_PRIORITY_COLUMN, "did", "query_hour"]
     )
     if config.max_eval_query_hours_per_split is not None:
         eval_lf = eval_lf.group_by("split", maintain_order=True).head(
@@ -312,8 +317,18 @@ def _build_provisional_query_lazyframes(
 ) -> Dict[str, pl.LazyFrame]:
     """Build candidate, per-user-capped, and split-capped query plans."""
 
+    # These ranks must be independent. Reusing the per-user rank globally
+    # favors highly active users because their retained rows are low order
+    # statistics from a larger set of hashes.
     candidate_queries_lf = candidate_query_counts_lf.with_columns(
-        _query_priority_expr(config.random_seed).alias("_query_priority")
+        _query_priority_expr(
+            config.random_seed,
+            namespace=_PER_USER_CAP_HASH_NAMESPACE,
+        ).alias(_PER_USER_PRIORITY_COLUMN),
+        _query_priority_expr(
+            config.random_seed,
+            namespace=_SPLIT_CAP_HASH_NAMESPACE,
+        ).alias(_SPLIT_PRIORITY_COLUMN),
     )
     after_user_cap_lf = _cap_queries_per_user(candidate_queries_lf, config)
     after_split_cap_lf = _cap_queries_per_split(after_user_cap_lf, config)

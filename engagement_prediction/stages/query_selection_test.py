@@ -355,12 +355,60 @@ def test_query_priority_does_not_depend_on_positive_count():
     assert first_queries.select(stage.QUERY_KEY).equals(second_queries.select(stage.QUERY_KEY))
 
 
+def test_per_user_and_split_caps_use_independent_namespaced_priorities():
+    candidate_counts = pl.DataFrame({
+        "did": ["did:active"] * 20 + [f"did:single-{idx}" for idx in range(20)],
+        "query_hour": [
+            datetime(2026, 1, 2, hour, tzinfo=UTC) for hour in range(20)
+        ]
+        + [datetime(2026, 1, 3, hour, tzinfo=UTC) for hour in range(20)],
+        "user_cohort": ["trainval"] * 40,
+        "split": ["train"] * 40,
+        stage.RAW_POSITIVE_COUNT_COLUMN: [1] * 40,
+    }).lazy()
+    config = _config(
+        max_hours_per_user_per_split=1,
+        max_train_query_hours=5,
+    )
+
+    lazyframes = stage._build_provisional_query_lazyframes(candidate_counts, config)
+    candidate_queries = lazyframes["candidate_queries"].collect()
+    after_user_cap = lazyframes["after_user_cap"].collect()
+    after_split_cap = lazyframes["after_split_cap"].collect()
+
+    assert candidate_queries.get_column(
+        stage._PER_USER_PRIORITY_COLUMN
+    ).to_list() != candidate_queries.get_column(
+        stage._SPLIT_PRIORITY_COLUMN
+    ).to_list()
+    expected = (
+        after_user_cap
+        .sort([stage._SPLIT_PRIORITY_COLUMN, "did", "query_hour"])
+        .head(5)
+        .select(stage.QUERY_KEY)
+    )
+    reused_hash_result = (
+        after_user_cap
+        .sort([stage._PER_USER_PRIORITY_COLUMN, "did", "query_hour"])
+        .head(5)
+        .select(stage.QUERY_KEY)
+    )
+
+    assert after_split_cap.select(stage.QUERY_KEY).equals(expected)
+    assert not after_split_cap.select(stage.QUERY_KEY).equals(reused_hash_result)
+
+
 def test_oversized_query_is_dropped_after_sampling_without_backfill():
     candidate_keys = pl.DataFrame({
         "did": ["did:one"] * 8,
         "split": ["train"] * 8,
         "query_hour": [datetime(2026, 1, 2, hour, tzinfo=UTC) for hour in range(8)],
-    }).with_columns(stage._query_priority_expr(42).alias("priority"))
+    }).with_columns(
+        stage._query_priority_expr(
+            42,
+            namespace=stage._SPLIT_CAP_HASH_NAMESPACE,
+        ).alias("priority")
+    )
     selected_hours = candidate_keys.sort(["priority", "did", "query_hour"])["query_hour"].to_list()[:2]
     oversized_hour = selected_hours[0]
 
@@ -494,7 +542,12 @@ def test_post_filtering_happens_after_query_budget_without_backfill():
         "did": ["did:one"] * 3,
         "split": ["train"] * 3,
         "query_hour": [datetime(2026, 1, 2, hour, tzinfo=UTC) for hour in range(3)],
-    }).with_columns(stage._query_priority_expr(42).alias("priority"))
+    }).with_columns(
+        stage._query_priority_expr(
+            42,
+            namespace=stage._SPLIT_CAP_HASH_NAMESPACE,
+        ).alias("priority")
+    )
     selected_hours = candidate_keys.sort(["priority", "did", "query_hour"])[
         "query_hour"
     ].to_list()[:2]

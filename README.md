@@ -145,7 +145,7 @@ Important Stage 1 behavior:
 
 - Users are assigned deterministically to a 90% `trainval` cohort and a 10% `unseen_eval` cohort.
 - Seen users produce `train`, `val`, and `holdout_seen_users` queries. Unseen users produce only `val_unseen_users` and `holdout_unseen_users` queries.
-- Query-hours are hash-sampled independently of their positive counts. Each user contributes at most 16 query-hours per split by default.
+- Query-hours are hash-sampled independently of their positive counts. Each user contributes at most 16 query-hours per split by default. The per-user cap and split-wide cap use independent hash namespaces so surviving queries from highly active users do not inherit artificially favorable global ranks.
 - Training and each evaluation split can be capped directly with query-hour budgets. The global caps default to no limit for the first slice.
 - Sampling caps are applied provisionally using all valid likes. Stage 1 then deduplicates positives within each selected user-hour and retains only URIs present as roots in Stage 00.
 - Positive counts are recomputed after post filtering. Selected hours with no retained positives or more than 32 retained positives are discarded without backfill; an hour with exactly 32 is retained.
