@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import polars as pl
 
+from engagement_prediction.data import like_counts
+
 
 UTC_DATETIME = pl.Datetime("us", "UTC")
 CANDIDATE_COLUMNS = ["subject_uri", "post_created_at"]
@@ -136,39 +138,12 @@ def build_candidate_hour_popularity(
     if eligible.is_empty():
         return empty_frame(CANDIDATE_HOUR_SCHEMA)
 
-    matched_likes = likes_df.join(
-        candidates_df.select("subject_uri"), on="subject_uri", how="semi"
-    )
-    if matched_likes.is_empty():
-        return eligible.with_columns(
-            pl.lit(0, dtype=pl.UInt64).alias("prior_like_count")
-        ).select(CANDIDATE_HOUR_COLUMNS)
-
-    cumulative_likes = (
-        matched_likes.with_columns(
-            pl.col("like_created_at").dt.truncate("1h").alias("_like_hour")
-        )
-        .group_by("subject_uri", "_like_hour")
-        .len(name="_hour_like_count")
-        .sort(["subject_uri", "_like_hour"])
-        .with_columns(
-            pl.col("_hour_like_count")
-            .cum_sum()
-            .over("subject_uri")
-            .cast(pl.UInt64)
-            .alias("prior_like_count")
-        )
-        .select("subject_uri", "_like_hour", "prior_like_count")
-    )
+    prior_counts = like_counts.calculate_prior_like_counts(eligible, likes_df)
     return (
-        eligible.join_asof(
-            cumulative_likes,
-            left_on="query_hour",
-            right_on="_like_hour",
-            by="subject_uri",
-            strategy="backward",
-            allow_exact_matches=False,
-            check_sortedness=False,
+        eligible.join(
+            prior_counts,
+            on=["subject_uri", "query_hour"],
+            how="left",
         )
         .with_columns(pl.col("prior_like_count").fill_null(0).cast(pl.UInt64))
         .select(CANDIDATE_HOUR_COLUMNS)

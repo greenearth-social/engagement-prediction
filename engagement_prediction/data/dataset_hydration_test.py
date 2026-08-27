@@ -77,35 +77,6 @@ def test_select_latest_valid_embeddings_reports_missing_and_non_finite_vectors()
     assert stats["non_finite_embedding_count"] == 1
 
 
-def test_prior_like_counts_are_strict_and_count_duplicate_rows():
-    hour = datetime(2026, 1, 1, 2, tzinfo=UTC)
-    pairs = pl.DataFrame({
-        "subject_uri": ["a", "b"],
-        "query_hour": [hour, hour],
-    }, schema={
-        "subject_uri": pl.String,
-        "query_hour": dataset_hydration.UTC_DATETIME,
-    })
-    events = pl.DataFrame({
-        "subject_uri": ["a", "a", "a"],
-        "like_created_at": [
-            datetime(2026, 1, 1, 1, tzinfo=UTC),
-            datetime(2026, 1, 1, 1, tzinfo=UTC),
-            hour,
-        ],
-    }, schema={
-        "subject_uri": pl.String,
-        "like_created_at": dataset_hydration.UTC_DATETIME,
-    })
-
-    result = dataset_hydration.calculate_prior_like_counts(pairs, events)
-
-    assert result.to_dicts() == [
-        {"subject_uri": "a", "query_hour": hour, "prior_like_count": 2},
-        {"subject_uri": "b", "query_hour": hour, "prior_like_count": 0},
-    ]
-
-
 def test_hydrated_post_metadata_defers_then_applies_author_vocabulary():
     created_at = datetime(2026, 1, 1, tzinfo=UTC)
     metadata = pl.DataFrame({

@@ -37,6 +37,7 @@ import pyarrow.parquet as pq
 from engagement_prediction.data import author_vocabulary
 from engagement_prediction.data import dataset_hydration
 from engagement_prediction.data import ingex
+from engagement_prediction.data import like_counts
 from engagement_prediction.data import post_selection
 from engagement_prediction.data import user_history
 from engagement_prediction.data.author_indices import AUTHOR_UNK_IDX
@@ -822,7 +823,7 @@ def attach_prior_counts(
                 "like_created_at": dataset_hydration.UTC_DATETIME,
             })
         )
-        counts_df = dataset_hydration.calculate_prior_like_counts(pairs_df, events_df)
+        counts_df = like_counts.calculate_prior_like_counts(pairs_df, events_df)
         pair_count += counts_df.height
         for source_path, output_path in (
             (positive_routes_path, counted_positives_path),

@@ -8,7 +8,6 @@ partition iteration, and artifact publication live in
 
 from __future__ import annotations
 
-from bisect import bisect_left
 import binascii
 from datetime import datetime
 import json
@@ -134,13 +133,6 @@ HOURLY_NEGATIVE_SCHEMA = {
     "emb_idx": pl.UInt32,
     "post_created_at": UTC_DATETIME,
     "author_idx": pl.UInt32,
-    "prior_like_count": pl.UInt64,
-}
-
-POST_HOUR_COUNT_COLUMNS = ["subject_uri", "query_hour", "prior_like_count"]
-POST_HOUR_COUNT_SCHEMA = {
-    "subject_uri": pl.String,
-    "query_hour": UTC_DATETIME,
     "prior_like_count": pl.UInt64,
 }
 
@@ -373,36 +365,6 @@ def attach_post_author_indices(
     )
     validate_frame(result, POST_SCHEMA, key=["subject_uri"])
     return result
-
-
-def calculate_prior_like_counts(
-    post_hours_df: pl.DataFrame,
-    events_df: pl.DataFrame,
-) -> pl.DataFrame:
-    """Count raw like rows strictly before each used post/query-hour pair.
-
-    Stage 5 deliberately preserves duplicate events, so the sorted timestamp
-    lists also preserve them. ``bisect_left`` enforces the strict boundary:
-    likes exactly at ``query_hour`` are excluded.
-    """
-    if post_hours_df.is_empty():
-        return empty_frame(POST_HOUR_COUNT_SCHEMA)
-    events_by_uri: dict[str, list[datetime]] = {}
-    for uri, created_at in events_df.select(
-        "subject_uri", "like_created_at"
-    ).sort(["subject_uri", "like_created_at"]).iter_rows():
-        events_by_uri.setdefault(str(uri), []).append(created_at)
-    rows = []
-    for uri, query_hour in post_hours_df.select(
-        "subject_uri", "query_hour"
-    ).unique().sort(["subject_uri", "query_hour"]).iter_rows():
-        count = bisect_left(events_by_uri.get(str(uri), []), query_hour)
-        rows.append({
-            "subject_uri": uri,
-            "query_hour": query_hour,
-            "prior_like_count": count,
-        })
-    return pl.from_dicts(rows, schema=POST_HOUR_COUNT_SCHEMA)
 
 
 def validate_frame(
