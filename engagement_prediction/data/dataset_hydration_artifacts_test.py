@@ -1,6 +1,7 @@
 import base64
 from datetime import datetime, timezone
 import logging
+from pathlib import Path
 import struct
 import zlib
 
@@ -254,6 +255,119 @@ def test_embedding_shards_are_deterministic_with_parallel_partition_workers(tmp_
     assert pl.read_parquet(
         tmp_path / "valid-embedding-rows" / "part-00001.parquet"
     ).get_column("subject_uri").to_list() == ["b"]
+
+
+def test_prior_counts_read_each_usage_partition_once(tmp_path, monkeypatch):
+    query_hour = datetime(2026, 1, 1, 2, tzinfo=UTC)
+    route_paths = {
+        "positive": tmp_path / "positive-routes",
+        "history": tmp_path / "history-routes",
+        "negative": tmp_path / "negative-routes",
+    }
+    route_frames = {
+        "positive": pl.DataFrame({
+            "did": ["user"],
+            "query_hour": [query_hour],
+            "subject_uri": ["shared"],
+            "like_created_at": [query_hour],
+        }),
+        "history": pl.DataFrame({
+            "did": ["user"],
+            "query_hour": [query_hour],
+            "_history_position": [0],
+            "subject_uri": ["shared"],
+            "like_created_at": [datetime(2026, 1, 1, 1, tzinfo=UTC)],
+        }),
+        "negative": pl.DataFrame({
+            "query_hour": [query_hour],
+            "subject_uri": ["negative"],
+            "selection_source": ["random"],
+            "_stage4_prior_like_count": [2],
+        }),
+    }
+    route_parts = []
+    for role, path in route_paths.items():
+        partition_path = path / "_post_partition=0"
+        partition_path.mkdir(parents=True)
+        part = partition_path / "part.parquet"
+        route_frames[role].write_parquet(part)
+        route_parts.append(part)
+
+    events_path = tmp_path / "post-liker-events"
+    events_path.mkdir()
+    event_part = events_path / "part-00000.parquet"
+    pl.DataFrame({
+        "subject_uri": ["shared", "shared", "negative", "negative"],
+        "liker_did": ["a", "b", "c", "d"],
+        "like_created_at": [
+            datetime(2026, 1, 1, 1, tzinfo=UTC),
+            query_hour,
+            datetime(2026, 1, 1, 0, tzinfo=UTC),
+            datetime(2026, 1, 1, 1, tzinfo=UTC),
+        ],
+    }).write_parquet(event_part)
+    unused_event_part = events_path / "part-00001.parquet"
+    pl.DataFrame({
+        "subject_uri": ["unused"],
+        "liker_did": ["unused-liker"],
+        "like_created_at": [datetime(2026, 1, 1, 1, tzinfo=UTC)],
+    }).write_parquet(unused_event_part)
+
+    read_paths = []
+    original_read_parquet = dataset_hydration_artifacts.pl.read_parquet
+
+    def recording_read_parquet(paths, *args, **kwargs):
+        input_paths = paths if isinstance(paths, list) else [paths]
+        read_paths.extend(Path(path) for path in input_paths)
+        return original_read_parquet(paths, *args, **kwargs)
+
+    monkeypatch.setattr(
+        dataset_hydration_artifacts.pl,
+        "read_parquet",
+        recording_read_parquet,
+    )
+    cumulative_build_count = 0
+    original_build_cumulative = (
+        dataset_hydration_artifacts.like_counts.build_cumulative_like_counts
+    )
+
+    def recording_build_cumulative(events):
+        nonlocal cumulative_build_count
+        cumulative_build_count += 1
+        return original_build_cumulative(events)
+
+    monkeypatch.setattr(
+        dataset_hydration_artifacts.like_counts,
+        "build_cumulative_like_counts",
+        recording_build_cumulative,
+    )
+
+    stats = dataset_hydration_artifacts.attach_prior_counts(
+        positive_routes_path=route_paths["positive"],
+        history_routes_path=route_paths["history"],
+        negative_routes_path=route_paths["negative"],
+        post_liker_events_path=events_path,
+        counted_positives_path=tmp_path / "counted-positives",
+        counted_histories_path=tmp_path / "counted-histories",
+        counted_negatives_path=tmp_path / "counted-negatives",
+        partition_count=2,
+        logger=logging.getLogger("prior-count-read-test"),
+    )
+
+    assert stats == {"post_query_hour_pair_count": 2}
+    assert all(read_paths.count(path) == 1 for path in route_parts)
+    assert read_paths.count(event_part) == 1
+    assert unused_event_part not in read_paths
+    assert cumulative_build_count == 1
+    assert original_read_parquet(
+        tmp_path / "counted-positives" / "part-00000.parquet"
+    ).get_column("prior_like_count").to_list() == [1]
+    assert original_read_parquet(
+        tmp_path / "counted-histories" / "part-00000.parquet"
+    ).get_column("prior_like_count").to_list() == [1]
+    assert original_read_parquet(
+        tmp_path / "counted-negatives" / "part-00000.parquet"
+    ).get_column("prior_like_count").to_list() == [2]
 
 
 def test_author_vocabulary_uses_only_surviving_training_feature_occurrences(tmp_path):

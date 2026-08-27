@@ -28,12 +28,17 @@ def test_prior_like_counts_are_strict_and_count_duplicate_rows():
     }, schema=like_counts.LIKE_EVENT_SCHEMA)
 
     result = like_counts.calculate_prior_like_counts(pairs, events)
+    reused_result = like_counts.lookup_prior_like_counts(
+        pairs,
+        like_counts.build_cumulative_like_counts(events),
+    )
 
     assert result.to_dicts() == [
         {"subject_uri": "a", "query_hour": first_hour, "prior_like_count": 1},
         {"subject_uri": "a", "query_hour": second_hour, "prior_like_count": 3},
         {"subject_uri": "b", "query_hour": second_hour, "prior_like_count": 0},
     ]
+    assert reused_result.equals(result)
 
 
 def test_prior_like_counts_handle_empty_inputs():

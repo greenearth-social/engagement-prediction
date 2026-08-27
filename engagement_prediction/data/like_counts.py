@@ -21,6 +21,16 @@ POST_HOUR_COUNT_SCHEMA = {
     **POST_HOUR_SCHEMA,
     "prior_like_count": pl.UInt64,
 }
+CUMULATIVE_LIKE_COUNT_COLUMNS = [
+    "subject_uri",
+    "like_hour",
+    "cumulative_like_count",
+]
+CUMULATIVE_LIKE_COUNT_SCHEMA = {
+    "subject_uri": pl.String,
+    "like_hour": UTC_DATETIME,
+    "cumulative_like_count": pl.UInt64,
+}
 
 
 def _validated_post_hours(post_hours_df: pl.DataFrame) -> pl.DataFrame:
@@ -71,6 +81,85 @@ def _validated_like_events(events_df: pl.DataFrame) -> pl.DataFrame:
     return events
 
 
+def _build_cumulative_like_counts(events: pl.DataFrame) -> pl.DataFrame:
+    if events.is_empty():
+        return pl.DataFrame(schema=CUMULATIVE_LIKE_COUNT_SCHEMA)
+    return (
+        events.with_columns(
+            pl.col("like_created_at").dt.truncate("1h").alias("like_hour")
+        )
+        .group_by("subject_uri", "like_hour")
+        .len(name="_hour_like_count")
+        .sort(["subject_uri", "like_hour"])
+        .with_columns(
+            pl.col("_hour_like_count")
+            .cum_sum()
+            .over("subject_uri")
+            .cast(pl.UInt64)
+            .alias("cumulative_like_count")
+        )
+        .select(CUMULATIVE_LIKE_COUNT_COLUMNS)
+    )
+
+
+def build_cumulative_like_counts(events_df: pl.DataFrame) -> pl.DataFrame:
+    """Aggregate raw events into cumulative per-post hourly counts."""
+
+    return _build_cumulative_like_counts(_validated_like_events(events_df))
+
+
+def _lookup_prior_like_counts(
+    post_hours: pl.DataFrame,
+    cumulative_likes: pl.DataFrame,
+) -> pl.DataFrame:
+    if post_hours.is_empty():
+        return pl.DataFrame(schema=POST_HOUR_COUNT_SCHEMA)
+    if cumulative_likes.is_empty():
+        return post_hours.with_columns(
+            pl.lit(0, dtype=pl.UInt64).alias("prior_like_count")
+        ).select(POST_HOUR_COUNT_COLUMNS)
+    return (
+        post_hours.join_asof(
+            cumulative_likes,
+            left_on="query_hour",
+            right_on="like_hour",
+            by="subject_uri",
+            strategy="backward",
+            allow_exact_matches=False,
+            check_sortedness=False,
+        )
+        .with_columns(
+            pl.col("cumulative_like_count")
+            .fill_null(0)
+            .cast(pl.UInt64)
+            .alias("prior_like_count")
+        )
+        .select(POST_HOUR_COUNT_COLUMNS)
+        .sort(POST_HOUR_COLUMNS)
+    )
+
+
+def lookup_prior_like_counts(
+    post_hours_df: pl.DataFrame,
+    cumulative_likes_df: pl.DataFrame,
+) -> pl.DataFrame:
+    """Look up strict counts from ``build_cumulative_like_counts`` output."""
+
+    post_hours = _validated_post_hours(post_hours_df)
+    missing = set(CUMULATIVE_LIKE_COUNT_COLUMNS) - set(cumulative_likes_df.columns)
+    if missing:
+        raise ValueError(
+            "Cumulative like counts are missing required columns: "
+            f"{', '.join(sorted(missing))}"
+        )
+    cumulative_likes = cumulative_likes_df.select(CUMULATIVE_LIKE_COUNT_COLUMNS)
+    if cumulative_likes.schema != pl.Schema(CUMULATIVE_LIKE_COUNT_SCHEMA):
+        raise ValueError(
+            f"Unexpected cumulative like-count schema: {cumulative_likes.schema}"
+        )
+    return _lookup_prior_like_counts(post_hours, cumulative_likes)
+
+
 def calculate_prior_like_counts(
     post_hours_df: pl.DataFrame,
     events_df: pl.DataFrame,
@@ -99,33 +188,5 @@ def calculate_prior_like_counts(
             .select(POST_HOUR_COUNT_COLUMNS)
         )
 
-    cumulative_likes = (
-        events.with_columns(
-            pl.col("like_created_at").dt.truncate("1h").alias("_like_hour")
-        )
-        .group_by("subject_uri", "_like_hour")
-        .len(name="_hour_like_count")
-        .sort(["subject_uri", "_like_hour"])
-        .with_columns(
-            pl.col("_hour_like_count")
-            .cum_sum()
-            .over("subject_uri")
-            .cast(pl.UInt64)
-            .alias("prior_like_count")
-        )
-        .select("subject_uri", "_like_hour", "prior_like_count")
-    )
-    return (
-        post_hours.join_asof(
-            cumulative_likes,
-            left_on="query_hour",
-            right_on="_like_hour",
-            by="subject_uri",
-            strategy="backward",
-            allow_exact_matches=False,
-            check_sortedness=False,
-        )
-        .with_columns(pl.col("prior_like_count").fill_null(0).cast(pl.UInt64))
-        .select(POST_HOUR_COUNT_COLUMNS)
-        .sort(POST_HOUR_COLUMNS)
-    )
+    cumulative_likes = _build_cumulative_like_counts(events)
+    return _lookup_prior_like_counts(post_hours, cumulative_likes)

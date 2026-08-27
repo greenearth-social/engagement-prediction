@@ -791,28 +791,33 @@ def attach_prior_counts(
     """Attach strict as-of Stage 5 event counts to every hydrated post use.
 
     The unique ``(subject_uri, query_hour)`` relation avoids recalculating a
-    count when the same post is used by several users in one hour. Negative
-    counts are cross-checked against Stage 4 before the private Stage 4 column
-    is discarded.
+    count when the same post is used by several users in one hour. The narrow
+    cumulative event table is built once per URI partition, while each full
+    usage partition is read, counted, and written sequentially. Negative counts
+    are cross-checked against Stage 4 before its private column is discarded.
     """
 
     for path in (counted_positives_path, counted_histories_path, counted_negatives_path):
         path.mkdir(parents=True, exist_ok=False)
     pair_count = 0
     for partition_id in range(partition_count):
-        relation_frames = []
-        for path in (positive_routes_path, history_routes_path, negative_routes_path):
-            parts = _partition_paths(path, partition_id)
+        relation_partitions = []
+        for source_path, output_path, is_negative in (
+            (positive_routes_path, counted_positives_path, False),
+            (history_routes_path, counted_histories_path, False),
+            (negative_routes_path, counted_negatives_path, True),
+        ):
+            parts = _partition_paths(source_path, partition_id)
             if parts:
-                relation_frames.append(pl.read_parquet(parts).select("subject_uri", "query_hour"))
-        pairs_df = (
-            pl.concat(relation_frames).unique().sort(["subject_uri", "query_hour"])
-            if relation_frames
-            else dataset_hydration.empty_frame({
-                "subject_uri": pl.String,
-                "query_hour": dataset_hydration.UTC_DATETIME,
-            })
-        )
+                relation_partitions.append((parts, output_path, is_negative))
+        if not relation_partitions:
+            logger.info(
+                "Computed as-of popularity for Stage 5 URI partition %s/%s: pairs=0",
+                partition_id + 1,
+                partition_count,
+            )
+            continue
+
         event_parts = _public_part(post_liker_events_path, partition_id)
         events_df = (
             pl.read_parquet(event_parts)
@@ -823,22 +828,23 @@ def attach_prior_counts(
                 "like_created_at": dataset_hydration.UTC_DATETIME,
             })
         )
-        counts_df = like_counts.calculate_prior_like_counts(pairs_df, events_df)
-        pair_count += counts_df.height
-        for source_path, output_path in (
-            (positive_routes_path, counted_positives_path),
-            (history_routes_path, counted_histories_path),
-            (negative_routes_path, counted_negatives_path),
-        ):
-            parts = _partition_paths(source_path, partition_id)
-            if not parts:
-                continue
-            counted_df = pl.read_parquet(parts).join(
+        cumulative_likes_df = like_counts.build_cumulative_like_counts(events_df)
+        del events_df
+
+        pair_frames = []
+        for parts, output_path, is_negative in relation_partitions:
+            source_df = pl.read_parquet(parts)
+            counts_df = like_counts.lookup_prior_like_counts(
+                source_df.select("subject_uri", "query_hour"),
+                cumulative_likes_df,
+            )
+            pair_frames.append(counts_df.select("subject_uri", "query_hour"))
+            counted_df = source_df.join(
                 counts_df,
                 on=["subject_uri", "query_hour"],
                 how="left",
             ).with_columns(pl.col("prior_like_count").fill_null(0).cast(pl.UInt64))
-            if source_path == negative_routes_path:
+            if is_negative:
                 mismatches = counted_df.filter(
                     pl.col("_stage4_prior_like_count") != pl.col("prior_like_count")
                 ).height
@@ -850,11 +856,17 @@ def attach_prior_counts(
                 output_path / f"part-{partition_id:05d}.parquet",
                 compression="zstd",
             )
+            del source_df, counts_df, counted_df
+
+        partition_pair_count = (
+            pl.concat(pair_frames).unique().height if pair_frames else 0
+        )
+        pair_count += partition_pair_count
         logger.info(
             "Computed as-of popularity for Stage 5 URI partition %s/%s: pairs=%s",
             partition_id + 1,
             partition_count,
-            f"{counts_df.height:,}",
+            f"{partition_pair_count:,}",
         )
     return {"post_query_hour_pair_count": pair_count}
 
