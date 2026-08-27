@@ -12,7 +12,7 @@ This repo trains engagement rankers for Bluesky posts using production-shaped us
 7. `07_dataset_hydration`: hydrate selected posts, build the training-exposure author vocabulary, write the content-embedding memmap, and publish permanent model-training tables plus a compact loader index.
 8. Train a canonical model directly from Stage 7: `08_train_bst_ranker` or `08_train_two_tower`.
 
-Native BST and two-tower training are active through Stage 8. MLP training has been removed. The old comparison command remains disabled until it is rebuilt against the Stage 7 dataset contract.
+Native BST and two-tower training are active through Stage 8. MLP training has been removed. Canonical Stage 8 artifacts can be compared independently against a Stage 7 dataset with `ops/compare_model_performance.py`.
 
 ## Setup
 
@@ -52,7 +52,8 @@ Tests use the `*_test.py` naming convention and live next to the code they cover
 ## Repository Layout
 
 - `cli.py`: unified pipeline CLI. `run-all` is implicit, so both invocation forms are accepted.
-- `compare.py`: checkpoint-backed ranker comparison code, temporarily unavailable until it consumes Stage 7.
+- `ops/compare_model_performance.py`: standalone comparison of exactly two canonical Stage 8 or standard legacy Stage 3 BST model artifacts on one Stage 7 dataset.
+- `engagement_prediction/evaluation/`: reusable artifact validation, author remapping, TorchScript scoring, comparison, and reporting helpers.
 - `engagement_prediction/stages/source_metadata.py`: active Stage 00 canonical source-metadata indexing.
 - `engagement_prediction/stages/query_selection.py`: active Stage 1 user-hour query selection.
 - `engagement_prediction/stages/user_history.py`: active Stage 2 orchestration.
@@ -296,7 +297,7 @@ python cli.py --config config.yml \
 
 ### Stage 8: Native BST Training
 
-Stage 8 consumes the required Stage 7 loader index directly. It trains on `train`, validates on `val`, and selects checkpoints using unseen-user validation NDCG from `val_unseen_users`. Training batches shuffle user-hours and resample their bounded negative pool each epoch; validation is deterministic. The existing train loader switches to deterministic evaluation mode for final metrics instead of creating a second worker pool. Holdout splits are not loaded during training. BST training does not compute or report MAP; NDCG is its ranking metric. Each split's random baseline is logged at epoch 0 in the same ClearML metric series as learned epochs 1 and later.
+Stage 8 consumes the required Stage 7 loader index directly. It trains on `train`, validates on `val`, and selects checkpoints using unseen-user validation NDCG from `val_unseen_users`. Training batches shuffle user-hours and resample their bounded negative pool each epoch; validation is deterministic. The existing train loader switches to deterministic evaluation mode for final metrics instead of creating a second worker pool. Holdout splits are not loaded during training. BST training does not compute or report MAP; NDCG is its ranking metric. Random baselines piggyback on the first train, validation, and unseen-validation passes, then appear in one grouped ClearML histogram at iteration 0 with all-query and zero-history bars; learned scalar metrics begin at iteration 1.
 
 Shared training options:
 
@@ -358,7 +359,7 @@ python cli.py --config config.yml \
   --stop-after train_two_tower
 ```
 
-Training uses every Stage 4 hourly negative retained in Stage 7. It uses `batch_size` for training and final train metrics, `eval_batch_size` for both validation splits, and unseen-user validation NDCG for checkpoint selection. Random NDCG baselines share the regular ClearML metric series at epoch 0. The architecture is fixed to the canonical author-aware cross-attention encoder and learned post projection; both towers always L2-normalize their outputs.
+Training uses every Stage 4 hourly negative retained in Stage 7. It uses `batch_size` for training and final train metrics, `eval_batch_size` for both validation splits, and unseen-user validation NDCG for checkpoint selection. Random baselines piggyback on the first split passes and are reported in the same grouped ClearML histogram contract as BST training. The architecture is fixed to the canonical author-aware cross-attention encoder and learned post projection; both towers always L2-normalize their outputs.
 
 Useful options include `--output-embedding-dim` (default `128`), `--user-hidden-dim`, `--post-hidden-dim`, `--content-projection-dim`, `--author-projection-dim`, `--author-embedding-dim`, `--dropout-rate-two-tower`, and `--similarity-temperature`.
 
@@ -366,9 +367,30 @@ The `08_train_two_tower/<stage_run_id>/` artifact contains `checkpoints/two_towe
 
 After final evaluation, the towers are registered once as the ClearML OutputModels `engagement_user_tower` and `engagement_post_tower`, and the author map is uploaded as `author_idx_mapping`. A successful complete upload writes `checkpoints/two_tower_serving_manifest.json`, including `output_embedding_dim` and the post-tower model ID as `embedding_space_id`. Remote publication is best-effort and never invalidates the verified local outputs. Deploying a non-128-dimensional model requires a coordinated Elasticsearch index migration and full post re-embedding.
 
-## Compare Rankers
+## Compare Model Performance
 
-`compare-rankers` is temporarily unavailable because its legacy data path has been retired and it has not yet been rewired to Stage 7. The disabled command and `compare.py` remain as references for that next change; their old dependency chain is not supported.
+Use the standalone comparison CLI with one completed Stage 7 artifact and exactly two uniquely named model artifacts. Canonical Stage 8 BST, canonical Stage 8 two-tower, and standard legacy Stage 3 BST artifacts can be mixed in one comparison. Model type is inferred from each artifact's configuration.
+
+```bash
+python ops/compare_model_performance.py \
+  --dataset /path/to/07_dataset_hydration/<run-id> \
+  --model baseline=/path/to/08_train_bst_ranker/<run-id> \
+  --model candidate=/path/to/08_train_two_tower/<run-id>
+```
+
+To compare a standard legacy BST ranker, pass its completed legacy `03_train` directory. The tool normally resolves the aligned legacy author-index artifact from its recorded lineage. If that input has moved or is otherwise unavailable, provide its exact author map explicitly under the same model name:
+
+```bash
+python ops/compare_model_performance.py \
+  --dataset /path/to/07_dataset_hydration/<run-id> \
+  --model legacy=/path/to/03_train/<run-id> \
+  --author-map legacy=/path/to/author_idx_<run-id>.parquet \
+  --model canonical=/path/to/08_train_bst_ranker/<run-id>
+```
+
+Legacy support is limited to standard BST TorchScript models exposing the same eight-input `score_candidate_matrix` API. Experimental legacy models requiring post-liker or target-user features are rejected. A legacy model is evaluated against the supplied canonical Stage 7 queries, histories, embeddings, and candidate pools; this does not reproduce metrics from its original legacy training dataset.
+
+The dataset argument may also point directly to its `hydrated_training_data_*` bundle. By default the tool evaluates `val`, `val_unseen_users`, `holdout_unseen_users`, and `holdout_seen_users`, using all Stage 7 hourly negatives and each model's configured history length. Results are built atomically under `outputs/comparisons/<run-id>/`; pass `--output-dir` to use another parent directory. Each completed comparison contains `metrics.json`, long-form `metrics.csv`, model-B-minus-model-A `metric_deltas.csv`, `model_specs.json`, `stage_info.txt`, and `comparison.log`. Floating-point result values are rounded to five decimal places while exact model and training configuration metadata remains unchanged. The tool does not create pipeline manifests, tracking tasks, uploads, or ranking-row artifacts.
 
 ## Legacy References
 
@@ -497,9 +519,8 @@ python cli.py --config config.yml --model-type bst-ranker --stop-after train_bst
 
 ## Development Notes
 
-- Treat `08_train_bst_ranker` and `08_train_two_tower` as the active pipeline boundaries until native evaluation is added.
+- Treat `08_train_bst_ranker` and `08_train_two_tower` as the active pipeline boundaries; use the standalone comparison tool for aggregate evaluation across their canonical artifacts.
 - Use `engagement_prediction/training/ranking.py` for matrix ranking metrics and ranking-row writes.
-- Rebuild `compare-rankers` against the Stage 7 loader index and canonical Stage 8 checkpoints rather than restoring the deleted legacy adapters.
 - Avoid adding new training paths without registering them in `engagement_prediction/pipeline/registry.py` and documenting their artifact contract here.
 
 ## Contributing

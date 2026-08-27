@@ -23,7 +23,6 @@ from typing import Optional, Dict, Any, List, Tuple
 import json
 import copy
 
-import compare as compare_rankers
 from engagement_prediction.pipeline import registry as reg
 from engagement_prediction.pipeline.dependencies import (
     pin_lineage_aligned_inputs,
@@ -357,14 +356,6 @@ def _resolve_prior_spec(
         f"Could not resolve prior spec for '{stage_folder}': {spec!r}. "
         f"Expected an existing path (absolute or relative to {Path(output_root).resolve()}) "
         f"or a stage_run_id under {Path(artifacts_dir).resolve() / stage_folder}."
-    )
-
-
-def cmd_compare_rankers(args: argparse.Namespace) -> int:
-    return compare_rankers.cmd_compare_rankers(
-        args,
-        resolve_run_dir=_resolve_run_dir,
-        resolve_prior_spec=_resolve_prior_spec,
     )
 
 
@@ -819,31 +810,13 @@ def build_parser() -> argparse.ArgumentParser:
         "command",
         nargs="?",
         default="run-all",
-        choices=["run-all", "compare-rankers"],
+        choices=["run-all"],
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--config",
         type=str,
         help="YAML/JSON config file with run-all parameters (CLI flags override config)",
-    )
-    parser.add_argument(
-        "--model",
-        action="append",
-        default=argparse.SUPPRESS,
-        help="compare-rankers model spec in name:type:path format; repeat for multiple models",
-    )
-    parser.add_argument(
-        "--splits",
-        nargs="+",
-        default=argparse.SUPPRESS,
-        help=f"compare-rankers splits to evaluate (default: {' '.join(compare_rankers.DEFAULT_COMPARE_SPLITS)})",
-    )
-    parser.add_argument(
-        "--bst-candidate-chunk-size",
-        type=int,
-        default=argparse.SUPPRESS,
-        help=f"compare-rankers BST candidate chunk size (default: {compare_rankers.DEFAULT_COMPARE_BST_CANDIDATE_CHUNK_SIZE})",
     )
     # run-all (modular pipeline)
     p_all = parser
@@ -1071,8 +1044,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     raw_args = parser.parse_args()
-    if raw_args.command == "compare-rankers":
-        return cmd_compare_rankers(raw_args)
     merged_args = _merge_args_with_config(raw_args)
     return merged_args.func(merged_args)
 

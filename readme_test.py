@@ -25,7 +25,11 @@ def test_readme_describes_current_pipeline_and_new_ranker_surface():
     assert "`legacy/`" in readme
     assert "engagement_prediction/pipeline/{core.py,dependencies.py,registry.py}" in readme
     assert "utils/" not in readme
-    assert "compare-rankers" in readme
+    assert "ops/compare_model_performance.py" in readme
+    assert "--author-map" in readme
+    assert "standard legacy Stage 3 BST" in readme
+    assert "eight-input `score_candidate_matrix`" in readme
+    assert "compare-rankers" not in readme
     assert "--model-type bst-ranker" in readme
     assert "--model-type two-tower" in readme
     assert "--output-embedding-dim" in readme

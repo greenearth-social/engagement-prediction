@@ -134,6 +134,11 @@ def _dataset(bundle, *, negative_cap=None):
     )
 
 
+def _write_author_override(path, values, *, dtype="<u4"):
+    np.save(path, np.asarray(values, dtype=dtype))
+    return path
+
+
 def test_native_dataset_builds_parity_batch_from_memory_mapped_index(tmp_path):
     dataset = _dataset(_bundle(tmp_path))
 
@@ -162,6 +167,93 @@ def test_native_dataset_builds_parity_batch_from_memory_mapped_index(tmp_path):
         batch["candidate_post_embeddings"],
         torch.tensor([[1.0, -1.0], [2.0, -2.0], [5.0, -5.0]]),
     )
+
+
+def test_model_author_override_remaps_posts_and_preserves_pad_and_unk(tmp_path):
+    bundle = _bundle(tmp_path)
+    override_path = _write_author_override(
+        tmp_path / "model_post_author_idx.npy",
+        [4, 1, 3, 2, 1],
+    )
+    dataset = HydratedBucketedEngagementDataset(
+        bundle,
+        split="train",
+        max_history_len=2,
+        seed=7,
+        logger=None,
+        post_author_idx_override_path=override_path,
+        author_table_num_rows_override=5,
+    )
+
+    batch = dataset.collate_tensor_batch([dataset[0], dataset[1]])
+
+    assert dataset.author_table_num_rows == 5
+    assert dataset._post_author_idx_override is not None
+    assert dataset._post_author_idx_override.flags.writeable is False
+    assert batch["history_author_indices"].tolist() == [[3, 3], [0, 0]]
+    assert batch["candidate_post_author_idx"].tolist() == [4, 1, 1]
+
+
+def test_model_author_override_requires_path_and_table_size_together(tmp_path):
+    bundle = _bundle(tmp_path)
+    override_path = _write_author_override(
+        tmp_path / "model_post_author_idx.npy",
+        [1, 1, 1, 1, 1],
+    )
+
+    with pytest.raises(ValueError, match="must be provided together"):
+        HydratedBucketedEngagementDataset(
+            bundle,
+            split="train",
+            max_history_len=2,
+            seed=7,
+            logger=None,
+            post_author_idx_override_path=override_path,
+        )
+    with pytest.raises(ValueError, match="must be provided together"):
+        HydratedBucketedEngagementDataset(
+            bundle,
+            split="train",
+            max_history_len=2,
+            seed=7,
+            logger=None,
+            author_table_num_rows_override=5,
+        )
+
+
+@pytest.mark.parametrize(
+    ("values", "dtype", "author_table_num_rows", "message"),
+    [
+        ([1, 1, 1, 1], "<u4", 5, "shape"),
+        ([1, 1, 1, 1, 1], "<i8", 5, "<u4"),
+        ([0, 1, 1, 1, 1], "<u4", 5, "outside"),
+        ([1, 1, 5, 1, 1], "<u4", 5, "outside"),
+    ],
+)
+def test_model_author_override_validates_shape_dtype_and_range(
+    tmp_path,
+    values,
+    dtype,
+    author_table_num_rows,
+    message,
+):
+    bundle = _bundle(tmp_path)
+    override_path = _write_author_override(
+        tmp_path / "model_post_author_idx.npy",
+        values,
+        dtype=dtype,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        HydratedBucketedEngagementDataset(
+            bundle,
+            split="train",
+            max_history_len=2,
+            seed=7,
+            logger=None,
+            post_author_idx_override_path=override_path,
+            author_table_num_rows_override=author_table_num_rows,
+        )
 
 
 def test_tensor_only_collation_skips_auxiliary_metadata_and_arrow_tables(tmp_path):
@@ -389,6 +481,40 @@ def test_dataset_pickle_excludes_open_mappings_and_large_python_state(tmp_path):
     torch.testing.assert_close(actual["label_matrix"], expected["label_matrix"])
 
 
+def test_model_author_override_is_reopened_after_pickling(tmp_path):
+    bundle = _bundle(tmp_path)
+    override_path = _write_author_override(
+        tmp_path / "model_post_author_idx.npy",
+        [4, 1, 3, 2, 1],
+    )
+    dataset = HydratedBucketedEngagementDataset(
+        bundle,
+        split="train",
+        max_history_len=2,
+        seed=7,
+        logger=None,
+        post_author_idx_override_path=override_path,
+        author_table_num_rows_override=5,
+    )
+    expected = dataset.collate_tensor_batch([dataset[0], dataset[1]])
+
+    restored = pickle.loads(pickle.dumps(dataset))
+
+    assert restored._owner_pid is None
+    assert restored._post_author_idx_override is None
+    actual = restored.collate_tensor_batch([restored[0], restored[1]])
+    assert restored._post_author_idx_override is not None
+    assert restored._post_author_idx_override.flags.writeable is False
+    torch.testing.assert_close(
+        actual["history_author_indices"],
+        expected["history_author_indices"],
+    )
+    torch.testing.assert_close(
+        actual["candidate_post_author_idx"],
+        expected["candidate_post_author_idx"],
+    )
+
+
 def test_dataset_reopens_inherited_mappings_after_a_pid_change(tmp_path, monkeypatch):
     dataset = _dataset(_bundle(tmp_path))
     dataset.collate_batch([dataset[0], dataset[1]])
@@ -402,6 +528,52 @@ def test_dataset_reopens_inherited_mappings_after_a_pid_change(tmp_path, monkeyp
     assert reopened_embeddings is not original_embeddings
     assert original_embeddings._mmap.closed
     assert reopened_embeddings.flags.writeable is False
+
+
+def test_model_author_override_closes_and_reopens_after_pid_change(
+    tmp_path,
+    monkeypatch,
+):
+    bundle = _bundle(tmp_path)
+    override_path = _write_author_override(
+        tmp_path / "model_post_author_idx.npy",
+        [4, 1, 3, 2, 1],
+    )
+    dataset = HydratedBucketedEngagementDataset(
+        bundle,
+        split="train",
+        max_history_len=2,
+        seed=7,
+        logger=None,
+        post_author_idx_override_path=override_path,
+        author_table_num_rows_override=5,
+    )
+    validate_range_calls = []
+    original_open_override = dataset._open_post_author_idx_override
+
+    def record_open_override(*, validate_range):
+        validate_range_calls.append(validate_range)
+        return original_open_override(validate_range=validate_range)
+
+    monkeypatch.setattr(
+        dataset,
+        "_open_post_author_idx_override",
+        record_open_override,
+    )
+    original_mapping = dataset._post_author_indices()
+    original_owner_pid = dataset._owner_pid
+
+    monkeypatch.setattr(datasets_module.os, "getpid", lambda: original_owner_pid + 1)
+    reopened_mapping = dataset._post_author_indices()
+
+    assert dataset._owner_pid == original_owner_pid + 1
+    assert reopened_mapping is not original_mapping
+    assert original_mapping._mmap.closed
+    assert reopened_mapping.flags.writeable is False
+    assert validate_range_calls == [False, False]
+    dataset.close()
+    assert reopened_mapping._mmap.closed
+    assert dataset._post_author_idx_override is None
 
 
 def test_native_sampler_is_hour_homogeneous_deterministic_and_bounded(tmp_path):

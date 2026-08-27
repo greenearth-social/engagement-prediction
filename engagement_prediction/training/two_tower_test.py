@@ -79,10 +79,38 @@ class _RecordingTracker:
     def log_scalar(self, title, series, value, iteration):
         self.calls.append(
             {
+                "kind": "scalar",
                 "title": title,
                 "series": series,
                 "value": value,
                 "iteration": iteration,
+            }
+        )
+
+    def log_histogram(
+        self,
+        title,
+        series,
+        values,
+        iteration=0,
+        xlabels=None,
+        xaxis=None,
+        yaxis=None,
+        labels=None,
+        mode=None,
+    ):
+        self.calls.append(
+            {
+                "kind": "histogram",
+                "title": title,
+                "series": series,
+                "values": values,
+                "iteration": iteration,
+                "xlabels": xlabels,
+                "xaxis": xaxis,
+                "yaxis": yaxis,
+                "labels": labels,
+                "mode": mode,
             }
         )
 
@@ -194,7 +222,16 @@ def test_two_tower_epoch_uses_topk_ndcg_only_and_updates_weights(monkeypatch):
     assert loss >= 0.0
     assert metrics["rank_metric_user_count"] == 2
     assert metrics["zero_history_rank_metric_user_count"] == 1
-    assert set(baseline_metrics) == {"ndcg@1", "ndcg@2"}
+    assert set(baseline_metrics) == {
+        "ndcg@1",
+        "ndcg@2",
+        "zero_history_ndcg@1",
+        "zero_history_ndcg@2",
+        "zero_history_rank_metric_user_count",
+        "rank_metric_user_count",
+    }
+    assert baseline_metrics["rank_metric_user_count"] == 2
+    assert baseline_metrics["zero_history_rank_metric_user_count"] == 1
     assert not any(key.startswith("dcg@") for key in metrics)
     assert not any("recall" in key or "average_precision" in key for key in metrics)
     assert not torch.equal(before, model.user_projection.weight)
@@ -254,13 +291,37 @@ def test_train_two_tower_uses_unseen_ndcg_for_checkpoint_and_min_delta_patience(
     tracker = _RecordingTracker()
     unseen_values = iter([0.50, 0.45, 0.56])
     callback_epochs = []
+    baseline_by_split = {
+        "Train": (0.10, 0.11),
+        "Validation": (0.20, 0.21),
+        "Validation Unseen Users": (0.30, 0.31),
+    }
+    epoch_calls = []
 
     def fake_epoch(**kwargs):
+        expected_baseline = len(epoch_calls) < 3
+        epoch_calls.append(
+            (kwargs["split_name"], kwargs["calc_baseline_metrics"])
+        )
+        assert kwargs["calc_baseline_metrics"] is expected_baseline
         ndcg = (
             next(unseen_values)
             if kwargs["split_name"] == "Validation Unseen Users"
             else 0.25
         )
+        baseline_metrics = {}
+        if expected_baseline:
+            baseline_ndcg, zero_history_baseline_ndcg = baseline_by_split[
+                kwargs["split_name"]
+            ]
+            baseline_metrics = {
+                "dcg@1": baseline_ndcg,
+                "ndcg@1": baseline_ndcg,
+                "zero_history_dcg@1": zero_history_baseline_ndcg,
+                "zero_history_ndcg@1": zero_history_baseline_ndcg,
+                "rank_metric_user_count": 10,
+                "zero_history_rank_metric_user_count": 4,
+            }
         return (
             1.0,
             {
@@ -270,7 +331,7 @@ def test_train_two_tower_uses_unseen_ndcg_for_checkpoint_and_min_delta_patience(
                 "zero_history_rank_metric_user_count": 1,
                 "rank_metric_user_count": 2,
             },
-            {"dcg@1": 0.4, "ndcg@1": 0.4},
+            baseline_metrics,
         )
 
     def callback(path):
@@ -329,6 +390,44 @@ def test_train_two_tower_uses_unseen_ndcg_for_checkpoint_and_min_delta_patience(
     assert checkpoint["metadata"] == {
         "model_config": {"output_embedding_dim": 3}
     }
+    assert epoch_calls == [
+        ("Train", True),
+        ("Validation", True),
+        ("Validation Unseen Users", True),
+        ("Train", False),
+        ("Validation", False),
+        ("Validation Unseen Users", False),
+        ("Train", False),
+        ("Validation", False),
+        ("Validation Unseen Users", False),
+    ]
+    assert results["baseline_metrics"]["train"]["ndcg@1"] == pytest.approx(0.10)
+    assert results["baseline_metrics"]["val"]["zero_history_ndcg@1"] == pytest.approx(0.21)
+    assert results["baseline_metrics"]["val_unseen_users"]["ndcg@1"] == pytest.approx(0.30)
+    histogram_calls = [call for call in tracker.calls if call["kind"] == "histogram"]
+    assert histogram_calls == [{
+        "kind": "histogram",
+        "title": "Random Baseline NDCG@1",
+        "series": "Random Baseline",
+        "values": [[0.10, 0.20, 0.30], [0.11, 0.21, 0.31]],
+        "iteration": 0,
+        "xlabels": ["Train", "Validation", "Validation Unseen Users"],
+        "xaxis": "Split",
+        "yaxis": "NDCG@1",
+        "labels": ["All observations", "Zero-history only"],
+        "mode": "group",
+    }]
+    histogram_index = next(
+        index
+        for index, call in enumerate(tracker.calls)
+        if call["kind"] == "histogram"
+    )
+    first_scalar_index = next(
+        index
+        for index, call in enumerate(tracker.calls)
+        if call["kind"] == "scalar"
+    )
+    assert histogram_index < first_scalar_index
 
     for series in (
         "Train NDCG@1",
@@ -338,9 +437,13 @@ def test_train_two_tower_uses_unseen_ndcg_for_checkpoint_and_min_delta_patience(
         iterations = [
             call["iteration"]
             for call in tracker.calls
-            if call["series"] == series
+            if call["kind"] == "scalar" and call["series"] == series
         ]
-        assert iterations == [0, 1, 2, 3]
+        assert iterations == [1, 2, 3]
+    assert not any(
+        call["kind"] == "scalar" and call["iteration"] == 0
+        for call in tracker.calls
+    )
     assert "new_checkpoint_best=True" in caplog.text
     assert "patience_reset=False" in caplog.text
     assert "patience=2/2" in caplog.text

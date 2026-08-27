@@ -8,6 +8,7 @@ from engagement_prediction.training.ranking import (
     calc_baseline_rank_metrics_for_batch,
     finalize_rank_metrics,
     finalize_zero_history_rank_metrics,
+    log_random_baseline_histogram,
     ndcg_metric_tensor_sums_for_batch,
     rank_metric_sums_for_batch,
     ranking_rows_for_batch,
@@ -15,6 +16,14 @@ from engagement_prediction.training.ranking import (
     topk_ranked_labels_for_scores,
     zero_history_rank_metric_sums_for_batch,
 )
+
+
+class _HistogramTracker:
+    def __init__(self):
+        self.calls = []
+
+    def log_histogram(self, **kwargs):
+        self.calls.append(kwargs)
 
 
 def test_rank_metrics_report_ndcg_and_map_without_recall():
@@ -63,6 +72,34 @@ def test_tensor_baseline_ndcg_matches_existing_metrics_without_host_scalars():
     assert int(tensor_count) == expected_count
     for key, expected in expected_sums.items():
         assert float(tensor_sums[key]) == pytest.approx(expected)
+
+
+def test_log_random_baseline_histogram_emits_one_grouped_plot():
+    tracker = _HistogramTracker()
+    baseline_metrics = {
+        "train": {"ndcg@30": 0.10, "zero_history_ndcg@30": 0.11},
+        "val": {"ndcg@30": 0.20, "zero_history_ndcg@30": 0.21},
+        "val_unseen_users": {
+            "ndcg@30": 0.30,
+            "zero_history_ndcg@30": 0.31,
+        },
+    }
+
+    log_random_baseline_histogram(tracker, baseline_metrics, [30, 100])
+
+    assert tracker.calls == [
+        {
+            "title": "Random Baseline NDCG@30",
+            "series": "Random Baseline",
+            "values": [[0.10, 0.20, 0.30], [0.11, 0.21, 0.31]],
+            "iteration": 0,
+            "xlabels": ["Train", "Validation", "Validation Unseen Users"],
+            "labels": ["All observations", "Zero-history only"],
+            "xaxis": "Split",
+            "yaxis": "NDCG@30",
+            "mode": "group",
+        }
+    ]
 
 
 def test_topk_ndcg_matches_full_sort_for_all_and_masked_rows():

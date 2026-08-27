@@ -78,6 +78,8 @@ class HydratedBucketedEngagementDataset(Dataset):
         bst_additional_batch_negatives: Optional[int] = None,
         seed: int,
         logger: Optional[logging.Logger],
+        post_author_idx_override_path: Optional[Path] = None,
+        author_table_num_rows_override: Optional[int] = None,
     ):
         """Read the loader-index header without loading feature rows."""
 
@@ -98,6 +100,18 @@ class HydratedBucketedEngagementDataset(Dataset):
         )
         if negative_cap is not None and negative_cap <= 0:
             raise ValueError("additional_batch_negatives must be positive when provided")
+        if (post_author_idx_override_path is None) != (
+            author_table_num_rows_override is None
+        ):
+            raise ValueError(
+                "post_author_idx_override_path and "
+                "author_table_num_rows_override must be provided together"
+            )
+        if (
+            author_table_num_rows_override is not None
+            and int(author_table_num_rows_override) < 2
+        ):
+            raise ValueError("author_table_num_rows_override must be at least 2")
 
         stage7_path = Path(stage7_path)
         bundle_path = (
@@ -146,7 +160,11 @@ class HydratedBucketedEngagementDataset(Dataset):
         self.seed = int(seed)
         self.embed_dim = int(embedding_shape[1])
         self.embedding_count = int(embedding_shape[0])
-        self.author_table_num_rows = int(metadata["author_table_num_rows"])
+        self.author_table_num_rows = (
+            int(author_table_num_rows_override)
+            if author_table_num_rows_override is not None
+            else int(metadata["author_table_num_rows"])
+        )
         self.query_count = int(counts["query_count"])
         self.history_count = int(counts["history_count"])
         self.positive_count = int(counts["positive_count"])
@@ -162,12 +180,22 @@ class HydratedBucketedEngagementDataset(Dataset):
         self._query_did_batch_offsets = tuple(
             int(value) for value in query_did_metadata["batch_offsets"]
         )
+        self._post_author_idx_override_path = (
+            Path(post_author_idx_override_path)
+            if post_author_idx_override_path is not None
+            else None
+        )
+
+        if self._post_author_idx_override_path is not None:
+            override = self._open_post_author_idx_override(validate_range=True)
+            _close_memmap(override)
 
         # These handles are process-local. They are deliberately absent from
         # serialized state and are reopened if a forked object changes PID.
         self._owner_pid: Optional[int] = None
         self._embeddings: Optional[np.ndarray] = None
         self._arrays: Optional[dict[str, np.memmap]] = None
+        self._post_author_idx_override: Optional[np.memmap] = None
         self._post_uris: Optional[MemoryMappedUtf8Table] = None
         self._query_dids: Optional[MemoryMappedUtf8Table] = None
 
@@ -187,6 +215,7 @@ class HydratedBucketedEngagementDataset(Dataset):
         state["_owner_pid"] = None
         state["_embeddings"] = None
         state["_arrays"] = None
+        state["_post_author_idx_override"] = None
         state["_post_uris"] = None
         state["_query_dids"] = None
         return state
@@ -198,6 +227,7 @@ class HydratedBucketedEngagementDataset(Dataset):
         self._owner_pid = None
         self._embeddings = None
         self._arrays = None
+        self._post_author_idx_override = None
         self._post_uris = None
         self._query_dids = None
 
@@ -207,6 +237,7 @@ class HydratedBucketedEngagementDataset(Dataset):
         _close_memmap(self._embeddings)
         for array in (self._arrays or {}).values():
             _close_memmap(array)
+        _close_memmap(self._post_author_idx_override)
         if self._post_uris is not None:
             self._post_uris.close()
         if self._query_dids is not None:
@@ -214,6 +245,7 @@ class HydratedBucketedEngagementDataset(Dataset):
         self._owner_pid = None
         self._embeddings = None
         self._arrays = None
+        self._post_author_idx_override = None
         self._post_uris = None
         self._query_dids = None
 
@@ -221,6 +253,46 @@ class HydratedBucketedEngagementDataset(Dataset):
         """Explicitly release process-local memory mappings."""
 
         self._close_mappings()
+
+    def _open_post_author_idx_override(
+        self,
+        *,
+        validate_range: bool,
+    ) -> np.memmap:
+        """Open the model author mapping and optionally scan its value range."""
+
+        assert self._post_author_idx_override_path is not None
+        try:
+            override = np.load(
+                self._post_author_idx_override_path,
+                mmap_mode="r",
+                allow_pickle=False,
+            )
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                "Unable to open post_author_idx_override_path as a NumPy array"
+            ) from exc
+        if (
+            not isinstance(override, np.memmap)
+            or override.dtype.str != np.dtype("<u4").str
+            or override.shape != (self.embedding_count,)
+            or override.flags.writeable
+        ):
+            _close_memmap(override)
+            raise ValueError(
+                "post_author_idx_override_path must be a read-only <u4 NumPy array "
+                f"with shape ({self.embedding_count},)"
+            )
+        if validate_range and override.size and (
+            int(np.min(override)) < 1
+            or int(np.max(override)) >= self.author_table_num_rows
+        ):
+            _close_memmap(override)
+            raise ValueError(
+                "post_author_idx_override_path contains an index outside the "
+                "declared model author table"
+            )
+        return override
 
     def _ensure_open(self) -> None:
         """Lazily open read-only numeric mappings, reopening after a PID change.
@@ -246,6 +318,7 @@ class HydratedBucketedEngagementDataset(Dataset):
             raise ValueError("Stage 7 embeddings do not match the loader_index metadata")
 
         arrays: dict[str, np.memmap] = {}
+        post_author_idx_override: Optional[np.memmap] = None
         try:
             for name in _GLOBAL_ARRAY_NAMES:
                 arrays[name] = load_index_array(self.loader_index_path, name)
@@ -255,14 +328,20 @@ class HydratedBucketedEngagementDataset(Dataset):
                     name,
                     split=self.split,
                 )
+            if self._post_author_idx_override_path is not None:
+                post_author_idx_override = self._open_post_author_idx_override(
+                    validate_range=False
+                )
         except Exception:
             _close_memmap(embeddings)
             for array in arrays.values():
                 _close_memmap(array)
+            _close_memmap(post_author_idx_override)
             raise
 
         self._embeddings = embeddings
         self._arrays = arrays
+        self._post_author_idx_override = post_author_idx_override
         self._owner_pid = current_pid
 
     def _ensure_identifier_tables_open(self) -> None:
@@ -307,6 +386,14 @@ class HydratedBucketedEngagementDataset(Dataset):
         self._ensure_open()
         assert self._arrays is not None
         return self._arrays[name]
+
+    def _post_author_indices(self) -> np.memmap:
+        """Return the configured dense emb_idx-to-author_idx mapping."""
+
+        self._ensure_open()
+        if self._post_author_idx_override is not None:
+            return self._post_author_idx_override
+        return self._array("post_author_idx")
 
     def __len__(self) -> int:
         """Return the number of user-hour queries in this split."""
@@ -365,7 +452,7 @@ class HydratedBucketedEngagementDataset(Dataset):
             ]
             mask[batch_rows, history_positions] = True
             author_indices[batch_rows, history_positions] = np.asarray(
-                self._array("post_author_idx")[history_emb_indices], dtype=np.int64
+                self._post_author_indices()[history_emb_indices], dtype=np.int64
             )
             if include_bst_features:
                 liked_at_us = np.asarray(
@@ -527,7 +614,7 @@ class HydratedBucketedEngagementDataset(Dataset):
             "candidate_post_embeddings": torch.from_numpy(candidate_embeddings),
             "candidate_post_author_idx": torch.from_numpy(
                 np.asarray(
-                    self._array("post_author_idx")[candidate_emb_array],
+                    self._post_author_indices()[candidate_emb_array],
                     dtype=np.int64,
                 ).copy()
             ),

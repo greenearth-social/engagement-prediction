@@ -73,10 +73,36 @@ class _RecordingTracker:
 
     def log_scalar(self, title, series, value, iteration):
         self.calls.append({
+            "kind": "scalar",
             "title": title,
             "series": series,
             "value": value,
             "iteration": iteration,
+        })
+
+    def log_histogram(
+        self,
+        title,
+        series,
+        values,
+        iteration=0,
+        xlabels=None,
+        xaxis=None,
+        yaxis=None,
+        labels=None,
+        mode=None,
+    ):
+        self.calls.append({
+            "kind": "histogram",
+            "title": title,
+            "series": series,
+            "values": values,
+            "iteration": iteration,
+            "xlabels": xlabels,
+            "xaxis": xaxis,
+            "yaxis": yaxis,
+            "labels": labels,
+            "mode": mode,
         })
 
 
@@ -244,6 +270,9 @@ def test_native_stage7_batch_runs_one_optimizer_step(tmp_path):
     assert "mean_average_precision" not in metrics
     assert "zero_history_mean_average_precision" not in metrics
     assert "mean_average_precision" not in baseline_metrics
+    assert baseline_metrics["rank_metric_user_count"] == 2
+    assert baseline_metrics["zero_history_rank_metric_user_count"] == 1
+    assert baseline_metrics["zero_history_ndcg@2"] >= 0.0
     assert not any("recall" in key for key in metrics | baseline_metrics)
     assert not torch.equal(before, model.post_feature_encoder.content_projection.weight)
 
@@ -277,7 +306,7 @@ def test_bst_epoch_metrics_do_not_require_full_argsort(monkeypatch):
     assert baseline_metrics["ndcg@2"] >= 0.0
 
 
-def test_train_bst_logs_epoch_zero_baselines_and_detailed_early_stopping(
+def test_train_bst_piggybacks_baseline_histogram_on_epoch_one_and_logs_detailed_early_stopping(
     tmp_path,
     monkeypatch,
     caplog,
@@ -287,19 +316,36 @@ def test_train_bst_logs_epoch_zero_baselines_and_detailed_early_stopping(
     tracker = _RecordingTracker()
     unseen_values = iter([0.50, 0.45, 0.56])
     callback_epochs = []
+    baseline_by_split = {
+        "Train": (0.10, 0.11),
+        "Validation": (0.20, 0.21),
+        "Validation Unseen Users": (0.30, 0.31),
+    }
+    epoch_calls = []
 
     def fake_epoch(**kwargs):
         split_name = kwargs["split_name"]
+        epoch_calls.append((split_name, kwargs["calc_baseline_metrics"]))
         ndcg = next(unseen_values) if split_name == "Validation Unseen Users" else 0.25
         metrics = {
             "loss": 1.0,
             "ndcg@1": ndcg,
+            "zero_history_ndcg@1": ndcg - 0.05,
+            "zero_history_rank_metric_user_count": 1,
             "rank_metric_user_count": 2,
         }
-        baseline = {
-            "dcg@1": 0.4,
-            "ndcg@1": 0.4,
-        }
+        if kwargs["calc_baseline_metrics"]:
+            baseline_ndcg, zero_history_baseline_ndcg = baseline_by_split[split_name]
+            baseline = {
+                "dcg@1": baseline_ndcg,
+                "ndcg@1": baseline_ndcg,
+                "zero_history_dcg@1": zero_history_baseline_ndcg,
+                "zero_history_ndcg@1": zero_history_baseline_ndcg,
+                "rank_metric_user_count": 10,
+                "zero_history_rank_metric_user_count": 4,
+            }
+        else:
+            baseline = {}
         return 1.0, metrics, baseline
 
     def best_checkpoint_callback(checkpoint_path):
@@ -349,7 +395,34 @@ def test_train_bst_logs_epoch_zero_baselines_and_detailed_early_stopping(
     assert checkpoint["best_val_metric"] == pytest.approx(0.56)
     assert checkpoint["metadata"] == {"model_config": {"model_dim": 4}}
     assert callback_epochs == [1, 3]
-    assert results["baseline_metrics"]["train"]["ndcg@1"] == pytest.approx(0.4)
+    assert epoch_calls == [
+        ("Train", True),
+        ("Validation", True),
+        ("Validation Unseen Users", True),
+        ("Train", False),
+        ("Validation", False),
+        ("Validation Unseen Users", False),
+        ("Train", False),
+        ("Validation", False),
+        ("Validation Unseen Users", False),
+    ]
+    assert results["baseline_metrics"]["train"]["ndcg@1"] == pytest.approx(0.10)
+    assert results["baseline_metrics"]["val"]["zero_history_ndcg@1"] == pytest.approx(0.21)
+    assert results["baseline_metrics"]["val_unseen_users"]["ndcg@1"] == pytest.approx(0.30)
+    histogram_calls = [call for call in tracker.calls if call["kind"] == "histogram"]
+    assert histogram_calls == [{
+        "kind": "histogram",
+        "title": "Random Baseline NDCG@1",
+        "series": "Random Baseline",
+        "values": [[0.10, 0.20, 0.30], [0.11, 0.21, 0.31]],
+        "iteration": 0,
+        "xlabels": ["Train", "Validation", "Validation Unseen Users"],
+        "xaxis": "Split",
+        "yaxis": "NDCG@1",
+        "labels": ["All observations", "Zero-history only"],
+        "mode": "group",
+    }]
+    assert tracker.calls[0]["kind"] == "histogram"
     for series in (
         "Train NDCG@1",
         "Validation NDCG@1",
@@ -358,21 +431,35 @@ def test_train_bst_logs_epoch_zero_baselines_and_detailed_early_stopping(
         calls = [
             call
             for call in tracker.calls
-            if call["title"] == "NDCG@1" and call["series"] == series
+            if call["kind"] == "scalar"
+            and call["title"] == "NDCG@1"
+            and call["series"] == series
         ]
-        assert [call["iteration"] for call in calls] == [0, 1, 2, 3]
-        assert calls[0]["value"] == pytest.approx(0.4)
+        assert [call["iteration"] for call in calls] == [1, 2, 3]
     primary_calls = [
         call
         for call in tracker.calls
-        if call["title"] == "Primary Ranking Metric (ndcg@1)"
+        if call["kind"] == "scalar"
+        and call["title"] == "Primary Ranking Metric (ndcg@1)"
     ]
-    assert [call["iteration"] for call in primary_calls] == [0, 1, 2, 3]
-    assert primary_calls[0]["value"] == pytest.approx(0.4)
+    assert [call["iteration"] for call in primary_calls] == [1, 2, 3]
     loss_calls = [
-        call for call in tracker.calls if call["title"] == "Training Loss History"
+        call
+        for call in tracker.calls
+        if call["kind"] == "scalar" and call["title"] == "Training Loss History"
     ]
     assert min(call["iteration"] for call in loss_calls) == 1
+    zero_history_calls = [
+        call
+        for call in tracker.calls
+        if call["kind"] == "scalar" and "Zero-History" in call["series"]
+    ]
+    assert zero_history_calls
+    assert min(call["iteration"] for call in zero_history_calls) == 1
+    assert not any(
+        call["kind"] == "scalar" and call["iteration"] == 0
+        for call in tracker.calls
+    )
     assert not any("Recall" in call["title"] or "Recall" in call["series"] for call in tracker.calls)
     assert not any("MAP" in call["title"] or "MAP" in call["series"] for call in tracker.calls)
     status_lines = [record.message for record in caplog.records if "BST early-stopping status" in record.message]
@@ -410,10 +497,18 @@ def test_best_checkpoint_callback_failure_propagates(tmp_path, monkeypatch):
     loader = DataLoader(_SingleBatchDataset(_batch()), batch_size=None, shuffle=False)
 
     def fake_epoch(**kwargs):
+        baseline = {
+            "dcg@1": 0.4,
+            "ndcg@1": 0.4,
+            "zero_history_dcg@1": 0.4,
+            "zero_history_ndcg@1": 0.4,
+            "rank_metric_user_count": 2,
+            "zero_history_rank_metric_user_count": 1,
+        } if kwargs["calc_baseline_metrics"] else {}
         return (
             1.0,
             {"loss": 1.0, "ndcg@1": 0.5, "rank_metric_user_count": 2},
-            {"dcg@1": 0.4, "ndcg@1": 0.4},
+            baseline,
         )
 
     def fail_callback(checkpoint_path):

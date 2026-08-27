@@ -3,6 +3,7 @@
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from engagement_prediction.experiment_tracking import ClearMLExperimentTracker
@@ -59,6 +60,14 @@ class _FailingOutputModel(_FakeOutputModel):
         raise RuntimeError("upload failed")
 
 
+class _FakeLogger:
+    def __init__(self) -> None:
+        self.histograms = []
+
+    def report_histogram(self, **kwargs) -> None:
+        self.histograms.append(kwargs)
+
+
 def test_log_params_updates_clearml_parameters_with_section_prefix():
     tracker = ClearMLExperimentTracker.__new__(ClearMLExperimentTracker)
     tracker._task = _FakeTask()
@@ -75,6 +84,31 @@ def test_log_params_updates_clearml_parameters_with_section_prefix():
         "Directories/run_dir": "/tmp/run",
         "Directories/run_name": "20260320_123456_all",
     }
+
+
+def test_log_histogram_reports_grouped_categorical_values():
+    tracker = ClearMLExperimentTracker.__new__(ClearMLExperimentTracker)
+    tracker._logger = _FakeLogger()
+
+    tracker.log_histogram(
+        title="Random baseline NDCG@30",
+        series="Baseline",
+        values=[[0.10, 0.20, 0.30], [0.40, 0.50, 0.60]],
+        iteration=0,
+        xlabels=["train", "val", "val_unseen_users"],
+        labels=["All observations", "Zero history"],
+        mode="group",
+    )
+
+    assert len(tracker._logger.histograms) == 1
+    reported = tracker._logger.histograms[0]
+    np.testing.assert_array_equal(
+        reported["values"],
+        np.asarray([[0.10, 0.20, 0.30], [0.40, 0.50, 0.60]]),
+    )
+    assert reported["xlabels"] == ["train", "val", "val_unseen_users"]
+    assert reported["labels"] == ["All observations", "Zero history"]
+    assert reported["mode"] == "group"
 
 
 def test_log_file_artifact_uploads_path_to_clearml_task(tmp_path):

@@ -20,11 +20,36 @@ class _RecordingTracker:
     def __init__(self, *, task_id="task-1"):
         self.id = task_id
         self.scalar_calls = []
+        self.histogram_calls = []
         self.model_artifacts = []
         self.file_artifacts = []
 
     def log_scalar(self, title, series, value, iteration):
         self.scalar_calls.append((title, series, value, iteration))
+
+    def log_histogram(
+        self,
+        title,
+        series,
+        values,
+        iteration=0,
+        xlabels=None,
+        xaxis=None,
+        yaxis=None,
+        labels=None,
+        mode=None,
+    ):
+        self.histogram_calls.append({
+            "title": title,
+            "series": series,
+            "values": values,
+            "iteration": iteration,
+            "xlabels": xlabels,
+            "xaxis": xaxis,
+            "yaxis": yaxis,
+            "labels": labels,
+            "mode": mode,
+        })
 
     def log_artifact(self, name, path):
         path = Path(path)
@@ -164,7 +189,25 @@ def test_stage8_trains_native_two_tower_and_publishes_serving_artifacts(
         "engagement_user_tower",
         "engagement_post_tower",
     ]
-    assert [call[3] for call in tracker.scalar_calls if call[1] == "Train NDCG@1"] == [0, 1]
+    assert len(tracker.histogram_calls) == 1
+    histogram_call = dict(tracker.histogram_calls[0])
+    histogram_values = histogram_call.pop("values")
+    assert histogram_call == {
+        "title": "Random Baseline NDCG@1",
+        "series": "Random Baseline",
+        "iteration": 0,
+        "xlabels": ["Train", "Validation", "Validation Unseen Users"],
+        "xaxis": "Split",
+        "yaxis": "NDCG@1",
+        "labels": ["All observations", "Zero-history only"],
+        "mode": "group",
+    }
+    assert len(histogram_values) == 2
+    assert [len(values) for values in histogram_values] == [3, 3]
+    assert histogram_values[0] == pytest.approx([1 / 3, 1 / 2, 1 / 2])
+    assert histogram_values[1] == pytest.approx([1 / 3, 0.0, 0.0])
+    assert [call[3] for call in tracker.scalar_calls if call[1] == "Train NDCG@1"] == [1]
+    assert not any(call[3] == 0 for call in tracker.scalar_calls)
     assert [call["batch_size"] for call in loader_calls] == [2, 3, 3]
     assert [call["shuffle"] for call in loader_calls] == [True, False, False]
     assert [call["resample_candidates_each_epoch"] for call in loader_calls] == [

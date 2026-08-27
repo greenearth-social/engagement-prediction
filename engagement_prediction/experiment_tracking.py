@@ -41,11 +41,16 @@ class ExperimentTracker(Protocol):
         self,
         title: str,
         series: str,
-        values: List[Union[int, float]],
+        values: Union[
+            List[Union[int, float]],
+            List[List[Union[int, float]]],
+        ],
         iteration: int = 0,
         xlabels: Optional[List[str]] = None,
         xaxis: Optional[str] = None,
         yaxis: Optional[str] = None,
+        labels: Optional[List[str]] = None,
+        mode: Optional[str] = None,
     ) -> None:
         ...
 
@@ -87,11 +92,16 @@ class NoOpExperimentTracker:
         self,
         title: str,
         series: str,
-        values: List[Union[int, float]],
+        values: Union[
+            List[Union[int, float]],
+            List[List[Union[int, float]]],
+        ],
         iteration: int = 0,
         xlabels: Optional[List[str]] = None,
         xaxis: Optional[str] = None,
         yaxis: Optional[str] = None,
+        labels: Optional[List[str]] = None,
+        mode: Optional[str] = None,
     ) -> None:
         return None
 
@@ -298,29 +308,34 @@ class ClearMLExperimentTracker:
         self,
         title: str,
         series: str,
-        values: List[Union[int, float]],
+        values: Union[
+            List[Union[int, float]],
+            List[List[Union[int, float]]],
+        ],
         iteration: int = 0,
         xlabels: Optional[List[str]] = None,
         xaxis: Optional[str] = None,
         yaxis: Optional[str] = None,
+        labels: Optional[List[str]] = None,
+        mode: Optional[str] = None,
     ) -> None:
-        """Log a histogram to ClearML.
+        """Log precomputed histogram or categorical bar values to ClearML.
         
         Args:
             title: Plot title (shown in ClearML UI)
             series: Series name within the plot
-            values: Raw values to histogram
+            values: One value row, or multiple rows whose columns align with xlabels
             iteration: Iteration/step number
-            xlabels: Optional bin labels
+            xlabels: Optional labels for the value columns
             xaxis: X-axis label
             yaxis: Y-axis label
+            labels: Optional names for multiple value rows
+            mode: Optional ClearML bar display mode, such as "group"
         """
         import numpy as np
         
-        # Convert to numpy array for histogram computation
-        values_arr = np.array(values)
+        values_arr = np.asarray(values)
         
-        # Use ClearML's report_histogram which auto-bins
         self._logger.report_histogram(
             title=title,
             series=series,
@@ -329,6 +344,8 @@ class ClearMLExperimentTracker:
             xlabels=xlabels,
             xaxis=xaxis,
             yaxis=yaxis,
+            labels=labels,
+            mode=mode,
         )
 
     def log_plot(

@@ -665,6 +665,42 @@ def clearml_metric_label(metric_name: str) -> str:
     }.get(metric_name, metric_name.replace("_", " ").title())
 
 
+def log_random_baseline_histogram(
+    experiment_tracker: Optional[Any],
+    baseline_metrics: Dict[str, Dict[str, Any]],
+    metrics_top_ks: list[int],
+) -> None:
+    """Log one grouped all-query/zero-history random-baseline bar chart."""
+
+    if experiment_tracker is None:
+        return
+    if not metrics_top_ks:
+        raise ValueError("metrics_top_ks must contain at least one value")
+
+    primary_k = metrics_top_ks[0]
+    metric_name = f"ndcg@{primary_k}"
+    zero_history_metric_name = f"{ZERO_HISTORY_METRIC_PREFIX}{metric_name}"
+    split_names = ("train", "val", "val_unseen_users")
+    values = [
+        [float(baseline_metrics[split][metric_name]) for split in split_names],
+        [
+            float(baseline_metrics[split][zero_history_metric_name])
+            for split in split_names
+        ],
+    ]
+    experiment_tracker.log_histogram(
+        title=f"Random Baseline NDCG@{primary_k}",
+        series="Random Baseline",
+        values=values,
+        iteration=0,
+        xlabels=["Train", "Validation", "Validation Unseen Users"],
+        labels=["All observations", "Zero-history only"],
+        xaxis="Split",
+        yaxis=f"NDCG@{primary_k}",
+        mode="group",
+    )
+
+
 def log_final_classification_metrics(
     experiment_tracker: Optional[Any],
     split_metrics: Dict[str, Dict[str, Any]],

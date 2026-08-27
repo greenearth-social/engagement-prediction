@@ -19,6 +19,7 @@ from engagement_prediction.training.ranking import (
     empty_ndcg_metric_tensor_sums,
     finalize_rank_metrics,
     finalize_zero_history_rank_metrics,
+    log_random_baseline_histogram,
     log_zero_history_rank_metrics,
     ndcg_metric_tensor_sums_for_batch,
     topk_ranked_labels_for_scores,
@@ -86,7 +87,7 @@ def run_bst_listwise_epoch(
     metrics_top_ks: List[int],
     calc_baseline_metrics: bool,
     max_batches: Optional[int],
-) -> Tuple[float, Dict[str, Any], Dict[str, float]]:
+) -> Tuple[float, Dict[str, Any], Dict[str, Any]]:
     if train:
         if optimizer is None:
             raise ValueError("optimizer is required when train=True")
@@ -101,6 +102,15 @@ def run_bst_listwise_epoch(
         device=device,
     )
     baseline_metric_user_count = torch.zeros((), device=device, dtype=torch.int64)
+    baseline_zero_history_metric_sums = empty_ndcg_metric_tensor_sums(
+        metrics_top_ks,
+        device=device,
+    )
+    baseline_zero_history_metric_user_count = torch.zeros(
+        (),
+        device=device,
+        dtype=torch.int64,
+    )
     metric_sums = empty_ndcg_metric_tensor_sums(
         metrics_top_ks,
         device=device,
@@ -138,6 +148,18 @@ def run_bst_listwise_epoch(
                 baseline_metric_user_count.add_(baseline_batch_metric_user_count)
                 for key, value in baseline_batch_metric_sums.items():
                     baseline_metric_sums[key].add_(value)
+                (
+                    baseline_zero_history_batch_metric_sums,
+                    baseline_zero_history_batch_metric_user_count,
+                ) = calc_baseline_ndcg_tensor_sums_for_batch(
+                    labels[zero_history_mask],
+                    metrics_top_ks,
+                )
+                baseline_zero_history_metric_user_count.add_(
+                    baseline_zero_history_batch_metric_user_count
+                )
+                for key, value in baseline_zero_history_batch_metric_sums.items():
+                    baseline_zero_history_metric_sums[key].add_(value)
 
             top_ranked_labels = topk_ranked_labels_for_scores(
                 scores,
@@ -179,24 +201,38 @@ def run_bst_listwise_epoch(
         [
             loss_sum.to(dtype=torch.float64),
             baseline_metric_user_count.to(dtype=torch.float64),
+            baseline_zero_history_metric_user_count.to(dtype=torch.float64),
             metric_user_count.to(dtype=torch.float64),
             zero_history_metric_user_count.to(dtype=torch.float64),
             *(baseline_metric_sums[name] for name in metric_names),
+            *(baseline_zero_history_metric_sums[name] for name in metric_names),
             *(metric_sums[name] for name in metric_names),
             *(zero_history_metric_sums[name] for name in metric_names),
         ]
     ).cpu().tolist()
     loss = float(packed_statistics[0]) / max(batches, 1)
     baseline_metric_user_count_value = int(packed_statistics[1])
-    metric_user_count_value = int(packed_statistics[2])
-    zero_history_metric_user_count_value = int(packed_statistics[3])
-    cursor = 4
+    baseline_zero_history_metric_user_count_value = int(packed_statistics[2])
+    metric_user_count_value = int(packed_statistics[3])
+    zero_history_metric_user_count_value = int(packed_statistics[4])
+    cursor = 5
     baseline_metric_sums_value = dict(zip(metric_names, packed_statistics[cursor : cursor + len(metric_names)]))
+    cursor += len(metric_names)
+    baseline_zero_history_metric_sums_value = dict(
+        zip(metric_names, packed_statistics[cursor : cursor + len(metric_names)])
+    )
     cursor += len(metric_names)
     metric_sums_value = dict(zip(metric_names, packed_statistics[cursor : cursor + len(metric_names)]))
     cursor += len(metric_names)
     zero_history_metric_sums_value = dict(zip(metric_names, packed_statistics[cursor : cursor + len(metric_names)]))
     baseline_metrics = finalize_rank_metrics(baseline_metric_sums_value, baseline_metric_user_count_value)
+    baseline_metrics.update(
+        finalize_zero_history_rank_metrics(
+            baseline_zero_history_metric_sums_value,
+            baseline_zero_history_metric_user_count_value,
+        )
+    )
+    baseline_metrics["rank_metric_user_count"] = baseline_metric_user_count_value
     metrics: Dict[str, Any] = finalize_rank_metrics(metric_sums_value, metric_user_count_value)
     metrics.update(
         finalize_zero_history_rank_metrics(
@@ -270,10 +306,6 @@ def _log_bst_listwise_epoch_metrics(
     train_metrics: Dict[str, Any],
     val_metrics: Dict[str, Any],
     val_unseen_metrics: Dict[str, Any],
-    train_baseline_metrics: Dict[str, float],
-    val_baseline_metrics: Dict[str, float],
-    val_unseen_baseline_metrics: Dict[str, float],
-    calc_baseline_metrics: bool,
     metrics_top_ks: List[int],
     primary_metric_name: str,
 ) -> None:
@@ -282,15 +314,6 @@ def _log_bst_listwise_epoch_metrics(
     primary_metric_key = primary_metric_name.replace("val_unseen_", "", 1)
     primary_title = f"Primary Ranking Metric ({primary_metric_key})"
     primary_series = f"Validation Unseen Users {primary_metric_key}"
-    if calc_baseline_metrics:
-        baseline_primary_metric = val_unseen_baseline_metrics.get(primary_metric_key)
-        if baseline_primary_metric is not None:
-            experiment_tracker.log_scalar(
-                primary_title,
-                primary_series,
-                float(baseline_primary_metric),
-                0,
-            )
     primary_metric_value = val_unseen_metrics.get(primary_metric_key)
     if primary_metric_value is not None:
         experiment_tracker.log_scalar(
@@ -302,18 +325,6 @@ def _log_bst_listwise_epoch_metrics(
     for k in metrics_top_ks:
         metric_name = f"ndcg@{k}"
         metric_label = f"NDCG@{k}"
-        if calc_baseline_metrics:
-            for split_label, metrics in (
-                ("Train", train_baseline_metrics),
-                ("Validation", val_baseline_metrics),
-                ("Validation Unseen Users", val_unseen_baseline_metrics),
-            ):
-                experiment_tracker.log_scalar(
-                    metric_label,
-                    f"{split_label} {metric_label}",
-                    float(metrics[metric_name]),
-                    0,
-                )
         for split_label, metrics in (
             ("Train", train_metrics),
             ("Validation", val_metrics),
@@ -415,7 +426,7 @@ def train_bst_ranker_model(
     best_epoch: Optional[int] = None
     epochs_completed = 0
     stopped_early = False
-    baseline_metrics: Dict[str, Dict[str, float]] = {}
+    baseline_metrics: Dict[str, Dict[str, Any]] = {}
 
     for epoch in tqdm(range(epochs), desc="Training epochs", disable=disable_progress):
         calc_baseline_metrics = epoch == 0
@@ -458,12 +469,18 @@ def train_bst_ranker_model(
             calc_baseline_metrics=calc_baseline_metrics,
             max_batches=None,
         )
+
         if calc_baseline_metrics:
             baseline_metrics = {
                 "train": dict(train_baseline_metrics),
                 "val": dict(val_baseline_metrics),
                 "val_unseen_users": dict(val_unseen_baseline_metrics),
             }
+            log_random_baseline_histogram(
+                experiment_tracker,
+                baseline_metrics,
+                metrics_top_ks,
+            )
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
@@ -485,10 +502,6 @@ def train_bst_ranker_model(
             train_metrics,
             val_metrics,
             val_unseen_metrics,
-            train_baseline_metrics,
-            val_baseline_metrics,
-            val_unseen_baseline_metrics,
-            calc_baseline_metrics,
             metrics_top_ks,
             primary_metric_name,
         )

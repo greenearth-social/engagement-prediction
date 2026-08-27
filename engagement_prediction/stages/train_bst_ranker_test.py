@@ -23,11 +23,36 @@ class _RecordingTracker:
         self.id = task_id
         self.manifest_uploaded = manifest_uploaded
         self.scalar_calls = []
+        self.histogram_calls = []
         self.file_artifacts = []
         self.model_artifacts = []
 
     def log_scalar(self, title, series, value, iteration):
         self.scalar_calls.append((title, series, value, iteration))
+
+    def log_histogram(
+        self,
+        title,
+        series,
+        values,
+        iteration=0,
+        xlabels=None,
+        xaxis=None,
+        yaxis=None,
+        labels=None,
+        mode=None,
+    ):
+        self.histogram_calls.append({
+            "title": title,
+            "series": series,
+            "values": values,
+            "iteration": iteration,
+            "xlabels": xlabels,
+            "xaxis": xaxis,
+            "yaxis": yaxis,
+            "labels": labels,
+            "mode": mode,
+        })
 
     def log_file_artifact(self, name, path):
         self.file_artifacts.append((name, Path(path)))
@@ -344,6 +369,23 @@ def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
             batch["candidate_prior_cumulative_likes"],
         )
     assert torch.equal(scores_a, scores_b)
+    assert len(tracker.histogram_calls) == 1
+    histogram_call = dict(tracker.histogram_calls[0])
+    histogram_values = histogram_call.pop("values")
+    assert histogram_call == {
+        "title": "Random Baseline NDCG@1",
+        "series": "Random Baseline",
+        "iteration": 0,
+        "xlabels": ["Train", "Validation", "Validation Unseen Users"],
+        "xaxis": "Split",
+        "yaxis": "NDCG@1",
+        "labels": ["All observations", "Zero-history only"],
+        "mode": "group",
+    }
+    assert len(histogram_values) == 2
+    assert [len(values) for values in histogram_values] == [3, 3]
+    assert histogram_values[0] == pytest.approx([1 / 3, 1 / 2, 1 / 2])
+    assert histogram_values[1] == pytest.approx([1 / 3, 0.0, 0.0])
     for series in (
         "Train NDCG@1",
         "Validation NDCG@1",
@@ -354,7 +396,8 @@ def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
             for call in tracker.scalar_calls
             if call[0] == "NDCG@1" and call[1] == series
         ]
-        assert [call[3] for call in calls] == [0, 1]
+        assert [call[3] for call in calls] == [1]
+    assert not any(call[3] == 0 for call in tracker.scalar_calls)
     assert not any(
         "MAP" in title or "MAP" in series
         for title, series, _, _ in tracker.scalar_calls
