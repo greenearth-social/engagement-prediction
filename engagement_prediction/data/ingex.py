@@ -50,7 +50,7 @@ def _list_ingex_parquet_files(
     end: Optional[datetime],
 ) -> Tuple[list[str], list[datetime]]:
     matches: list[tuple[datetime, str]] = []
-    for blob in client.list_blobs(gcs_bucket):
+    for blob in client.list_blobs(gcs_bucket, prefix=f"{blob_prefix}_"):
         timestamp = parse_ingex_blob_timestamp(blob.name, blob_prefix)
         if timestamp is None:
             continue

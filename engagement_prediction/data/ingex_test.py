@@ -9,8 +9,9 @@ class _FakeClient:
     def __init__(self, names):
         self._blobs = [SimpleNamespace(name=name) for name in names]
 
-    def list_blobs(self, bucket):
+    def list_blobs(self, bucket, *, prefix):
         assert bucket == "test-bucket"
+        assert prefix == "bsky_likes_"
         return self._blobs
 
 
