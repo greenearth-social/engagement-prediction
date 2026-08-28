@@ -16,9 +16,7 @@ from engagement_prediction.data.author_indices import (
     AUTHOR_PAD_IDX,
     AUTHOR_UNK_IDX,
 )
-from engagement_prediction.training.bst_publication import (
-    RANKER_AUTHOR_MAP_SCHEMA,
-)
+from engagement_prediction.training.model_artifacts import AUTHOR_MAP_SCHEMA
 
 
 AUTHOR_INDEX_DTYPE = np.dtype("<u4")
@@ -56,7 +54,7 @@ def load_model_author_map(
         author_map = pl.read_parquet(path)
     except Exception as exc:
         raise ValueError(f"Could not read model author map {path}: {exc}") from exc
-    expected_schema = pl.Schema(RANKER_AUTHOR_MAP_SCHEMA)
+    expected_schema = pl.Schema(AUTHOR_MAP_SCHEMA)
     if allow_extra_columns:
         missing_columns = [
             column for column in expected_schema.names() if column not in author_map.columns
@@ -73,7 +71,7 @@ def load_model_author_map(
                 f"missing={missing_columns} invalid_types={invalid_types}"
             )
     elif author_map.schema != expected_schema or author_map.columns != list(
-        RANKER_AUTHOR_MAP_SCHEMA
+        AUTHOR_MAP_SCHEMA
     ):
         raise ValueError(
             f"Model author map has an unexpected schema: {author_map.schema}"

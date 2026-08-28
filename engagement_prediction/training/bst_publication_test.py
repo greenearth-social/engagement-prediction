@@ -6,16 +6,10 @@ import json
 import logging
 from pathlib import Path
 
-import polars as pl
 import pytest
 
-from engagement_prediction.data.author_vocabulary import AUTHOR_VOCABULARY_SCHEMA
 from engagement_prediction.training import bst_publication
-from engagement_prediction.training.bst_publication import (
-    RANKER_AUTHOR_MAP_SCHEMA,
-    publish_ranker_to_tracker,
-    write_ranker_author_map,
-)
+from engagement_prediction.training.bst_publication import publish_ranker_to_tracker
 
 
 class _Tracker:
@@ -50,50 +44,6 @@ class _Tracker:
         if name == "author_idx_mapping":
             return self.author_uploaded
         return self.manifest_uploaded
-
-
-def _write_authors(path: Path) -> None:
-    path.mkdir()
-    pl.DataFrame({
-        "author_did": ["did:a", "did:b"],
-        "author_idx": [2, 3],
-        "training_feature_count": [50, 75],
-        "training_positive_count": [10, 25],
-        "training_history_count": [30, 25],
-        "training_negative_count": [10, 25],
-    }, schema=AUTHOR_VOCABULARY_SCHEMA).write_parquet(path / "part-00000.parquet")
-
-
-def test_write_ranker_author_map_publishes_minimal_dense_mapping(tmp_path):
-    authors_path = tmp_path / "authors"
-    _write_authors(authors_path)
-    output_path = tmp_path / "ranker_author_idx.parquet"
-
-    stats = write_ranker_author_map(
-        authors_path=authors_path,
-        output_path=output_path,
-        author_table_num_rows=4,
-    )
-
-    assert pl.read_parquet_schema(output_path) == pl.Schema(RANKER_AUTHOR_MAP_SCHEMA)
-    assert pl.read_parquet(output_path).to_dicts() == [
-        {"author_did": "did:a", "author_idx": 2},
-        {"author_did": "did:b", "author_idx": 3},
-    ]
-    assert stats["author_count"] == 2
-    assert not (tmp_path / "ranker_author_idx.parquet.partial").exists()
-
-
-def test_write_ranker_author_map_rejects_mismatched_table_size(tmp_path):
-    authors_path = tmp_path / "authors"
-    _write_authors(authors_path)
-
-    with pytest.raises(ValueError, match="does not match"):
-        write_ranker_author_map(
-            authors_path=authors_path,
-            output_path=tmp_path / "ranker_author_idx.parquet",
-            author_table_num_rows=5,
-        )
 
 
 def test_publish_ranker_creates_exact_manifest_after_complete_upload(tmp_path):
@@ -217,7 +167,7 @@ def test_publish_ranker_does_not_expose_manifest_after_local_write_failure(
 
     monkeypatch.setattr(
         bst_publication,
-        "_write_serving_manifest_atomically",
+        "write_json_atomically",
         fail_manifest_write,
     )
     result = publish_ranker_to_tracker(

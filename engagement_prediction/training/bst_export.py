@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from hashlib import sha256
 from pathlib import Path
 from typing import Any, Mapping
 
 import torch
 
 from engagement_prediction.models.bst_ranker import BSTRanker
+from engagement_prediction.training.model_artifacts import file_sha256
 
 
 _MODEL_TYPE = "bst-ranker"
@@ -236,14 +236,6 @@ def _validate_score_parity(
     }
 
 
-def _file_sha256(path: Path) -> str:
-    digest = sha256()
-    with Path(path).open("rb") as file_obj:
-        while chunk := file_obj.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def validate_bst_ranker_export(
     *,
     checkpoint_path: Path,
@@ -277,7 +269,7 @@ def validate_bst_ranker_export(
     return {
         "best_epoch": best_epoch,
         "size_bytes": scripted_model_path.stat().st_size,
-        "sha256": _file_sha256(scripted_model_path),
+        "sha256": file_sha256(scripted_model_path),
         "parity": parity,
     }
 

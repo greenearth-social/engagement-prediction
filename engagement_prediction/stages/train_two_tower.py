@@ -35,7 +35,10 @@ from engagement_prediction.training.two_tower_export import (
 )
 from engagement_prediction.training.two_tower_publication import (
     publish_two_tower_to_tracker,
-    write_two_tower_author_map,
+)
+from engagement_prediction.training.model_artifacts import (
+    write_author_map,
+    write_json_atomically,
 )
 from engagement_prediction.training.runtime import (
     clear_cuda_memory,
@@ -45,20 +48,6 @@ from engagement_prediction.training.runtime import (
 
 
 STAGE_FOLDER = "08_train_two_tower"
-
-
-def _write_json(path: Path, payload: Dict[str, Any]) -> None:
-    """Write deterministic JSON without exposing a truncated final file."""
-
-    partial_path = path.with_name(f"{path.name}.partial")
-    try:
-        partial_path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
-        )
-        partial_path.replace(path)
-    except Exception:
-        partial_path.unlink(missing_ok=True)
-        raise
 
 
 def _load_stage7_summary(stage7_dir: Path) -> Dict[str, Any]:
@@ -354,8 +343,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     }
     model_config_path = out_dir / "model_config.json"
     training_config_path = out_dir / "training_config.json"
-    _write_json(model_config_path, model_config)
-    _write_json(training_config_path, training_config)
+    write_json_atomically(model_config_path, model_config)
+    write_json_atomically(training_config_path, training_config)
 
     authors_source_path = bundle_path / "authors"
     authors_path = out_dir / "authors"
@@ -454,7 +443,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         )
 
     author_map_path = out_dir / "two_tower_author_idx.parquet"
-    author_map_stats = write_two_tower_author_map(
+    author_map_stats = write_author_map(
         authors_path=authors_path,
         output_path=author_map_path,
         author_table_num_rows=author_table_num_rows,
@@ -527,7 +516,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "runtime_seconds": runtime_seconds,
     }
     training_results_path = out_dir / "training_results.json"
-    _write_json(training_results_path, result_payload)
+    write_json_atomically(training_results_path, result_payload)
 
     summary_path = out_dir / "summary.json"
     summary = {
@@ -570,7 +559,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "clearml_publication": clearml_publication,
         "runtime_seconds": runtime_seconds,
     }
-    _write_json(summary_path, summary)
+    write_json_atomically(summary_path, summary)
 
     primary_key = f"ndcg@{metrics_top_ks[0]}"
     stage_info_path = out_dir / "stage_info.txt"

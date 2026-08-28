@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from hashlib import sha256
 import json
 import math
 from pathlib import Path
@@ -20,6 +19,7 @@ from engagement_prediction.data.training_index import (
     validate_loader_index,
 )
 from engagement_prediction.evaluation.author_mapping import validate_model_author_map
+from engagement_prediction.training.model_artifacts import file_sha256
 
 
 BST_MODEL_TYPE = "bst-ranker"
@@ -191,14 +191,6 @@ def _require_nonempty_string(value: Any, *, description: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{description} must be a non-empty string")
     return value
-
-
-def _file_sha256(path: Path) -> str:
-    digest = sha256()
-    with path.open("rb") as file_obj:
-        while chunk := file_obj.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _validate_torchscript_method(
@@ -480,7 +472,7 @@ def _resolve_canonical_model_artifact(
         model_config=model_config,
         training_config=training_config,
         script_paths={key: path.resolve() for key, path in script_paths.items()},
-        script_sha256={key: _file_sha256(path) for key, path in script_paths.items()},
+        script_sha256={key: file_sha256(path) for key, path in script_paths.items()},
         author_map_path=author_map_path.resolve(),
         author_map_stats=author_map_stats,
         author_map_allow_extra_columns=False,
@@ -776,7 +768,7 @@ def _resolve_legacy_bst_artifact(
         model_config=model_config,
         training_config=training_config,
         script_paths={"ranker": ranker_path.resolve()},
-        script_sha256={"ranker": _file_sha256(ranker_path)},
+        script_sha256={"ranker": file_sha256(ranker_path)},
         author_map_path=author_map_path,
         author_map_stats=author_map_stats,
         author_map_allow_extra_columns=True,

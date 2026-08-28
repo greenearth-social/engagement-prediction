@@ -2,40 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Any, Dict
 
-from engagement_prediction.training.bst_publication import write_ranker_author_map
-
-
-def write_two_tower_author_map(
-    *,
-    authors_path: Path,
-    output_path: Path,
-    author_table_num_rows: int,
-) -> Dict[str, int]:
-    """Publish the same two-column PAD/UNK-aware author contract as serving."""
-
-    return write_ranker_author_map(
-        authors_path=authors_path,
-        output_path=output_path,
-        author_table_num_rows=author_table_num_rows,
-    )
-
-
-def _write_serving_manifest_atomically(
-    manifest_path: Path,
-    manifest: Dict[str, Any],
-) -> None:
-    partial_path = manifest_path.with_name(f"{manifest_path.name}.partial")
-    try:
-        partial_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-        partial_path.replace(manifest_path)
-    except Exception:
-        partial_path.unlink(missing_ok=True)
-        raise
+from engagement_prediction.training.model_artifacts import write_json_atomically
 
 
 def publish_two_tower_to_tracker(
@@ -143,7 +114,7 @@ def publish_two_tower_to_tracker(
         "embedding_space_id": result["post_tower_clearml_model_id"],
     }
     try:
-        _write_serving_manifest_atomically(Path(manifest_path), manifest)
+        write_json_atomically(Path(manifest_path), manifest)
         result["manifest_created"] = True
         result["manifest_path"] = str(manifest_path)
     except Exception as exc:

@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from hashlib import sha256
 from pathlib import Path
 from typing import Any, Mapping
 
 import torch
 
 from engagement_prediction.models.two_tower import TwoTowerModel
+from engagement_prediction.training.model_artifacts import file_sha256
 
 
 _MODEL_TYPE = "two-tower"
@@ -233,14 +233,6 @@ def _validate_parity(
     return {"case_count": len(cases), "all_exact": True, "cases": cases}
 
 
-def _file_sha256(path: Path) -> str:
-    digest = sha256()
-    with Path(path).open("rb") as file_obj:
-        while chunk := file_obj.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _replace_tower_pair_with_rollback(
     *,
     user_partial_path: Path,
@@ -335,11 +327,11 @@ def validate_two_tower_export(
         "parity": parity,
         "user_tower": {
             "size_bytes": user_tower_path.stat().st_size,
-            "sha256": _file_sha256(user_tower_path),
+            "sha256": file_sha256(user_tower_path),
         },
         "post_tower": {
             "size_bytes": post_tower_path.stat().st_size,
-            "sha256": _file_sha256(post_tower_path),
+            "sha256": file_sha256(post_tower_path),
         },
     }
 
