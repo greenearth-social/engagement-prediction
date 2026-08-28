@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-from engagement_prediction.data import ingex
+from engagement_prediction.data import ingex, timestamps
 
 
 @dataclass(frozen=True)
@@ -52,10 +52,21 @@ def load_source_snapshot(
             f"Source manifest {manifest_path} must use {expected_blob_prefix}, "
             f"found {blob_prefix!r}"
         )
-    start = ingex.parse_utc_datetime(manifest.get("start"), field_name="posts_start")
-    end = ingex.parse_utc_datetime(manifest.get("end"), field_name="posts_end")
-    if start is None or end is None or end <= start:
+    start = timestamps.parse_utc_datetime(manifest.get("start"), field_name="posts_start")
+    end = timestamps.parse_utc_datetime(manifest.get("end"), field_name="posts_end")
+    if start is None or end is None:
         raise ValueError(f"Source manifest {manifest_path} has invalid source bounds")
+    try:
+        timestamps.validate_half_open_utc_window(
+            start=start,
+            end=end,
+            start_field_name="posts_start",
+            end_field_name="posts_end",
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"Source manifest {manifest_path} has invalid source bounds: {exc}"
+        ) from exc
     gcs_bucket = manifest.get("gcs_bucket")
     if not isinstance(gcs_bucket, str) or not gcs_bucket:
         raise ValueError(f"Source manifest {manifest_path} has no GCS bucket")

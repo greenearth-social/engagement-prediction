@@ -17,7 +17,7 @@ import zlib
 import numpy as np
 import polars as pl
 
-from engagement_prediction.data import post_selection
+from engagement_prediction.data import post_selection, timestamps
 from engagement_prediction.data.author_indices import AUTHOR_PAD_IDX, AUTHOR_UNK_IDX
 from engagement_prediction.data.embeddings import get_expanded_embedding_vector
 
@@ -175,7 +175,7 @@ def normalize_embedding_source_rows(
         )
     normalized = source_lf.select(
         pl.col("at_uri").cast(pl.String).alias("subject_uri"),
-        post_selection._utc_timestamp_expr(  # canonical Stage 3 timestamp handling
+        timestamps.utc_timestamp_expr(
             source_lf,
             "record_created_at",
         ).alias("post_created_at"),
@@ -187,8 +187,11 @@ def normalize_embedding_source_rows(
         pl.col("subject_uri").is_not_null()
         & (pl.col("subject_uri").str.len_chars() > 0)
         & pl.col("post_created_at").is_not_null()
-        & (pl.col("post_created_at") >= pl.lit(posts_start))
-        & (pl.col("post_created_at") < pl.lit(posts_end))
+        & timestamps.half_open_window_expr(
+            "post_created_at",
+            start=posts_start,
+            end=posts_end,
+        )
         & pl.col("author_did").is_not_null()
         & (pl.col("author_did").str.len_chars() > 0)
     )

@@ -15,22 +15,6 @@ TIMESTAMP_SUFFIX_PATTERN = r"_(\d{8})_(\d{6})\.parquet$"
 SOURCE_MANIFEST_VERSION = 1
 
 
-def parse_utc_datetime(value: Optional[str], *, field_name: str) -> Optional[datetime]:
-    """Parse a CLI timestamp and normalize it to UTC."""
-    if value is None:
-        return None
-    raw = str(value).strip()
-    if not raw:
-        raise ValueError(f"{field_name} must not be empty")
-    try:
-        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ValueError(f"Invalid {field_name} timestamp: {value!r}") from exc
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
 def parse_ingex_blob_timestamp(blob_name: str, blob_prefix: str) -> Optional[datetime]:
     """Parse the UTC timestamp from an Ingex export filename."""
     pattern = re.compile(re.escape(blob_prefix) + TIMESTAMP_SUFFIX_PATTERN)

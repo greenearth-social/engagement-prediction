@@ -13,8 +13,9 @@ from pathlib import Path
 
 import polars as pl
 
+from engagement_prediction.data import timestamps
 
-UTC_DATETIME = pl.Datetime("us", "UTC")
+UTC_DATETIME = timestamps.UTC_DATETIME
 POST_METADATA_COLUMNS = ["subject_uri", "post_created_at", "author_did", "is_reply"]
 POST_METADATA_SCHEMA = {
     "subject_uri": pl.String,
@@ -52,29 +53,6 @@ def uri_partition_expr(partition_count: int) -> pl.Expr:
     )
 
 
-def _utc_timestamp_expr(lf: pl.LazyFrame, column: str) -> pl.Expr:
-    """Normalize one string or datetime source column to UTC."""
-
-    schema = lf.collect_schema()
-    if column not in schema:
-        raise ValueError(f"Input data is missing required column {column!r}")
-    dtype = schema[column]
-    value = pl.col(column)
-    if dtype == pl.String:
-        has_timezone = value.str.contains(r"(Z|[+-]\d{2}:?\d{2})$")
-        normalized = pl.when(has_timezone).then(value).otherwise(value + pl.lit("Z"))
-        return normalized.str.to_datetime(
-            format="%Y-%m-%dT%H:%M:%S%.f%#z",
-            time_zone="UTC",
-            strict=False,
-        )
-    if isinstance(dtype, pl.Datetime):
-        if dtype.time_zone is None:
-            return value.dt.replace_time_zone("UTC")
-        return value.dt.convert_time_zone("UTC")
-    raise ValueError(f"{column} must be a string or datetime column, found {dtype}")
-
-
 def normalize_source_records(
     source_lf: pl.LazyFrame,
     *,
@@ -100,7 +78,10 @@ def normalize_source_records(
         )
     normalized = source_lf.select(
         pl.col("at_uri").cast(pl.String).alias("subject_uri"),
-        _utc_timestamp_expr(source_lf, "record_created_at").alias("post_created_at"),
+        timestamps.utc_timestamp_expr(
+            source_lf,
+            "record_created_at",
+        ).alias("post_created_at"),
         pl.col("did").cast(pl.String).alias("author_did"),
         pl.lit(is_reply, dtype=pl.Boolean).alias("is_reply"),
         *(pl.col(column) for column in passthrough_columns),
@@ -110,8 +91,11 @@ def normalize_source_records(
             pl.col("subject_uri").is_not_null()
             & (pl.col("subject_uri").str.len_chars() > 0)
             & pl.col("post_created_at").is_not_null()
-            & (pl.col("post_created_at") >= pl.lit(posts_start))
-            & (pl.col("post_created_at") < pl.lit(posts_end))
+            & timestamps.half_open_window_expr(
+                "post_created_at",
+                start=posts_start,
+                end=posts_end,
+            )
             & pl.col("author_did").is_not_null()
             & (pl.col("author_did").str.len_chars() > 0)
         ).alias("_post_row_valid")

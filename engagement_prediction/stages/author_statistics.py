@@ -17,6 +17,7 @@ from engagement_prediction.data import author_statistics
 from engagement_prediction.data import author_statistics_artifacts
 from engagement_prediction.data import ingex
 from engagement_prediction.data import source_manifests
+from engagement_prediction.data import timestamps
 from engagement_prediction.data.parquet import find_artifact_path
 from engagement_prediction.data.source_metadata_artifacts import (
     SourceMetadataArtifact,
@@ -51,18 +52,12 @@ def build_config(
         raise ValueError("author_statistics_partition_count must be positive")
     if source_metadata_partition_count <= 0:
         raise ValueError("Stage 00 source_metadata_partition_count must be positive")
-    if support_end <= support_start:
-        raise ValueError("Author-statistics support_end must be after support_start")
-    for field_name, value in (
-        ("support_start", support_start),
-        ("support_end", support_end),
-    ):
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError(f"{field_name} must be timezone-aware UTC")
-        if value.utcoffset().total_seconds() != 0:
-            raise ValueError(f"{field_name} must use UTC")
-        if value.minute or value.second or value.microsecond:
-            raise ValueError(f"{field_name} must be aligned to an hour")
+    timestamps.validate_half_open_utc_window(
+        start=support_start,
+        end=support_end,
+        start_field_name="support_start",
+        end_field_name="support_end",
+    )
     return AuthorStatisticsConfig(
         support_start=support_start,
         support_end=support_end,
@@ -81,11 +76,11 @@ def _load_support_window(query_selection_dir: Path) -> tuple[datetime, datetime]
         )
     try:
         summary = json.loads(summary_path.read_text())
-        support_start = ingex.parse_utc_datetime(
+        support_start = timestamps.parse_utc_datetime(
             summary["posts_start"],
             field_name="posts_start",
         )
-        support_end = ingex.parse_utc_datetime(
+        support_end = timestamps.parse_utc_datetime(
             summary["parameters"]["val_start"],
             field_name="val_start",
         )

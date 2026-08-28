@@ -21,7 +21,7 @@ import shutil
 import time
 from typing import Any, Dict
 
-from engagement_prediction.data import ingex, source_metadata_artifacts
+from engagement_prediction.data import ingex, source_metadata_artifacts, timestamps
 from engagement_prediction.pipeline.core import Context
 from engagement_prediction.pipeline.logging import get_stage_logger
 
@@ -40,15 +40,16 @@ class SourceMetadataConfig:
 def build_config(args: argparse.Namespace) -> SourceMetadataConfig:
     """Parse the common source window and Stage 00 physical settings."""
 
-    posts_start = ingex.parse_utc_datetime(args.posts_start, field_name="posts_start")
-    posts_end = ingex.parse_utc_datetime(args.posts_end, field_name="posts_end")
+    posts_start = timestamps.parse_utc_datetime(args.posts_start, field_name="posts_start")
+    posts_end = timestamps.parse_utc_datetime(args.posts_end, field_name="posts_end")
     if posts_start is None or posts_end is None:
         raise ValueError("posts_start and posts_end are required for source_metadata")
-    for field_name, value in (("posts_start", posts_start), ("posts_end", posts_end)):
-        if value.minute or value.second or value.microsecond:
-            raise ValueError(f"{field_name} must be aligned to the start of an hour")
-    if posts_end <= posts_start:
-        raise ValueError("posts_end must be after posts_start")
+    timestamps.validate_half_open_utc_window(
+        start=posts_start,
+        end=posts_end,
+        start_field_name="posts_start",
+        end_field_name="posts_end",
+    )
     partition_count = int(args.source_metadata_partition_count)
     if partition_count <= 0:
         raise ValueError("source_metadata_partition_count must be positive")

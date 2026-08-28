@@ -18,6 +18,7 @@ from engagement_prediction.data import (
     likes,
     query_selection_artifacts,
     source_metadata_artifacts,
+    timestamps,
 )
 from engagement_prediction.pipeline.core import Context
 from engagement_prediction.pipeline.lineage import resolve_recorded_stage_lineage
@@ -55,15 +56,6 @@ class QuerySelectionConfig:
     holdout_end: Optional[datetime]
 
 
-def _validate_hour_aligned(value: Optional[datetime], field_name: str) -> None:
-    """Reject boundaries that cannot be represented as query-hour buckets."""
-
-    if value is None:
-        return
-    if value.minute != 0 or value.second != 0 or value.microsecond != 0:
-        raise ValueError(f"{field_name} must be aligned to the start of an hour")
-
-
 def _optional_nonnegative_int(value: Any, field_name: str) -> Optional[int]:
     """Parse an optional query budget while preserving ``None`` as unbounded."""
 
@@ -78,27 +70,34 @@ def _optional_nonnegative_int(value: Any, field_name: str) -> Optional[int]:
 def build_config(args: argparse.Namespace) -> QuerySelectionConfig:
     """Parse CLI values and validate the common source and target windows."""
 
-    posts_start = ingex.parse_utc_datetime(args.posts_start, field_name="posts_start")
-    posts_end = ingex.parse_utc_datetime(args.posts_end, field_name="posts_end")
-    train_start = ingex.parse_utc_datetime(args.train_start, field_name="train_start")
-    val_start = ingex.parse_utc_datetime(args.val_start, field_name="val_start")
-    holdout_start = ingex.parse_utc_datetime(args.holdout_start, field_name="holdout_start")
-    holdout_end = ingex.parse_utc_datetime(args.holdout_end, field_name="holdout_end")
+    posts_start = timestamps.parse_utc_datetime(args.posts_start, field_name="posts_start")
+    posts_end = timestamps.parse_utc_datetime(args.posts_end, field_name="posts_end")
+    train_start = timestamps.parse_utc_datetime(args.train_start, field_name="train_start")
+    val_start = timestamps.parse_utc_datetime(args.val_start, field_name="val_start")
+    holdout_start = timestamps.parse_utc_datetime(
+        args.holdout_start,
+        field_name="holdout_start",
+    )
+    holdout_end = timestamps.parse_utc_datetime(
+        args.holdout_end,
+        field_name="holdout_end",
+    )
 
     if posts_start is None or posts_end is None:
         raise ValueError("posts_start and posts_end are required for query_selection")
+    timestamps.validate_half_open_utc_window(
+        start=posts_start,
+        end=posts_end,
+        start_field_name="posts_start",
+        end_field_name="posts_end",
+    )
     for field_name, value in (
-        ("posts_start", posts_start),
-        ("posts_end", posts_end),
         ("train_start", train_start),
         ("val_start", val_start),
         ("holdout_start", holdout_start),
         ("holdout_end", holdout_end),
     ):
-        _validate_hour_aligned(value, field_name)
-
-    if posts_end <= posts_start:
-        raise ValueError("posts_end must be after posts_start")
+        timestamps.validate_utc_hour_aligned(value, field_name=field_name)
     if train_start is None:
         raise ValueError("train_start is required")
     if train_start < posts_start:

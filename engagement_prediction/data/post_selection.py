@@ -44,7 +44,6 @@ def random_candidate_expr(fraction: float, random_seed: int) -> pl.Expr:
     return bucket < pl.lit(selected_bucket_count, dtype=pl.UInt64)
 
 
-_utc_timestamp_expr = source_metadata._utc_timestamp_expr
 normalize_posts = source_metadata.normalize_source_records
 select_latest_post_rows = source_metadata.select_latest_metadata_rows
 

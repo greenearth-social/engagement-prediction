@@ -21,7 +21,7 @@ from typing import Any, Dict
 
 import polars as pl
 
-from engagement_prediction.data import ingex, likes, partition_workers
+from engagement_prediction.data import ingex, likes, partition_workers, source_manifests
 from engagement_prediction.data.parquet import (
     load_parquet_from_prior,
     sink_partitioned_parquet,
@@ -58,23 +58,6 @@ def build_config(args: argparse.Namespace) -> UserHistoryConfig:
         user_history_partition_count=user_history_partition_count,
         data_partition_worker_count=data_partition_worker_count,
     )
-
-
-def _find_like_sources_path(query_selection_dir: Path) -> Path:
-    """Locate the one immutable like-source snapshot recorded by Stage 1."""
-
-    candidates = sorted(query_selection_dir.glob("like_sources_*.json"))
-    if not candidates:
-        raise FileNotFoundError(
-            "Stage 2 requires like_sources_*.json from query_selection. "
-            "Rerun Stage 1 with the current query-selection implementation."
-        )
-    if len(candidates) > 1:
-        raise ValueError(
-            f"Expected one like_sources_*.json artifact under {query_selection_dir}, "
-            f"found {len(candidates)}"
-        )
-    return candidates[0]
 
 
 def _publish_partitioned_dataset(
@@ -347,18 +330,16 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     min_query_hour = query_summary.item(0, "min_query_hour")
     max_query_hour = query_summary.item(0, "max_query_hour")
 
-    like_sources_path = _find_like_sources_path(query_selection_dir)
-    source_manifest = ingex.load_source_manifest(like_sources_path)
-    if source_manifest.get("blob_prefix") != "bsky_likes":
-        raise ValueError("Stage 1 like source manifest must use bsky_likes")
-    source_like_paths = [entry["uri"] for entry in source_manifest["files"]]
-    source_start = ingex.parse_utc_datetime(source_manifest.get("start"), field_name="posts_start")
-    source_end = ingex.parse_utc_datetime(source_manifest.get("end"), field_name="posts_end")
-    if source_start is None or source_end is None or source_end <= source_start:
-        raise ValueError("Stage 1 like source manifest must contain an ordered source window")
-    for field_name, value in (("posts_start", source_start), ("posts_end", source_end)):
-        if value.minute or value.second or value.microsecond:
-            raise ValueError(f"Stage 1 like source {field_name} must be hour-aligned")
+    like_snapshot = source_manifests.load_source_snapshot(
+        query_selection_dir,
+        manifest_prefix="like_sources_",
+        expected_blob_prefix="bsky_likes",
+    )
+    like_sources_path = like_snapshot.path
+    source_manifest = like_snapshot.manifest
+    source_like_paths = list(like_snapshot.file_uris)
+    source_start = like_snapshot.start
+    source_end = like_snapshot.end
     if min_query_hour < source_start or max_query_hour >= source_end:
         raise ValueError("Stage 1 query hours must fall within its recorded like source window")
 

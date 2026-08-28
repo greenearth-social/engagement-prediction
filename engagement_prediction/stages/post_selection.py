@@ -13,7 +13,7 @@ from typing import Any, Dict
 
 import polars as pl
 
-from engagement_prediction.data import ingex, post_selection_artifacts
+from engagement_prediction.data import ingex, post_selection_artifacts, timestamps
 from engagement_prediction.data.parquet import find_artifact_path, scan_parquet_artifact
 from engagement_prediction.data.source_metadata_artifacts import (
     load_source_metadata_artifact,
@@ -35,22 +35,19 @@ class PostSelectionConfig:
     data_partition_worker_count: int
 
 
-def _require_hour_aligned(value: datetime, field_name: str) -> None:
-    if value.minute or value.second or value.microsecond:
-        raise ValueError(f"{field_name} must be aligned to the start of an hour")
-
-
 def build_config(args: argparse.Namespace) -> PostSelectionConfig:
     """Parse Stage 3 settings; the physical partition count belongs to Stage 00."""
 
-    posts_start = ingex.parse_utc_datetime(args.posts_start, field_name="posts_start")
-    posts_end = ingex.parse_utc_datetime(args.posts_end, field_name="posts_end")
+    posts_start = timestamps.parse_utc_datetime(args.posts_start, field_name="posts_start")
+    posts_end = timestamps.parse_utc_datetime(args.posts_end, field_name="posts_end")
     if posts_start is None or posts_end is None:
         raise ValueError("posts_start and posts_end are required for post_selection")
-    _require_hour_aligned(posts_start, "posts_start")
-    _require_hour_aligned(posts_end, "posts_end")
-    if posts_end <= posts_start:
-        raise ValueError("posts_end must be after posts_start")
+    timestamps.validate_half_open_utc_window(
+        start=posts_start,
+        end=posts_end,
+        start_field_name="posts_start",
+        end_field_name="posts_end",
+    )
     fraction = float(args.random_candidate_sampling_fraction)
     if not 0.0 <= fraction <= 1.0:
         raise ValueError("random_candidate_sampling_fraction must be between 0 and 1")
