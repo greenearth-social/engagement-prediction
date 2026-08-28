@@ -75,6 +75,45 @@ def test_popularity_is_strictly_prior_and_counts_duplicate_rows():
     ].to_list() == [0, 0, 0]
 
 
+def test_popularity_filters_non_candidate_likes_before_aggregation(monkeypatch):
+    created_at = datetime(2026, 1, 1, 10, 30, tzinfo=UTC)
+    likes = _likes({
+        "subject_uri": ["candidate", "candidate", "unrelated", "unrelated"],
+        "like_created_at": [
+            datetime(2026, 1, 1, 10, 40, tzinfo=UTC),
+            datetime(2026, 1, 1, 10, 40, tzinfo=UTC),
+            datetime(2026, 1, 1, 9, tzinfo=UTC),
+            datetime(2026, 1, 1, 9, tzinfo=UTC),
+        ],
+    })
+    aggregated_events = []
+    original_builder = candidate_popularity.like_counts.build_cumulative_like_counts
+
+    def record_aggregated_events(events_df):
+        aggregated_events.append(events_df.clone())
+        return original_builder(events_df)
+
+    monkeypatch.setattr(
+        candidate_popularity.like_counts,
+        "build_cumulative_like_counts",
+        record_aggregated_events,
+    )
+
+    result = candidate_popularity.build_candidate_hour_popularity(
+        _candidates({"subject_uri": ["candidate"], "post_created_at": [created_at]}),
+        likes,
+        _hours(datetime(2026, 1, 1, 11, tzinfo=UTC)),
+        max_candidate_age_hours=2,
+    )
+
+    assert len(aggregated_events) == 1
+    assert aggregated_events[0]["subject_uri"].to_list() == [
+        "candidate",
+        "candidate",
+    ]
+    assert result["prior_like_count"].to_list() == [2]
+
+
 def test_creation_hour_offsets_are_inclusive_then_exclusive():
     created_at = datetime(2026, 1, 1, 10, 59, tzinfo=UTC)
     creation_hour = created_at.replace(minute=0)

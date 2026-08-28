@@ -138,14 +138,39 @@ def build_candidate_hour_popularity(
     if eligible.is_empty():
         return empty_frame(CANDIDATE_HOUR_SCHEMA)
 
-    prior_counts = like_counts.calculate_prior_like_counts(eligible, likes_df)
-    return (
-        eligible.join(
-            prior_counts,
-            on=["subject_uri", "query_hour"],
-            how="left",
+    # Stage 4 already has the complete eligible candidate-hour frame, including
+    # post metadata. Filter before aggregation, then attach cumulative counts
+    # directly so we do not normalize/sort the large key frame and hash-join it
+    # back solely to recover ``post_created_at``.
+    matched_likes = likes_df.join(
+        candidates_df.select("subject_uri"), on="subject_uri", how="semi"
+    )
+    if matched_likes.is_empty():
+        return (
+            eligible.with_columns(
+                pl.lit(0, dtype=pl.UInt64).alias("prior_like_count")
+            )
+            .select(CANDIDATE_HOUR_COLUMNS)
+            .sort(["query_hour", "subject_uri"])
         )
-        .with_columns(pl.col("prior_like_count").fill_null(0).cast(pl.UInt64))
+
+    cumulative_likes = like_counts.build_cumulative_like_counts(matched_likes)
+    return (
+        eligible.join_asof(
+            cumulative_likes,
+            left_on="query_hour",
+            right_on="like_hour",
+            by="subject_uri",
+            strategy="backward",
+            allow_exact_matches=False,
+            check_sortedness=False,
+        )
+        .with_columns(
+            pl.col("cumulative_like_count")
+            .fill_null(0)
+            .cast(pl.UInt64)
+            .alias("prior_like_count")
+        )
         .select(CANDIDATE_HOUR_COLUMNS)
         .sort(["query_hour", "subject_uri"])
     )
