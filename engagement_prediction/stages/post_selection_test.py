@@ -190,18 +190,19 @@ def _context(tmp_path: Path, stage2_dir: Path) -> Context:
     return context
 
 
-def _args(random_fraction=1.0):
+def _args(random_fraction=1.0, worker_count=1):
     return SimpleNamespace(
         gcs_bucket="unused",
         posts_start="2026-01-01T00:00:00Z",
         posts_end="2026-01-02T00:00:00Z",
         random_candidate_sampling_fraction=random_fraction,
         random_seed=42,
+        data_partition_worker_count=worker_count,
         _argv=["--start-from", "post_selection", "--stop-after", "post_selection"],
     )
 
 
-def _run_stage(tmp_path, monkeypatch, partition_count=4):
+def _run_stage(tmp_path, monkeypatch, partition_count=4, worker_count=1):
     posts_source, replies_source = _write_sources(tmp_path)
     source_metadata_dir = _write_source_metadata_artifact(
         tmp_path,
@@ -220,7 +221,7 @@ def _run_stage(tmp_path, monkeypatch, partition_count=4):
     result = registry.run_stage(
         "post_selection",
         _context(tmp_path, stage2_dir),
-        _args(),
+        _args(worker_count=worker_count),
     )
     return (
         result,
@@ -297,6 +298,7 @@ def test_registry_run_publishes_root_and_reply_post_universe(tmp_path, monkeypat
     assert summary["required_post_stats"]["history_resolved_as_root_count"] == 2
     assert summary["required_post_stats"]["history_resolved_as_reply_count"] == 1
     assert summary["required_post_stats"]["root_reply_overlap_count"] == 1
+    assert summary["parameters"]["data_partition_worker_count"] == 1
     stage_info = (output_dir / "stage_info.txt").read_text()
     assert "source_metadata_partition_count: 4" in stage_info
     stage_log = (output_dir / "stage.log").read_text()
@@ -316,6 +318,34 @@ def test_logical_output_is_partition_count_independent(tmp_path, monkeypatch):
         first_df = scan_parquet_artifact(Path(first["artifacts"][artifact])).collect()
         second_df = scan_parquet_artifact(Path(second["artifacts"][artifact])).collect()
         assert first_df.sort(first_df.columns).equals(second_df.sort(second_df.columns))
+
+
+def test_parallel_partition_workers_preserve_logical_output(tmp_path, monkeypatch):
+    serial = _run_stage(
+        tmp_path / "serial", monkeypatch, partition_count=4, worker_count=1
+    )[0]
+    parallel = _run_stage(
+        tmp_path / "parallel", monkeypatch, partition_count=4, worker_count=2
+    )[0]
+
+    for artifact in (
+        "posts_path",
+        "required_posts_path",
+        "candidate_sources_path",
+        "missing_required_posts_path",
+    ):
+        serial_df = scan_parquet_artifact(Path(serial["artifacts"][artifact])).collect()
+        parallel_df = scan_parquet_artifact(Path(parallel["artifacts"][artifact])).collect()
+        assert serial_df.sort(serial_df.columns).equals(
+            parallel_df.sort(parallel_df.columns)
+        )
+    summary = json.loads((Path(parallel["output_dir"]) / "summary.json").read_text())
+    assert summary["parameters"]["data_partition_worker_count"] == 2
+    assert summary["partition_processing"]["partition_worker_count"] == 2
+    assert [
+        row["partition_id"]
+        for row in summary["partition_processing"]["partition_stats"]
+    ] == [0, 1, 2, 3]
 
 
 def test_reply_only_positive_fails(tmp_path, monkeypatch):
@@ -351,8 +381,12 @@ def test_missing_positive_fails(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="absent from the exact root snapshot"):
         registry.run_stage(
-            "post_selection", _context(tmp_path, stage2_dir), _args()
+            "post_selection", _context(tmp_path, stage2_dir), _args(worker_count=2)
         )
+
+    stage3_dir = next((tmp_path / "artifacts" / "03_post_selection").iterdir())
+    assert list(stage3_dir.glob("post_universe_*.partial"))
+    assert not (stage3_dir / "manifest.json").exists()
 
 
 def test_failed_partition_leaves_partial_bundle_and_no_manifest(tmp_path, monkeypatch):
@@ -391,4 +425,10 @@ def test_config_validation(field, value):
     args = _args()
     setattr(args, field, value)
     with pytest.raises(ValueError, match=field):
+        stage.build_config(args)
+
+
+def test_worker_count_must_be_positive():
+    args = _args(worker_count=0)
+    with pytest.raises(ValueError, match="data_partition_worker_count"):
         stage.build_config(args)

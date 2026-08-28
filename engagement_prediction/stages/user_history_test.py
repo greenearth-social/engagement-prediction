@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -97,10 +98,11 @@ def _context(tmp_path: Path, stage1_dir: Path) -> Context:
     return context
 
 
-def _args(partition_count=4):
+def _args(partition_count=4, worker_count=1):
     return SimpleNamespace(
         max_history_posts_per_query=64,
         user_history_partition_count=partition_count,
+        data_partition_worker_count=worker_count,
         _argv=["--start-from", "user_history", "--stop-after", "user_history"],
     )
 
@@ -182,6 +184,32 @@ def test_logical_output_is_independent_of_stage_partition_count(tmp_path):
     assert first_history_post_uris.equals(second_history_post_uris)
 
 
+def test_parallel_partition_workers_preserve_logical_output(tmp_path):
+    stage1_dir, _ = _write_query_selection_artifact(tmp_path)
+    serial = registry.run_stage(
+        "user_history", _context(tmp_path, stage1_dir), _args(4, 1)
+    )
+    parallel = registry.run_stage(
+        "user_history", _context(tmp_path, stage1_dir), _args(4, 2)
+    )
+
+    for artifact, sort_columns in (
+        ("query_histories_path", ["query_hour", "did"]),
+        ("history_post_uris_path", ["subject_uri"]),
+    ):
+        serial_df = scan_parquet_artifact(Path(serial["artifacts"][artifact])).collect()
+        parallel_df = scan_parquet_artifact(Path(parallel["artifacts"][artifact])).collect()
+        assert serial_df.sort(sort_columns).equals(parallel_df.sort(sort_columns))
+    summary = json.loads((Path(parallel["output_dir"]) / "summary.json").read_text())
+    assert summary["parameters"]["data_partition_worker_count"] == 2
+    assert summary["partition_processing"]["history_partition_worker_count"] == 2
+    assert summary["partition_processing"]["history_post_partition_worker_count"] == 2
+    assert [
+        row["partition_id"]
+        for row in summary["partition_processing"]["history_partition_stats"]
+    ] == [0, 2, 3]
+
+
 def test_history_post_uri_publication_deduplicates_across_user_partition_shards(tmp_path):
     shards_path = tmp_path / "shards.partial"
     shards_path.mkdir()
@@ -199,10 +227,12 @@ def test_history_post_uri_publication_deduplicates_across_user_partition_shards(
         routed_history_post_uris_path=routed_path,
         partial_output_path=output_path,
         partition_count=4,
+        worker_count=1,
+        logger=logging.getLogger("test-history-post-uri-dedup"),
     )
 
     actual = scan_parquet_artifact(output_path).collect().sort("subject_uri")
-    assert unique_count == 3
+    assert unique_count[:2] == (3, 1)
     assert actual["subject_uri"].to_list() == ["only-a", "only-b", "shared"]
     assert actual["subject_uri"].n_unique() == actual.height
 
@@ -217,10 +247,12 @@ def test_history_post_uri_publication_writes_schema_correct_empty_dataset(tmp_pa
         routed_history_post_uris_path=tmp_path / "routed.partial",
         partial_output_path=output_path,
         partition_count=4,
+        worker_count=1,
+        logger=logging.getLogger("test-empty-history-post-uri-dedup"),
     )
 
     actual = scan_parquet_artifact(output_path).collect()
-    assert unique_count == 0
+    assert unique_count == (0, 0, [])
     assert actual.is_empty()
     assert actual.schema == pl.Schema(stage.history_data.HISTORY_POST_URI_SCHEMA)
 
@@ -254,11 +286,19 @@ def test_config_requires_positive_limits():
         stage.build_config(SimpleNamespace(
             max_history_posts_per_query=0,
             user_history_partition_count=4,
+            data_partition_worker_count=1,
         ))
     with pytest.raises(ValueError, match="user_history_partition_count"):
         stage.build_config(SimpleNamespace(
             max_history_posts_per_query=64,
             user_history_partition_count=0,
+            data_partition_worker_count=1,
+        ))
+    with pytest.raises(ValueError, match="data_partition_worker_count"):
+        stage.build_config(SimpleNamespace(
+            max_history_posts_per_query=64,
+            user_history_partition_count=4,
+            data_partition_worker_count=0,
         ))
 
 

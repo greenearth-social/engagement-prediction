@@ -114,9 +114,12 @@ gcs_bucket: "greenearth-471522-ingex-extract-prod"
 posts_start: "2026-06-20T00:00:00Z"
 posts_end: "2026-06-24T00:00:00Z"
 source_metadata_partition_count: 16
+data_partition_worker_count: 4
 ```
 
 The atomic `source_metadata_*` bundle contains `post_metadata/` with `subject_uri`, UTC `post_created_at`, `author_did`, and `is_reply`, plus exact `post_sources_*.json` and `reply_sources_*.json` manifests. Each URI appears exactly once. Stages 1, 3, and 6 read this index instead of rescanning raw metadata; Stage 7 reuses the manifests to find embedding payloads in the authoritative raw files.
+
+After each streaming hash-routing pass completes, Stages 00, 2, and 3 process independent partitions with up to `data_partition_worker_count` spawned worker processes. The default is `4`; set it to `1` for the lowest-memory serial path. Partition-derived output filenames and parent-side ordered statistics keep logical artifacts deterministic across worker counts.
 
 ### Stage 1: Query Selection
 
@@ -173,6 +176,7 @@ Common config:
 ```yaml
 max_history_posts_per_query: 64
 user_history_partition_count: 16
+data_partition_worker_count: 4
 ```
 
 The source history window begins at `posts_start`, using the exact Stage 1 `like_sources_*.json` snapshot. Set `posts_start` earlier than `train_start` when training queries need a warm-up period. Stage 2 performs no post or reply lookup: unresolved URIs remain in its aligned lists for Stage 3 to resolve later.
@@ -185,6 +189,7 @@ Common config:
 
 ```yaml
 random_candidate_sampling_fraction: 0.10
+data_partition_worker_count: 4
 ```
 
 The random reservoir uses a stable URI hash and is approximate rather than exactly sized. Candidates are drawn only from root posts. Replies can enter the universe only when required by at least one retained history; they never become positive labels or candidate posts. If a URI occurs in both source types, root metadata takes precedence. Missing or reply-only positives fail the stage, while unresolved history URIs are reported without rewriting Stage 2 history lists.

@@ -170,6 +170,14 @@ def test_dataset_hydration_args_merge_from_cli():
     assert merged.min_author_training_feature_count == 75
 
 
+def test_data_partition_worker_count_merges_from_cli():
+    merged = cli._merge_args_with_config(
+        cli.build_parser().parse_args(["--data-partition-worker-count", "8"])
+    )
+
+    assert merged.data_partition_worker_count == 8
+
+
 def test_query_sampling_args_replace_user_sampling_args(tmp_path):
     parser = cli.build_parser()
     raw = parser.parse_args([
@@ -217,6 +225,7 @@ def test_query_sampling_defaults():
     assert merged.user_history_partition_count == 16
     assert merged.random_candidate_sampling_fraction == 0.10
     assert merged.source_metadata_partition_count == 16
+    assert merged.data_partition_worker_count == 4
     assert merged.negative_candidates_per_hour == 1000
     assert merged.min_likes_for_popular_candidate == 10
     assert merged.popular_candidate_fraction == 0.50

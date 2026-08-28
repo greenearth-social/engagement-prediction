@@ -34,6 +34,7 @@ class SourceMetadataConfig:
     posts_start: datetime
     posts_end: datetime
     source_metadata_partition_count: int
+    data_partition_worker_count: int
 
 
 def build_config(args: argparse.Namespace) -> SourceMetadataConfig:
@@ -51,6 +52,9 @@ def build_config(args: argparse.Namespace) -> SourceMetadataConfig:
     partition_count = int(args.source_metadata_partition_count)
     if partition_count <= 0:
         raise ValueError("source_metadata_partition_count must be positive")
+    worker_count = int(args.data_partition_worker_count)
+    if worker_count <= 0:
+        raise ValueError("data_partition_worker_count must be positive")
     gcs_bucket = str(args.gcs_bucket).strip()
     if not gcs_bucket:
         raise ValueError("gcs_bucket must not be empty")
@@ -59,6 +63,7 @@ def build_config(args: argparse.Namespace) -> SourceMetadataConfig:
         posts_start=posts_start,
         posts_end=posts_end,
         source_metadata_partition_count=partition_count,
+        data_partition_worker_count=worker_count,
     )
 
 
@@ -155,6 +160,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         normalized_replies_path=normalized_replies_path,
         post_metadata_path=post_metadata_path,
         partition_count=config.source_metadata_partition_count,
+        worker_count=config.data_partition_worker_count,
         logger=logger,
     )
 
@@ -171,6 +177,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "posts_end": config.posts_end.isoformat(),
         "parameters": {
             "source_metadata_partition_count": config.source_metadata_partition_count,
+            "data_partition_worker_count": config.data_partition_worker_count,
         },
         "source_file_counts": {
             "post_file_count": len(post_paths),
@@ -193,6 +200,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "stage: source_metadata",
             f"runtime_seconds: {runtime_seconds:.2f}",
             f"source_metadata_partition_count: {config.source_metadata_partition_count}",
+            f"data_partition_worker_count: {config.data_partition_worker_count}",
+            f"effective_partition_worker_count: {index_stats['partition_worker_count']}",
             f"canonical_record_count: {index_stats['canonical_record_count']}",
             f"canonical_root_count: {index_stats['canonical_root_count']}",
             f"canonical_reply_count: {index_stats['canonical_reply_count']}",

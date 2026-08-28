@@ -16,9 +16,12 @@ from __future__ import annotations
 from bisect import bisect_left
 from datetime import datetime
 from pathlib import Path
+import time
 from typing import Any
 
 import polars as pl
+
+from engagement_prediction.data.parquet import read_parquet_parts
 
 
 QUERY_KEY = ["did", "query_hour"]
@@ -218,6 +221,76 @@ def build_query_histories_for_partition(
         max_history_posts_per_query=max_history_posts_per_query,
     )
     return history_df, history_post_uri_frame(history_post_uris), stats
+
+
+def write_query_history_partition(
+    *,
+    query_paths: list[Path],
+    like_paths: list[Path],
+    partial_output_path: Path,
+    history_post_uri_shards_path: Path,
+    partition_id: int,
+    max_history_posts_per_query: int,
+) -> dict[str, Any]:
+    """Construct and write one independently owned DID-hash partition."""
+
+    started = time.monotonic()
+    queries_df = read_parquet_parts(query_paths)
+    likes_df = read_parquet_parts(like_paths, empty=empty_likes())
+    history_df, history_post_uris_df, partition_stats = (
+        build_query_histories_for_partition(
+            queries_df,
+            likes_df,
+            max_history_posts_per_query=max_history_posts_per_query,
+        )
+    )
+    history_df.write_parquet(
+        partial_output_path / f"part-{partition_id:05d}.parquet",
+        compression="zstd",
+    )
+    if not history_post_uris_df.is_empty():
+        history_post_uris_df.write_parquet(
+            history_post_uri_shards_path / f"part-{partition_id:05d}.parquet",
+            compression="zstd",
+        )
+    return {
+        "partition_id": partition_id,
+        "query_count": history_df.height,
+        "stats": partition_stats,
+        "runtime_seconds": time.monotonic() - started,
+    }
+
+
+def write_history_post_uri_partition(
+    *,
+    partition_paths: list[Path],
+    partial_output_path: Path,
+    partition_id: int,
+    partition_count: int,
+) -> dict[str, Any]:
+    """Deduplicate and write one independently owned post-URI partition."""
+
+    started = time.monotonic()
+    history_post_uris_df = (
+        pl.read_parquet(partition_paths)
+        .select("subject_uri")
+        .unique()
+        .sort("subject_uri")
+    )
+    validate_history_post_uri_partition(
+        history_post_uris_df,
+        partition_id=partition_id,
+        partition_count=partition_count,
+    )
+    history_post_uris_df.write_parquet(
+        partial_output_path / f"part-{partition_id:05d}.parquet",
+        compression="zstd",
+    )
+    return {
+        "partition_id": partition_id,
+        "unique_history_post_count": history_post_uris_df.height,
+        "runtime_seconds": time.monotonic() - started,
+    }
 
 
 def validate_partition_artifact(

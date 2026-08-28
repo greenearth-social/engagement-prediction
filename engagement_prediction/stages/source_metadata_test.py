@@ -46,12 +46,13 @@ def _sources(tmp_path: Path) -> tuple[Path, Path]:
     return posts, replies
 
 
-def _args(partition_count: int) -> SimpleNamespace:
+def _args(partition_count: int, worker_count: int = 1) -> SimpleNamespace:
     return SimpleNamespace(
         gcs_bucket="bucket",
         posts_start="2026-01-01T00:00:00Z",
         posts_end="2026-01-02T00:00:00Z",
         source_metadata_partition_count=partition_count,
+        data_partition_worker_count=worker_count,
         _argv=["--stop-after", "source_metadata"],
     )
 
@@ -72,7 +73,7 @@ def _reset_logger() -> None:
             handler.close()
 
 
-def _run(tmp_path: Path, monkeypatch, partition_count: int):
+def _run(tmp_path: Path, monkeypatch, partition_count: int, worker_count: int = 1):
     tmp_path.mkdir(parents=True, exist_ok=True)
     posts, replies = _sources(tmp_path)
 
@@ -85,7 +86,7 @@ def _run(tmp_path: Path, monkeypatch, partition_count: int):
     return registry.run_stage(
         "source_metadata",
         _context(tmp_path, f"run-{partition_count}"),
-        _args(partition_count),
+        _args(partition_count, worker_count),
     )
 
 
@@ -107,6 +108,8 @@ def test_publishes_canonical_metadata_and_exact_snapshots(tmp_path, monkeypatch)
     assert summary["index"]["root_reply_overlap_count"] == 1
     assert summary["index"]["canonical_record_count"] == 5
     assert summary["parameters"]["source_metadata_partition_count"] == 3
+    assert summary["parameters"]["data_partition_worker_count"] == 1
+    assert summary["index"]["partition_worker_count"] == 1
     assert not list(output_dir.glob("*.partial"))
     assert not list(output_dir.glob("_source_metadata_staging_*"))
     assert json.loads((output_dir / "manifest.json").read_text())["inputs"] == {}
@@ -118,6 +121,21 @@ def test_logical_output_is_partition_count_independent(tmp_path, monkeypatch):
     second = _run(tmp_path / "four", monkeypatch, 4)
     second_df = scan_parquet_artifact(Path(second["artifacts"]["post_metadata_path"])).collect()
     assert first_df.sort("subject_uri").equals(second_df.sort("subject_uri"))
+
+
+def test_parallel_partition_workers_preserve_logical_output(tmp_path, monkeypatch):
+    serial = _run(tmp_path / "serial", monkeypatch, 4, 1)
+    parallel = _run(tmp_path / "parallel", monkeypatch, 4, 2)
+    serial_df = scan_parquet_artifact(Path(serial["artifacts"]["post_metadata_path"])).collect()
+    parallel_df = scan_parquet_artifact(
+        Path(parallel["artifacts"]["post_metadata_path"])
+    ).collect()
+    assert serial_df.sort("subject_uri").equals(parallel_df.sort("subject_uri"))
+    parallel_summary = json.loads((Path(parallel["output_dir"]) / "summary.json").read_text())
+    assert parallel_summary["index"]["partition_worker_count"] == 2
+    assert [
+        row["partition_id"] for row in parallel_summary["index"]["partition_stats"]
+    ] == [0, 1, 2, 3]
 
 
 def test_failed_partition_does_not_publish_bundle_or_manifest(tmp_path, monkeypatch):
@@ -153,3 +171,5 @@ def test_failed_partition_does_not_publish_bundle_or_manifest(tmp_path, monkeypa
 def test_config_validation():
     with pytest.raises(ValueError, match="source_metadata_partition_count"):
         stage.build_config(_args(0))
+    with pytest.raises(ValueError, match="data_partition_worker_count"):
+        stage.build_config(_args(1, 0))

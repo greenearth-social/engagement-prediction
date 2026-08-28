@@ -56,6 +56,7 @@ DEFAULTS: Dict[str, Any] = {
     "posts_start": None,
     "posts_end": None,
     "source_metadata_partition_count": 16,
+    "data_partition_worker_count": 4,
     # Stage 1: Query selection
     "unseen_user_fraction": 0.1,
     "max_hours_per_user_per_split": 16,
@@ -830,6 +831,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--source-metadata-partition-count", type=int,
                           default=argparse.SUPPRESS,
                           help_text="Stable URI-hash partition count owned by the Stage 00 metadata index")
+    _add_arg_with_default(p_all, "--data-partition-worker-count", type=int,
+                          default=argparse.SUPPRESS,
+                          help_text="Worker processes used for independent Stage 00, 2, and 3 partitions")
     _add_arg_with_default(p_all, "--unseen-user-fraction", type=float, default=argparse.SUPPRESS,
                           help_text="Stable fraction of users reserved for unseen-user evaluation")
     _add_arg_with_default(p_all, "--max-hours-per-user-per-split", type=int, default=argparse.SUPPRESS,

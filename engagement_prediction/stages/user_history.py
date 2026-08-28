@@ -21,10 +21,9 @@ from typing import Any, Dict
 
 import polars as pl
 
-from engagement_prediction.data import ingex, likes
+from engagement_prediction.data import ingex, likes, partition_workers
 from engagement_prediction.data.parquet import (
     load_parquet_from_prior,
-    read_parquet_parts,
     sink_partitioned_parquet,
 )
 from engagement_prediction.data import user_history as history_data
@@ -39,6 +38,7 @@ class UserHistoryConfig:
 
     max_history_posts_per_query: int
     user_history_partition_count: int
+    data_partition_worker_count: int
 
 
 def build_config(args: argparse.Namespace) -> UserHistoryConfig:
@@ -50,9 +50,13 @@ def build_config(args: argparse.Namespace) -> UserHistoryConfig:
     user_history_partition_count = int(args.user_history_partition_count)
     if user_history_partition_count <= 0:
         raise ValueError("user_history_partition_count must be positive")
+    data_partition_worker_count = int(args.data_partition_worker_count)
+    if data_partition_worker_count <= 0:
+        raise ValueError("data_partition_worker_count must be positive")
     return UserHistoryConfig(
         max_history_posts_per_query=max_history_posts_per_query,
         user_history_partition_count=user_history_partition_count,
+        data_partition_worker_count=data_partition_worker_count,
     )
 
 
@@ -145,7 +149,7 @@ def _write_query_histories(
     history_post_uri_shards_path: Path,
     config: UserHistoryConfig,
     logger: logging.Logger,
-) -> dict[str, dict[str, int]]:
+) -> tuple[dict[str, dict[str, int]], int, list[dict[str, Any]]]:
     """Write histories and one locally deduplicated URI shard per user partition.
 
     The shard files reflect the DID-based processing layout. They are not yet
@@ -154,8 +158,7 @@ def _write_query_histories(
     """
     partial_output_path.mkdir(parents=True, exist_ok=False)
     history_post_uri_shards_path.mkdir(parents=True, exist_ok=False)
-    all_partition_stats: list[dict[str, dict[str, int]]] = []
-    output_rows = 0
+    worker_kwargs: list[dict[str, Any]] = []
     for partition_id in range(config.user_history_partition_count):
         query_paths = history_data.partition_parquet_paths(
             query_partitions_path,
@@ -167,37 +170,50 @@ def _write_query_histories(
             queried_user_likes_path,
             partition_id,
         )
-        queries_df = read_parquet_parts(query_paths)
-        likes_df = read_parquet_parts(like_paths, empty=history_data.empty_likes())
-        history_df, history_post_uris_df, partition_stats = (
-            history_data.build_query_histories_for_partition(
-                queries_df,
-                likes_df,
-                max_history_posts_per_query=config.max_history_posts_per_query,
-            )
-        )
-        history_df.write_parquet(
-            partial_output_path / f"part-{partition_id:05d}.parquet",
-            compression="zstd",
-        )
-        if not history_post_uris_df.is_empty():
-            # This physical shard is locally unique only. The next phase routes
-            # its rows into URI-hash partitions for global deduplication.
-            history_post_uris_df.write_parquet(
-                history_post_uri_shards_path / f"part-{partition_id:05d}.parquet",
-                compression="zstd",
-            )
-        output_rows += history_df.height
-        all_partition_stats.append(partition_stats)
+        worker_kwargs.append({
+            "query_paths": query_paths,
+            "like_paths": like_paths,
+            "partial_output_path": partial_output_path,
+            "history_post_uri_shards_path": history_post_uri_shards_path,
+            "partition_id": partition_id,
+            "max_history_posts_per_query": config.max_history_posts_per_query,
+        })
+
+    logger.info(
+        "Constructing histories across %s populated user partitions with up to %s workers",
+        len(worker_kwargs),
+        config.data_partition_worker_count,
+    )
+
+    def log_result(result: dict[str, Any]) -> None:
         logger.info(
-            "Completed user-history partition %s with %s queries",
-            partition_id,
-            f"{history_df.height:,}",
+            "Completed user-history partition %s in %.1fs with %s queries",
+            result["partition_id"],
+            result["runtime_seconds"],
+            f"{result['query_count']:,}",
         )
 
+    results, effective_worker_count = partition_workers.run_partition_jobs(
+        worker=history_data.write_query_history_partition,
+        worker_kwargs=worker_kwargs,
+        worker_count=config.data_partition_worker_count,
+        on_result=log_result,
+    )
+    output_rows = sum(int(result["query_count"]) for result in results)
     if output_rows == 0:
         raise ValueError("User history selection produced no query histories")
-    return history_data.merge_partition_stats(all_partition_stats)
+    return (
+        history_data.merge_partition_stats([result["stats"] for result in results]),
+        effective_worker_count,
+        [
+            {
+                "partition_id": result["partition_id"],
+                "query_count": result["query_count"],
+                "runtime_seconds": result["runtime_seconds"],
+            }
+            for result in results
+        ],
+    )
 
 
 def _write_history_post_uris(
@@ -206,7 +222,9 @@ def _write_history_post_uris(
     routed_history_post_uris_path: Path,
     partial_output_path: Path,
     partition_count: int,
-) -> int:
+    worker_count: int,
+    logger: logging.Logger,
+) -> tuple[int, int, list[dict[str, Any]]]:
     """Repartition local URI shards and publish globally unique URI partitions.
 
     A source shard can contain URIs belonging to many destination partitions.
@@ -228,7 +246,7 @@ def _write_history_post_uris(
             partial_output_path / "part-00000.parquet",
             compression="zstd",
         )
-        return 0
+        return 0, 0, []
 
     # Repartition physical user-partition shards by the logical URI hash key.
     sink_partitioned_parquet(
@@ -239,9 +257,9 @@ def _write_history_post_uris(
         key="_history_post_partition",
     )
 
-    unique_history_post_count = 0
     # Each URI is confined to one partition, so partition-local uniqueness also
     # guarantees uniqueness across the complete published dataset.
+    worker_kwargs: list[dict[str, Any]] = []
     for partition_id in range(partition_count):
         partition_paths = history_data.history_post_partition_parquet_paths(
             routed_history_post_uris_path,
@@ -249,23 +267,39 @@ def _write_history_post_uris(
         )
         if not partition_paths:
             continue
-        history_post_uris_df = (
-            pl.read_parquet(partition_paths)
-            .select("subject_uri")
-            .unique()
-            .sort("subject_uri")
+        worker_kwargs.append({
+            "partition_paths": partition_paths,
+            "partial_output_path": partial_output_path,
+            "partition_id": partition_id,
+            "partition_count": partition_count,
+        })
+
+    logger.info(
+        "Deduplicating %s populated history-post URI partitions with up to %s workers",
+        len(worker_kwargs),
+        worker_count,
+    )
+
+    def log_result(result: dict[str, Any]) -> None:
+        logger.info(
+            "Completed history-post URI partition %s/%s in %.1fs: unique=%s",
+            result["partition_id"] + 1,
+            partition_count,
+            result["runtime_seconds"],
+            f"{result['unique_history_post_count']:,}",
         )
-        history_data.validate_history_post_uri_partition(
-            history_post_uris_df,
-            partition_id=partition_id,
-            partition_count=partition_count,
-        )
-        history_post_uris_df.write_parquet(
-            partial_output_path / f"part-{partition_id:05d}.parquet",
-            compression="zstd",
-        )
-        unique_history_post_count += history_post_uris_df.height
-    return unique_history_post_count
+
+    results, effective_worker_count = partition_workers.run_partition_jobs(
+        worker=history_data.write_history_post_uri_partition,
+        worker_kwargs=worker_kwargs,
+        worker_count=worker_count,
+        on_result=log_result,
+    )
+    return (
+        sum(int(result["unique_history_post_count"]) for result in results),
+        effective_worker_count,
+        results,
+    )
 
 
 def _log_stats(logger: logging.Logger, stats: dict[str, dict[str, int]]) -> None:
@@ -357,7 +391,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         queried_user_likes_path=queried_user_likes_path,
         logger=logger,
     )
-    stats = _write_query_histories(
+    stats, history_worker_count, history_partition_stats = _write_query_histories(
         query_partitions_path=query_partitions_path,
         queried_user_likes_path=queried_user_likes_path,
         partial_output_path=query_histories_partial_path,
@@ -373,11 +407,17 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         )
     # History construction emits locally unique URI shards. Repartitioning the
     # shards by URI makes partition-local deduplication globally sufficient.
-    unique_history_post_count = _write_history_post_uris(
+    (
+        unique_history_post_count,
+        history_post_worker_count,
+        history_post_partition_stats,
+    ) = _write_history_post_uris(
         history_post_uri_shards_path=history_post_uri_shards_path,
         routed_history_post_uris_path=routed_history_post_uris_path,
         partial_output_path=history_post_uris_partial_path,
         partition_count=config.user_history_partition_count,
+        worker_count=config.data_partition_worker_count,
+        logger=logger,
     )
     shutil.rmtree(history_post_uri_shards_path)
     if routed_history_post_uris_path.exists():
@@ -402,6 +442,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "parameters": {
             "max_history_posts_per_query": config.max_history_posts_per_query,
             "user_history_partition_count": config.user_history_partition_count,
+            "data_partition_worker_count": config.data_partition_worker_count,
         },
         "input": {
             "source_metadata_dir": str(source_metadata_dir),
@@ -418,6 +459,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "query_count": output_query_count,
             "unique_history_post_count": unique_history_post_count,
         },
+        "partition_processing": {
+            "history_partition_worker_count": history_worker_count,
+            "history_partition_stats": history_partition_stats,
+            "history_post_partition_worker_count": history_post_worker_count,
+            "history_post_partition_stats": history_post_partition_stats,
+        },
         "selection_stats_by_split": stats,
         "runtime_seconds": runtime_seconds,
     }
@@ -430,6 +477,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             f"input_like_files: {len(source_like_paths)}",
             f"max_history_posts_per_query: {config.max_history_posts_per_query}",
             f"user_history_partition_count: {config.user_history_partition_count}",
+            f"data_partition_worker_count: {config.data_partition_worker_count}",
+            f"effective_history_partition_worker_count: {history_worker_count}",
+            f"effective_history_post_partition_worker_count: {history_post_worker_count}",
             f"query_histories_path: {query_histories_path.name}",
             f"history_post_uris_path: {history_post_uris_path.name}",
             f"unique_history_post_count: {unique_history_post_count}",

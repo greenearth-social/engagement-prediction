@@ -32,6 +32,7 @@ class PostSelectionConfig:
     posts_end: datetime
     random_candidate_sampling_fraction: float
     random_seed: int
+    data_partition_worker_count: int
 
 
 def _require_hour_aligned(value: datetime, field_name: str) -> None:
@@ -53,12 +54,16 @@ def build_config(args: argparse.Namespace) -> PostSelectionConfig:
     fraction = float(args.random_candidate_sampling_fraction)
     if not 0.0 <= fraction <= 1.0:
         raise ValueError("random_candidate_sampling_fraction must be between 0 and 1")
+    worker_count = int(args.data_partition_worker_count)
+    if worker_count <= 0:
+        raise ValueError("data_partition_worker_count must be positive")
     return PostSelectionConfig(
         gcs_bucket=str(args.gcs_bucket),
         posts_start=posts_start,
         posts_end=posts_end,
         random_candidate_sampling_fraction=fraction,
         random_seed=int(args.random_seed),
+        data_partition_worker_count=worker_count,
     )
 
 
@@ -167,6 +172,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         missing_required_posts_path=missing_required_posts_path,
         config=config,
         partition_count=partition_count,
+        worker_count=config.data_partition_worker_count,
         logger=logger,
     )
     required_stats = selection_stats["required_post_stats"]
@@ -194,6 +200,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "parameters": {
             "random_candidate_sampling_fraction": config.random_candidate_sampling_fraction,
             "source_metadata_partition_count": partition_count,
+            "data_partition_worker_count": config.data_partition_worker_count,
             "random_seed": config.random_seed,
         },
         "input": {
@@ -210,6 +217,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "reply_source_stats": source_index["reply_source_stats"],
         },
         "required_post_stats": required_stats,
+        "partition_processing": {
+            "partition_worker_count": selection_stats["partition_worker_count"],
+            "partition_stats": selection_stats["partition_stats"],
+        },
         "outputs": {
             "post_universe_path": bundle_path.name,
             "posts_path": str(Path(bundle_path.name) / "posts"),
@@ -230,6 +241,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "stage: post_selection",
             f"runtime_seconds: {runtime_seconds:.2f}",
             f"source_metadata_partition_count: {partition_count}",
+            f"data_partition_worker_count: {config.data_partition_worker_count}",
+            f"effective_partition_worker_count: {selection_stats['partition_worker_count']}",
             f"post_count: {output_stats['post_count']}",
             f"root_post_count: {output_stats['root_post_count']}",
             f"reply_post_count: {output_stats['reply_post_count']}",
