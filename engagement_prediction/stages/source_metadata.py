@@ -15,13 +15,17 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import datetime
-import json
 from pathlib import Path
-import shutil
 import time
 from typing import Any, Dict
 
-from engagement_prediction.data import ingex, source_metadata_artifacts, timestamps
+from engagement_prediction.data import (
+    ingex,
+    source_metadata,
+    source_metadata_artifacts,
+    timestamps,
+)
+from engagement_prediction.pipeline.artifacts import PartialArtifactBundle
 from engagement_prediction.pipeline.core import Context
 from engagement_prediction.pipeline.logging import get_stage_logger
 
@@ -107,12 +111,20 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # Everything beneath the public bundle is written under one partial
     # directory. The final rename is the publication boundary: downstream
     # stages cannot mistake an interrupted build for a completed artifact.
-    bundle_path = out_dir / f"source_metadata_{artifact_suffix}"
-    partial_bundle_path = out_dir / f"source_metadata_{artifact_suffix}.partial"
-    partial_bundle_path.mkdir(parents=True, exist_ok=False)
-    post_metadata_path = partial_bundle_path / "post_metadata"
-    post_sources_path = partial_bundle_path / f"post_sources_{artifact_suffix}.json"
-    reply_sources_path = partial_bundle_path / f"reply_sources_{artifact_suffix}.json"
+    publication = PartialArtifactBundle.create(
+        output_dir=out_dir,
+        bundle_name=f"source_metadata_{artifact_suffix}",
+        staging_name=f"_source_metadata_staging_{artifact_suffix}.partial",
+        dataset_schemas={"post_metadata": source_metadata.POST_METADATA_SCHEMA},
+    )
+    bundle_path = publication.final_path
+    post_metadata_path = publication.public_path("post_metadata")
+    post_sources_path = publication.public_path(
+        f"post_sources_{artifact_suffix}.json"
+    )
+    reply_sources_path = publication.public_path(
+        f"reply_sources_{artifact_suffix}.json"
+    )
     # These manifests freeze both the exact physical files and the common
     # source window. Downstream stages validate against them rather than
     # relisting GCS, where new exports could otherwise change a rerun.
@@ -135,8 +147,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     ingex.write_source_manifest(post_sources_path, post_manifest)
     ingex.write_source_manifest(reply_sources_path, reply_manifest)
 
-    staging_root = out_dir / f"_source_metadata_staging_{artifact_suffix}.partial"
-    staging_root.mkdir(parents=True, exist_ok=False)
+    staging_root = publication.staging_path
     normalized_posts_path = staging_root / "normalized_posts"
     normalized_replies_path = staging_root / "normalized_replies"
 
@@ -165,9 +176,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         logger=logger,
     )
 
-    logger.info("Phase 4/4: removing raw staging and publishing the metadata bundle")
-    shutil.rmtree(staging_root)
-    partial_bundle_path.replace(bundle_path)
+    logger.info("Phase 4/4: validating and publishing the metadata bundle")
     final_metadata_path = bundle_path / "post_metadata"
     final_post_sources_path = bundle_path / post_sources_path.name
     final_reply_sources_path = bundle_path / reply_sources_path.name
@@ -193,11 +202,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         },
         "runtime_seconds": runtime_seconds,
     }
-    (out_dir / "summary.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n"
-    )
-    (out_dir / "stage_info.txt").write_text(
-        "\n".join([
+    stage_info = "\n".join([
             "stage: source_metadata",
             f"runtime_seconds: {runtime_seconds:.2f}",
             f"source_metadata_partition_count: {config.source_metadata_partition_count}",
@@ -211,6 +216,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             f"post_sources_path: {Path(bundle_path.name) / final_post_sources_path.name}",
             f"reply_sources_path: {Path(bundle_path.name) / final_reply_sources_path.name}",
         ]) + "\n"
+    publication.publish(
+        summary=summary,
+        stage_info=stage_info,
     )
     logger.info(
         "Source metadata completed in %.2fs: records=%s roots=%s replies=%s",

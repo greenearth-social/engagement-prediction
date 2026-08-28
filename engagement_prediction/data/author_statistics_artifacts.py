@@ -14,7 +14,11 @@ from engagement_prediction.data import author_statistics
 from engagement_prediction.data import ingex
 from engagement_prediction.data import likes
 from engagement_prediction.data import source_metadata
-from engagement_prediction.data.parquet import read_parquet_parts, sink_partitioned_parquet
+from engagement_prediction.data.parquet import (
+    read_parquet_parts,
+    sink_partitioned_parquet,
+    write_parquet_part_if_not_empty,
+)
 
 
 class AuthorStatisticsConfig(Protocol):
@@ -30,13 +34,6 @@ def _count_rows(lf: pl.LazyFrame) -> int:
     """Count a lazy source partition without collecting its columns."""
 
     return int(lf.select(pl.len()).collect(engine="streaming").item())
-
-
-def _write_if_not_empty(df: pl.DataFrame, path: Path) -> None:
-    """Skip arbitrary empty shard files; public empty handling happens later."""
-
-    if not df.is_empty():
-        df.write_parquet(path, compression="zstd")
 
 
 def _support_count_buckets(df: pl.DataFrame, column: str) -> dict[str, int]:
@@ -170,7 +167,7 @@ def process_uri_partitions(
             support_start=config.support_start,
             support_end=config.support_end,
         )
-        _write_if_not_empty(
+        write_parquet_part_if_not_empty(
             per_post_df,
             per_post_shards_path / f"part-{partition_id:05d}.parquet",
         )

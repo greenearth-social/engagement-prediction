@@ -13,7 +13,11 @@ from engagement_prediction.data import ingex
 from engagement_prediction.data import likes
 from engagement_prediction.data import post_liker_history
 from engagement_prediction.data import post_selection
-from engagement_prediction.data.parquet import read_parquet_parts, sink_partitioned_parquet
+from engagement_prediction.data.parquet import (
+    read_parquet_parts,
+    sink_partitioned_parquet,
+    write_parquet_part_if_not_empty,
+)
 
 
 def _public_partition_path(dataset_path: Path, partition_id: int) -> list[Path]:
@@ -54,11 +58,10 @@ def materialize_selected_post_routes(
             negative_post_uris_df,
         )
         post_liker_history.validate_selected_posts(selected_posts_df)
-        if not selected_posts_df.is_empty():
-            selected_posts_df.write_parquet(
-                shard_path / f"part-{partition_id:05d}.parquet",
-                compression="zstd",
-            )
+        write_parquet_part_if_not_empty(
+            selected_posts_df,
+            shard_path / f"part-{partition_id:05d}.parquet",
+        )
 
     shards = sorted(shard_path.glob("*.parquet"))
     if not shards:

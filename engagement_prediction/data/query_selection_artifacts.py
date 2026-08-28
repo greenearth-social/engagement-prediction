@@ -11,7 +11,12 @@ import polars as pl
 
 from engagement_prediction.data import post_selection as post_data
 from engagement_prediction.data import source_metadata
-from engagement_prediction.data.parquet import read_parquet_parts, sink_partitioned_parquet
+from engagement_prediction.data.parquet import (
+    ensure_typed_parquet_dataset,
+    read_parquet_parts,
+    sink_partitioned_parquet,
+    write_parquet_part_if_not_empty,
+)
 
 
 QUERY_KEY = ["did", "query_hour"]
@@ -140,11 +145,10 @@ def filter_positive_partitions(
         _add_split_counts(positive_stats, eligible_df, "retained_positive_count")
         _add_split_counts(positive_stats, missing_df, "missing_post_positive_count")
 
-        if not eligible_df.is_empty():
-            eligible_df.write_parquet(
-                eligible_positive_rows_path / f"part-{partition_id:05d}.parquet",
-                compression="zstd",
-            )
+        write_parquet_part_if_not_empty(
+            eligible_df,
+            eligible_positive_rows_path / f"part-{partition_id:05d}.parquet",
+        )
         logger.info(
             "Checked positive URI partition %s/%s in %.1fs: selected_rows=%s "
             "deduplicated=%s retained=%s missing=%s valid_posts=%s",
@@ -158,11 +162,10 @@ def filter_positive_partitions(
             f"{unique_posts_df.height:,}",
         )
 
-    if not list(eligible_positive_rows_path.glob("*.parquet")):
-        pl.DataFrame(schema=INTERNAL_POSITIVE_SCHEMA).write_parquet(
-            eligible_positive_rows_path / "part-00000.parquet",
-            compression="zstd",
-        )
+    ensure_typed_parquet_dataset(
+        eligible_positive_rows_path,
+        INTERNAL_POSITIVE_SCHEMA,
+    )
     logger.info("Finished post-membership checks in %.1fs", time.monotonic() - started)
     return {
         "positive_filter_stats_by_split": positive_stats,

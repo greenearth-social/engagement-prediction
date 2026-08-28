@@ -11,7 +11,12 @@ import polars as pl
 
 from engagement_prediction.data import partition_workers
 from engagement_prediction.data import post_selection as post_data
-from engagement_prediction.data.parquet import read_parquet_parts, sink_partitioned_parquet
+from engagement_prediction.data.parquet import (
+    ensure_typed_parquet_dataset,
+    read_parquet_parts,
+    sink_partitioned_parquet,
+    write_parquet_part_if_not_empty,
+)
 
 
 class PostSelectionConfig(Protocol):
@@ -19,23 +24,6 @@ class PostSelectionConfig(Protocol):
 
     random_candidate_sampling_fraction: float
     random_seed: int
-
-
-def _write_if_not_empty(df: pl.DataFrame, path: Path) -> None:
-    """Avoid creating arbitrary empty partition files during bounded writes."""
-
-    if not df.is_empty():
-        df.write_parquet(path, compression="zstd")
-
-
-def _ensure_nonempty_dataset(path: Path, schema: dict[str, pl.DataType]) -> None:
-    """Guarantee a schema-bearing Parquet file for a logically empty dataset."""
-
-    if not list(path.rglob("*.parquet")):
-        post_data.empty_frame(schema).write_parquet(
-            path / "part-00000.parquet",
-            compression="zstd",
-        )
 
 
 def materialize_required_rows(
@@ -153,16 +141,19 @@ def _process_uri_partition(
         partition_id=partition_id,
         partition_count=partition_count,
     )
-    _write_if_not_empty(posts_df, posts_path / f"part-{partition_id:05d}.parquet")
-    _write_if_not_empty(
+    write_parquet_part_if_not_empty(
+        posts_df,
+        posts_path / f"part-{partition_id:05d}.parquet",
+    )
+    write_parquet_part_if_not_empty(
         required_posts_df,
         required_posts_path / f"part-{partition_id:05d}.parquet",
     )
-    _write_if_not_empty(
+    write_parquet_part_if_not_empty(
         candidate_sources_df,
         candidate_sources_path / f"part-{partition_id:05d}.parquet",
     )
-    _write_if_not_empty(
+    write_parquet_part_if_not_empty(
         missing_required_df,
         missing_required_posts_path / f"part-{partition_id:05d}.parquet",
     )
@@ -303,7 +294,7 @@ def process_uri_partitions(
         (candidate_sources_path, post_data.CANDIDATE_SOURCE_SCHEMA),
         (missing_required_posts_path, post_data.REQUIRED_POST_SCHEMA),
     ):
-        _ensure_nonempty_dataset(path, schema)
+        ensure_typed_parquet_dataset(path, schema)
     return {
         "required_post_stats": required_counts,
         "output_stats": output_counts,

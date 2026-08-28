@@ -5,20 +5,24 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import datetime
-import json
 from pathlib import Path
-import shutil
 import time
 from typing import Any, Dict
 
 import polars as pl
 
-from engagement_prediction.data import ingex, post_selection_artifacts, timestamps
+from engagement_prediction.data import (
+    ingex,
+    post_selection as post_data,
+    post_selection_artifacts,
+    timestamps,
+)
 from engagement_prediction.data.parquet import find_artifact_path, scan_parquet_artifact
 from engagement_prediction.data.source_metadata_artifacts import (
     load_source_metadata_artifact,
 )
 from engagement_prediction.pipeline.core import Context
+from engagement_prediction.pipeline.artifacts import PartialArtifactBundle
 from engagement_prediction.pipeline.lineage import resolve_recorded_stage_lineage
 from engagement_prediction.pipeline.logging import get_stage_logger
 
@@ -136,20 +140,28 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     )
 
     artifact_suffix = out_dir.name
-    bundle_path = out_dir / f"post_universe_{artifact_suffix}"
-    bundle_partial_path = out_dir / f"post_universe_{artifact_suffix}.partial"
-    bundle_partial_path.mkdir(parents=True, exist_ok=False)
-    posts_path = bundle_partial_path / "posts"
-    required_posts_path = bundle_partial_path / "required_posts"
-    candidate_sources_path = bundle_partial_path / "candidate_sources"
-    missing_required_posts_path = bundle_partial_path / "missing_required_posts"
-    post_sources_path = bundle_partial_path / f"post_sources_{artifact_suffix}.json"
-    reply_sources_path = bundle_partial_path / f"reply_sources_{artifact_suffix}.json"
+    publication = PartialArtifactBundle.create(
+        output_dir=out_dir,
+        bundle_name=f"post_universe_{artifact_suffix}",
+        staging_name=f"_post_selection_staging_{artifact_suffix}.partial",
+        dataset_schemas={
+            "posts": post_data.POST_SCHEMA,
+            "required_posts": post_data.REQUIRED_POST_SCHEMA,
+            "candidate_sources": post_data.CANDIDATE_SOURCE_SCHEMA,
+            "missing_required_posts": post_data.REQUIRED_POST_SCHEMA,
+        },
+    )
+    bundle_path = publication.final_path
+    posts_path = publication.public_path("posts")
+    required_posts_path = publication.public_path("required_posts")
+    candidate_sources_path = publication.public_path("candidate_sources")
+    missing_required_posts_path = publication.public_path("missing_required_posts")
+    post_sources_path = publication.public_path(f"post_sources_{artifact_suffix}.json")
+    reply_sources_path = publication.public_path(f"reply_sources_{artifact_suffix}.json")
     ingex.write_source_manifest(post_sources_path, source_artifact.post_snapshot.manifest)
     ingex.write_source_manifest(reply_sources_path, source_artifact.reply_snapshot.manifest)
 
-    staging_root = out_dir / f"_post_selection_staging_{artifact_suffix}.partial"
-    staging_root.mkdir(parents=True, exist_ok=False)
+    staging_root = publication.staging_path
     required_rows_path = staging_root / "required_rows"
 
     logger.info("Phase 2/4: routing positive and history requirements by URI")
@@ -178,9 +190,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     )
     output_stats = selection_stats["output_stats"]
 
-    logger.info("Phase 4/4: removing staging and atomically publishing the bundle")
-    shutil.rmtree(staging_root)
-    bundle_partial_path.replace(bundle_path)
+    logger.info("Phase 4/4: validating and atomically publishing the bundle")
     final_posts_path = bundle_path / "posts"
     final_required_posts_path = bundle_path / "required_posts"
     final_candidate_sources_path = bundle_path / "candidate_sources"
@@ -232,9 +242,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         },
         "runtime_seconds": runtime_seconds,
     }
-    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
-    (out_dir / "stage_info.txt").write_text(
-        "\n".join([
+    stage_info = "\n".join([
             "stage: post_selection",
             f"runtime_seconds: {runtime_seconds:.2f}",
             f"source_metadata_partition_count: {partition_count}",
@@ -248,6 +256,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             f"post_sources_path: {Path(bundle_path.name) / final_post_sources_path.name}",
             f"reply_sources_path: {Path(bundle_path.name) / final_reply_sources_path.name}",
         ]) + "\n"
+    publication.publish(
+        summary=summary,
+        stage_info=stage_info,
     )
     logger.info(
         "Post selection completed in %.2fs: posts=%s roots=%s replies=%s random=%s",

@@ -9,6 +9,7 @@ execution contract.
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 
+from .artifacts import complete_stage_artifacts
 from .core import ROOT, Context, load_run_callable
 
 
@@ -41,16 +42,10 @@ def run_stage(stage_name: str, context: Context, args) -> Dict[str, object]:
     # the canonical artifact store and returning its path.
     context.begin_stage(stage_name, folder)
     result = run_fn(context, args)
-    # Expect: {'output_dir': Path, 'artifacts': {...}}
-    out_dir = result.get('output_dir') if isinstance(result, dict) else None
-    if out_dir is None:
-        raise RuntimeError(f"Stage '{stage_name}' did not return an output_dir")
-    context.record_artifact(stage_name, Path(out_dir), extras=(result.get('artifacts') or {}))
-    context.finalize_stage(
+    return complete_stage_artifacts(
+        context=context,
         stage_key=stage_name,
         stage_folder=folder,
-        output_dir=Path(out_dir),
+        result=result,
         args=args,
-        argv=getattr(args, "_argv", None),
     )
-    return result

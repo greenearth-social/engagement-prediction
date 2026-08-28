@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-import json
 from pathlib import Path
-import shutil
 import time
 from typing import Any, Dict
 
@@ -19,6 +17,7 @@ from engagement_prediction.data import negative_selection_artifacts
 from engagement_prediction.data import source_manifests
 from engagement_prediction.data.parquet import find_artifact_path, scan_parquet_artifact
 from engagement_prediction.data.source_metadata_artifacts import load_source_metadata_artifact
+from engagement_prediction.pipeline.artifacts import PartialArtifactBundle
 from engagement_prediction.pipeline.core import Context
 from engagement_prediction.pipeline.lineage import resolve_recorded_stage_lineage
 from engagement_prediction.pipeline.logging import get_stage_logger
@@ -136,16 +135,22 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     )
 
     artifact_suffix = out_dir.name
-    bundle_path = out_dir / f"negative_candidates_{artifact_suffix}"
-    bundle_partial_path = out_dir / f"negative_candidates_{artifact_suffix}.partial"
-    bundle_partial_path.mkdir(parents=True, exist_ok=False)
-    hourly_candidates_path = bundle_partial_path / "hourly_candidates"
-    negative_post_uris_path = bundle_partial_path / "negative_post_uris"
-    like_sources_path = bundle_partial_path / f"like_sources_{artifact_suffix}.json"
+    publication = PartialArtifactBundle.create(
+        output_dir=out_dir,
+        bundle_name=f"negative_candidates_{artifact_suffix}",
+        staging_name=f"_negative_selection_staging_{artifact_suffix}.partial",
+        dataset_schemas={
+            "hourly_candidates": negative_selection.HOURLY_CANDIDATE_SCHEMA,
+            "negative_post_uris": negative_selection.NEGATIVE_POST_URI_SCHEMA,
+        },
+    )
+    bundle_path = publication.final_path
+    hourly_candidates_path = publication.public_path("hourly_candidates")
+    negative_post_uris_path = publication.public_path("negative_post_uris")
+    like_sources_path = publication.public_path(f"like_sources_{artifact_suffix}.json")
     ingex.write_source_manifest(like_sources_path, like_snapshot.manifest)
 
-    staging_root = out_dir / f"_negative_selection_staging_{artifact_suffix}.partial"
-    staging_root.mkdir(parents=True, exist_ok=False)
+    staging_root = publication.staging_path
     normalized_likes_path = staging_root / "normalized_likes"
     local_finalists_path = staging_root / "local_finalists"
     routed_finalists_path = staging_root / "routed_finalists"
@@ -210,9 +215,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         config=config,
     )
 
-    logger.info("Phase 7/7: removing internal staging and publishing completed bundle")
-    shutil.rmtree(staging_root)
-    bundle_partial_path.replace(bundle_path)
+    logger.info("Phase 7/7: validating and publishing the completed bundle")
     final_hourly_candidates_path = bundle_path / "hourly_candidates"
     final_negative_post_uris_path = bundle_path / "negative_post_uris"
     final_like_sources_path = bundle_path / like_sources_path.name
@@ -276,10 +279,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         },
         "runtime_seconds": runtime_seconds,
     }
-    (out_dir / "summary.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n"
-    )
-    (out_dir / "stage_info.txt").write_text(
+    stage_info = (
         "\n".join([
             "stage: negative_selection",
             f"runtime_seconds: {runtime_seconds:.2f}",
@@ -295,6 +295,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             f"like_sources_path: {Path(bundle_path.name) / final_like_sources_path.name}",
         ])
         + "\n"
+    )
+    publication.publish(
+        summary=summary,
+        stage_info=stage_info,
     )
     logger.info(
         "Negative selection completed in %.2fs: query_hours=%s selected_rows=%s "

@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 from pathlib import Path
-import shutil
 import time
 from typing import Any, Dict
 
@@ -23,6 +22,7 @@ from engagement_prediction.data.source_metadata_artifacts import (
     SourceMetadataArtifact,
     load_source_metadata_artifact,
 )
+from engagement_prediction.pipeline.artifacts import PartialArtifactBundle
 from engagement_prediction.pipeline.core import Context
 from engagement_prediction.pipeline.lineage import resolve_recorded_stage_lineage
 from engagement_prediction.pipeline.logging import get_stage_logger
@@ -204,19 +204,24 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     )
 
     artifact_suffix = out_dir.name
-    bundle_path = out_dir / f"author_statistics_{artifact_suffix}"
-    bundle_partial_path = out_dir / f"author_statistics_{artifact_suffix}.partial"
-    bundle_partial_path.mkdir(parents=True, exist_ok=False)
-    author_statistics_path = bundle_partial_path / "author_statistics"
-    post_sources_path = bundle_partial_path / f"post_sources_{artifact_suffix}.json"
-    reply_sources_path = bundle_partial_path / f"reply_sources_{artifact_suffix}.json"
-    like_sources_path = bundle_partial_path / f"like_sources_{artifact_suffix}.json"
+    publication = PartialArtifactBundle.create(
+        output_dir=out_dir,
+        bundle_name=f"author_statistics_{artifact_suffix}",
+        staging_name=f"_author_statistics_staging_{artifact_suffix}.partial",
+        dataset_schemas={
+            "author_statistics": author_statistics.AUTHOR_STAT_SCHEMA,
+        },
+    )
+    bundle_path = publication.final_path
+    author_statistics_path = publication.public_path("author_statistics")
+    post_sources_path = publication.public_path(f"post_sources_{artifact_suffix}.json")
+    reply_sources_path = publication.public_path(f"reply_sources_{artifact_suffix}.json")
+    like_sources_path = publication.public_path(f"like_sources_{artifact_suffix}.json")
     ingex.write_source_manifest(post_sources_path, post_snapshot.manifest)
     ingex.write_source_manifest(reply_sources_path, reply_snapshot.manifest)
     ingex.write_source_manifest(like_sources_path, like_snapshot.manifest)
 
-    staging_root = out_dir / f"_author_statistics_staging_{artifact_suffix}.partial"
-    staging_root.mkdir(parents=True, exist_ok=False)
+    staging_root = publication.staging_path
     normalized_likes_path = staging_root / "normalized_likes"
     per_post_shards_path = staging_root / "per_post_shards"
     per_post_by_author_path = staging_root / "per_post_by_author"
@@ -267,9 +272,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     if public_stats["author_count"] != aggregation_stats["author_count"]:
         raise ValueError("Published author count does not match aggregated author count")
 
-    logger.info("Phase 6/6: removing internal staging and publishing the bundle")
-    shutil.rmtree(staging_root)
-    bundle_partial_path.replace(bundle_path)
+    logger.info("Phase 6/6: validating and publishing the bundle")
     final_author_statistics_path = bundle_path / "author_statistics"
     final_post_sources_path = bundle_path / post_sources_path.name
     final_reply_sources_path = bundle_path / reply_sources_path.name
@@ -314,10 +317,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         },
         "runtime_seconds": runtime_seconds,
     }
-    (out_dir / "summary.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n"
-    )
-    (out_dir / "stage_info.txt").write_text(
+    stage_info = (
         "\n".join([
             "stage: author_statistics",
             f"runtime_seconds: {runtime_seconds:.2f}",
@@ -334,6 +334,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             f"like_sources_path: {Path(bundle_path.name) / final_like_sources_path.name}",
         ])
         + "\n"
+    )
+    publication.publish(
+        summary=summary,
+        stage_info=stage_info,
     )
     logger.info(
         "Author statistics completed in %.2fs: posts=%s matched_likes=%s authors=%s",

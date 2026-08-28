@@ -475,23 +475,6 @@ def test_train_bst_piggybacks_baseline_histogram_on_epoch_one_and_logs_detailed_
     assert "patience_reset=False" in status_lines[-1]
 
 
-def test_save_checkpoint_atomically_replaces_partial_file(tmp_path):
-    checkpoint_path = tmp_path / "bst_ranker_best.pth"
-    partial_path = tmp_path / "bst_ranker_best.pth.partial"
-    checkpoint_path.write_bytes(b"old checkpoint")
-
-    bst_training._save_checkpoint_atomically(
-        checkpoint={"epoch": 2, "tensor": torch.tensor([1.0, 2.0])},
-        checkpoint_path=checkpoint_path,
-    )
-
-    assert checkpoint_path.is_file()
-    assert not partial_path.exists()
-    checkpoint = torch.load(checkpoint_path, weights_only=False)
-    assert checkpoint["epoch"] == 2
-    torch.testing.assert_close(checkpoint["tensor"], torch.tensor([1.0, 2.0]))
-
-
 def test_best_checkpoint_callback_failure_propagates(tmp_path, monkeypatch):
     model = _model(use_popularity_feature=False)
     loader = DataLoader(_SingleBatchDataset(_batch()), batch_size=None, shuffle=False)
@@ -544,3 +527,33 @@ def test_best_checkpoint_callback_failure_propagates(tmp_path, monkeypatch):
 
     assert (tmp_path / "bst_ranker_best.pth").is_file()
     assert not (tmp_path / "bst_ranker_best.pth.partial").exists()
+
+
+def test_train_bst_preserves_named_max_batch_validation():
+    with pytest.raises(
+        ValueError,
+        match="bst_max_train_batches_per_epoch must be positive when provided",
+    ):
+        bst_training.train_bst_ranker_model(
+            model=None,
+            train_loader=None,
+            val_loader=None,
+            val_unseen_loader=None,
+            device="cpu",
+            epochs=1,
+            learning_rate=1.0e-3,
+            weight_decay=0.0,
+            patience=1,
+            early_stopping_min_delta=0.0,
+            checkpoints_dir=None,
+            disable_progress=True,
+            lr_scheduler_factor=0.5,
+            lr_scheduler_patience=1,
+            gradient_clip_max_norm=1.0,
+            metrics_top_ks=[1],
+            bst_max_train_batches_per_epoch=0,
+            checkpoint_metadata={},
+            best_checkpoint_callback=None,
+            experiment_tracker=None,
+            logger=logging.getLogger("bst-training-validation-test"),
+        )

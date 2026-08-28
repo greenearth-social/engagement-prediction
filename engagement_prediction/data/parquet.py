@@ -73,3 +73,48 @@ def read_parquet_parts(
     if empty is None:
         raise ValueError("Expected at least one Parquet part")
     return empty
+
+
+def write_parquet_part_if_not_empty(df: pl.DataFrame, path: Path) -> bool:
+    """Write one prepared public part, returning whether a file was created."""
+
+    if df.is_empty():
+        return False
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    df.write_parquet(path, compression="zstd")
+    return True
+
+
+def ensure_typed_parquet_dataset(
+    path: Path,
+    schema: dict[str, pl.DataType],
+) -> None:
+    """Ensure a partitioned dataset has at least one schema-bearing part."""
+
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    if not list(path.rglob("*.parquet")):
+        pl.DataFrame(schema=schema).write_parquet(
+            path / "part-00000.parquet",
+            compression="zstd",
+        )
+
+
+def validate_parquet_part_schemas(
+    path: Path,
+    schema: dict[str, pl.DataType],
+) -> int:
+    """Validate the exact schema of every physical part in a dataset."""
+
+    path = Path(path)
+    parts = sorted(path.rglob("*.parquet")) if path.is_dir() else []
+    if not parts:
+        raise ValueError(f"Partitioned Parquet dataset has no parts: {path}")
+    expected = pl.Schema(schema)
+    for part in parts:
+        actual = pl.read_parquet_schema(part)
+        if actual != expected:
+            raise ValueError(
+                f"Unexpected Parquet schema for {part}: expected {expected}, found {actual}"
+            )
+    return len(parts)

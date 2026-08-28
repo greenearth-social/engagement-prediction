@@ -21,7 +21,10 @@ from typing import Any
 
 import polars as pl
 
-from engagement_prediction.data.parquet import read_parquet_parts
+from engagement_prediction.data.parquet import (
+    read_parquet_parts,
+    write_parquet_part_if_not_empty,
+)
 
 
 QUERY_KEY = ["did", "query_hour"]
@@ -248,11 +251,10 @@ def write_query_history_partition(
         partial_output_path / f"part-{partition_id:05d}.parquet",
         compression="zstd",
     )
-    if not history_post_uris_df.is_empty():
-        history_post_uris_df.write_parquet(
-            history_post_uri_shards_path / f"part-{partition_id:05d}.parquet",
-            compression="zstd",
-        )
+    write_parquet_part_if_not_empty(
+        history_post_uris_df,
+        history_post_uri_shards_path / f"part-{partition_id:05d}.parquet",
+    )
     return {
         "partition_id": partition_id,
         "query_count": history_df.height,

@@ -45,6 +45,14 @@ from engagement_prediction.training.runtime import (
     get_device,
     set_random_seeds,
 )
+from engagement_prediction.training.stage8 import (
+    build_training_result_payload,
+    build_training_summary,
+    evaluate_listwise_splits,
+    upload_reproducibility_artifacts,
+    write_stage_info,
+    write_training_result_files,
+)
 
 
 STAGE_FOLDER = "08_train_two_tower"
@@ -133,23 +141,16 @@ def _final_metrics(
 ) -> Dict[str, Dict[str, Any]]:
     """Evaluate the reloaded best model with deterministic candidate pools."""
 
-    results: Dict[str, Dict[str, Any]] = {}
-    for split_name, loader in loaders.items():
-        _, metrics, _ = run_two_tower_listwise_epoch(
-            train=False,
-            split_name=f"Final {split_name}",
-            model=model,
-            device=device,
-            dataloader=loader,
-            optimizer=None,
-            disable_progress=disable_progress,
-            gradient_clip_max_norm=gradient_clip_max_norm,
-            metrics_top_ks=metrics_top_ks,
-            calc_baseline_metrics=False,
-            max_batches=None,
-        )
-        results[split_name] = metrics
-    return results
+    return evaluate_listwise_splits(
+        model=model,
+        epoch_runner=run_two_tower_listwise_epoch,
+        device=device,
+        loaders=loaders,
+        disable_progress=disable_progress,
+        gradient_clip_max_norm=gradient_clip_max_norm,
+        metrics_top_ks=metrics_top_ks,
+        max_batches_by_split={},
+    )
 
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
@@ -494,51 +495,28 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         ],
         "final_validation": final_export_validation,
     }
-    result_payload = {
-        "output_embedding_dim": output_embedding_dim,
-        "primary_metric_name": training_results["primary_metric_name"],
-        "best_val_metric": training_results["best_val_metric"],
-        "best_val_loss": training_results["best_val_loss"],
-        "best_epoch": training_results["best_epoch"],
-        "epochs_completed": training_results["epochs_completed"],
-        "stopped_early": training_results["stopped_early"],
-        "patience_counter": training_results["patience_counter"],
-        "baseline_metrics": training_results["baseline_metrics"],
-        "final_metrics": final_metrics,
-        "training_history": training_results["history"],
-        "split_query_counts": {
+    result_payload = build_training_result_payload(
+        training_results=training_results,
+        final_metrics=final_metrics,
+        split_query_counts={
             split: len(dataset) for split, dataset in datasets.items()
         },
-        "torchscript_export": export_payload,
-        "author_map": {"path": str(author_map_path), **author_map_stats},
-        "clearml_publication": clearml_publication,
-        "local_pipeline_runtime_seconds": local_pipeline_runtime_seconds,
-        "runtime_seconds": runtime_seconds,
-    }
+        torchscript_export=export_payload,
+        author_map={"path": str(author_map_path), **author_map_stats},
+        clearml_publication=clearml_publication,
+        local_pipeline_runtime_seconds=local_pipeline_runtime_seconds,
+        runtime_seconds=runtime_seconds,
+        extra_fields={"output_embedding_dim": output_embedding_dim},
+    )
     training_results_path = out_dir / "training_results.json"
-    write_json_atomically(training_results_path, result_payload)
-
     summary_path = out_dir / "summary.json"
-    summary = {
-        "parameters": training_config,
-        "input": {
-            "dataset_hydration_dir": str(stage7_dir),
-            "hydrated_training_data_path": str(bundle_path),
-        },
-        "model": model_config,
-        "results": {
-            key: value
-            for key, value in result_payload.items()
-            if key not in {
-                "training_history",
-                "final_metrics",
-                "torchscript_export",
-                "author_map",
-                "clearml_publication",
-            }
-        },
-        "final_metrics": final_metrics,
-        "outputs": {
+    summary = build_training_summary(
+        training_config=training_config,
+        stage7_dir=stage7_dir,
+        bundle_path=bundle_path,
+        model_config=model_config,
+        result_payload=result_payload,
+        outputs={
             "checkpoint_path": str(checkpoint_path),
             "user_tower_path": str(user_tower_path),
             "post_tower_path": str(post_tower_path),
@@ -554,12 +532,15 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "authors_path": authors_path.name,
             "training_plot_path": plot_path.name if plot_path else None,
         },
-        "torchscript_export": export_payload,
-        "author_map": result_payload["author_map"],
-        "clearml_publication": clearml_publication,
-        "runtime_seconds": runtime_seconds,
-    }
-    write_json_atomically(summary_path, summary)
+        runtime_seconds=runtime_seconds,
+        extra_sections={},
+    )
+    write_training_result_files(
+        training_results_path=training_results_path,
+        result_payload=result_payload,
+        summary_path=summary_path,
+        summary=summary,
+    )
 
     primary_key = f"ndcg@{metrics_top_ks[0]}"
     stage_info_path = out_dir / "stage_info.txt"
@@ -595,27 +576,28 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "clearml_publication_errors: "
         f"{json.dumps(clearml_publication['errors'], sort_keys=True)}",
     ]
-    for split, metrics in final_metrics.items():
-        stage_info_lines.extend([
-            f"{split}_loss: {metrics['loss']:.6f}",
-            f"{split}_{primary_key}: {metrics[primary_key]:.6f}",
-        ])
-    stage_info_path.write_text("\n".join(stage_info_lines) + "\n")
+    write_stage_info(
+        stage_info_path=stage_info_path,
+        lines=stage_info_lines,
+        final_metrics=final_metrics,
+        primary_metric_key=primary_key,
+    )
 
-    if context.tracker is not None and str(getattr(context.tracker, "id", "") or ""):
-        artifact_paths = {
-            "two_tower_model_config": model_config_path,
-            "two_tower_training_config": training_config_path,
-            "two_tower_training_results": training_results_path,
-            "two_tower_best_checkpoint": checkpoint_path,
-            "two_tower_stage_summary": summary_path,
-            "two_tower_stage_info": stage_info_path,
-        }
-        if plot_path is not None:
-            artifact_paths["two_tower_training_history_plot"] = plot_path
-        for name, path in artifact_paths.items():
-            if not context.tracker.log_file_artifact(name, path):
-                logger.warning("Experiment tracker did not upload artifact '%s'", name)
+    artifact_paths = {
+        "two_tower_model_config": model_config_path,
+        "two_tower_training_config": training_config_path,
+        "two_tower_training_results": training_results_path,
+        "two_tower_best_checkpoint": checkpoint_path,
+        "two_tower_stage_summary": summary_path,
+        "two_tower_stage_info": stage_info_path,
+    }
+    if plot_path is not None:
+        artifact_paths["two_tower_training_history_plot"] = plot_path
+    upload_reproducibility_artifacts(
+        tracker=context.tracker,
+        logger=logger,
+        artifact_paths=artifact_paths,
+    )
 
     clear_cuda_memory()
     logger.info(

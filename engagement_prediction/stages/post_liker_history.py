@@ -4,17 +4,17 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-import json
 from pathlib import Path
-import shutil
 import time
 from typing import Any, Dict
 
 from engagement_prediction.data import ingex
+from engagement_prediction.data import post_liker_history
 from engagement_prediction.data import post_liker_history_artifacts
 from engagement_prediction.data import source_manifests
 from engagement_prediction.data.parquet import find_artifact_path
 from engagement_prediction.data.source_metadata_artifacts import load_source_metadata_artifact
+from engagement_prediction.pipeline.artifacts import PartialArtifactBundle
 from engagement_prediction.pipeline.core import Context
 from engagement_prediction.pipeline.lineage import resolve_recorded_stage_lineage
 from engagement_prediction.pipeline.logging import get_stage_logger
@@ -122,16 +122,22 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     )
 
     artifact_suffix = out_dir.name
-    bundle_path = out_dir / f"post_liker_histories_{artifact_suffix}"
-    bundle_partial_path = out_dir / f"post_liker_histories_{artifact_suffix}.partial"
-    bundle_partial_path.mkdir(parents=True, exist_ok=False)
-    post_liker_events_path = bundle_partial_path / "post_liker_events"
-    post_liker_posts_path = bundle_partial_path / "post_liker_posts"
-    like_sources_path = bundle_partial_path / f"like_sources_{artifact_suffix}.json"
+    publication = PartialArtifactBundle.create(
+        output_dir=out_dir,
+        bundle_name=f"post_liker_histories_{artifact_suffix}",
+        staging_name=f"_post_liker_history_staging_{artifact_suffix}.partial",
+        dataset_schemas={
+            "post_liker_events": post_liker_history.POST_LIKER_EVENT_SCHEMA,
+            "post_liker_posts": post_liker_history.POST_LIKER_POST_SCHEMA,
+        },
+    )
+    bundle_path = publication.final_path
+    post_liker_events_path = publication.public_path("post_liker_events")
+    post_liker_posts_path = publication.public_path("post_liker_posts")
+    like_sources_path = publication.public_path(f"like_sources_{artifact_suffix}.json")
     ingex.write_source_manifest(like_sources_path, stage4_like_snapshot.manifest)
 
-    staging_root = out_dir / f"_post_liker_history_staging_{artifact_suffix}.partial"
-    staging_root.mkdir(parents=True, exist_ok=False)
+    staging_root = publication.staging_path
     selected_post_shards_path = staging_root / "selected_post_shards"
     selected_post_routes_path = staging_root / "selected_post_routes"
     normalized_likes_path = staging_root / "normalized_likes"
@@ -179,9 +185,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         logger=logger,
     )
 
-    logger.info("Phase 5/5: removing internal staging and publishing the bundle")
-    shutil.rmtree(staging_root)
-    bundle_partial_path.replace(bundle_path)
+    logger.info("Phase 5/5: validating and publishing the bundle")
     final_events_path = bundle_path / "post_liker_events"
     final_posts_path = bundle_path / "post_liker_posts"
     final_like_sources_path = bundle_path / like_sources_path.name
@@ -218,10 +222,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         },
         "runtime_seconds": runtime_seconds,
     }
-    (out_dir / "summary.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n"
-    )
-    (out_dir / "stage_info.txt").write_text(
+    stage_info = (
         "\n".join([
             "stage: post_liker_history",
             f"runtime_seconds: {runtime_seconds:.2f}",
@@ -240,6 +241,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             f"like_sources_path: {Path(bundle_path.name) / final_like_sources_path.name}",
         ])
         + "\n"
+    )
+    publication.publish(
+        summary=summary,
+        stage_info=stage_info,
     )
     logger.info(
         "Post-liker history completed in %.2fs: posts=%s events=%s zero_like_posts=%s",

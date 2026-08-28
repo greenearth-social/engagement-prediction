@@ -30,9 +30,11 @@ from engagement_prediction.data import (
     source_metadata,
 )
 from engagement_prediction.data.parquet import (
+    ensure_typed_parquet_dataset,
     find_artifact_path,
     read_parquet_parts,
     sink_partitioned_parquet,
+    write_parquet_part_if_not_empty,
 )
 
 
@@ -197,11 +199,10 @@ def _process_uri_partition(
         partition_id=partition_id,
         partition_count=partition_count,
     )
-    if not metadata.is_empty():
-        metadata.write_parquet(
-            post_metadata_path / f"part-{partition_id:05d}.parquet",
-            compression="zstd",
-        )
+    write_parquet_part_if_not_empty(
+        metadata,
+        post_metadata_path / f"part-{partition_id:05d}.parquet",
+    )
 
     partition_root_count = metadata.filter(~pl.col("is_reply")).height
     partition_reply_count = metadata.filter(pl.col("is_reply")).height
@@ -269,11 +270,10 @@ def process_uri_partitions(
 
     # Parquet dataset readers require at least one physical file. Publish a
     # typed empty part when every raw row was invalid.
-    if not list(post_metadata_path.glob("*.parquet")):
-        source_metadata.empty_frame(source_metadata.POST_METADATA_SCHEMA).write_parquet(
-            post_metadata_path / "part-00000.parquet",
-            compression="zstd",
-        )
+    ensure_typed_parquet_dataset(
+        post_metadata_path,
+        source_metadata.POST_METADATA_SCHEMA,
+    )
     return {
         "root_source_stats": _merge_numeric_stats([
             result["root_source_stats"] for result in results

@@ -42,9 +42,11 @@ from engagement_prediction.data import post_selection
 from engagement_prediction.data import user_history
 from engagement_prediction.data.author_indices import AUTHOR_UNK_IDX
 from engagement_prediction.data.parquet import (
+    ensure_typed_parquet_dataset,
     read_parquet_parts,
     scan_parquet_artifact,
     sink_partitioned_parquet,
+    write_parquet_part_if_not_empty,
 )
 
 
@@ -62,17 +64,6 @@ def _partition_paths(path: Path, partition_id: int) -> list[Path]:
     """Return files from a hash-partitioned staging dataset."""
 
     return post_selection.partition_parquet_paths(path, partition_id)
-
-
-def _ensure_dataset(path: Path, schema: dict[str, pl.DataType]) -> None:
-    """Ensure a logical empty dataset still publishes its exact schema."""
-
-    path.mkdir(parents=True, exist_ok=True)
-    if not list(path.rglob("*.parquet")):
-        dataset_hydration.empty_frame(schema).write_parquet(
-            path / "part-00000.parquet",
-            compression="zstd",
-        )
 
 
 def route_selected_posts(
@@ -137,11 +128,10 @@ def build_selected_metadata(
         )
         if selected_df.height != roles_df.height:
             raise ValueError("Stage 5 selected posts are not all present in Stage 3 posts")
-        if not selected_df.is_empty():
-            selected_df.write_parquet(
-                output_path / f"part-{partition_id:05d}.parquet",
-                compression="zstd",
-            )
+        write_parquet_part_if_not_empty(
+            selected_df,
+            output_path / f"part-{partition_id:05d}.parquet",
+        )
         selected_count += selected_df.height
         for role, output_name in (
             ("is_positive", "selected_positive_post_count"),
@@ -762,11 +752,10 @@ def hydrate_usage_partitions(
             (histories_df, hydrated_histories_path),
             (negatives_df, hydrated_negatives_path),
         ):
-            if not df.is_empty():
-                df.write_parquet(
-                    output / f"part-{partition_id:05d}.parquet",
-                    compression="zstd",
-                )
+            write_parquet_part_if_not_empty(
+                df,
+                output / f"part-{partition_id:05d}.parquet",
+            )
         counts["input_positive_count"] += input_positives_df.height
         counts["input_history_item_count"] += input_histories_df.height
         counts["input_negative_count"] += input_negatives_df.height
@@ -1051,11 +1040,10 @@ def build_author_vocabulary(
         eligible_df = support_df.filter(
             pl.col("training_feature_count") >= min_training_feature_count
         )
-        if not eligible_df.is_empty():
-            eligible_df.write_parquet(
-                eligible_shards_path / f"part-{partition_id:05d}.parquet",
-                compression="zstd",
-            )
+        write_parquet_part_if_not_empty(
+            eligible_df,
+            eligible_shards_path / f"part-{partition_id:05d}.parquet",
+        )
         totals["pre_threshold_author_count"] += support_df.height
         totals["eligible_author_count"] += eligible_df.height
         for column in (
@@ -1342,11 +1330,10 @@ def publish_query_artifacts(
             (public_positives_df, query_positives_path),
             (public_histories_df, query_histories_path),
         ):
-            if not df.is_empty():
-                df.write_parquet(
-                    path / f"part-{partition_id:05d}.parquet",
-                    compression="zstd",
-                )
+            write_parquet_part_if_not_empty(
+                df,
+                path / f"part-{partition_id:05d}.parquet",
+            )
         totals["input_query_count"] += query_df.height
         totals["retained_query_count"] += retained_queries_df.height
         totals["dropped_zero_positive_query_count"] += query_df.height - retained_queries_df.height
@@ -1367,7 +1354,7 @@ def publish_query_artifacts(
         (query_positives_path, dataset_hydration.QUERY_POSITIVE_SCHEMA),
         (query_histories_path, dataset_hydration.QUERY_HISTORY_SCHEMA),
     ):
-        _ensure_dataset(path, schema)
+        ensure_typed_parquet_dataset(path, schema)
     if totals["retained_query_count"] == 0:
         raise ValueError("Dataset hydration produced no model-ready queries")
     return {**totals, "retained_query_hours": sorted(retained_hours)}
@@ -1384,9 +1371,9 @@ def publish_negative_candidates(
     parts = sorted(counted_negatives_path.glob("*.parquet"))
     output_path.mkdir(parents=True, exist_ok=False)
     if not parts or not retained_query_hours:
-        dataset_hydration.empty_frame(dataset_hydration.HOURLY_NEGATIVE_SCHEMA).write_parquet(
-            output_path / "part-00000.parquet",
-            compression="zstd",
+        ensure_typed_parquet_dataset(
+            output_path,
+            dataset_hydration.HOURLY_NEGATIVE_SCHEMA,
         )
         return {"retained_negative_count": 0, "retained_negative_post_count": 0}
     hours_df = pl.DataFrame(

@@ -24,6 +24,8 @@ from typing import Any, Dict
 import polars as pl
 
 from engagement_prediction.data import author_statistics
+from engagement_prediction.data import author_vocabulary
+from engagement_prediction.data import dataset_hydration as dataset_data
 from engagement_prediction.data import dataset_hydration_artifacts
 from engagement_prediction.data import ingex
 from engagement_prediction.data import source_manifests
@@ -34,6 +36,7 @@ from engagement_prediction.data.source_metadata_artifacts import (
     SourceMetadataArtifact,
     load_source_metadata_artifact,
 )
+from engagement_prediction.pipeline.artifacts import PartialArtifactBundle
 from engagement_prediction.pipeline.core import Context
 from engagement_prediction.pipeline.lineage import resolve_recorded_stage_lineage
 from engagement_prediction.pipeline.logging import get_stage_logger
@@ -242,27 +245,38 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     hourly_candidates_lf = pl.scan_parquet(sorted(hourly_candidates_path.rglob("*.parquet")))
 
     artifact_suffix = out_dir.name
-    # ``partial_bundle_path`` is the future public artifact. It contains only
-    # final-contract files. All disposable shuffles live under the separate
-    # staging root below, so they cannot leak into the published bundle.
-    bundle_path = out_dir / f"hydrated_training_data_{artifact_suffix}"
-    partial_bundle_path = out_dir / f"hydrated_training_data_{artifact_suffix}.partial"
-    partial_bundle_path.mkdir(parents=True, exist_ok=False)
-    embeddings_path = partial_bundle_path / "embeddings.npy"
-    posts_path = partial_bundle_path / "posts"
-    queries_path = partial_bundle_path / "queries"
-    positives_path = partial_bundle_path / "query_positives"
-    histories_path = partial_bundle_path / "query_histories"
-    negatives_path = partial_bundle_path / "hourly_negative_candidates"
-    authors_path = partial_bundle_path / "authors"
-    loader_index_path = partial_bundle_path / "loader_index"
+    # The publication's partial path contains only final-contract files. All
+    # disposable shuffles live under its separate staging root, so they cannot
+    # leak into the published bundle.
+    publication = PartialArtifactBundle.create(
+        output_dir=out_dir,
+        bundle_name=f"hydrated_training_data_{artifact_suffix}",
+        staging_name=f"_dataset_hydration_staging_{artifact_suffix}.partial",
+        dataset_schemas={
+            "posts": dataset_data.POST_SCHEMA,
+            "queries": dataset_data.QUERY_SCHEMA,
+            "query_positives": dataset_data.QUERY_POSITIVE_SCHEMA,
+            "query_histories": dataset_data.QUERY_HISTORY_SCHEMA,
+            "hourly_negative_candidates": dataset_data.HOURLY_NEGATIVE_SCHEMA,
+            "authors": author_vocabulary.AUTHOR_VOCABULARY_SCHEMA,
+        },
+    )
+    bundle_path = publication.final_path
+    embeddings_path = publication.public_path("embeddings.npy")
+    posts_path = publication.public_path("posts")
+    queries_path = publication.public_path("queries")
+    positives_path = publication.public_path("query_positives")
+    histories_path = publication.public_path("query_histories")
+    negatives_path = publication.public_path("hourly_negative_candidates")
+    authors_path = publication.public_path("authors")
+    loader_index_path = publication.public_path("loader_index")
     copied_manifests = []
     for prefix, manifest in (
         ("post_sources", post_snapshot.manifest),
         ("reply_sources", reply_snapshot.manifest),
         ("like_sources", like_snapshot.manifest),
     ):
-        path = partial_bundle_path / f"{prefix}_{artifact_suffix}.json"
+        path = publication.public_path(f"{prefix}_{artifact_suffix}.json")
         ingex.write_source_manifest(path, manifest)
         copied_manifests.append(path)
     manifest_output_paths = {
@@ -270,8 +284,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         for path in copied_manifests
     }
 
-    staging_root = out_dir / f"_dataset_hydration_staging_{artifact_suffix}.partial"
-    staging_root.mkdir(parents=True, exist_ok=False)
+    staging_root = publication.staging_path
     # Stage 5 role rows are first routed to Stage 00/3 URI partitions and
     # joined with Stage 3 metadata. ``selected_metadata`` is the authoritative
     # selected URI/role/creation/author table for the rest of this stage.
@@ -503,11 +516,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         output_path=loader_index_path,
         logger=logger,
     )
-    # A successful validation is the only path that removes diagnostic staging
-    # and promotes the public partial directory to its final artifact name.
-    # Exceptions leave partial state behind and no completed stage manifest.
-    shutil.rmtree(staging_root)
-    partial_bundle_path.replace(bundle_path)
     runtime_seconds = time.time() - started_at
     summary = {
         "parameters": {
@@ -565,9 +573,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         },
         "runtime_seconds": runtime_seconds,
     }
-    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
-    (out_dir / "stage_info.txt").write_text(
-        "\n".join([
+    stage_info = "\n".join([
             "stage: dataset_hydration",
             f"runtime_seconds: {runtime_seconds:.2f}",
             f"embedding_model: {embedding_model}",
@@ -600,6 +606,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                 for name, path in sorted(manifest_output_paths.items())
             ],
         ]) + "\n"
+    # Exceptions leave the partial bundle and diagnostic staging in place. The
+    # registry writes the completed stage manifest only after this returns.
+    publication.publish(
+        summary=summary,
+        stage_info=stage_info,
     )
     logger.info(
         "Dataset hydration completed in %.2fs: posts=%s queries=%s positives=%s histories=%s negatives=%s authors=%s loader_index_bytes=%s",

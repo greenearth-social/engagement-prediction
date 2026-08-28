@@ -14,7 +14,12 @@ from engagement_prediction.data import ingex
 from engagement_prediction.data import likes
 from engagement_prediction.data import negative_selection
 from engagement_prediction.data import post_selection
-from engagement_prediction.data.parquet import read_parquet_parts, sink_partitioned_parquet
+from engagement_prediction.data.parquet import (
+    ensure_typed_parquet_dataset,
+    read_parquet_parts,
+    sink_partitioned_parquet,
+    write_parquet_part_if_not_empty,
+)
 
 
 class NegativeSelectionConfig(Protocol):
@@ -26,24 +31,6 @@ class NegativeSelectionConfig(Protocol):
     max_candidate_age_hours: int
     partition_count: int
     random_seed: int
-
-
-def _write_if_not_empty(df: pl.DataFrame, path: Path) -> None:
-    """Write a physical partition only when it contains public rows."""
-
-    if not df.is_empty():
-        df.write_parquet(path, compression="zstd")
-
-
-def _ensure_nonempty_dataset(path: Path, schema: dict[str, pl.DataType]) -> None:
-    """Publish one schema-bearing file when a logical dataset is empty."""
-
-    path.mkdir(parents=True, exist_ok=True)
-    if not list(path.rglob("*.parquet")):
-        pl.DataFrame(schema=schema).write_parquet(
-            path / "part-00000.parquet",
-            compression="zstd",
-        )
 
 
 def _public_partition_path(dataset_path: Path, partition_id: int) -> list[Path]:
@@ -191,7 +178,7 @@ def process_uri_partitions(
             min_likes_for_popular_candidate=config.min_likes_for_popular_candidate,
             random_seed=config.random_seed,
         )
-        _write_if_not_empty(
+        write_parquet_part_if_not_empty(
             local_finalists_df,
             local_finalists_path / f"part-{partition_id:05d}.parquet",
         )
@@ -311,7 +298,7 @@ def process_hour_partitions(
                 raise ValueError(
                     f"Hour partition {partition_id} contains rows assigned to {assigned}"
                 )
-        _write_if_not_empty(
+        write_parquet_part_if_not_empty(
             hourly_candidates_df,
             hourly_candidates_path / f"part-{partition_id:05d}.parquet",
         )
@@ -340,7 +327,7 @@ def process_hour_partitions(
             time.monotonic() - partition_started,
             f"{hourly_candidates_df.height:,}",
         )
-    _ensure_nonempty_dataset(
+    ensure_typed_parquet_dataset(
         hourly_candidates_path,
         negative_selection.HOURLY_CANDIDATE_SCHEMA,
     )
@@ -422,12 +409,12 @@ def build_negative_post_uris(
             raise ValueError("Selected negatives contain a URI missing from posts")
         if selected_posts.filter(pl.col("is_reply")).height:
             raise ValueError("Selected negatives contain a reply")
-        _write_if_not_empty(
+        write_parquet_part_if_not_empty(
             unique_uris_df,
             negative_post_uris_path / f"part-{partition_id:05d}.parquet",
         )
         unique_count += unique_uris_df.height
-    _ensure_nonempty_dataset(
+    ensure_typed_parquet_dataset(
         negative_post_uris_path,
         negative_selection.NEGATIVE_POST_URI_SCHEMA,
     )

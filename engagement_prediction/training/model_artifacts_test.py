@@ -7,6 +7,7 @@ from pathlib import Path
 
 import polars as pl
 import pytest
+import torch
 
 from engagement_prediction.data.author_vocabulary import AUTHOR_VOCABULARY_SCHEMA
 from engagement_prediction.training.model_artifacts import (
@@ -14,6 +15,7 @@ from engagement_prediction.training.model_artifacts import (
     file_sha256,
     write_author_map,
     write_json_atomically,
+    write_torch_checkpoint_atomically,
 )
 
 
@@ -89,3 +91,40 @@ def test_file_sha256_returns_known_digest(tmp_path):
     assert file_sha256(path) == (
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     )
+
+
+def test_write_torch_checkpoint_atomically_replaces_existing_file(tmp_path):
+    checkpoint_path = tmp_path / "model.pth"
+    partial_path = tmp_path / "model.pth.partial"
+    checkpoint_path.write_bytes(b"old checkpoint")
+
+    write_torch_checkpoint_atomically(
+        checkpoint_path,
+        {"epoch": 2, "tensor": torch.tensor([1.0, 2.0])},
+    )
+
+    assert checkpoint_path.is_file()
+    assert not partial_path.exists()
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
+    assert checkpoint["epoch"] == 2
+    torch.testing.assert_close(checkpoint["tensor"], torch.tensor([1.0, 2.0]))
+
+
+def test_write_torch_checkpoint_atomically_cleans_partial_on_failure(
+    tmp_path,
+    monkeypatch,
+):
+    checkpoint_path = tmp_path / "model.pth"
+    checkpoint_path.write_bytes(b"old checkpoint")
+
+    def fail_save(checkpoint, path):
+        Path(path).write_bytes(b"partial checkpoint")
+        raise RuntimeError("injected save failure")
+
+    monkeypatch.setattr(torch, "save", fail_save)
+
+    with pytest.raises(RuntimeError, match="injected save failure"):
+        write_torch_checkpoint_atomically(checkpoint_path, {"epoch": 2})
+
+    assert checkpoint_path.read_bytes() == b"old checkpoint"
+    assert not (tmp_path / "model.pth.partial").exists()

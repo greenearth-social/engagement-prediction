@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import polars as pl
+import torch
 
 from engagement_prediction.data.parquet import scan_parquet_artifact
 
@@ -41,6 +42,19 @@ def file_sha256(path: Path) -> str:
         while chunk := file_obj.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def write_torch_checkpoint_atomically(path: Path, checkpoint: Any) -> None:
+    """Publish a Torch checkpoint without exposing a partial final file."""
+
+    path = Path(path)
+    partial_path = path.with_name(f"{path.name}.partial")
+    try:
+        torch.save(checkpoint, partial_path)
+        partial_path.replace(path)
+    except Exception:
+        partial_path.unlink(missing_ok=True)
+        raise
 
 
 def write_author_map(
