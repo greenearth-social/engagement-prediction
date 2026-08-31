@@ -6,12 +6,13 @@ import logging
 from pathlib import Path
 from typing import Any, Dict
 
+from engagement_prediction.experiment_tracking import ModelPublicationTracker
 from engagement_prediction.training.model_artifacts import write_json_atomically
 
 
 def publish_two_tower_to_tracker(
     *,
-    tracker: Any,
+    tracker: ModelPublicationTracker,
     logger: logging.Logger,
     user_tower_path: Path,
     post_tower_path: Path,
@@ -25,7 +26,7 @@ def publish_two_tower_to_tracker(
     tower OutputModels and the matching author vocabulary reached ClearML.
     """
 
-    task_id = str(getattr(tracker, "id", "") or "") if tracker is not None else ""
+    task_id = str(tracker.id or "")
     result: Dict[str, Any] = {
         "status": "not_configured" if not task_id else "incomplete",
         "clearml_task_id": task_id,

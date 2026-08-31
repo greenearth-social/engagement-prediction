@@ -7,18 +7,22 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Union
 
 
-class ExperimentTracker(Protocol):
-    """Small tracker surface used by training without depending on ClearML."""
+class ModelPublicationTracker(Protocol):
+    """Tracker surface needed to publish serving models and companion files."""
 
     id: str
-
-    def log_scalar(self, title: str, series: str, value: float, iteration: int) -> None:
-        ...
 
     def log_artifact(self, name: str, path: Path) -> dict[str, str]:
         ...
 
     def log_file_artifact(self, name: str, path: Path) -> bool:
+        ...
+
+
+class ExperimentTracker(ModelPublicationTracker, Protocol):
+    """Full tracker surface used by training without depending on ClearML."""
+
+    def log_scalar(self, title: str, series: str, value: float, iteration: int) -> None:
         ...
 
     def log_params(self, params: Dict[str, Any], name: Optional[str] = None) -> None:
@@ -63,7 +67,7 @@ class ExperimentTracker(Protocol):
 class NoOpExperimentTracker:
     """Discard tracking calls while preserving the training call contract."""
 
-    id: str
+    id: str = ""
 
     def log_scalar(self, title: str, series: str, value: float, iteration: int) -> None:
         return None
