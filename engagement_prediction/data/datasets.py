@@ -308,6 +308,11 @@ class HydratedBucketedEngagementDataset(Dataset):
         if self._owner_pid is not None:
             self._close_mappings()
 
+        # Array mappings are opened once per worker process. Parse the shared
+        # descriptor once for that open cycle instead of once per array, but do
+        # not retain it in pickled dataset state or a potentially stale global
+        # cache.
+        metadata = load_loader_index_metadata(self.loader_index_path)
         embeddings = np.load(self._embeddings_path, mmap_mode="r")
         if (
             not isinstance(embeddings, np.memmap)
@@ -321,12 +326,17 @@ class HydratedBucketedEngagementDataset(Dataset):
         post_author_idx_override: Optional[np.memmap] = None
         try:
             for name in _GLOBAL_ARRAY_NAMES:
-                arrays[name] = load_index_array(self.loader_index_path, name)
+                arrays[name] = load_index_array(
+                    self.loader_index_path,
+                    name,
+                    metadata=metadata,
+                )
             for name in _SPLIT_ARRAY_NAMES:
                 arrays[name] = load_index_array(
                     self.loader_index_path,
                     name,
                     split=self.split,
+                    metadata=metadata,
                 )
             if self._post_author_idx_override_path is not None:
                 post_author_idx_override = self._open_post_author_idx_override(

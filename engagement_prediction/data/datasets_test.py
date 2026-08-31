@@ -169,6 +169,50 @@ def test_native_dataset_builds_parity_batch_from_memory_mapped_index(tmp_path):
     )
 
 
+def test_dataset_reuses_one_metadata_descriptor_when_opening_arrays(
+    tmp_path,
+    monkeypatch,
+):
+    bundle = _bundle(tmp_path)
+    original_metadata_loader = datasets_module.load_loader_index_metadata
+    original_array_loader = datasets_module.load_index_array
+    metadata_load_count = 0
+    array_metadata_ids = []
+
+    def load_metadata(path):
+        nonlocal metadata_load_count
+        metadata_load_count += 1
+        return original_metadata_loader(path)
+
+    def load_array(index_path, name, split=None, *, metadata=None):
+        assert metadata is not None
+        array_metadata_ids.append(id(metadata))
+        return original_array_loader(
+            index_path,
+            name,
+            split,
+            metadata=metadata,
+        )
+
+    monkeypatch.setattr(datasets_module, "load_loader_index_metadata", load_metadata)
+    monkeypatch.setattr(datasets_module, "load_index_array", load_array)
+
+    dataset = _dataset(bundle)
+    dataset.collate_tensor_batch([dataset[0], dataset[1]])
+    opened_array_count = len(datasets_module._GLOBAL_ARRAY_NAMES) + len(
+        datasets_module._SPLIT_ARRAY_NAMES
+    )
+
+    # One read validates the constructor header and one read supplies every
+    # mapping opened by this process. Repeated batches reuse those mappings.
+    assert metadata_load_count == 2
+    assert len(array_metadata_ids) == opened_array_count
+    assert len(set(array_metadata_ids)) == 1
+    dataset.collate_tensor_batch([dataset[0], dataset[1]])
+    assert metadata_load_count == 2
+    assert len(array_metadata_ids) == opened_array_count
+
+
 def test_model_author_override_remaps_posts_and_preserves_pad_and_unk(tmp_path):
     bundle = _bundle(tmp_path)
     override_path = _write_author_override(

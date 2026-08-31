@@ -413,11 +413,22 @@ def _metadata_entry(
     return section[name]
 
 
-def load_index_array(index_path: Path, name: str, split: str | None = None) -> np.memmap:
-    """Open one declared numeric index array as a read-only NumPy mapping."""
+def load_index_array(
+    index_path: Path,
+    name: str,
+    split: str | None = None,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> np.memmap:
+    """Open one declared numeric index array as a read-only NumPy mapping.
+
+    Callers opening several arrays from one index can pass the already-parsed
+    descriptor so ``format.json`` is read only once.
+    """
 
     index_path = Path(index_path)
-    metadata = load_loader_index_metadata(index_path)
+    if metadata is None:
+        metadata = load_loader_index_metadata(index_path)
     entry = _metadata_entry(metadata, name, split)
     array = np.load(index_path / entry["path"], mmap_mode="r", allow_pickle=False)
     if array.dtype.str != entry["dtype"] or list(array.shape) != entry["shape"]:
