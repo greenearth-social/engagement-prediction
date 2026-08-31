@@ -50,6 +50,8 @@ def is_performance_metric(metric_name: str) -> bool:
 
 
 def _optional_finite_float(value: Any) -> float | None:
+    """Normalize optional numeric output while rejecting NaN and infinity."""
+
     if value is None or isinstance(value, bool):
         return None
     try:
@@ -102,6 +104,8 @@ def build_metric_deltas(
 
 
 def _csv_value(value: Any) -> Any:
+    """Format finite floats consistently while preserving nonnumeric values."""
+
     if value is None:
         return ""
     rounded = round_output_floats(value)

@@ -73,6 +73,8 @@ SPLIT_ARRAY_DTYPES = {
 
 
 def _json_dump(path: Path, value: dict[str, Any]) -> None:
+    """Write deterministic, human-readable index metadata."""
+
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
@@ -94,6 +96,8 @@ def _iter_parquet_batches(
     columns: list[str],
     batch_size: int = ARROW_BATCH_SIZE,
 ) -> Iterator[pa.RecordBatch]:
+    """Read selected Parquet columns in bounded Arrow batches."""
+
     parquet_file = pq.ParquetFile(path)
     yield from parquet_file.iter_batches(columns=columns, batch_size=batch_size)
 
@@ -106,6 +110,8 @@ def _parquet_row_count(paths: Path | Sequence[Path]) -> int:
 
 
 def _timestamp_values(array: pa.Array) -> np.ndarray:
+    """Convert a non-null UTC Arrow timestamp array to little-endian epoch micros."""
+
     if array.null_count:
         raise ValueError("Training-index timestamp arrays may not contain nulls")
     if not pa.types.is_timestamp(array.type):
@@ -120,6 +126,8 @@ def _timestamp_values(array: pa.Array) -> np.ndarray:
 
 
 def _integer_values(array: pa.Array, dtype: np.dtype[Any]) -> np.ndarray:
+    """Validate and cast nonnegative Arrow integers to an index storage dtype."""
+
     if array.null_count:
         raise ValueError("Training-index integer arrays may not contain nulls")
     values = array.to_numpy(zero_copy_only=False)
@@ -156,11 +164,15 @@ def _list_values(
 
 
 def _allocate_array(path: Path, dtype: np.dtype[Any], length: int) -> np.memmap:
+    """Allocate an exact-sized ``.npy`` file and return its writable memmap."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     return np.lib.format.open_memmap(path, mode="w+", dtype=dtype, shape=(int(length),))
 
 
 def _array_metadata(root: Path, path: Path, dtype: np.dtype[Any], length: int) -> dict[str, Any]:
+    """Describe one numeric file relative to the loader-index root."""
+
     return {
         "path": str(path.relative_to(root)),
         "dtype": dtype.str,
@@ -182,6 +194,8 @@ class _Utf8IpcWriter:
         self.batch_offsets = [0]
 
     def write(self, values: pa.Array) -> None:
+        """Append one record batch and remember its cumulative row boundary."""
+
         if values.null_count:
             raise ValueError(f"Arrow identifier column {self.column!r} contains nulls")
         if not pa.types.is_string(values.type):
@@ -209,6 +223,8 @@ def _arrow_metadata(
     row_count: int,
     batch_offsets: list[int],
 ) -> dict[str, Any]:
+    """Describe a memory-mapped identifier table and its record batches."""
+
     return {
         "path": str(path.relative_to(root)),
         "column": column,
@@ -269,6 +285,8 @@ class MemoryMappedUtf8Table:
         self._owner_pid = None
 
     def _ensure_open(self) -> None:
+        """Open or reopen the Arrow file in the process performing the read."""
+
         pid = os.getpid()
         if self._reader is not None and self._owner_pid == pid:
             return
@@ -381,6 +399,8 @@ def _metadata_entry(
     name: str,
     split: str | None,
 ) -> dict[str, Any]:
+    """Locate one declared global or split-specific numeric array."""
+
     if split is None:
         section = metadata.get("arrays", {})
     else:
@@ -485,6 +505,8 @@ def _write_query_core(
     query_path: Path,
     query_count: int,
 ) -> tuple[dict[str, Any], dict[str, Any], np.ndarray, np.ndarray]:
+    """Write canonical query hours/DIDs and derive contiguous hour ranges."""
+
     hours_path = split_dir / "query_hours_us.npy"
     dids_path = split_dir / "query_dids.arrow"
     hours = _allocate_array(hours_path, TIMESTAMP_DTYPE, query_count)
@@ -520,16 +542,22 @@ def _write_query_core(
 
 
 def _route_paths(path: Path, partition_id: int) -> list[Path]:
+    """Return temporary rows routed from one public query partition."""
+
     partition_path = path / f"_source_partition={partition_id}"
     return sorted(partition_path.rglob("*.parquet")) if partition_path.exists() else []
 
 
 def _split_paths(path: Path, split: str) -> list[Path]:
+    """Return temporary rows routed to one logical dataset split."""
+
     partition_path = path / f"_split_partition={split}"
     return sorted(partition_path.rglob("*.parquet")) if partition_path.exists() else []
 
 
 def _read_query_route(path: Path, partition_id: int) -> pl.DataFrame:
+    """Load one bounded map from public query keys to canonical query indices."""
+
     paths = _route_paths(path, partition_id)
     if not paths:
         return pl.DataFrame(
@@ -549,6 +577,8 @@ def _joined_partition(
     query_route: pl.DataFrame,
     kind: str,
 ) -> pl.DataFrame:
+    """Attach canonical query indices to one aligned history/positive part."""
+
     if source_path is None:
         raise ValueError(f"Hydrated query partition is missing its aligned {kind} part")
     if kind == "history":
@@ -585,6 +615,8 @@ def _scatter_history_slice(
     liked_ats: np.memmap,
     prior_counts: np.memmap,
 ) -> int:
+    """Scatter one Arrow history slice into its exact global ragged-array ranges."""
+
     table = frame.rechunk().to_arrow()
     query_indices = np.asarray(
         table.column("_query_idx").chunk(0).to_numpy(zero_copy_only=False),
@@ -826,6 +858,8 @@ def _write_hour_and_negatives(
     query_offsets: np.ndarray,
     negative_count: int,
 ) -> dict[str, Any]:
+    """Write hour offsets and flattened, hour-grouped negative features."""
+
     paths = {
         "hour_values_us": split_dir / "hour_values_us.npy",
         "hour_query_offsets": split_dir / "hour_query_offsets.npy",
@@ -1018,6 +1052,8 @@ def _build_split(
     positive_parts: dict[str, Path],
     history_parts: dict[str, Path],
 ) -> dict[str, Any]:
+    """Build every compact array and identifier table for one logical split."""
+
     split_dir = root / "splits" / split
     split_dir.mkdir(parents=True, exist_ok=False)
     query_count = _parquet_row_count(query_path)
@@ -1064,6 +1100,8 @@ def _build_split(
 
 
 def _total_declared_bytes(metadata: dict[str, Any]) -> int:
+    """Sum the file sizes represented by the index metadata."""
+
     total = sum(entry["file_size_bytes"] for entry in metadata["arrays"].values())
     total += sum(entry["file_size_bytes"] for entry in metadata["arrow_tables"].values())
     for split_metadata in metadata["splits"].values():
@@ -1094,6 +1132,8 @@ def _artifact_part_map(path: Path) -> dict[str, Path]:
 def _queries_with_source_partitions(
     query_parts: dict[str, Path],
 ) -> tuple[pl.LazyFrame, dict[int, str]]:
+    """Tag query rows with the public partition containing aligned relations."""
+
     source_part_keys = {
         partition_id: source_key
         for partition_id, source_key in enumerate(sorted(query_parts))
@@ -1254,6 +1294,8 @@ def _validate_array(
     expected_dtype: np.dtype[Any],
     expected_length: int,
 ) -> np.memmap:
+    """Validate one declared numeric file and open it read-only."""
+
     if entry.get("dtype") != expected_dtype.str or entry.get("shape") != [expected_length]:
         raise ValueError(f"Invalid loader-index array declaration: {entry}")
     path = root / entry["path"]
@@ -1268,6 +1310,8 @@ def _validate_array(
 
 
 def _validate_offsets(offsets: np.ndarray, value_count: int, name: str) -> None:
+    """Validate a ragged-array offset vector against its flattened values."""
+
     if offsets.size == 0 or int(offsets[0]) != 0 or int(offsets[-1]) != value_count:
         raise ValueError(f"{name} does not span its flat value array")
     if np.any(offsets[1:] < offsets[:-1]):
@@ -1275,6 +1319,8 @@ def _validate_offsets(offsets: np.ndarray, value_count: int, name: str) -> None:
 
 
 def _validate_arrow_table(root: Path, entry: dict[str, Any], expected_rows: int) -> None:
+    """Validate a declared identifier file without materializing its strings."""
+
     if entry.get("row_count") != expected_rows:
         raise ValueError("Arrow table row count does not match the declared index count")
     path = root / entry["path"]

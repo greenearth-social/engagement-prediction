@@ -1,4 +1,9 @@
-"""Stage 8: train the canonical BST ranker from the Stage 7 dataset."""
+"""Stage 8: train and publish the canonical BST ranker from Stage 7 data.
+
+This entrypoint fits training-only popularity normalization, opens the compact
+loader index, selects a checkpoint using unseen-user validation, and publishes
+both reproducibility files and the serving TorchScript artifact.
+"""
 
 from __future__ import annotations
 
@@ -93,6 +98,8 @@ def _create_dataset(
     random_seed: int,
     logger: Any,
 ) -> HydratedBucketedEngagementDataset:
+    """Open one required Stage 7 split and reject an empty training input."""
+
     dataset = HydratedBucketedEngagementDataset(
         bundle_path,
         split=split,
@@ -118,6 +125,8 @@ def _create_loader(
     random_seed: int,
     resample_candidates_each_epoch: bool,
 ):
+    """Create the tensor-only hour-bucketed loader used by canonical BST."""
+
     return create_hydrated_data_loader(
         dataset,
         batch_size=batch_size,
@@ -393,6 +402,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     torchscript_exports = []
 
     def export_best_checkpoint(checkpoint_path: Path) -> None:
+        """Refresh the validated local TorchScript model after a new best epoch."""
+
         export = export_bst_ranker_checkpoint(
             checkpoint_path=checkpoint_path,
             output_path=torchscript_path,

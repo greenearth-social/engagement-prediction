@@ -39,6 +39,8 @@ from engagement_prediction.data.parquet import (
 
 
 class SourceMetadataConfig(Protocol):
+    """Structural settings required to build the Stage 00 metadata index."""
+
     posts_start: datetime
     posts_end: datetime
     source_metadata_partition_count: int
@@ -112,6 +114,8 @@ def load_source_metadata_artifact(stage_dir: Path) -> SourceMetadataArtifact:
 
 
 def _merge_numeric_stats(stats: list[dict[str, int]]) -> dict[str, int]:
+    """Sum like-named source-quality counters from independent partitions."""
+
     merged: dict[str, int] = {}
     for values in stats:
         for key, value in values.items():

@@ -33,7 +33,12 @@ def materialize_required_rows(
     output_path: Path,
     partition_count: int,
 ) -> None:
-    """Route positive/history requirement rows by URI without a global union."""
+    """Route positive/history requirement rows by URI without a global union.
+
+    Role flags are deliberately not deduplicated here. Once all copies of a URI
+    are colocated, :func:`build_required_posts` can combine them locally and keep
+    both flags when a post is used as a positive and as history.
+    """
     positive_schema = query_positives_lf.collect_schema()
     history_schema = history_post_uris_lf.collect_schema()
     if "subject_uri" not in positive_schema or positive_schema["subject_uri"] != pl.String:
@@ -74,7 +79,13 @@ def _process_uri_partition(
     partition_id: int,
     partition_count: int,
 ) -> dict[str, Any]:
-    """Resolve and write one independently owned Stage 3 URI partition."""
+    """Resolve and write one independently owned Stage 3 URI partition.
+
+    Required posts are the lossless positive/history universe. The public
+    ``posts`` table is their resolved metadata unioned with the sampled root-post
+    reservoir; unresolved histories are reported separately, while a missing or
+    reply-only positive is a fatal lineage-integrity error.
+    """
 
     partition_started = time.monotonic()
     required_rows_df = read_parquet_parts(

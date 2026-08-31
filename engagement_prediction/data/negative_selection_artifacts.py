@@ -1,4 +1,10 @@
-"""Bounded disk orchestration for Stage 4 popularity and negative selection."""
+"""Bounded disk orchestration for Stage 4 popularity and negative selection.
+
+Popularity is first calculated in URI partitions, where all likes for a post are
+local. Only bounded per-hour finalists leave those partitions. They are shuffled
+by query hour to apply global quotas, then the selected URIs are shuffled back by
+URI to publish a globally unique post list aligned with Stage 3.
+"""
 
 from __future__ import annotations
 
@@ -113,7 +119,12 @@ def process_uri_partitions(
     config: NegativeSelectionConfig,
     logger: logging.Logger,
 ) -> dict[str, Any]:
-    """Calculate popularity and write bounded method finalists per URI partition."""
+    """Calculate popularity and write bounded method finalists per URI partition.
+
+    The full candidate-by-query-hour relation is intentionally temporary. Only
+    each partition's top K rows for each method cross into the hour shuffle, which
+    bounds intermediate disk and memory while preserving the global top-K result.
+    """
     local_finalists_path.mkdir(parents=True, exist_ok=False)
     totals = {
         "candidate_reservoir_count": 0,
@@ -238,7 +249,12 @@ def process_hour_partitions(
     config: NegativeSelectionConfig,
     logger: logging.Logger,
 ) -> dict[str, Any]:
-    """Apply global quotas and write deterministic public hour partitions."""
+    """Apply global quotas and write deterministic public hour partitions.
+
+    All finalists for one query hour share a hash partition at this point, so the
+    popular-first quota and random shortfall fill are global rather than local to
+    one URI partition.
+    """
     hourly_candidates_path.mkdir(parents=True, exist_ok=False)
     hourly_stats = {
         row["query_hour"].isoformat(): {

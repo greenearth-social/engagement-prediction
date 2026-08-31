@@ -33,6 +33,13 @@ def _list_ingex_parquet_files(
     start: Optional[datetime],
     end: Optional[datetime],
 ) -> Tuple[list[str], list[datetime]]:
+    """List one export family and apply half-open bounds to filename timestamps.
+
+    The GCS prefix is applied server-side; parsing still rejects unrelated or
+    malformed object names. Sorting by timestamp and URI makes source manifests
+    reproducible even if GCS returns objects in a different order.
+    """
+
     matches: list[tuple[datetime, str]] = []
     for blob in client.list_blobs(gcs_bucket, prefix=f"{blob_prefix}_"):
         timestamp = parse_ingex_blob_timestamp(blob.name, blob_prefix)
@@ -89,7 +96,12 @@ def build_source_manifest(
     paths: Sequence[str],
     timestamps: Sequence[datetime],
 ) -> dict[str, Any]:
-    """Describe the exact Ingex files used by a stage."""
+    """Describe the exact Ingex files used by a stage.
+
+    Downstream stages rescan these recorded URIs instead of relisting GCS. This
+    freezes the raw-data snapshot and prevents late-arriving exports from changing
+    the contents of a rerun partway through the lineage.
+    """
     if len(paths) != len(timestamps):
         raise ValueError("Ingex source paths and timestamps must have the same length")
     return {
@@ -106,6 +118,8 @@ def build_source_manifest(
 
 
 def write_source_manifest(path: Path, manifest: dict[str, Any]) -> None:
+    """Write a source snapshot in stable, human-readable JSON form."""
+
     Path(path).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 
 

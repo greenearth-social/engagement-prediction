@@ -99,6 +99,8 @@ def _format_lineage_mismatch(
     expected_path: Path,
     recorded_path: Path,
 ) -> str:
+    """Explain which selected artifact disagrees with a recorded parent."""
+
     return (
         f"Misaligned inputs for stage '{consumer_stage_folder}': selected artifact '{artifact_dir}' "
         f"for stage folder '{artifact_stage_folder}' was created from '{recorded_path}' as its "
@@ -268,6 +270,8 @@ def resolve_stage_dependencies_for_run(
     deps: List[str] = []
 
     def add_with_ancestors(stage_folder: str) -> None:
+        """Append one dependency after recursively adding all its parents."""
+
         for parent_folder in stage_input_folders.get(stage_folder, []):
             add_with_ancestors(parent_folder)
         if stage_folder not in deps:

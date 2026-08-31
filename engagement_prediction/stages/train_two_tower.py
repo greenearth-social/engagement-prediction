@@ -1,4 +1,9 @@
-"""Stage 8: train the canonical two-tower model from the Stage 7 dataset."""
+"""Stage 8: train and publish canonical two-tower models from Stage 7 data.
+
+The native loader supplies shared candidate slates to the cross-attention user
+tower and post tower. Checkpoint improvements refresh both serving TorchScript
+modules; tracker publication occurs only after final local validation.
+"""
 
 from __future__ import annotations
 
@@ -59,6 +64,8 @@ STAGE_FOLDER = "08_train_two_tower"
 
 
 def _load_stage7_summary(stage7_dir: Path) -> Dict[str, Any]:
+    """Load the embedding-model identity recorded by dataset hydration."""
+
     summary_path = stage7_dir / "summary.json"
     try:
         summary = json.loads(summary_path.read_text())
@@ -71,6 +78,8 @@ def _load_stage7_summary(stage7_dir: Path) -> Dict[str, Any]:
 
 
 def _require_loader_index(bundle_path: Path) -> Dict[str, Any]:
+    """Validate the compact Stage 7 contract before allocating model state."""
+
     index_path = bundle_path / "loader_index"
     try:
         return training_index.validate_loader_index(index_path)
@@ -89,6 +98,8 @@ def _create_dataset(
     random_seed: int,
     logger: Any,
 ) -> HydratedBucketedEngagementDataset:
+    """Open one required Stage 7 split using its complete hourly negatives."""
+
     dataset = HydratedBucketedEngagementDataset(
         bundle_path,
         split=split,
@@ -114,6 +125,8 @@ def _create_loader(
     random_seed: int,
     resample_candidates_each_epoch: bool,
 ):
+    """Create the tensor-only loader containing just two-tower inputs."""
+
     return create_hydrated_data_loader(
         dataset,
         batch_size=batch_size,
@@ -366,6 +379,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     torchscript_exports: list[Dict[str, Any]] = []
 
     def export_best_checkpoint(checkpoint_path: Path) -> None:
+        """Refresh and validate both local TorchScript towers for a new best."""
+
         export = export_two_tower_checkpoint(
             checkpoint_path=checkpoint_path,
             user_tower_path=user_tower_path,

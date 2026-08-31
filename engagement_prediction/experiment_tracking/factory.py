@@ -12,6 +12,8 @@ from engagement_prediction.experiment_tracking.base import (
 
 
 def normalize_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively convert CLI parameters into tracker-safe primitive values."""
+
     def _normalize(value: Any) -> Any:
         if isinstance(value, Path):
             return str(value)
@@ -32,6 +34,8 @@ def build_experiment_tracker(
     tags: Optional[Iterable[str]] = None,
     model_output_uri: Optional[str] = None,
 ) -> ExperimentTracker:
+    """Construct the requested tracker, or a side-effect-free no-op tracker."""
+
     if kind == "clearml":
         from engagement_prediction.experiment_tracking.clearml import (
             ClearMLExperimentTracker,

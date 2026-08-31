@@ -26,11 +26,15 @@ ZERO_HISTORY_RANK_METRIC_USER_COUNT = f"{ZERO_HISTORY_METRIC_PREFIX}rank_metric_
 
 @dataclass
 class MatrixBatchScores:
+    """Scores, plus an optional model-specific loss, for one shared slate."""
+
     scores: torch.Tensor
     loss: Optional[torch.Tensor] = None
 
 
 class MatrixRankingScorer(Protocol):
+    """Minimal interface shared by eager and TorchScript comparison scorers."""
+
     def prepare_for_eval(self, device: str) -> None:
         ...
 
@@ -39,6 +43,8 @@ class MatrixRankingScorer(Protocol):
 
 
 class TorchMatrixModelScorer:
+    """Compatibility wrapper for eager models exposing compute_loss_and_preds."""
+
     def __init__(self, model: torch.nn.Module, embed_dim: int):
         self.model = model
         self.embed_dim = int(embed_dim)
@@ -57,6 +63,8 @@ def empty_rank_metric_sums(
     *,
     include_mean_average_precision: bool = True,
 ) -> Dict[str, float]:
+    """Create host-side accumulators for the requested aggregate metrics."""
+
     metric_sums = {f"dcg@{k}": 0.0 for k in metrics_top_ks}
     metric_sums.update({f"ndcg@{k}": 0.0 for k in metrics_top_ks})
     if include_mean_average_precision:
@@ -308,6 +316,8 @@ def rank_metric_sums_for_batch(
 
 
 def finalize_rank_metrics(metric_sums: Dict[str, float], user_count: int) -> Dict[str, float]:
+    """Convert summed per-user metrics to means, with defined empty output."""
+
     if user_count <= 0:
         return {key: 0.0 for key in metric_sums}
     return {
@@ -317,6 +327,8 @@ def finalize_rank_metrics(metric_sums: Dict[str, float], user_count: int) -> Dic
 
 
 def zero_history_row_mask_for_batch(batch: Dict[str, Any], ranked_labels: torch.Tensor) -> torch.Tensor:
+    """Identify query rows whose padded history contains no real events."""
+
     history_mask = batch.get("history_mask")
     if history_mask is None:
         return torch.zeros(ranked_labels.size(0), dtype=torch.bool, device=ranked_labels.device)
@@ -333,6 +345,8 @@ def zero_history_rank_metric_sums_for_batch(
     *,
     include_mean_average_precision: bool = True,
 ) -> Tuple[Dict[str, float], int]:
+    """Calculate ordinary rank sums over only the empty-history rows."""
+
     zero_history_mask = zero_history_row_mask_for_batch(batch, ranked_labels)
     return rank_metric_sums_for_batch(
         ranked_labels[zero_history_mask],
@@ -345,6 +359,8 @@ def finalize_zero_history_rank_metrics(
     metric_sums: Dict[str, float],
     user_count: int,
 ) -> Dict[str, float]:
+    """Prefix zero-history metrics so they can coexist with all-user metrics."""
+
     metrics = {
         f"{ZERO_HISTORY_METRIC_PREFIX}{key}": value
         for key, value in finalize_rank_metrics(metric_sums, user_count).items()
@@ -359,6 +375,8 @@ def ranking_rows_for_batch(
     labels: torch.Tensor,
     metrics_top_ks: list[int],
 ) -> List[Dict[str, Any]]:
+    """Build optional per-query diagnostics from a scored candidate matrix."""
+
     rows: List[Dict[str, Any]] = []
     user_ids = batch["user_id"]
     bucket = batch["bucket"]
@@ -433,6 +451,8 @@ def run_matrix_epoch(
     metrics_top_ks: list[int],
     calc_baseline_metrics: bool,
 ) -> Tuple[float, Dict[str, float], Dict[str, float]]:
+    """Run one epoch for the older eager matrix-model interface."""
+
     if train:
         if optimizer is None:
             raise ValueError("optimizer is required when train=True")
@@ -569,6 +589,9 @@ def evaluate_matrix_scorer(
                     metric_labels = np.concatenate([metric_labels, flat_labels])
                     metric_scores = np.concatenate([metric_scores, flat_scores])
             elif max_classification_metric_pairs > 0:
+                # Assign each pair one deterministic random priority and retain
+                # the globally smallest priorities.  This is reservoir-like
+                # uniform sampling whose result is independent of batch sizes.
                 flat_priorities = rng.random(flat_labels.size)
                 if metric_labels is None or metric_scores is None or metric_priorities is None:
                     metric_labels = flat_labels
@@ -638,6 +661,8 @@ def evaluate_matrix_model(
 
 
 def optional_float_metric(value: Any) -> Optional[float]:
+    """Return a finite metric value, treating missing/NaN/inf as unavailable."""
+
     if value is None:
         return None
     metric_value = float(value)
@@ -647,6 +672,8 @@ def optional_float_metric(value: Any) -> Optional[float]:
 
 
 def optional_metric_value(metrics: Dict[str, Any], metric_name: str) -> Optional[float]:
+    """Resolve a canonical metric name through any supported legacy aliases."""
+
     for key in CLASSIFICATION_METRIC_ALIASES.get(metric_name, (metric_name,)):
         metric_value = optional_float_metric(metrics.get(key))
         if metric_value is not None:
@@ -767,6 +794,8 @@ def _metric_at_k_sort_key(metric_name: str) -> int:
 
 
 def stage_info_metric_lines(split_metrics: Dict[str, Dict[str, Any]]) -> List[str]:
+    """Render optional final and zero-history metrics for stage_info.txt."""
+
     lines = []
     for split_name, metrics in split_metrics.items():
         for metric_name in FINAL_CLASSIFICATION_METRICS:
@@ -802,6 +831,8 @@ def write_ranking_rows(
     split_name: str,
     num_total_likes_by_user: Dict[str, int],
 ) -> None:
+    """Write optional per-query diagnostics enriched with user support counts."""
+
     enriched_rows = []
     for row in rows:
         enriched = dict(row)

@@ -54,20 +54,28 @@ class Stage7Artifact:
 
     @property
     def loader_index_path(self) -> Path:
+        """Return the permanent mmap/Arrow acceleration index."""
+
         return self.bundle_path / "loader_index"
 
     @property
     def embedding_count(self) -> int:
+        """Return the number of dense post embedding rows."""
+
         return int(self.loader_index_validation["embedding_count"])
 
     @property
     def split_query_counts(self) -> dict[str, int]:
+        """Return query counts recorded for every indexed split."""
+
         return {
             split: int(counts["query_count"])
             for split, counts in self.loader_index_validation["splits"].items()
         }
 
     def to_dict(self) -> dict[str, Any]:
+        """Return stable provenance suitable for comparison output JSON."""
+
         return {
             "root": str(self.root),
             "bundle_path": str(self.bundle_path),
@@ -105,6 +113,8 @@ class ModelArtifact:
     similarity_temperature: float | None
 
     def to_dict(self) -> dict[str, Any]:
+        """Return the resolved model contract without loading model weights."""
+
         return {
             "name": self.name,
             "root": str(self.root),
@@ -135,6 +145,8 @@ class ModelArtifact:
 
 
 def _load_json_object(path: Path, *, description: str) -> dict[str, Any]:
+    """Load a required JSON object with an artifact-specific error message."""
+
     if not path.is_file():
         raise FileNotFoundError(f"Missing {description}: {path}")
     try:
@@ -152,6 +164,8 @@ def _validate_completed_manifest(
     expected_stage_key: str,
     expected_stage_folder: str,
 ) -> dict[str, Any]:
+    """Validate the completion marker and directory identity for one stage."""
+
     manifest = _load_json_object(root / "manifest.json", description="completed manifest")
     if "status" in manifest and manifest["status"] != "complete":
         raise ValueError(f"Stage manifest is not complete: {root / 'manifest.json'}")
@@ -199,6 +213,8 @@ def _validate_torchscript_method(
     method_name: str,
     expected_argument_names: Sequence[str],
 ) -> None:
+    """Load a script and verify its externally consumed method signature."""
+
     if not path.is_file():
         raise FileNotFoundError(f"Missing TorchScript artifact: {path}")
     try:
@@ -294,6 +310,8 @@ def resolve_stage7_artifact(path: Path) -> Stage7Artifact:
 def _validate_model_config(
     model_config: dict[str, Any],
 ) -> tuple[str, str, int, int, int, float | None]:
+    """Extract and validate fields shared by all comparison model formats."""
+
     model_type = model_config.get("model_type")
     if model_type not in SUPPORTED_MODEL_TYPES:
         raise ValueError(
@@ -387,6 +405,8 @@ def _resolve_canonical_model_artifact(
         author_table_num_rows,
         similarity_temperature,
     ) = _validate_model_config(model_config)
+    # Filenames and callable signatures are deployment contracts, not merely
+    # conventions: the inference service consumes these exact artifacts.
     if model_type == BST_MODEL_TYPE:
         expected_stage_key = "train_bst_ranker"
         expected_stage_folder = "08_train_bst_ranker"

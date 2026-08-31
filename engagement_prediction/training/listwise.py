@@ -40,6 +40,8 @@ def _filtered_metrics(
     *,
     include_dcg_metrics: bool,
 ) -> dict[str, float]:
+    """Keep the metric subset requested by a particular model family."""
+
     metrics = finalize_rank_metrics(metric_sums, user_count)
     if include_dcg_metrics:
         return metrics
@@ -52,6 +54,8 @@ def _filtered_zero_history_metrics(
     *,
     include_dcg_metrics: bool,
 ) -> dict[str, float | int]:
+    """Apply the same model-specific filtering to the zero-history slice."""
+
     metrics = finalize_zero_history_rank_metrics(metric_sums, user_count)
     if include_dcg_metrics:
         return metrics
@@ -205,6 +209,9 @@ def run_listwise_epoch(
             for key, value in batch_zero_history_metric_sums.items():
                 zero_history_metric_sums[key].add_(value)
 
+    # Packing all accumulators into one tensor produces one device-to-host
+    # synchronization at the end of the epoch instead of one per metric and
+    # batch.  Keep the packing/unpacking order in lockstep below.
     metric_names = list(metric_sums)
     packed_statistics = torch.stack(
         [
@@ -278,6 +285,8 @@ def _append_epoch_history(
     split_metrics: Mapping[str, Mapping[str, Any]],
     metric_names: list[str],
 ) -> None:
+    """Append one epoch while preserving stable serialized history keys."""
+
     for split_name, loss in losses.items():
         history[f"{split_name}_loss"].append(float(loss))
     for split_name, metrics in split_metrics.items():
@@ -297,6 +306,8 @@ def _log_epoch_metrics(
     metrics_top_ks: list[int],
     primary_metric_key: str,
 ) -> None:
+    """Report learned metrics at their one-based epoch iteration."""
+
     if experiment_tracker is None:
         return
     for series, split_name in (
@@ -361,6 +372,8 @@ def _checkpoint_payload(
     checkpoint_metadata: Mapping[str, Any],
     checkpoint_extra_fields: Mapping[str, Any],
 ) -> dict[str, Any]:
+    """Merge shared and model-specific state without ambiguous key overrides."""
+
     protected_keys = {
         "epoch",
         "best_epoch",
@@ -506,6 +519,9 @@ def train_listwise_model(
         desc="Training epochs",
         disable=disable_progress,
     ):
+        # Random baselines depend only on each batch's labels.  Compute them
+        # while epoch one's batches are already resident instead of making an
+        # extra pre-training pass through all three loaders.
         calc_baseline_metrics = epoch == 0
         epoch_outputs = {}
         for split_name, display_name, loader, train_split, max_batches in (
@@ -583,6 +599,10 @@ def train_listwise_model(
         )
         epoch_number = epoch + 1
         epochs_completed = epoch_number
+        # Checkpoint selection tracks every improvement, whereas patience is
+        # reset only by an improvement of at least min_delta.  Keeping these
+        # references separate avoids throwing away a genuinely best model just
+        # because its gain was too small to extend training.
         new_checkpoint_best = (
             primary_metric is not None and primary_metric > best_val_metric
         )
@@ -630,6 +650,9 @@ def train_listwise_model(
                 ),
             )
             if best_checkpoint_callback is not None:
+                # Stage-specific callbacks export serving TorchScript from the
+                # just-published checkpoint.  A callback failure is fatal so a
+                # completed stage never advertises stale serving files.
                 best_checkpoint_callback(checkpoint_path)
 
         epochs_since_best = (

@@ -1,4 +1,9 @@
-"""Stage 4: calculate candidate popularity and select hourly negatives."""
+"""Stage 4: calculate candidate popularity and select hourly negatives.
+
+The random Stage 3 reservoir is scored with strict as-of like counts for each
+query hour. Bounded local finalists are then merged by hour to apply globally
+exact popular-first and random-fill quotas without a full post-hour matrix.
+"""
 
 from __future__ import annotations
 

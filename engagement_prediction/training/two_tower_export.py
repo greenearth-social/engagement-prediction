@@ -15,6 +15,8 @@ _MODEL_TYPE = "two-tower"
 
 
 def _require_mapping(value: Any, *, description: str) -> Mapping[str, Any]:
+    """Narrow dynamically loaded checkpoint metadata to a mapping."""
+
     if not isinstance(value, Mapping):
         raise ValueError(f"{description} must be a mapping")
     return value
@@ -98,6 +100,8 @@ def _parity_inputs(
     *,
     all_masked: bool,
 ) -> tuple[torch.Tensor, ...]:
+    """Create deterministic ordinary or all-masked serving inputs."""
+
     users = 2
     candidates = 3
     history_len = min(3, model.user_tower.history_encoder.max_history_len)
@@ -143,6 +147,8 @@ def _validate_parity(
     scripted_user_tower: torch.jit.ScriptModule,
     scripted_post_tower: torch.jit.ScriptModule,
 ) -> dict[str, Any]:
+    """Require both towers and their combined scores to match eager output."""
+
     cases: list[dict[str, Any]] = []
     with torch.inference_mode():
         for case_name, all_masked in (

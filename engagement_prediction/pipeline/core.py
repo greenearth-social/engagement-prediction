@@ -44,14 +44,20 @@ STAGE_RESOLVED_CONFIG_FILENAME = "resolved_config.json"
 
 
 def generate_run_timestamp() -> str:
+    """Return the canonical timestamp prefix used in run and artifact names."""
+
     # Keep artifact names independent of the host machine timezone.
     return datetime.now(RUN_TIMESTAMP_TIMEZONE).strftime(RUN_TIMESTAMP_FORMAT)
 
 def _short_uuid(n: int = 8) -> str:
+    """Generate the collision-resistant suffix used beside a run timestamp."""
+
     return uuid.uuid4().hex[:n]
 
 
 def _normalize_for_json(value: Any) -> Any:
+    """Recursively convert common pipeline values to JSON-compatible forms."""
+
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, datetime):
@@ -64,6 +70,8 @@ def _normalize_for_json(value: Any) -> Any:
 
 
 def _write_json(path: Path, data: Dict[str, Any]) -> None:
+    """Write deterministic, human-readable pipeline metadata."""
+
     path.write_text(json.dumps(_normalize_for_json(data), indent=2, sort_keys=True) + "\n")
 
 
@@ -78,6 +86,8 @@ def _build_stage_manifest(
     inputs: Dict[str, str],
     status: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Build provenance for one stage without writing it to disk."""
+
     manifest: Dict[str, Any] = {
         "stage_key": stage_key,
         "stage_folder": stage_folder,
@@ -94,6 +104,8 @@ def _build_stage_manifest(
 
 
 def _git_sha(repo_root: Path) -> Optional[str]:
+    """Return the checked-out commit SHA when the directory is a Git checkout."""
+
     try:
         proc = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -110,6 +122,8 @@ def _git_sha(repo_root: Path) -> Optional[str]:
 
 
 def _ensure_symlink(link_path: Path, target_path: Path) -> None:
+    """Replace a file or symlink, but never an existing real directory."""
+
     link_path = Path(link_path)
     target_path = Path(target_path)
     if link_path.exists() or link_path.is_symlink():
@@ -126,6 +140,8 @@ def new_pipeline_run_dir(
     *,
     base_name: str,
 ) -> Path:
+    """Create a unique run-view directory, adding a numeric suffix if needed."""
+
     runs_dir = Path(runs_dir).resolve()
     runs_dir.mkdir(parents=True, exist_ok=True)
     candidate = runs_dir / base_name
@@ -141,6 +157,8 @@ def new_pipeline_run_dir(
 
 
 def ensure_pipeline_run_dir(runs_dir: Path, *, pipeline_run_id: str) -> Path:
+    """Create or reopen the directory for a caller-supplied pipeline run ID."""
+
     runs_dir = Path(runs_dir).resolve()
     runs_dir.mkdir(parents=True, exist_ok=True)
     p = runs_dir / pipeline_run_id
@@ -151,6 +169,8 @@ def ensure_pipeline_run_dir(runs_dir: Path, *, pipeline_run_id: str) -> Path:
 
 
 def update_latest_symlink(runs_dir: Path, pipeline_run_dir: Path) -> None:
+    """Point ``runs/latest`` at the most recently started pipeline run."""
+
     runs_dir = Path(runs_dir).resolve()
     pipeline_run_dir = Path(pipeline_run_dir).resolve()
     _ensure_symlink(runs_dir / "latest", pipeline_run_dir)
@@ -158,6 +178,13 @@ def update_latest_symlink(runs_dir: Path, pipeline_run_dir: Path) -> None:
 
 @dataclass
 class Context:
+    """Carry one pipeline run's paths, resolved inputs, and produced artifacts.
+
+    ``run_dir`` is a human-friendly view made of stage symlinks. Stage data is
+    stored once under ``artifacts_dir`` so separate pipeline runs can reuse the
+    same immutable output without copying it.
+    """
+
     # Pipeline run "view" directory (contains symlinks to canonical artifacts).
     run_dir: Path
     # Canonical artifact store root.
@@ -197,22 +224,30 @@ class Context:
         )
 
     def begin_stage(self, stage_key: str, stage_folder: str) -> None:
+        """Reset per-stage provenance before invoking a stage entrypoint."""
+
         self._active_stage_key = stage_key
         self._active_stage_folder = stage_folder
         self._active_stage_inputs = {}
 
     def record_prior_input(self, stage_folder: str, chosen_path: Path) -> Path:
+        """Record one concrete upstream artifact for the current manifest."""
+
         chosen_path = Path(chosen_path).resolve()
         self._active_stage_inputs[stage_folder] = str(chosen_path)
         return chosen_path
 
     def get_active_stage_inputs(self) -> Dict[str, Path]:
+        """Return the upstream artifacts selected for the active stage."""
+
         return {
             folder: Path(path).resolve()
             for folder, path in self._active_stage_inputs.items()
         }
 
     def resolve_prior_output(self, stage_folder: str, *, prior_path: Optional[Path] = None) -> Path:
+        """Resolve an explicit or latest upstream artifact and record its use."""
+
         chosen = select_prior_output(
             artifacts_dir=Path(self.artifacts_dir).resolve(),
             stage_folder=stage_folder,
@@ -232,6 +267,8 @@ class Context:
         args: Any,
         argv: Optional[Iterable[str]] = None,
     ) -> None:
+        """Publish configuration, manifest, run-view symlink, and lineage metadata."""
+
         output_dir = Path(output_dir).resolve()
         stage_run_id = output_dir.name
 
@@ -273,6 +310,8 @@ class Context:
         stage_folder: Optional[str] = None,
         argv: Optional[Iterable[str]] = None,
     ) -> Path:
+        """Write diagnostic provenance for an in-progress or interrupted stage."""
+
         stage_key = stage_key or self._active_stage_key
         stage_folder = stage_folder or self._active_stage_folder
         if not stage_key or not stage_folder:
@@ -293,16 +332,22 @@ class Context:
         return manifest_path
 
     def record_artifact(self, stage: str, output_dir: Path, extras: Optional[Dict[str, Any]] = None) -> None:
+        """Expose a completed stage's outputs to later stages in this process."""
+
         self.artifacts[stage] = {
             'output_dir': output_dir,
             **(extras or {}),
         }
 
     def get_artifact_dir(self, stage: str) -> Optional[Path]:
+        """Return a same-process stage output when one has been recorded."""
+
         info = self.artifacts.get(stage)
         return Path(info['output_dir']) if info and info.get('output_dir') else None
 
     def _append_stage_info_inputs(self, output_dir: Path) -> None:
+        """Append resolved upstream paths to the human-readable stage report."""
+
         stage_info_path = Path(output_dir) / "stage_info.txt"
         prior_inputs = self.get_active_stage_inputs()
         lines = [f"prior_inputs: {len(prior_inputs)}"]
@@ -328,6 +373,8 @@ class Context:
         resolved_config_path: Path,
         manifest_path: Path,
     ) -> None:
+        """Add the completed stage to the pipeline run's cumulative lineage."""
+
         run_dir = Path(self.run_dir).resolve()
         lineage_path = run_dir / LINEAGE_FILENAME
         legacy_lineage_path = run_dir / "lineage.yaml"
@@ -361,6 +408,8 @@ def new_stage_artifact_dir(
     *,
     timestamp: Optional[str] = None,
 ) -> Path:
+    """Create a unique timestamped directory in the canonical artifact store."""
+
     base = (Path(artifacts_dir) / stage_folder).resolve()
     base.mkdir(parents=True, exist_ok=True)
     ts = str(timestamp).strip() if timestamp else generate_run_timestamp()
@@ -383,6 +432,8 @@ def new_stage_artifact_dir(
 
 
 def _parse_stage_run_timestamp(stage_run_id: str) -> Optional[datetime]:
+    """Extract the sortable timestamp prefix from current and legacy run IDs."""
+
     # stage_run_id formats:
     # - <ts>_<uuid>
     # - <ts>_<tag>_<uuid>
@@ -403,12 +454,16 @@ def _parse_stage_run_timestamp(stage_run_id: str) -> Optional[datetime]:
 
 
 def list_stage_outputs(artifacts_dir: Path, stage_folder: str) -> List[Path]:
+    """List a stage folder's artifact directories from newest to oldest."""
+
     base = (Path(artifacts_dir) / stage_folder).resolve()
     if not base.exists() or not base.is_dir():
         return []
     subdirs = [p for p in base.iterdir() if p.is_dir()]
     # Sort by parsed timestamp desc; tie-break by mtime desc.
     def _key(p: Path):
+        """Produce a stable newest-first key for current and legacy names."""
+
         ts = _parse_stage_run_timestamp(p.name) or datetime.min
         try:
             mtime = float(p.stat().st_mtime)
@@ -426,6 +481,8 @@ def select_prior_output(
     use_latest: bool = True,
     prior_path: Optional[Path] = None,
 ) -> Optional[Path]:
+    """Prefer an explicit artifact, otherwise optionally select the newest one."""
+
     if prior_path is not None:
         p = Path(prior_path)
         return p if p.exists() else None

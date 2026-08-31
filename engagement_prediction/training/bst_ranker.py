@@ -23,6 +23,13 @@ def compute_bst_listwise_loss_and_scores(
     batch: Dict[str, Any],
     device: str,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Score one shared slate and compute a multi-positive listwise loss.
+
+    Each user's positive labels are normalized to a probability distribution,
+    so a query with multiple positives contributes the same total target mass
+    as a query with one positive.
+    """
+
     label_matrix = batch["label_matrix"]
     # Native loader batches arrive on the host. Validate them before the
     # asynchronous CUDA copy so invalid-data detection does not introduce a
@@ -137,10 +144,14 @@ class BSTRankerMatrixScorer:
         self.model = model
 
     def prepare_for_eval(self, device: str) -> None:
+        """Move the eager model once and disable training-only behavior."""
+
         self.model = self.model.to(device)
         self.model.eval()
 
     def score_batch(self, batch: Dict[str, Any], device: str) -> MatrixBatchScores:
+        """Adapt the BST training primitive to the generic matrix evaluator."""
+
         loss, scores, _ = compute_bst_listwise_loss_and_scores(
             self.model, batch, device
         )

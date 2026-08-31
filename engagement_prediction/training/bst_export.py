@@ -15,6 +15,8 @@ _MODEL_TYPE = "bst-ranker"
 
 
 def _require_mapping(value: Any, *, description: str) -> Mapping[str, Any]:
+    """Narrow dynamically loaded checkpoint metadata to a mapping."""
+
     if not isinstance(value, Mapping):
         raise ValueError(f"{description} must be a mapping")
     return value
@@ -184,6 +186,8 @@ def _validate_score_parity(
     eager_model: BSTRanker,
     scripted_model: torch.jit.ScriptModule,
 ) -> dict[str, Any]:
+    """Require bitwise eager/scripted parity across serving edge cases."""
+
     case_results: list[dict[str, Any]] = []
     constructor_values = {
         "post_embedding_dim": eager_model.post_embedding_dim,
@@ -290,6 +294,8 @@ def export_bst_ranker_checkpoint(
     )
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    # The partial suffix also keeps ClearML's ``*.pt`` framework hook from
+    # observing an unvalidated intermediate model.
     partial_path = output_path.with_name(f"{output_path.name}.partial")
     scripted_model = torch.jit.script(eager_model)
     scripted_model.save(str(partial_path))

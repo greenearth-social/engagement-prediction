@@ -1,4 +1,10 @@
-"""Bounded disk orchestration for Stage 6 author-statistics artifacts."""
+"""Bounded disk orchestration for Stage 6 author-statistics artifacts.
+
+Stage 6 uses two disk-backed shuffles. Likes first follow Stage 00's URI hash so
+they can be joined to canonical post metadata and collapsed to one row per post.
+Those narrow rows are then shuffled by author so each author's complete set of
+posts can be aggregated without loading the global post table into memory.
+"""
 
 from __future__ import annotations
 
@@ -95,7 +101,12 @@ def process_uri_partitions(
     config: AuthorStatisticsConfig,
     logger: logging.Logger,
 ) -> dict[str, object]:
-    """Filter canonical metadata and collapse raw likes to one row per post URI."""
+    """Filter canonical metadata and collapse raw likes to one row per post URI.
+
+    Stage 00 guarantees that all metadata and like rows for a URI share this
+    partition. The emitted files are called shards because their partitioning is
+    still URI-based; they are repartitioned by author before author aggregation.
+    """
     per_post_shards_path.mkdir(parents=True, exist_ok=False)
     totals = {
         "root_reply_overlap_count": 0,
@@ -226,7 +237,11 @@ def route_per_post_rows_by_author(
     per_post_by_author_path: Path,
     partition_count: int,
 ) -> None:
-    """Route already-collapsed post rows so every author has one local partition."""
+    """Route already-collapsed post rows so every author has one local partition.
+
+    This second shuffle is what makes the following per-partition author group-by
+    globally complete: all posts for a given author are guaranteed to be local.
+    """
     shards = sorted(per_post_shards_path.glob("*.parquet"))
     if not shards:
         per_post_by_author_path.mkdir(parents=True, exist_ok=False)

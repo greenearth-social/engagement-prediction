@@ -23,6 +23,8 @@ def _batch_tensor(
     device: str,
     dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
+    """Fetch one required host tensor and transfer it non-blockingly."""
+
     value = batch.get(key)
     if not isinstance(value, torch.Tensor):
         raise RuntimeError(f"Ranking batch is missing tensor {key!r}")
@@ -45,6 +47,8 @@ class BSTTorchScriptScorer:
         self._device: str | None = None
 
     def prepare_for_eval(self, device: str) -> None:
+        """Lazily load the script on the requested device and reuse it."""
+
         if self.model is not None and self._device == str(device):
             self.model.eval()
             return
@@ -62,6 +66,8 @@ class BSTTorchScriptScorer:
         self._device = str(device)
 
     def score_batch(self, batch: dict[str, Any], device: str) -> MatrixBatchScores:
+        """Score candidates in bounded chunks while reusing user histories."""
+
         if self.model is None:
             raise RuntimeError("BST scorer must be prepared before scoring")
         history_embeddings = _batch_tensor(
@@ -124,6 +130,8 @@ class BSTTorchScriptScorer:
         return MatrixBatchScores(scores=scores)
 
     def close(self) -> None:
+        """Drop the loaded ScriptModule so its device memory can be released."""
+
         self.model = None
         self._device = None
 
@@ -151,6 +159,8 @@ class TwoTowerTorchScriptScorer:
         self._device: str | None = None
 
     def prepare_for_eval(self, device: str) -> None:
+        """Lazily load the matching exported tower pair on one device."""
+
         if (
             self.user_tower is not None
             and self.post_tower is not None
@@ -180,6 +190,8 @@ class TwoTowerTorchScriptScorer:
         self._device = str(device)
 
     def score_batch(self, batch: dict[str, Any], device: str) -> MatrixBatchScores:
+        """Encode each side once and form the complete score matrix."""
+
         if self.user_tower is None or self.post_tower is None:
             raise RuntimeError("Two-tower scorer must be prepared before scoring")
         history_embeddings = _batch_tensor(
@@ -232,6 +244,8 @@ class TwoTowerTorchScriptScorer:
         return MatrixBatchScores(scores=scores)
 
     def close(self) -> None:
+        """Drop both ScriptModules so their device memory can be released."""
+
         self.user_tower = None
         self.post_tower = None
         self._device = None

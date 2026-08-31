@@ -1,4 +1,10 @@
-"""Bounded disk orchestration for Stage 5 post-liker history artifacts."""
+"""Bounded disk orchestration for Stage 5 post-liker history artifacts.
+
+Selected post roles first move from Stage 3's URI layout into Stage 5's URI
+partitions. The exact like snapshot is normalized and routed by the same hash,
+so each selected-post/event join can be completed independently without
+holding either global relation in memory.
+"""
 
 from __future__ import annotations
 
@@ -37,7 +43,11 @@ def materialize_selected_post_routes(
     shard_path: Path,
     partition_count: int,
 ) -> None:
-    """Build selected roles in bounded Stage 3 shards, then route by Stage 5 hash."""
+    """Build selected roles in bounded Stage 3 shards, then route by Stage 5 hash.
+
+    The shard step preserves the bounded Stage 3 reads. The later sink is a
+    physical shuffle needed when Stage 5 uses a different partition count.
+    """
     shard_path.mkdir(parents=True, exist_ok=False)
     for partition_id in range(stage3_partition_count):
         required_posts_df = read_parquet_parts(

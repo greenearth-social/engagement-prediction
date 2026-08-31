@@ -1,4 +1,10 @@
-"""Training-feature support and the canonical Stage 7 author vocabulary."""
+"""Training-feature support and the canonical Stage 7 author vocabulary.
+
+Unlike Stage 6's descriptive statistics, vocabulary membership is based only on
+author occurrences in the final model-facing training features. This prevents
+validation/holdout exposure or globally prolific but unused authors from earning
+a dedicated embedding-table row.
+"""
 
 from __future__ import annotations
 
@@ -79,7 +85,7 @@ def aggregate_support_rows(exposure_rows_df: pl.DataFrame) -> pl.DataFrame:
 
 
 def add_author_indices(author_support_lf: pl.LazyFrame) -> pl.LazyFrame:
-    """Globally sort eligible authors and reserve indices 0 and 1."""
+    """Globally sort eligible authors and reserve 0=PAD and 1=UNK."""
 
     return (
         author_support_lf.sort("author_did")

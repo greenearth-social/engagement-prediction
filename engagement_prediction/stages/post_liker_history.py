@@ -1,4 +1,9 @@
-"""Stage 5: extract complete post-liker event histories for selected posts."""
+"""Stage 5: extract complete post-liker event histories for selected posts.
+
+Unlike query selection, this stage keeps every valid source-window like for the
+resolved positive, history, and final-negative universe. Later stages use these
+raw timestamped events for strict as-of popularity and liker-history features.
+"""
 
 from __future__ import annotations
 

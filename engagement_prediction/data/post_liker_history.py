@@ -1,4 +1,10 @@
-"""Schemas and reusable transformations for Stage 5 post-liker histories."""
+"""Schemas and reusable transformations for Stage 5 post-liker histories.
+
+Stage 5 preserves every valid raw like event for the selected post universe;
+it does not deduplicate likers or apply an as-of cutoff. Query-time popularity
+and future liker-embedding replay can therefore derive their own strict
+``like_created_at < query_hour`` views from this lossless event artifact.
+"""
 
 from __future__ import annotations
 
@@ -72,7 +78,11 @@ def build_selected_posts(
     missing_required_posts_df: pl.DataFrame,
     negative_post_uris_df: pl.DataFrame,
 ) -> pl.DataFrame:
-    """Build unique post roles from resolved requirements and final negatives."""
+    """Build unique post roles from resolved requirements and final negatives.
+
+    Missing Stage 3 requirements are deliberately excluded because they have
+    no resolved metadata or embedding source. A URI can retain several roles.
+    """
     resolved_required_df = (
         required_posts_df.join(
             missing_required_posts_df.select("subject_uri"),

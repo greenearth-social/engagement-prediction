@@ -855,6 +855,8 @@ def attach_prior_counts(
                 "like_created_at": dataset_hydration.UTC_DATETIME,
             })
         )
+        # One cumulative row per event timestamp supports strict as-of lookups
+        # for all uses in this partition via the shared join-asof algorithm.
         cumulative_likes_df = like_counts.build_cumulative_like_counts(events_df)
         del events_df
 
@@ -949,6 +951,8 @@ def build_author_vocabulary(
     train_hours_lf = retained_train_queries_lf.select("query_hour").unique()
 
     def role_rows(lf: pl.LazyFrame, role: str) -> pl.LazyFrame:
+        """Represent each feature occurrence as one narrow support counter row."""
+
         return lf.select(
             "author_did",
             pl.lit(1 if role == "positive" else 0, dtype=pl.UInt64).alias(

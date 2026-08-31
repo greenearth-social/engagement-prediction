@@ -14,6 +14,8 @@ if TYPE_CHECKING:
 
 
 class ClearMLExperimentTracker:
+    """Adapt the pipeline's tracker interface to one ClearML Task."""
+
     def __init__(
         self,
         project_name: str,
@@ -42,6 +44,8 @@ class ClearMLExperimentTracker:
 
     @staticmethod
     def _coerce_like(value: Any, template: Any) -> Any:
+        """Restore argparse-compatible types after ClearML remote overrides."""
+
         if template is None:
             return value
 
@@ -115,6 +119,8 @@ class ClearMLExperimentTracker:
         )
 
     def log_artifact(self, name: str, path: Path) -> dict[str, str]:
+        """Register a model file as a ClearML OutputModel and return its IDs."""
+
         from clearml import OutputModel
         empty_metadata = {"model_id": "", "uri": ""}
         p = Path(path)
@@ -145,6 +151,8 @@ class ClearMLExperimentTracker:
         }
 
     def log_file_artifact(self, name: str, path: Path) -> bool:
+        """Upload an ordinary task artifact and report whether it succeeded."""
+
         p = Path(path)
         if not p.exists():
             return False

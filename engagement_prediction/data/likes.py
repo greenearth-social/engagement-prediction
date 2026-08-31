@@ -44,7 +44,12 @@ def prepare_likes(
     start: datetime | None,
     end: datetime | None,
 ) -> pl.LazyFrame:
-    """Normalize likes, remove invalid rows, and apply an inclusive/exclusive window."""
+    """Normalize likes, remove invalid rows, and apply a half-open source window.
+
+    This is the canonical validity predicate shared by every raw-like consumer.
+    It intentionally preserves duplicate valid events; each downstream stage
+    decides whether its artifact contract calls for deduplication or raw counts.
+    """
     filtered_lf = normalize_likes(likes_lf).filter(
         valid_identifier_expr("did")
         & valid_identifier_expr("subject_uri")

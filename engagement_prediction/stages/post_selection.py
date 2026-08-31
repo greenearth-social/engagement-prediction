@@ -1,4 +1,9 @@
-"""Stage 3: resolve required posts and build a random root-post reservoir."""
+"""Stage 3: resolve required posts and build a random root-post reservoir.
+
+Required positive and history URIs are joined to Stage 00's canonical metadata.
+Separately, a stable sample of root posts becomes the reservoir from which
+Stage 4 can choose query-hour negatives.
+"""
 
 from __future__ import annotations
 
@@ -72,6 +77,8 @@ def _validate_query_window(
     queries_lf: pl.LazyFrame,
     config: PostSelectionConfig,
 ) -> tuple[datetime, datetime]:
+    """Validate query-hour typing and coverage by the common source window."""
+
     schema = queries_lf.collect_schema()
     if "query_hour" not in schema:
         raise ValueError("Stage 1 queries artifact is missing query_hour")

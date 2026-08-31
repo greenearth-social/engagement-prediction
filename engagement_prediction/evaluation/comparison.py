@@ -59,6 +59,8 @@ def _validate_settings(
     *,
     available_splits: set[str],
 ) -> None:
+    """Validate standalone CLI settings against the resolved Stage 7 index."""
+
     if not settings.splits:
         raise ValueError("At least one evaluation split is required")
     if len(set(settings.splits)) != len(settings.splits):
@@ -91,6 +93,8 @@ def _validate_settings(
 def _close_datasets(
     datasets: dict[str, HydratedBucketedEngagementDataset],
 ) -> None:
+    """Release process-local mmap and Arrow handles before temp-file cleanup."""
+
     for dataset in datasets.values():
         dataset.close()
 
@@ -128,6 +132,8 @@ def run_model_comparison(
 
     metrics_by_model: dict[str, dict[str, dict[str, Any]]] = {}
     mapping_coverage_by_model: dict[str, dict[str, Any]] = {}
+    # Models are evaluated sequentially so a mixed BST/two-tower comparison
+    # never keeps both sets of TorchScript weights resident on the GPU.
     for model in models:
         logger.info(
             "Evaluating model %s (%s, %s) with history length %s",

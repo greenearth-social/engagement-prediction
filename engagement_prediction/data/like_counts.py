@@ -34,6 +34,8 @@ CUMULATIVE_LIKE_COUNT_SCHEMA = {
 
 
 def _validated_post_hours(post_hours_df: pl.DataFrame) -> pl.DataFrame:
+    """Normalize requested lookup keys to unique, sorted post-hour rows."""
+
     missing = set(POST_HOUR_COLUMNS) - set(post_hours_df.columns)
     if missing:
         raise ValueError(
@@ -63,6 +65,8 @@ def _validated_post_hours(post_hours_df: pl.DataFrame) -> pl.DataFrame:
 
 
 def _validated_like_events(events_df: pl.DataFrame) -> pl.DataFrame:
+    """Select and type-check raw event columns without deduplicating rows."""
+
     missing = set(LIKE_EVENT_COLUMNS) - set(events_df.columns)
     if missing:
         raise ValueError(
@@ -82,6 +86,8 @@ def _validated_like_events(events_df: pl.DataFrame) -> pl.DataFrame:
 
 
 def _build_cumulative_like_counts(events: pl.DataFrame) -> pl.DataFrame:
+    """Collapse raw events by hour and cumulatively sum within each post."""
+
     if events.is_empty():
         return pl.DataFrame(schema=CUMULATIVE_LIKE_COUNT_SCHEMA)
     return (
@@ -112,6 +118,8 @@ def _lookup_prior_like_counts(
     post_hours: pl.DataFrame,
     cumulative_likes: pl.DataFrame,
 ) -> pl.DataFrame:
+    """Attach the last cumulative count strictly before each query hour."""
+
     if post_hours.is_empty():
         return pl.DataFrame(schema=POST_HOUR_COUNT_SCHEMA)
     if cumulative_likes.is_empty():

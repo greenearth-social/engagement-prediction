@@ -30,6 +30,8 @@ class PopularityNormalizationStats:
 
 @dataclass(frozen=True)
 class _Moments:
+    """Mergeable sufficient statistics for population mean and variance."""
+
     count: int
     value_sum: float
     squared_value_sum: float
@@ -64,6 +66,8 @@ def _log1p_moments(counts_lf: pl.LazyFrame) -> _Moments:
 
 
 def _validate_non_null_counts(counts_lf: pl.LazyFrame, *, description: str) -> None:
+    """Fail before fitting if any model-facing popularity value is absent."""
+
     invalid = (
         counts_lf.filter(pl.col("prior_like_count").is_null())
         .limit(1)

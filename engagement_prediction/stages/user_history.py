@@ -169,6 +169,8 @@ def _write_query_histories(
     )
 
     def log_result(result: dict[str, Any]) -> None:
+        """Report each completed worker result as soon as it becomes available."""
+
         logger.info(
             "Completed user-history partition %s in %.1fs with %s queries",
             result["partition_id"],
@@ -264,6 +266,8 @@ def _write_history_post_uris(
     )
 
     def log_result(result: dict[str, Any]) -> None:
+        """Report progress while globally deduplicating URI partitions."""
+
         logger.info(
             "Completed history-post URI partition %s/%s in %.1fs: unique=%s",
             result["partition_id"] + 1,

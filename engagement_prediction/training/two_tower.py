@@ -136,10 +136,14 @@ class TwoTowerMatrixScorer:
         self.model = model
 
     def prepare_for_eval(self, device: str) -> None:
+        """Move the eager model once and disable training-only behavior."""
+
         self.model = self.model.to(device)
         self.model.eval()
 
     def score_batch(self, batch: Dict[str, Any], device: str) -> MatrixBatchScores:
+        """Adapt the two-tower loss helper to the generic matrix evaluator."""
+
         loss, scores, _ = compute_two_tower_listwise_loss_and_scores(
             self.model,
             batch,

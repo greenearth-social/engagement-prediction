@@ -157,6 +157,9 @@ def build_author_index_override(
     if output_path.exists():
         raise FileExistsError(f"Refusing to overwrite author-index override: {output_path}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Start with a sentinel that cannot be a valid uint32 model index.  It lets
+    # the streaming pass detect both duplicate and missing emb_idx rows without
+    # retaining a global Python set.
     override = np.lib.format.open_memmap(
         output_path,
         mode="w+",

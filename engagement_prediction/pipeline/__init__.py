@@ -1,1 +1,1 @@
-"""Pipeline orchestration, artifacts, lineage, and stage registration."""
+"""Pipeline execution, artifact publication, dependency, and lineage helpers."""

@@ -11,7 +11,13 @@ from engagement_prediction.data.author_indices import AUTHOR_PAD_IDX, AUTHOR_UNK
 
 
 class ProjectedPostFeatureEncoder(nn.Module):
-    """Fuse post content, author, and optional popularity features."""
+    """Map heterogeneous post features into one model-width representation.
+
+    Content, author identity, and optional as-of popularity are normalized in
+    separate branches before fusion.  Keeping the branches separate prevents
+    the much larger pretrained content-vector scale from dominating the small
+    learned categorical and scalar features.
+    """
 
     __constants__ = ["use_popularity_feature"]
 
@@ -137,6 +143,9 @@ class ProjectedPostFeatureEncoder(nn.Module):
             self.projection_activation(self.author_projection(author_embeddings))
         )
         if self.use_popularity_feature:
+            # Counts are raw cumulative likes as of the scoring hour.  The
+            # training stage fits the log-space mean/std using training rows
+            # only, and those constants travel with the exported model.
             popularity_counts_input = torch.jit._unwrap_optional(prior_cumulative_likes)
             popularity_counts = popularity_counts_input.to(device=post_embeddings.device, dtype=post_embeddings.dtype)
             popularity_log = torch.log1p(torch.clamp(popularity_counts, min=0.0))

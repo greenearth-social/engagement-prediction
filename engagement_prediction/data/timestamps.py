@@ -12,7 +12,11 @@ UTC_DATETIME = pl.Datetime("us", "UTC")
 
 
 def parse_utc_datetime(value: Any | None, *, field_name: str) -> datetime | None:
-    """Parse a scalar timestamp, treating timezone-naive values as UTC."""
+    """Parse a scalar timestamp, treating timezone-naive values as UTC.
+
+    CLI and manifest boundaries use this permissive convention for historical
+    compatibility; all returned values are nevertheless timezone-aware UTC.
+    """
 
     if value is None:
         return None
@@ -29,7 +33,11 @@ def parse_utc_datetime(value: Any | None, *, field_name: str) -> datetime | None
 
 
 def utc_timestamp_expr(lf: pl.LazyFrame, column: str) -> pl.Expr:
-    """Normalize one string or datetime column to microsecond-resolution UTC."""
+    """Normalize one string or datetime column to microsecond-resolution UTC.
+
+    String parsing is non-strict, so malformed values become null and are removed
+    by the caller's canonical row-validity predicate rather than aborting a scan.
+    """
 
     schema = lf.collect_schema()
     if column not in schema:

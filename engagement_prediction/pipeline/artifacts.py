@@ -18,6 +18,8 @@ from engagement_prediction.pipeline.core import Context
 
 
 def _child_path(parent: Path, relative_name: str) -> Path:
+    """Resolve a bundle member while preventing escape from its parent."""
+
     relative_path = Path(relative_name)
     if relative_path.is_absolute() or ".." in relative_path.parts:
         raise ValueError(f"Artifact paths must be relative children: {relative_name}")
@@ -48,6 +50,8 @@ class PartialArtifactBundle:
         staging_name: str,
         dataset_schemas: Mapping[str, dict[str, pl.DataType]],
     ) -> "PartialArtifactBundle":
+        """Create fresh partial and staging roots after checking all conflicts."""
+
         output_dir = Path(output_dir)
         final_path = _child_path(output_dir, bundle_name)
         partial_path = _child_path(output_dir, f"{bundle_name}.partial")

@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional, Protocol, Union
 
 
 class ExperimentTracker(Protocol):
+    """Small tracker surface used by training without depending on ClearML."""
+
     id: str
 
     def log_scalar(self, title: str, series: str, value: float, iteration: int) -> None:
@@ -59,6 +61,8 @@ class ExperimentTracker(Protocol):
 
 
 class NoOpExperimentTracker:
+    """Discard tracking calls while preserving the training call contract."""
+
     id: str
 
     def log_scalar(self, title: str, series: str, value: float, iteration: int) -> None:

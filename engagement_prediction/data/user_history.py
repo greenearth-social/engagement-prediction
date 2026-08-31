@@ -161,6 +161,9 @@ def build_query_histories_for_partition(
             descending=[False, False, True],
         )
     )
+    # These Python lists are intentionally local to one DID-hash partition.
+    # Keeping each user's events chronological makes every query cutoff a
+    # binary search instead of a join between all queries and all user likes.
     likes_by_user: dict[str, list[tuple[datetime, str]]] = {}
     for did, subject_uri, like_created_at in sorted_likes.iter_rows():
         likes_by_user.setdefault(did, []).append((like_created_at, subject_uri))
@@ -170,6 +173,8 @@ def build_query_histories_for_partition(
     }
 
     rows: list[dict[str, Any]] = []
+    # This set is derived from the capped histories, not every scanned like.
+    # Its partition-local shard is globally deduplicated in a later URI pass.
     history_post_uris: set[str] = set()
     stats: dict[str, dict[str, int]] = {}
     sorted_queries = queries_df.sort(["did", "query_hour"])

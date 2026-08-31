@@ -228,6 +228,9 @@ def select_latest_valid_embedding_vectors(
             "Embedding source rows are missing columns: " + ", ".join(sorted(missing))
         )
 
+    # This dictionary can grow to the number of selected URIs in one hash
+    # partition, never the full source snapshot. It retains decoded winners so
+    # the caller can write an embedding shard without decoding them again.
     best: dict[str, tuple[datetime, str, str, np.ndarray]] = {}
     stats = {
         "source_row_count": source_rows_df.height,

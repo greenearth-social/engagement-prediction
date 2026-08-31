@@ -438,6 +438,9 @@ class HydratedBucketedEngagementDataset(Dataset):
 
         total_items = int(lengths.sum())
         if total_items:
+            # Convert per-query ragged ranges into one flat gather. ``batch_rows``
+            # and ``history_positions`` are the destination coordinates in the
+            # padded batch; ``source_positions`` addresses the loader index.
             batch_rows = np.repeat(np.arange(batch_size, dtype=np.int64), lengths)
             repeated_starts = np.repeat(starts, lengths)
             segment_starts = np.repeat(np.cumsum(lengths) - lengths, lengths)
@@ -554,6 +557,8 @@ class HydratedBucketedEngagementDataset(Dataset):
         positive_indices_by_row: list[list[int]] = []
 
         def add_candidate(emb_idx: int, prior_like_count: Optional[int] = None) -> int:
+            """Return one batch-local column for a positive or shared negative."""
+
             candidate_idx = candidate_index.get(emb_idx)
             if candidate_idx is None:
                 candidate_idx = len(candidate_emb_indices)
@@ -599,9 +604,10 @@ class HydratedBucketedEngagementDataset(Dataset):
             )
 
         candidate_emb_array = np.asarray(candidate_emb_indices, dtype=np.int64)
-        candidate_embeddings = np.array(
-            self.embeddings[candidate_emb_array], dtype=np.float32, copy=True
-        )
+        # NumPy advanced indexing already materializes a writable, contiguous
+        # batch array, so copying that result again would only double memory
+        # traffic in this hot collation path.
+        candidate_embeddings = self.embeddings[candidate_emb_array]
         labels = torch.zeros(
             (len(row_indices), len(candidate_emb_indices)), dtype=torch.float32
         )
@@ -733,6 +739,8 @@ class HydratedBucketedBatchSampler(Sampler[list[Any]]):
             else np.uint64
         )
         query_order = np.empty(self.dataset.query_count, dtype=index_dtype)
+        # Descriptors contain only slices into ``query_order``. This avoids a
+        # Python list for every query and every already-constructed batch.
         descriptors = np.empty((len(self), 2), dtype=np.uint64)
         descriptor_idx = 0
         hour_order = np.arange(self.dataset.hour_count, dtype=np.uint32)

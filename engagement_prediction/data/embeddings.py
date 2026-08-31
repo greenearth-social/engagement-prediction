@@ -1,4 +1,9 @@
-"""Content-embedding model metadata and payload decoding."""
+"""Content-embedding model metadata and Ingex payload decoding.
+
+Ingex stores model vectors in an embeddings key/value collection. Each value
+is a base85-encoded, zlib-compressed sequence of little-endian float32 values;
+Stage 7 expands only the configured model before writing ``embeddings.npy``.
+"""
 
 from __future__ import annotations
 
@@ -70,6 +75,9 @@ def _decompress_and_unpack_embedding(
 
     payload = base64.b85decode(encoded.encode())
 
+    # ``decompress=None`` is retained for callers that accept historical
+    # uncompressed payloads. Stage 7 passes ``True`` and therefore fails fast
+    # if a supposedly compressed source value is malformed.
     if decompress or decompress is None:
         try:
             payload = zlib.decompress(payload)

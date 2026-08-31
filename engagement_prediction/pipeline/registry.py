@@ -29,6 +29,8 @@ STAGE_SPECS: Dict[str, Tuple[str, str]] = {
 
 
 def get_stage_spec(stage_name: str) -> Tuple[Path, str]:
+    """Resolve a public stage key to its entrypoint and artifact folder."""
+
     if stage_name not in STAGE_SPECS:
         raise KeyError(f"Unknown stage '{stage_name}'")
     rel_path, folder = STAGE_SPECS[stage_name]
@@ -36,6 +38,8 @@ def get_stage_spec(stage_name: str) -> Tuple[Path, str]:
 
 
 def run_stage(stage_name: str, context: Context, args) -> Dict[str, object]:
+    """Load, run, and finalize one registered stage."""
+
     module_path, folder = get_stage_spec(stage_name)
     run_fn = load_run_callable(module_path)
     # Each stage script is responsible for creating a timestamped subdir under

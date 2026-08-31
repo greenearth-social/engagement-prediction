@@ -1,4 +1,10 @@
-"""Bounded Parquet processing for Stage 1 positive-post membership."""
+"""Bounded Parquet processing for Stage 1 positive-post membership.
+
+Query hours are sampled before metadata membership is known. Their like rows are
+then routed by post URI, deduplicated locally, and semi-joined to Stage 00 roots.
+Queries emptied or made oversized by that final filtering are handled by Stage 1
+without backfilling, preserving the intended provisional-sampling contract.
+"""
 
 from __future__ import annotations
 
@@ -45,7 +51,11 @@ def materialize_provisional_positive_rows(
     output_path: Path,
     logger: logging.Logger,
 ) -> None:
-    """Route likes for provisionally sampled query-hours by post URI."""
+    """Route likes for provisionally sampled query-hours by post URI.
+
+    This rescans the exact likes snapshot because the earlier candidate-count
+    artifact intentionally contains only query-level counts, not positive rows.
+    """
     started = time.monotonic()
     provisional_lf = (
         positive_rows_lf
@@ -99,7 +109,12 @@ def filter_positive_partitions(
     splits: Sequence[str],
     logger: logging.Logger,
 ) -> dict[str, Any]:
-    """Semi-join deduplicated positives to valid posts one URI partition at a time."""
+    """Semi-join deduplicated positives to Stage 00 roots one partition at a time.
+
+    Deduplication happens after provisional query sampling and retains the earliest
+    timestamp for each user/hour/post key. Reply-only and absent URIs are excluded
+    here; query-level positive counts are recomputed by the Stage 1 runner later.
+    """
     eligible_positive_rows_path.mkdir(parents=True, exist_ok=False)
     positive_stats = {
         split: {

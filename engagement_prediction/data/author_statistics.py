@@ -80,7 +80,12 @@ def build_per_post_statistics(
     resolved_posts_df: pl.DataFrame,
     like_counts_df: pl.DataFrame,
 ) -> pl.DataFrame:
-    """Attach raw received-like counts to every resolved in-window record."""
+    """Attach raw received-like counts to every resolved in-window record.
+
+    The metadata frame drives the left join so posts with no matching likes are
+    retained with a zero count. Those zero-like posts must remain present for
+    unbiased per-author post counts and likes-per-post statistics.
+    """
     if like_counts_df.is_empty():
         like_counts_df = empty_frame({
             "subject_uri": pl.String,
@@ -99,7 +104,13 @@ def build_per_post_statistics(
 def aggregate_author_statistics(
     per_post_df: pl.DataFrame,
 ) -> pl.DataFrame:
-    """Aggregate one descriptive statistics row for every author."""
+    """Aggregate one descriptive statistics row for every author.
+
+    ``received_like_count`` is already a raw-event count per post, so duplicate
+    source like rows contribute independently. Mean, median, and maximum are
+    calculated over every authored post, including the zero-like rows preserved
+    by :func:`build_per_post_statistics`.
+    """
     if per_post_df.is_empty():
         return empty_frame(AUTHOR_STAT_SCHEMA)
     return (

@@ -47,7 +47,11 @@ def sink_partitioned_parquet(
     output_path: Path,
     key: str,
 ) -> None:
-    """Stream a lazy frame into Parquet partitions using an existing key column."""
+    """Stream a lazy frame into Parquet partitions using an existing key column.
+
+    Polars writes Hive-style ``key=value`` directories and omits the routing key
+    from each file. Callers later read one directory at a time to bound memory.
+    """
     output_path.mkdir(parents=True, exist_ok=False)
     lf.sink_parquet(
         pl.PartitionBy(
@@ -89,7 +93,11 @@ def ensure_typed_parquet_dataset(
     path: Path,
     schema: dict[str, pl.DataType],
 ) -> None:
-    """Ensure a partitioned dataset has at least one schema-bearing part."""
+    """Ensure a partitioned dataset has at least one schema-bearing part.
+
+    Empty datasets still need a physical Parquet file so lazy readers can recover
+    the intended schema without special-casing every downstream consumer.
+    """
 
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)

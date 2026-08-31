@@ -14,6 +14,8 @@ from engagement_prediction.models.common import LinearPredictionHead, ProjectedP
 def _validate_time_delta_bucket_boundaries(
     boundaries_hours: Sequence[float],
 ) -> tuple[float, ...]:
+    """Return an immutable, strictly increasing set of positive hour cutoffs."""
+
     boundaries = tuple(float(boundary) for boundary in boundaries_hours)
     if len(boundaries) == 0:
         raise ValueError("time delta bucket boundaries must not be empty")
@@ -136,6 +138,8 @@ class BSTRanker(nn.Module):
         )
 
     def _bucketize_time_deltas_hours(self, time_deltas_hours: torch.Tensor) -> torch.Tensor:
+        """Map history ages to a dedicated zero bucket plus configured ranges."""
+
         deltas = time_deltas_hours
         if not torch.is_floating_point(deltas):
             deltas = deltas.to(dtype=torch.float32)
@@ -196,6 +200,13 @@ class BSTRanker(nn.Module):
         history_prior_cumulative_likes: Optional[torch.Tensor] = None,
         candidate_prior_cumulative_likes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Encode aligned history/candidate pairs and return candidate states.
+
+        This pairwise path expects one candidate per user.  Listwise training
+        normally uses :meth:`score_candidate_matrix`, which scores a shared
+        candidate slate without replicating every user's history.
+        """
+
         if history_embeddings.dim() != 3:
             raise ValueError("history_embeddings must have shape [B, H, D]")
         if candidate_post_embeddings.dim() != 2:
@@ -271,9 +282,13 @@ class BSTRanker(nn.Module):
             transformer_input,
             src_key_padding_mask=src_key_padding_mask,
         )
+        # The candidate was appended after the history, so its contextualized
+        # state is always the final sequence element.
         return encoded_sequence[:, -1, :]
 
     def _validate_one_layer_matrix_scorer(self) -> nn.TransformerEncoderLayer:
+        """Check the implementation assumptions used by the fast matrix path."""
+
         layers = getattr(self.transformer_encoder, "layers", None)
         if layers is None or len(layers) != 1:
             raise RuntimeError("score_candidate_matrix_one_layer requires exactly one transformer layer")
@@ -300,6 +315,14 @@ class BSTRanker(nn.Module):
         history_mask: torch.Tensor,
         candidate_input: torch.Tensor,
     ) -> torch.Tensor:
+        """Compute only candidate-token attention for every user/candidate pair.
+
+        A normal transformer run over the Cartesian product would repeat each
+        history once per candidate.  Here histories and candidates are
+        projected independently, and einsums form the ``[U, C]`` interactions
+        while retaining exactly the one-layer attention math.
+        """
+
         # Resolve the layer from this module instead of accepting it as a typed
         # argument. TorchScript otherwise binds the helper to the first
         # concrete TransformerEncoderLayer compiled in the process, which
@@ -324,6 +347,7 @@ class BSTRanker(nn.Module):
         candidate_key = F.linear(candidate_input, k_weight, k_bias).view(num_candidates, num_heads, head_dim)
         candidate_value = F.linear(candidate_input, v_weight, v_bias).view(num_candidates, num_heads, head_dim)
 
+        # U=user, C=candidate, N=head, H=history position, D=head width.
         history_scores = torch.einsum("cnd,uhnd->unch", query, history_key) * scale
         history_scores = history_scores.masked_fill(~history_mask[:, None, None, :], float("-inf"))
         candidate_scores = (query * candidate_key).sum(dim=-1).transpose(0, 1) * scale
@@ -355,6 +379,8 @@ class BSTRanker(nn.Module):
         self,
         candidate_state: torch.Tensor,
     ) -> torch.Tensor:
+        """Apply the transformer layer's feed-forward block to candidate states."""
+
         layer = self.transformer_encoder.layers[0]
         hidden = F.linear(candidate_state, layer.linear1.weight, layer.linear1.bias)
         hidden = F.gelu(hidden)
@@ -373,6 +399,8 @@ class BSTRanker(nn.Module):
         history_prior_cumulative_likes: Optional[torch.Tensor] = None,
         candidate_prior_cumulative_likes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Validate inputs for, then delegate to, the optimized matrix scorer."""
+
         self._validate_one_layer_matrix_scorer()
         if history_embeddings.dim() != 3:
             raise ValueError("history_embeddings must have shape [U, H, D]")
@@ -427,6 +455,13 @@ class BSTRanker(nn.Module):
         history_prior_cumulative_likes: Optional[torch.Tensor] = None,
         candidate_prior_cumulative_likes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Score a shared candidate set for every user without a U*C expansion.
+
+        The exported serving API uses this method.  It manually evaluates the
+        candidate token of a single TransformerEncoderLayer because history
+        token outputs are never consumed by the prediction head.
+        """
+
         if len(self.transformer_encoder.layers) != 1:
             raise RuntimeError("score_candidate_matrix requires exactly one transformer layer")
         layer = self.transformer_encoder.layers[0]
@@ -552,6 +587,8 @@ class BSTRanker(nn.Module):
         history_prior_cumulative_likes: Optional[torch.Tensor] = None,
         candidate_prior_cumulative_likes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Score one aligned candidate per user through the ordinary BST path."""
+
         transformer_output = self._forward_transformer(
             history_embeddings=history_embeddings,
             history_mask=history_mask,

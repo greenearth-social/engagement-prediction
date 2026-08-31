@@ -80,6 +80,8 @@ class CrossAttentionHistoryEncoder(nn.Module):
         history_features: torch.Tensor,
         history_mask: torch.Tensor,
     ) -> torch.Tensor:
+        """Pool one fixed-width, newest-first history per batch row."""
+
         if history_features.dim() != 3:
             raise ValueError("history_features must have shape [B, H, D]")
         batch_size = int(history_features.size(0))
@@ -123,8 +125,9 @@ class CrossAttentionHistoryEncoder(nn.Module):
             dim=1
         ).clamp(min=1.0)
 
-        # Histories are newest-first. Flipping the embedding-table index makes
-        # position zero consistently represent the most recent event.
+        # Histories are newest-first. Index relative to max_history_len rather
+        # than the observed width so a given recency position has the same
+        # embedding in every batch (including short or truncated histories).
         positions = torch.arange(history_len, device=history_features.device)
         positions = (self.max_history_len - 1) - positions
         positioned = projected + self.positional_embedding(positions).unsqueeze(0)
@@ -167,6 +170,8 @@ class TwoTowerUserTower(nn.Module):
         history_mask: torch.Tensor,
         history_author_indices: torch.Tensor,
     ) -> torch.Tensor:
+        """Encode newest-first histories into unit-length retrieval vectors."""
+
         history_features = self.post_feature_encoder(
             history_embeddings,
             history_author_indices,
@@ -226,6 +231,8 @@ class TwoTowerPostTower(nn.Module):
         post_embeddings: torch.Tensor,
         post_author_indices: torch.Tensor,
     ) -> torch.Tensor:
+        """Encode independent candidate posts into unit-length vectors."""
+
         post_features = self.post_feature_encoder(
             post_embeddings,
             post_author_indices,
@@ -312,6 +319,8 @@ class TwoTowerModel(nn.Module):
         history_mask: torch.Tensor,
         history_author_indices: torch.Tensor,
     ) -> torch.Tensor:
+        """Run the serving-compatible user tower."""
+
         return self.user_tower(
             history_embeddings,
             history_mask,
@@ -323,6 +332,8 @@ class TwoTowerModel(nn.Module):
         post_embeddings: torch.Tensor,
         post_author_indices: torch.Tensor,
     ) -> torch.Tensor:
+        """Run the serving-compatible post tower."""
+
         return self.post_tower(post_embeddings, post_author_indices)
 
     def forward(
@@ -333,6 +344,8 @@ class TwoTowerModel(nn.Module):
         history_author_indices: torch.Tensor,
         post_author_indices: torch.Tensor,
     ) -> torch.Tensor:
+        """Return temperature-scaled scores for every user/post combination."""
+
         user_vectors = self.encode_user(
             history_embeddings,
             history_mask,
@@ -340,4 +353,3 @@ class TwoTowerModel(nn.Module):
         )
         post_vectors = self.encode_post(post_embeddings, post_author_indices)
         return torch.matmul(user_vectors, post_vectors.transpose(0, 1)) / self.similarity_temperature
-
