@@ -22,7 +22,7 @@ dependencies:
 
   # data / IO
   - pyarrow<21
-  - polars
+  - polars>=1.40,<2
   - boto3
   - google-cloud-storage
 

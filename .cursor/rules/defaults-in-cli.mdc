@@ -1,6 +1,6 @@
 ---
 description: Default values for pipeline/training parameters live only in cli.py
-globs: utils/04_train/**/*.py, utils/dataloaders.py, cli.py
+globs: engagement_prediction/models/**/*.py, engagement_prediction/training/**/*.py, engagement_prediction/stages/**/*.py, engagement_prediction/data/datasets.py, cli.py
 alwaysApply: false
 ---
 
@@ -8,9 +8,9 @@ alwaysApply: false
 
 All default values for run-all / training parameters are defined in **cli.py** in the `DEFAULTS` dict. Do not add default argument values in:
 
-- Model `__init__` (e.g. `AttentionMLP`, `TwoTowerModel`, `SummarizedMLP`)
-- Encoder `__init__` (e.g. `TransformerDualPoolingEncoder`, `CrossAttentionPoolingEncoder`)
-- Tower `__init__` (e.g. `PostTower`)
+- Model `__init__` (e.g. `BSTRanker`, `TwoTowerModel`)
+- Encoder `__init__` (e.g. `CrossAttentionHistoryEncoder`, `ProjectedPostFeatureEncoder`)
+- Tower `__init__` (e.g. `TwoTowerPostTower`)
 - Stage scripts or dataloaders
 
 For any parameter that is set via CLI (e.g. `--user-hidden-dim`, `--max-history-len`), the constructor should require it as a mandatory argument with no default. Callers (train stages) pass values from `args` which are filled from `DEFAULTS` + config + CLI.

@@ -13,7 +13,7 @@
 version: 1
 metadata:
   content_hash:
-    linux-64: 921c69043778f069f66bffe4873574e3fb8ce8b02c1c42ddcc0d0b3f49820a54
+    linux-64: ab421c9f8c6eebdaedc494012ede3fcfc5a67b88a949e47af54d8657b19beaeb
   channels:
   - url: pytorch
     used_env_vars: []
@@ -664,15 +664,15 @@ package:
   category: main
   optional: false
 - name: ca-certificates
-  version: 2026.2.25
+  version: 2026.7.22
   manager: conda
   platform: linux-64
   dependencies:
     __unix: ''
-  url: https://conda.anaconda.org/conda-forge/noarch/ca-certificates-2026.2.25-hbd8a1cb_0.conda
+  url: https://conda.anaconda.org/conda-forge/noarch/ca-certificates-2026.7.22-hbd8a1cb_0.conda
   hash:
-    md5: 4492fd26db29495f0ba23f146cd5638d
-    sha256: 67cc7101b36421c5913a1687ef1b99f85b5d6868da3abbf6ec1a4181e79782fc
+    md5: 0f51e2391ade309db462a55611263e9c
+    sha256: 0a0544cf95f64394fe4959286f5c71f5444ad58feb0602e53becb27448d24da6
   category: main
   optional: false
 - name: cachecontrol
@@ -733,15 +733,15 @@ package:
   category: main
   optional: false
 - name: certifi
-  version: 2026.2.25
+  version: 2026.7.22
   manager: conda
   platform: linux-64
   dependencies:
     python: '>=3.10'
-  url: https://conda.anaconda.org/conda-forge/noarch/certifi-2026.2.25-pyhd8ed1ab_0.conda
+  url: https://conda.anaconda.org/conda-forge/noarch/certifi-2026.7.22-pyhd8ed1ab_0.conda
   hash:
-    md5: 765c4d97e877cdbbb88ff33152b86125
-    sha256: a6b118fd1ed6099dc4fc03f9c492b88882a780fadaef4ed4f93dc70757713656
+    md5: 37e13edbe3b48f1095a9d085ef9cd83b
+    sha256: fb167de4388e64e52aa3907ed099afab944c1fa6e5f74b281a312dae1bcf7f3b
   category: main
   optional: false
 - name: cffi
@@ -1235,7 +1235,7 @@ package:
   dependencies:
     email_validator: ''
     fastapi-cli: ''
-    fastapi-core: ==0.135.1
+    fastapi-core: 0.135.1
     httpx: ''
     jinja2: ''
     pydantic-extra-types: ''
@@ -3878,17 +3878,17 @@ package:
   category: main
   optional: false
 - name: openssl
-  version: 3.6.1
+  version: 3.6.3
   manager: conda
   platform: linux-64
   dependencies:
     __glibc: '>=2.17,<3.0.a0'
     ca-certificates: ''
     libgcc: '>=14'
-  url: https://conda.anaconda.org/conda-forge/linux-64/openssl-3.6.1-h35e630c_1.conda
+  url: https://conda.anaconda.org/conda-forge/linux-64/openssl-3.6.3-h35e630c_1.conda
   hash:
-    md5: f61eb8cd60ff9057122a3d338b99c00f
-    sha256: 44c877f8af015332a5d12f5ff0fb20ca32f896526a7d0cdb30c769df1144fb5c
+    md5: c5955c27917ff2234def47f075e71e02
+    sha256: 012096056b97abf1f68c46b7146bd2cbd68c1be762340b4f5dad4fbbe99177bc
   category: main
   optional: false
 - name: orc
@@ -4059,20 +4059,20 @@ package:
   category: main
   optional: false
 - name: polars
-  version: 1.39.2
+  version: 1.43.2
   manager: conda
   platform: linux-64
   dependencies:
-    polars-runtime-32: 1.39.2
+    polars-runtime-32: 1.43.2
     python: ''
-  url: https://conda.anaconda.org/conda-forge/noarch/polars-1.39.2-pyh58ad624_0.conda
+  url: https://conda.anaconda.org/conda-forge/noarch/polars-1.43.2-pyh8da0edf_0.conda
   hash:
-    md5: 864d9058d966bd37c8584b6161dc79a9
-    sha256: f8585bb56153d4731fef07d07ff6d046b49eb4eac10a809f97af072d51697e39
+    md5: fbca53c3325e69df796fcef948ec9aaa
+    sha256: 00cdfd4dbf90c68058885e888fb9b1e92d597611206568705214b786229224d5
   category: main
   optional: false
 - name: polars-runtime-32
-  version: 1.39.2
+  version: 1.43.2
   manager: conda
   platform: linux-64
   dependencies:
@@ -4082,10 +4082,10 @@ package:
     libgcc: '>=14'
     libstdcxx: '>=14'
     python: ''
-  url: https://conda.anaconda.org/conda-forge/linux-64/polars-runtime-32-1.39.2-py310hffdcd12_0.conda
+  url: https://conda.anaconda.org/conda-forge/linux-64/polars-runtime-32-1.43.2-py310h9585f58_0.conda
   hash:
-    md5: 70722b3f259f04ad98f8d659bbfe91c4
-    sha256: 4aaa55f624aca4ab07536f6271ad2a62fb4e30cad8ff6d2c30c4f0a1f2bb4780
+    md5: 912d8eb6fdbea640f27c5e97859be85b
+    sha256: ba6c79dd4c74a41d866b6716e2d22e1d656f099cbd17b2039c7933181d571793
   category: main
   optional: false
 - name: prometheus-cpp
@@ -5357,7 +5357,7 @@ package:
   manager: conda
   platform: linux-64
   dependencies:
-    typing_extensions: ==4.15.0
+    typing_extensions: 4.15.0
   url: https://conda.anaconda.org/conda-forge/noarch/typing-extensions-4.15.0-h396c80c_0.conda
   hash:
     md5: edd329d7d3a4ab45dcf905899a7a6115
@@ -5456,7 +5456,7 @@ package:
     httptools: '>=0.6.3'
     python-dotenv: '>=0.13'
     pyyaml: '>=5.1'
-    uvicorn: ==0.42.0
+    uvicorn: 0.42.0
     uvloop: '>=0.15.1'
     watchfiles: '>=0.20'
     websockets: '>=10.4'

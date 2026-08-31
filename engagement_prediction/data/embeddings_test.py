@@ -1,0 +1,108 @@
+"""Tests for content-embedding payload helpers."""
+
+import base64
+import struct
+import zlib
+
+import pytest
+
+from engagement_prediction.data.embeddings import (
+    _decompress_and_unpack_embedding,
+    _extract_compressed_embedding_vector_from_struct,
+    get_embedding_dim_for_known_model,
+    get_expanded_embedding_vector,
+)
+
+
+def test_get_embedding_value_for_model_dicts():
+    embeddings = [
+        {"key": "other", "value": "x"},
+        {"key": "target", "value": "y"},
+    ]
+    assert _extract_compressed_embedding_vector_from_struct(embeddings, "target") == "y"
+    assert _extract_compressed_embedding_vector_from_struct(embeddings, "missing") is None
+    assert _extract_compressed_embedding_vector_from_struct(None, "target") is None
+
+
+def test_get_embedding_value_for_model_list_or_tuple_items():
+    embeddings_tuples = [
+        ("other", "x"),
+        ("target", "y"),
+    ]
+    assert _extract_compressed_embedding_vector_from_struct(embeddings_tuples, "target") == "y"
+
+    embeddings_lists = [
+        ["other", "x"],
+        ["target", "y"],
+    ]
+    assert _extract_compressed_embedding_vector_from_struct(embeddings_lists, "target") == "y"
+
+    embeddings_mixed = [
+        None,
+        ["too-short"],
+        ("target", "y", "extra"),
+    ]
+    assert _extract_compressed_embedding_vector_from_struct(embeddings_mixed, "target") == "y"
+
+
+def test_get_embedding_value_for_model_object_items():
+    class _Item:
+        def __init__(self, key: str, value: str):
+            self.key = key
+            self.value = value
+
+    embeddings = [_Item("other", "x"), _Item("target", "y")]
+    assert _extract_compressed_embedding_vector_from_struct(embeddings, "target") == "y"
+    assert _extract_compressed_embedding_vector_from_struct(embeddings, "missing") is None
+
+
+def test_get_embedding_dim_for_known_model_ok_and_unknown():
+    assert get_embedding_dim_for_known_model("all-MiniLM-L6-v2") == 384
+    with pytest.raises(ValueError, match="Unknown embedding model"):
+        get_embedding_dim_for_known_model("does-not-exist")
+
+
+def _encode_embedding_bytes(vec: list[float], *, compress: bool) -> str:
+    raw = struct.pack(f"<{len(vec)}f", *vec)
+    bs = zlib.compress(raw) if compress else raw
+    return base64.b85encode(bs).decode()
+
+
+def test_decompress_and_unpack_embedding_round_trip_compressed():
+    encoded = _encode_embedding_bytes([0.1, 0.2, 0.3], compress=True)
+    result = _decompress_and_unpack_embedding(encoded, decompress=True)
+    assert result == pytest.approx([0.1, 0.2, 0.3], rel=1e-6, abs=1e-6)
+
+
+def test_decompress_and_unpack_embedding_uncompressed_with_decompress_none_and_false():
+    encoded = _encode_embedding_bytes([1.0, 2.0, 3.0], compress=False)
+    result_none = _decompress_and_unpack_embedding(encoded, decompress=None)
+    result_false = _decompress_and_unpack_embedding(encoded, decompress=False)
+    assert result_none == pytest.approx([1.0, 2.0, 3.0], rel=1e-6, abs=1e-6)
+    assert result_false == pytest.approx([1.0, 2.0, 3.0], rel=1e-6, abs=1e-6)
+
+
+def test_decompress_and_unpack_embedding_raises_when_decompress_true_on_uncompressed():
+    encoded = _encode_embedding_bytes([1.0, 2.0, 3.0], compress=False)
+    with pytest.raises(zlib.error):
+        _decompress_and_unpack_embedding(encoded, decompress=True)
+
+
+def test_decompress_and_unpack_embedding_raises_on_bad_length():
+    encoded = base64.b85encode(b"abc").decode()
+    with pytest.raises(ValueError, match="multiple of 4"):
+        _decompress_and_unpack_embedding(encoded, decompress=False)
+
+
+def test_get_expanded_embedding_vector_extracts_target_and_returns_none():
+    embedding_model = "model_b"
+    embedding_input = [
+        {"key": "other", "value": _encode_embedding_bytes([9.9], compress=True)},
+        {
+            "key": embedding_model,
+            "value": _encode_embedding_bytes([0.4, 0.5, 0.6], compress=True),
+        },
+    ]
+    result = get_expanded_embedding_vector(embedding_input, embedding_model)
+    assert result == pytest.approx([0.4, 0.5, 0.6], rel=1e-6, abs=1e-6)
+    assert get_expanded_embedding_vector(embedding_input, "missing") is None
