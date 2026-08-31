@@ -109,7 +109,7 @@ def test_partial_bundle_creation_rejects_existing_paths_without_new_paths(
     assert not (Path(tmp_path) / other_name).exists()
 
 
-def test_complete_stage_artifacts_records_then_finalizes(tmp_path):
+def test_complete_stage_artifacts_finalizes_then_records(tmp_path):
     calls = []
 
     class RecordingContext:
@@ -134,11 +134,32 @@ def test_complete_stage_artifacts_records_then_finalizes(tmp_path):
         result=result,
         args=args,
     ) is result
-    assert calls[0] == (
+    assert calls[0][0] == "finalize"
+    assert calls[0][1]["argv"] == ["run-all"]
+    assert calls[1] == (
         "record",
         "test_stage",
         output_dir,
         result["artifacts"],
     )
-    assert calls[1][0] == "finalize"
-    assert calls[1][1]["argv"] == ["run-all"]
+
+
+def test_complete_stage_artifacts_does_not_record_failed_finalization(tmp_path):
+    class FailingContext:
+        def finalize_stage(self, **kwargs):
+            raise OSError("finalization failed")
+
+        def record_artifact(self, stage, output_dir, extras):
+            pytest.fail("failed stage must not be recorded")
+
+    output_dir = Path(tmp_path) / "output"
+    output_dir.mkdir()
+
+    with pytest.raises(OSError, match="finalization failed"):
+        complete_stage_artifacts(
+            context=FailingContext(),
+            stage_key="test_stage",
+            stage_folder="00_test",
+            result={"output_dir": output_dir, "artifacts": {}},
+            args=type("Args", (), {"_argv": []})(),
+        )

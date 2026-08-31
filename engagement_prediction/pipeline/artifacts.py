@@ -184,7 +184,6 @@ def complete_stage_artifacts(
     if not isinstance(artifact_values, dict):
         raise RuntimeError(f"Stage '{stage_key}' artifacts must be a dictionary")
 
-    context.record_artifact(stage_key, output_dir, extras=artifact_values)
     context.finalize_stage(
         stage_key=stage_key,
         stage_folder=stage_folder,
@@ -192,4 +191,7 @@ def complete_stage_artifacts(
         args=args,
         argv=getattr(args, "_argv", None),
     )
+    # Same-process dependency resolution should see only artifacts whose
+    # completion metadata and run-view publication both succeeded.
+    context.record_artifact(stage_key, output_dir, extras=artifact_values)
     return result

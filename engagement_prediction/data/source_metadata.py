@@ -13,7 +13,7 @@ from pathlib import Path
 
 import polars as pl
 
-from engagement_prediction.data import timestamps
+from engagement_prediction.data import likes, timestamps
 
 UTC_DATETIME = timestamps.UTC_DATETIME
 POST_METADATA_COLUMNS = ["subject_uri", "post_created_at", "author_did", "is_reply"]
@@ -88,16 +88,14 @@ def normalize_source_records(
     )
     return normalized.with_columns(
         (
-            pl.col("subject_uri").is_not_null()
-            & (pl.col("subject_uri").str.len_chars() > 0)
+            likes.valid_identifier_expr("subject_uri")
             & pl.col("post_created_at").is_not_null()
             & timestamps.half_open_window_expr(
                 "post_created_at",
                 start=posts_start,
                 end=posts_end,
             )
-            & pl.col("author_did").is_not_null()
-            & (pl.col("author_did").str.len_chars() > 0)
+            & likes.valid_identifier_expr("author_did")
         ).alias("_post_row_valid")
     )
 

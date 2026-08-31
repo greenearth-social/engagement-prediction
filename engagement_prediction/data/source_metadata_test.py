@@ -45,6 +45,21 @@ def test_normalizes_and_selects_latest_metadata_with_stable_tie_break():
     }
 
 
+def test_normalization_marks_whitespace_only_identifiers_invalid():
+    normalized = source_metadata.normalize_source_records(
+        pl.DataFrame({
+            "at_uri": ["valid-post", "   ", "post-with-invalid-author"],
+            "record_created_at": ["2026-01-01T01:00:00Z"] * 3,
+            "did": ["valid-author", "valid-author", "\t"],
+        }).lazy(),
+        posts_start=datetime(2026, 1, 1, tzinfo=UTC),
+        posts_end=datetime(2026, 1, 2, tzinfo=UTC),
+        is_reply=False,
+    ).collect()
+
+    assert normalized.get_column("_post_row_valid").to_list() == [True, False, False]
+
+
 def test_applies_root_precedence():
     roots = pl.DataFrame({
         "subject_uri": ["both", "root"],

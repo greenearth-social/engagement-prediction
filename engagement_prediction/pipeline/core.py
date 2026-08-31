@@ -75,6 +75,19 @@ def _write_json(path: Path, data: Dict[str, Any]) -> None:
     path.write_text(json.dumps(_normalize_for_json(data), indent=2, sort_keys=True) + "\n")
 
 
+def _write_json_atomic(path: Path, data: Dict[str, Any]) -> None:
+    """Atomically publish JSON without exposing a partially written file."""
+
+    path = Path(path)
+    partial_path = path.with_name(f".{path.name}.{_short_uuid()}.partial")
+    try:
+        _write_json(partial_path, data)
+        partial_path.replace(path)
+    finally:
+        if partial_path.exists():
+            partial_path.unlink()
+
+
 def _build_stage_manifest(
     *,
     stage_key: str,
@@ -267,14 +280,19 @@ class Context:
         args: Any,
         argv: Optional[Iterable[str]] = None,
     ) -> None:
-        """Publish configuration, manifest, run-view symlink, and lineage metadata."""
+        """Publish configuration, lineage, and the stage completion markers.
+
+        ``manifest.json`` is the authoritative completion marker used by
+        automatic artifact discovery.  Keep both it and the run-view symlink
+        unpublished until every fallible metadata update has succeeded, so an
+        interrupted finalization remains an incomplete artifact directory.
+        """
 
         output_dir = Path(output_dir).resolve()
         stage_run_id = output_dir.name
 
         pipeline_run_dir = Path(self.run_dir).resolve()
         pipeline_run_dir.mkdir(parents=True, exist_ok=True)
-        _ensure_symlink(pipeline_run_dir / stage_folder, output_dir)
 
         resolved_config_path = output_dir / STAGE_RESOLVED_CONFIG_FILENAME
         args_dict = {k: v for k, v in vars(args).items() if k != "func" and not callable(v)}
@@ -289,8 +307,8 @@ class Context:
             pipeline_run_id=self.pipeline_run_id,
             argv=argv,
             inputs=self._active_stage_inputs,
+            status="complete",
         )
-        _write_json(manifest_path, manifest)
         self._append_stage_info_inputs(output_dir)
 
         self._update_lineage(
@@ -301,6 +319,19 @@ class Context:
             resolved_config_path=resolved_config_path,
             manifest_path=manifest_path,
         )
+
+        # The symlink is a convenient run-local view; manifest.json remains the
+        # authoritative completion marker and is deliberately published last.
+        # If writing the manifest fails, remove only the link created here so
+        # the failed finalization does not leave either completion signal.
+        stage_link = pipeline_run_dir / stage_folder
+        _ensure_symlink(stage_link, output_dir)
+        try:
+            _write_json_atomic(manifest_path, manifest)
+        except Exception:
+            if stage_link.is_symlink() and stage_link.resolve() == output_dir:
+                stage_link.unlink()
+            raise
 
     def write_partial_stage_manifest(
         self,
@@ -453,13 +484,43 @@ def _parse_stage_run_timestamp(stage_run_id: str) -> Optional[datetime]:
         return None
 
 
+def _has_completed_stage_manifest(stage_output: Path) -> bool:
+    """Return whether an artifact has a readable completed manifest.
+
+    Older canonical manifests predate the explicit ``status`` field, so the
+    absence of that field remains compatible.  A present non-complete status,
+    malformed JSON, or non-object payload is never eligible for automatic
+    prior selection.
+    """
+
+    manifest_path = Path(stage_output) / STAGE_MANIFEST_FILENAME
+    if not manifest_path.is_file():
+        return False
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(manifest, dict):
+        return False
+    return "status" not in manifest or manifest.get("status") == "complete"
+
+
 def list_stage_outputs(artifacts_dir: Path, stage_folder: str) -> List[Path]:
-    """List a stage folder's artifact directories from newest to oldest."""
+    """List completed stage artifacts from newest to oldest.
+
+    Stage directories are created before their work begins and intentionally
+    survive failures for diagnosis.  Filtering on the final manifest prevents
+    a newer failed directory from masking the latest reusable artifact.
+    """
 
     base = (Path(artifacts_dir) / stage_folder).resolve()
     if not base.exists() or not base.is_dir():
         return []
-    subdirs = [p for p in base.iterdir() if p.is_dir()]
+    subdirs = [
+        p
+        for p in base.iterdir()
+        if p.is_dir() and _has_completed_stage_manifest(p)
+    ]
     # Sort by parsed timestamp desc; tie-break by mtime desc.
     def _key(p: Path):
         """Produce a stable newest-first key for current and legacy names."""

@@ -21,6 +21,25 @@ def _embedding(value: str) -> list[dict[str, str]]:
     return [{"key": "all_MiniLM_L12_v2", "value": value}]
 
 
+def test_embedding_source_normalization_rejects_whitespace_only_identifiers():
+    normalized = dataset_hydration.normalize_embedding_source_rows(
+        pl.DataFrame({
+            "at_uri": ["valid-post", "   ", "post-with-invalid-author"],
+            "record_created_at": ["2026-01-01T01:00:00Z"] * 3,
+            "did": ["valid-author", "valid-author", "\t"],
+            "embeddings": [None, None, None],
+        }).lazy(),
+        posts_start=datetime(2026, 1, 1, tzinfo=UTC),
+        posts_end=datetime(2026, 1, 2, tzinfo=UTC),
+        is_reply=False,
+    ).collect()
+
+    assert normalized.select("subject_uri", "author_did").to_dicts() == [{
+        "subject_uri": "valid-post",
+        "author_did": "valid-author",
+    }]
+
+
 def test_select_latest_valid_embeddings_uses_latest_usable_row_and_stable_ties():
     rows = pl.DataFrame({
         "subject_uri": ["a", "a", "b", "b", "c"],

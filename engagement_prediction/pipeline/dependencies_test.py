@@ -93,6 +93,36 @@ def test_resolve_stage_dependencies_for_user_history_selects_latest_query_artifa
     }
 
 
+def test_parentless_stage_resolution_skips_newer_incomplete_artifact(tmp_path):
+    artifacts_dir = Path(tmp_path) / "artifacts"
+    run_dir = Path(tmp_path) / "runs" / "run1"
+    run_dir.mkdir(parents=True)
+    completed_source = _make_stage_output(
+        artifacts_dir,
+        "00_source_metadata",
+        "20260101_000000_complete",
+    )
+    incomplete_source = (
+        artifacts_dir
+        / "00_source_metadata"
+        / "20260102_000000_incomplete"
+    )
+    incomplete_source.mkdir(parents=True)
+    ctx = Context(
+        run_dir=run_dir,
+        artifacts_dir=artifacts_dir,
+        runs_dir=Path(tmp_path) / "runs",
+        use_latest=True,
+    )
+
+    resolved = resolve_stage_dependencies_for_run(
+        ctx=ctx,
+        consumer_stage_folder="01_query_selection",
+    )
+
+    assert resolved == {"00_source_metadata": completed_source.resolve()}
+
+
 def test_resolve_post_selection_from_history_pin_infers_query_ancestor(tmp_path):
     artifacts_dir = Path(tmp_path) / "artifacts"
     run_dir = Path(tmp_path) / "runs" / "run1"
