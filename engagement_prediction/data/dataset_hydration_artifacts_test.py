@@ -11,6 +11,7 @@ import polars as pl
 from engagement_prediction.data import dataset_hydration
 from engagement_prediction.data import dataset_hydration_artifacts
 from engagement_prediction.data import author_vocabulary
+from engagement_prediction.data import post_liker_users
 from engagement_prediction.data.parquet import scan_parquet_artifact
 
 
@@ -314,9 +315,10 @@ def test_prior_counts_read_each_usage_partition_once(tmp_path, monkeypatch):
     events_path.mkdir()
     event_part = events_path / "part-00000.parquet"
     pl.DataFrame({
-        "subject_uri": ["shared", "shared", "negative", "negative"],
-        "liker_did": ["a", "b", "c", "d"],
+        "subject_uri": ["shared", "shared", "shared", "negative", "negative"],
+        "liker_did": ["a", "a", "b", "c", "d"],
         "like_created_at": [
+            datetime(2026, 1, 1, 1, tzinfo=UTC),
             datetime(2026, 1, 1, 1, tzinfo=UTC),
             query_hour,
             datetime(2026, 1, 1, 0, tzinfo=UTC),
@@ -329,6 +331,17 @@ def test_prior_counts_read_each_usage_partition_once(tmp_path, monkeypatch):
         "liker_did": ["unused-liker"],
         "like_created_at": [datetime(2026, 1, 1, 1, tzinfo=UTC)],
     }).write_parquet(unused_event_part)
+    use_windows_path = tmp_path / "post-liker-use-windows"
+    use_windows_partition = use_windows_path / "_post_partition=0"
+    use_windows_partition.mkdir(parents=True)
+    pl.DataFrame({
+        "subject_uri": ["shared", "negative"],
+        "emb_idx": [0, 1],
+        "final_use_query_hour": [query_hour, query_hour],
+        "final_training_use_query_hour": [query_hour, query_hour],
+    }, schema=post_liker_users.POST_LIKER_USE_WINDOW_SCHEMA).write_parquet(
+        use_windows_partition / "part.parquet"
+    )
 
     read_paths = []
     original_read_parquet = dataset_hydration_artifacts.pl.read_parquet
@@ -364,6 +377,8 @@ def test_prior_counts_read_each_usage_partition_once(tmp_path, monkeypatch):
         history_routes_path=route_paths["history"],
         negative_routes_path=route_paths["negative"],
         post_liker_events_path=events_path,
+        post_liker_use_windows_path=use_windows_path,
+        post_liker_feature_events_path=tmp_path / "post-liker-feature-events",
         counted_positives_path=tmp_path / "counted-positives",
         counted_histories_path=tmp_path / "counted-histories",
         counted_negatives_path=tmp_path / "counted-negatives",
@@ -371,20 +386,248 @@ def test_prior_counts_read_each_usage_partition_once(tmp_path, monkeypatch):
         logger=logging.getLogger("prior-count-read-test"),
     )
 
-    assert stats == {"post_query_hour_pair_count": 2}
+    assert stats == {
+        "post_query_hour_pair_count": 2,
+        "raw_post_liker_event_count": 5,
+        "deduplicated_post_liker_event_count": 4,
+        "retained_post_liker_feature_event_count": 3,
+        "training_visible_post_liker_event_count": 3,
+    }
     assert all(read_paths.count(path) == 1 for path in route_parts)
     assert read_paths.count(event_part) == 1
     assert unused_event_part not in read_paths
     assert cumulative_build_count == 1
     assert original_read_parquet(
         tmp_path / "counted-positives" / "part-00000.parquet"
-    ).get_column("prior_like_count").to_list() == [1]
+    ).get_column("prior_like_count").to_list() == [2]
     assert original_read_parquet(
         tmp_path / "counted-histories" / "part-00000.parquet"
-    ).get_column("prior_like_count").to_list() == [1]
+    ).get_column("prior_like_count").to_list() == [2]
     assert original_read_parquet(
         tmp_path / "counted-negatives" / "part-00000.parquet"
     ).get_column("prior_like_count").to_list() == [2]
+    feature_events = original_read_parquet(
+        tmp_path / "post-liker-feature-events" / "part-00000.parquet"
+    )
+    assert feature_events.select(
+        "emb_idx", "liker_did", "like_created_at", "is_training_visible"
+    ).to_dicts() == [
+        {
+            "emb_idx": 0,
+            "liker_did": "a",
+            "like_created_at": datetime(2026, 1, 1, 1, tzinfo=UTC),
+            "is_training_visible": True,
+        },
+        {
+            "emb_idx": 1,
+            "liker_did": "c",
+            "like_created_at": datetime(2026, 1, 1, 0, tzinfo=UTC),
+            "is_training_visible": True,
+        },
+        {
+            "emb_idx": 1,
+            "liker_did": "d",
+            "like_created_at": datetime(2026, 1, 1, 1, tzinfo=UTC),
+            "is_training_visible": True,
+        },
+    ]
+
+
+def test_post_liker_use_windows_exclude_dropped_queries_and_track_train_horizon(
+    tmp_path,
+):
+    train_hour = datetime(2026, 1, 1, 2, tzinfo=UTC)
+    val_hour = datetime(2026, 1, 1, 3, tzinfo=UTC)
+    dropped_hour = datetime(2026, 1, 1, 4, tzinfo=UTC)
+    queries_lf = pl.DataFrame({
+        "did": ["train-user", "val-user", "dropped-user"],
+        "query_hour": [train_hour, val_hour, dropped_hour],
+        "split": ["train", "val", "train"],
+    }).lazy()
+    positives_path = tmp_path / "hydrated-positives"
+    histories_path = tmp_path / "hydrated-histories"
+    negatives_path = tmp_path / "hydrated-negatives"
+    _write_part(positives_path / "_post_partition=0", pl.DataFrame({
+        "did": ["train-user", "val-user"],
+        "query_hour": [train_hour, val_hour],
+        "subject_uri": ["positive", "positive"],
+        "emb_idx": pl.Series([0, 0], dtype=pl.UInt32),
+    }))
+    _write_part(histories_path / "_post_partition=0", pl.DataFrame({
+        "did": ["train-user", "val-user", "dropped-user"],
+        "query_hour": [train_hour, val_hour, dropped_hour],
+        "subject_uri": ["shared-history", "shared-history", "dropped-history"],
+        "emb_idx": pl.Series([1, 1, 2], dtype=pl.UInt32),
+    }))
+    _write_part(negatives_path / "_post_partition=0", pl.DataFrame({
+        "query_hour": [train_hour, val_hour, dropped_hour],
+        "subject_uri": ["negative", "negative", "dropped-negative"],
+        "emb_idx": pl.Series([3, 3, 4], dtype=pl.UInt32),
+    }))
+
+    output_path = tmp_path / "use-windows"
+    stats = dataset_hydration_artifacts.materialize_post_liker_use_windows(
+        queries_lf=queries_lf,
+        positive_routes_path=positives_path,
+        history_routes_path=histories_path,
+        negative_routes_path=negatives_path,
+        output_path=output_path,
+        partition_count=1,
+    )
+
+    windows = scan_parquet_artifact(output_path).collect().sort("emb_idx")
+    assert stats == {"post_count": 3, "training_post_count": 3}
+    assert windows.select(
+        "subject_uri",
+        "emb_idx",
+        "final_use_query_hour",
+        "final_training_use_query_hour",
+    ).to_dicts() == [
+        {
+            "subject_uri": "positive",
+            "emb_idx": 0,
+            "final_use_query_hour": val_hour,
+            "final_training_use_query_hour": train_hour,
+        },
+        {
+            "subject_uri": "shared-history",
+            "emb_idx": 1,
+            "final_use_query_hour": val_hour,
+            "final_training_use_query_hour": train_hour,
+        },
+        {
+            "subject_uri": "negative",
+            "emb_idx": 3,
+            "final_use_query_hour": val_hour,
+            "final_training_use_query_hour": train_hour,
+        },
+    ]
+
+
+def test_post_liker_vocabulary_caps_support_and_maps_remaining_events_to_unk(
+    tmp_path,
+):
+    feature_events_path = tmp_path / "feature-events"
+    event_time = datetime(2026, 1, 1, 1, tzinfo=UTC)
+    rows = []
+    for emb_idx, liker_did, count, is_training_visible in (
+        (0, "a", 3, True),
+        (1, "b", 2, True),
+        (2, "c", 2, True),
+        (3, "validation-only", 1, False),
+    ):
+        rows.extend(
+            {
+                "emb_idx": emb_idx,
+                "liker_did": liker_did,
+                "like_created_at": datetime(
+                    2026, 1, 1, 1, event_index, tzinfo=UTC
+                ),
+                "is_training_visible": is_training_visible,
+            }
+            for event_index in range(count)
+        )
+    _write_part(
+        feature_events_path,
+        pl.DataFrame(rows, schema=post_liker_users.POST_LIKER_FEATURE_EVENT_SCHEMA),
+    )
+    vocabulary_path = tmp_path / "post-liker-users"
+    stats = dataset_hydration_artifacts.build_post_liker_user_vocabulary(
+        feature_events_path=feature_events_path,
+        support_routes_path=tmp_path / "support-routes",
+        support_shards_path=tmp_path / "support-shards",
+        vocabulary_path=vocabulary_path,
+        min_training_event_count=2,
+        max_vocabulary_size=2,
+        partition_count=2,
+        logger=logging.getLogger("post-liker-vocabulary-test"),
+    )
+
+    vocabulary = scan_parquet_artifact(vocabulary_path).collect()
+    assert vocabulary.to_dicts() == [
+        {"liker_did": "a", "liker_idx": 2, "training_event_count": 3},
+        {"liker_did": "b", "liker_idx": 3, "training_event_count": 2},
+    ]
+    assert stats["threshold_eligible_user_count"] == 3
+    assert stats["excluded_by_cap_user_count"] == 1
+    assert stats["all_training_event_count"] == 7
+    assert stats["known_training_event_count"] == 5
+    assert stats["unk_training_event_count"] == 2
+
+    other_vocabulary_path = tmp_path / "post-liker-users-one-partition"
+    dataset_hydration_artifacts.build_post_liker_user_vocabulary(
+        feature_events_path=feature_events_path,
+        support_routes_path=tmp_path / "support-routes-one-partition",
+        support_shards_path=tmp_path / "support-shards-one-partition",
+        vocabulary_path=other_vocabulary_path,
+        min_training_event_count=2,
+        max_vocabulary_size=2,
+        partition_count=1,
+        logger=logging.getLogger("post-liker-vocabulary-partition-test"),
+    )
+    assert scan_parquet_artifact(other_vocabulary_path).collect().equals(vocabulary)
+
+    indexed_path = tmp_path / "indexed-events"
+    indexed_stats = dataset_hydration_artifacts.attach_post_liker_user_indices(
+        feature_events_path=feature_events_path,
+        vocabulary_path=vocabulary_path,
+        indexed_events_path=indexed_path,
+        partition_count=1,
+    )
+    indexed = scan_parquet_artifact(indexed_path).collect()
+    assert indexed_stats == {
+        "event_count": 8,
+        "unknown_event_count": 3,
+        "known_event_count": 5,
+        "post_count": 4,
+    }
+    assert indexed.filter(pl.col("emb_idx") == 2).get_column("liker_idx").to_list() == [
+        post_liker_users.POST_LIKER_USER_UNK_IDX,
+        post_liker_users.POST_LIKER_USER_UNK_IDX,
+    ]
+    assert indexed.filter(pl.col("emb_idx") == 3).get_column("liker_idx").to_list() == [
+        post_liker_users.POST_LIKER_USER_UNK_IDX
+    ]
+
+
+def test_post_liker_vocabulary_and_index_are_schema_correct_when_events_are_empty(
+    tmp_path,
+):
+    feature_events_path = tmp_path / "feature-events"
+    _write_part(
+        feature_events_path,
+        post_liker_users.empty_frame(
+            post_liker_users.POST_LIKER_FEATURE_EVENT_SCHEMA
+        ),
+    )
+    vocabulary_path = tmp_path / "post-liker-users"
+    stats = dataset_hydration_artifacts.build_post_liker_user_vocabulary(
+        feature_events_path=feature_events_path,
+        support_routes_path=tmp_path / "support-routes",
+        support_shards_path=tmp_path / "support-shards",
+        vocabulary_path=vocabulary_path,
+        min_training_event_count=2,
+        max_vocabulary_size=10,
+        partition_count=2,
+        logger=logging.getLogger("empty-post-liker-vocabulary-test"),
+    )
+    assert stats["user_count"] == 0
+    assert stats["user_table_num_rows"] == 2
+    assert scan_parquet_artifact(vocabulary_path).collect_schema() == pl.Schema(
+        post_liker_users.POST_LIKER_USER_VOCABULARY_SCHEMA
+    )
+
+    indexed_path = tmp_path / "indexed-events"
+    indexed_stats = dataset_hydration_artifacts.attach_post_liker_user_indices(
+        feature_events_path=feature_events_path,
+        vocabulary_path=vocabulary_path,
+        indexed_events_path=indexed_path,
+        partition_count=1,
+    )
+    assert indexed_stats["event_count"] == 0
+    assert scan_parquet_artifact(indexed_path).collect_schema() == pl.Schema(
+        post_liker_users.INDEXED_POST_LIKER_EVENT_SCHEMA
+    )
 
 
 def test_author_vocabulary_uses_only_surviving_training_feature_occurrences(tmp_path):

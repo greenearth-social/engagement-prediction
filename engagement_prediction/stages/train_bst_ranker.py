@@ -23,6 +23,10 @@ from engagement_prediction.data.datasets import (
     create_hydrated_data_loader,
 )
 from engagement_prediction.data.parquet import find_artifact_path, scan_parquet_artifact
+from engagement_prediction.data.post_liker_users import (
+    POST_LIKER_USER_PAD_IDX,
+    POST_LIKER_USER_UNK_IDX,
+)
 from engagement_prediction.models.bst_ranker import BSTRanker
 from engagement_prediction.pipeline.core import Context
 from engagement_prediction.pipeline.lineage import resolve_recorded_stage_lineage
@@ -33,6 +37,7 @@ from engagement_prediction.training.bst_ranker import (
 )
 from engagement_prediction.training.bst_export import (
     export_bst_ranker_checkpoint,
+    export_post_liker_serving_artifacts,
     validate_bst_ranker_export,
 )
 from engagement_prediction.training.bst_publication import publish_ranker_to_tracker
@@ -95,6 +100,8 @@ def _create_dataset(
     split: str,
     max_history_len: int,
     additional_negatives: int,
+    use_post_liker_feature: bool,
+    max_post_liker_replay_events_per_post: int,
     random_seed: int,
     logger: Any,
 ) -> HydratedBucketedEngagementDataset:
@@ -105,6 +112,12 @@ def _create_dataset(
         split=split,
         max_history_len=max_history_len,
         bst_additional_batch_negatives=additional_negatives,
+        use_post_liker_feature=use_post_liker_feature,
+        max_post_liker_replay_events_per_post=(
+            max_post_liker_replay_events_per_post
+            if use_post_liker_feature
+            else None
+        ),
         seed=random_seed,
         logger=logger,
     )
@@ -204,6 +217,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     prefetch_factor = int(args.dataloader_prefetch_factor)
     metrics_top_ks = [int(value) for value in args.metrics_top_ks]
     use_popularity_feature = bool(args.bst_use_popularity_feature)
+    use_post_liker_feature = bool(args.bst_use_post_liker_feature)
+    max_post_liker_replay_events_per_post = int(
+        args.bst_max_post_liker_replay_events_per_post
+    )
     generate_plots = not bool(args.no_plots)
     disable_progress = bool(args.disable_progress)
     max_train_batches = args.bst_max_train_batches_per_epoch
@@ -217,6 +234,15 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("num_dataloader_workers must be nonnegative")
     if num_workers > 0 and prefetch_factor <= 0:
         raise ValueError("dataloader_prefetch_factor must be positive")
+    if max_post_liker_replay_events_per_post <= 0:
+        raise ValueError(
+            "bst_max_post_liker_replay_events_per_post must be positive"
+        )
+    if use_post_liker_feature and int(loader_index_validation["format_version"]) < 2:
+        raise ValueError(
+            "BST post-liker features require Stage 7 loader-index format version 2; "
+            "regenerate Stage 7"
+        )
 
     device = get_device(args.device)
     if device.startswith("cuda") and not torch.cuda.is_available():
@@ -225,7 +251,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     logger.info(
         "Starting native BST training: dataset=%s device=%s history_len=%s "
         "train_batch_size=%s eval_batch_size=%s negatives_per_batch_pool=%s "
-        "popularity=%s",
+        "popularity=%s post_liker_feature=%s",
         bundle_path,
         device,
         max_history_len,
@@ -233,6 +259,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         eval_batch_size,
         additional_negatives,
         use_popularity_feature,
+        use_post_liker_feature,
     )
 
     logger.info("Phase 2/8: fitting training-only popularity normalization")
@@ -264,6 +291,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             split=split,
             max_history_len=max_history_len,
             additional_negatives=additional_negatives,
+            use_post_liker_feature=use_post_liker_feature,
+            max_post_liker_replay_events_per_post=(
+                max_post_liker_replay_events_per_post
+            ),
             random_seed=random_seed,
             logger=logger,
         )
@@ -271,15 +302,33 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     }
     embed_dim = datasets["train"].embed_dim
     author_table_num_rows = datasets["train"].author_table_num_rows
+    post_liker_user_table_num_rows = (
+        int(datasets["train"].post_liker_user_table_num_rows)
+        if use_post_liker_feature
+        else 2
+    )
     if embed_dim != int(loader_index_validation["embedding_dim"]):
         raise ValueError("Stage 7 dataset embedding dimension does not match loader_index")
     if author_table_num_rows != int(loader_index_validation["author_table_num_rows"]):
         raise ValueError("Stage 7 dataset author vocabulary size does not match loader_index")
+    if use_post_liker_feature and post_liker_user_table_num_rows != int(
+        loader_index_validation["post_liker_user_table_num_rows"]
+    ):
+        raise ValueError(
+            "Stage 7 dataset post-liker user vocabulary size does not match loader_index"
+        )
     for split, dataset in datasets.items():
         if dataset.embed_dim != embed_dim:
             raise ValueError(f"Stage 7 split '{split}' has a different embedding dimension")
         if dataset.author_table_num_rows != author_table_num_rows:
             raise ValueError(f"Stage 7 split '{split}' has a different author vocabulary size")
+        if use_post_liker_feature and (
+            dataset.post_liker_user_table_num_rows
+            != post_liker_user_table_num_rows
+        ):
+            raise ValueError(
+                f"Stage 7 split '{split}' has a different post-liker user vocabulary size"
+            )
 
     train_loader = _create_loader(
         dataset=datasets["train"],
@@ -337,6 +386,18 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "popularity_projection_dim": int(args.bst_popularity_projection_dim),
         "popularity_log_mean": popularity_stats.log_mean,
         "popularity_log_std": popularity_stats.log_std,
+        "use_post_liker_feature": use_post_liker_feature,
+        "post_liker_user_table_num_rows": post_liker_user_table_num_rows,
+        "post_liker_user_embedding_dim": int(
+            args.bst_post_liker_user_embedding_dim
+        ),
+        "post_liker_projection_dim": int(args.bst_post_liker_projection_dim),
+        "post_liker_pooling_tau_hours": float(
+            args.bst_post_liker_pooling_tau_hours
+        ),
+        "post_liker_user_unknown_dropout_rate": float(
+            args.bst_post_liker_user_unknown_dropout_rate
+        ),
     }
     model_config = {
         "model_type": "bst-ranker",
@@ -344,6 +405,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "max_history_len": max_history_len,
         "author_pad_idx": AUTHOR_PAD_IDX,
         "author_unk_idx": AUTHOR_UNK_IDX,
+        "post_liker_user_pad_idx": POST_LIKER_USER_PAD_IDX,
+        "post_liker_user_unk_idx": POST_LIKER_USER_UNK_IDX,
         "constructor_args": constructor_args,
     }
     training_config = {
@@ -372,6 +435,20 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "dataloader_pin_memory": pin_memory,
         "dataloader_persistent_workers": persistent_workers,
         "dataloader_prefetch_factor": prefetch_factor,
+        "bst_use_post_liker_feature": use_post_liker_feature,
+        "bst_post_liker_user_embedding_dim": int(
+            args.bst_post_liker_user_embedding_dim
+        ),
+        "bst_post_liker_projection_dim": int(args.bst_post_liker_projection_dim),
+        "bst_post_liker_pooling_tau_hours": float(
+            args.bst_post_liker_pooling_tau_hours
+        ),
+        "bst_max_post_liker_replay_events_per_post": (
+            max_post_liker_replay_events_per_post
+        ),
+        "bst_post_liker_user_unknown_dropout_rate": float(
+            args.bst_post_liker_user_unknown_dropout_rate
+        ),
         "device": device,
         "generate_plots": generate_plots,
     }
@@ -388,6 +465,16 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     if not authors_source_path.is_dir():
         raise FileNotFoundError(f"Stage 7 authors artifact is missing: {authors_source_path}")
     shutil.copytree(authors_source_path, authors_path)
+    post_liker_users_path = None
+    if use_post_liker_feature:
+        post_liker_users_source_path = bundle_path / "post_liker_users"
+        post_liker_users_path = out_dir / "post_liker_users"
+        if not post_liker_users_source_path.is_dir():
+            raise FileNotFoundError(
+                "Stage 7 post-liker user vocabulary is missing: "
+                f"{post_liker_users_source_path}"
+            )
+        shutil.copytree(post_liker_users_source_path, post_liker_users_path)
 
     logger.info(
         "Phase 4/8: training the canonical BST ranker and exporting every new best"
@@ -483,6 +570,32 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         output_path=ranker_author_idx_path,
         author_table_num_rows=author_table_num_rows,
     )
+    ranker_liker_user_idx_path = None
+    ranker_liker_user_embeddings_path = None
+    post_liker_state_config_path = None
+    post_liker_serving_artifacts = None
+    if use_post_liker_feature:
+        assert post_liker_users_path is not None
+        ranker_liker_user_idx_path = out_dir / "ranker_liker_user_idx.parquet"
+        ranker_liker_user_embeddings_path = (
+            out_dir / "ranker_liker_user_embeddings.npy"
+        )
+        post_liker_state_config_path = out_dir / "post_liker_state_config.json"
+        post_liker_serving_artifacts = export_post_liker_serving_artifacts(
+            checkpoint_path=checkpoint_path,
+            scripted_model_path=torchscript_path,
+            expected_model_config=model_config,
+            expected_popularity_stats=popularity_payload,
+            vocabulary_path=post_liker_users_path,
+            user_map_output_path=ranker_liker_user_idx_path,
+            embeddings_output_path=ranker_liker_user_embeddings_path,
+            state_config_output_path=post_liker_state_config_path,
+            max_replay_events_per_post=max_post_liker_replay_events_per_post,
+        )
+        if post_liker_serving_artifacts["best_epoch"] != training_results["best_epoch"]:
+            raise RuntimeError(
+                "Post-liker serving artifacts do not match the selected BST checkpoint"
+            )
     logger.info(
         "Validated final BST serving artifacts: best_epoch=%s ranker_bytes=%s "
         "author_count=%s",
@@ -509,6 +622,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         torchscript_path=torchscript_path,
         author_map_path=ranker_author_idx_path,
         manifest_path=serving_manifest_path,
+        post_liker_feature_enabled=use_post_liker_feature,
+        post_liker_user_map_path=ranker_liker_user_idx_path,
+        post_liker_user_embeddings_path=ranker_liker_user_embeddings_path,
+        post_liker_state_config_path=post_liker_state_config_path,
     )
     clearml_publication["runtime_seconds"] = time.time() - publication_started_at
     if clearml_publication["status"] != "complete":
@@ -546,7 +663,26 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         clearml_publication=clearml_publication,
         local_pipeline_runtime_seconds=local_pipeline_runtime_seconds,
         runtime_seconds=runtime_seconds,
-        extra_fields={},
+        extra_fields={
+            "post_liker_feature": {
+                "enabled": use_post_liker_feature,
+                "user_table_num_rows": post_liker_user_table_num_rows,
+                "user_embedding_dim": int(
+                    args.bst_post_liker_user_embedding_dim
+                ),
+                "projection_dim": int(args.bst_post_liker_projection_dim),
+                "pooling_tau_hours": float(
+                    args.bst_post_liker_pooling_tau_hours
+                ),
+                "max_replay_events_per_post": (
+                    max_post_liker_replay_events_per_post
+                ),
+                "user_unknown_dropout_rate": float(
+                    args.bst_post_liker_user_unknown_dropout_rate
+                ),
+            },
+            "post_liker_serving_artifacts": post_liker_serving_artifacts,
+        },
     )
     training_results_path = out_dir / "training_results.json"
     summary_path = out_dir / "summary.json"
@@ -560,6 +696,21 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "checkpoint_path": str(checkpoint_path),
             "torchscript_path": str(torchscript_path),
             "ranker_author_idx_path": ranker_author_idx_path.name,
+            "ranker_liker_user_idx_path": (
+                ranker_liker_user_idx_path.name
+                if ranker_liker_user_idx_path is not None
+                else None
+            ),
+            "ranker_liker_user_embeddings_path": (
+                ranker_liker_user_embeddings_path.name
+                if ranker_liker_user_embeddings_path is not None
+                else None
+            ),
+            "post_liker_state_config_path": (
+                post_liker_state_config_path.name
+                if post_liker_state_config_path is not None
+                else None
+            ),
             "serving_manifest_path": (
                 str(serving_manifest_path)
                 if serving_manifest_path.is_file()
@@ -573,7 +724,14 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "training_plot_path": plot_path.name if plot_path else None,
         },
         runtime_seconds=runtime_seconds,
-        extra_sections={"popularity": popularity_payload},
+        extra_sections={
+            "popularity": popularity_payload,
+            "post_liker_feature": {
+                "enabled": use_post_liker_feature,
+                "user_table_num_rows": post_liker_user_table_num_rows,
+                "serving_artifacts": post_liker_serving_artifacts,
+            },
+        },
     )
     write_training_result_files(
         training_results_path=training_results_path,
@@ -592,6 +750,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"embedding_model: {stage7_metadata['embedding_model']}",
         f"embedding_dim: {embed_dim}",
         f"author_table_num_rows: {author_table_num_rows}",
+        f"post_liker_feature_enabled: {use_post_liker_feature}",
+        f"post_liker_user_table_num_rows: {post_liker_user_table_num_rows}",
+        "post_liker_max_replay_events_per_post: "
+        f"{max_post_liker_replay_events_per_post}",
         f"train_batch_size: {batch_size}",
         f"eval_batch_size: {eval_batch_size}",
         f"best_epoch: {training_results['best_epoch']}",
@@ -608,6 +770,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"ranker_clearml_model_id: {clearml_publication['ranker_clearml_model_id']}",
         f"ranker_uri: {clearml_publication['ranker_uri']}",
         f"author_map_uploaded: {clearml_publication['author_map_uploaded']}",
+        "post_liker_user_map_uploaded: "
+        f"{clearml_publication['post_liker_user_map_uploaded']}",
+        "post_liker_user_embeddings_uploaded: "
+        f"{clearml_publication['post_liker_user_embeddings_uploaded']}",
+        "post_liker_state_config_uploaded: "
+        f"{clearml_publication['post_liker_state_config_uploaded']}",
         f"serving_manifest_uploaded: {clearml_publication['manifest_uploaded']}",
         "clearml_publication_errors: "
         f"{json.dumps(clearml_publication['errors'], sort_keys=True)}",
@@ -650,6 +818,26 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "checkpoint_path": str(checkpoint_path),
             "torchscript_path": str(torchscript_path),
             "ranker_author_idx_path": str(ranker_author_idx_path),
+            "ranker_liker_user_idx_path": (
+                str(ranker_liker_user_idx_path)
+                if ranker_liker_user_idx_path is not None
+                else None
+            ),
+            "ranker_liker_user_embeddings_path": (
+                str(ranker_liker_user_embeddings_path)
+                if ranker_liker_user_embeddings_path is not None
+                else None
+            ),
+            "post_liker_state_config_path": (
+                str(post_liker_state_config_path)
+                if post_liker_state_config_path is not None
+                else None
+            ),
+            "post_liker_users_path": (
+                str(post_liker_users_path)
+                if post_liker_users_path is not None
+                else None
+            ),
             "serving_manifest_path": (
                 str(serving_manifest_path)
                 if serving_manifest_path.is_file()
@@ -663,5 +851,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "training_plot_path": str(plot_path) if plot_path else None,
         },
         "torchscript_export": result_payload["torchscript_export"],
+        "post_liker_serving_artifacts": post_liker_serving_artifacts,
         "clearml_publication": clearml_publication,
     }

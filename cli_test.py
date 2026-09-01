@@ -235,6 +235,8 @@ def test_query_sampling_defaults():
     assert merged.embedding_source_batch_size == 64
     assert merged.embedding_partition_worker_count == 4
     assert merged.min_author_training_feature_count == 50
+    assert merged.min_post_liker_user_training_event_count == 2
+    assert merged.max_post_liker_user_vocabulary_size == 1_000_000
 
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(["--max-prior-likes", "64"])
@@ -765,6 +767,12 @@ def test_bst_ranker_training_defaults():
     assert merged.bst_max_train_batches_per_epoch is None
     assert merged.bst_use_popularity_feature is True
     assert merged.bst_popularity_projection_dim == 8
+    assert merged.bst_use_post_liker_feature is True
+    assert merged.bst_post_liker_user_embedding_dim == 16
+    assert merged.bst_post_liker_projection_dim == 32
+    assert merged.bst_post_liker_pooling_tau_hours == 168.0
+    assert merged.bst_max_post_liker_replay_events_per_post == 128
+    assert merged.bst_post_liker_user_unknown_dropout_rate == 0.20
     cli._validate_bst_config(merged)
 
 
@@ -788,6 +796,10 @@ def test_bst_ranker_requires_one_transformer_layer():
         ("--eval-batch-size", "eval-batch-size"),
         ("--bst-max-train-batches-per-epoch", "bst-max-train-batches-per-epoch"),
         ("--bst-popularity-projection-dim", "bst-popularity-projection-dim"),
+        ("--bst-post-liker-user-embedding-dim", "bst-post-liker-user-embedding-dim"),
+        ("--bst-post-liker-projection-dim", "bst-post-liker-projection-dim"),
+        ("--bst-post-liker-pooling-tau-hours", "bst-post-liker-pooling-tau-hours"),
+        ("--bst-max-post-liker-replay-events-per-post", "bst-max-post-liker-replay-events-per-post"),
     ],
 )
 def test_bst_ranker_rejects_non_positive_listwise_training_controls(flag, message):

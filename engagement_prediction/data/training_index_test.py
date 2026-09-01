@@ -11,6 +11,7 @@ import pyarrow.ipc as ipc
 import pytest
 
 from engagement_prediction.data import dataset_hydration
+from engagement_prediction.data import post_liker_users
 from engagement_prediction.data import training_index
 from engagement_prediction.data.training_index import (
     FORMAT_VERSION,
@@ -134,6 +135,34 @@ def _hydrated_inputs(tmp_path):
                 }
             ),
         ),
+        "indexed_post_liker_events_path": _write_dataset(
+            bundle,
+            "indexed_post_liker_events",
+            pl.DataFrame(
+                {
+                    "emb_idx": [0, 0, 2],
+                    "liker_idx": [2, 1, 2],
+                    "like_created_at": [
+                        datetime(2026, 1, 1, 9, tzinfo=UTC),
+                        datetime(2026, 1, 1, 10, tzinfo=UTC),
+                        datetime(2026, 1, 1, 10, 30, tzinfo=UTC),
+                    ],
+                },
+                schema=post_liker_users.INDEXED_POST_LIKER_EVENT_SCHEMA,
+            ),
+        ),
+        "post_liker_users_path": _write_dataset(
+            bundle,
+            "post_liker_users",
+            pl.DataFrame(
+                {
+                    "liker_did": ["known-liker"],
+                    "liker_idx": [2],
+                    "training_event_count": [2],
+                },
+                schema=post_liker_users.POST_LIKER_USER_VOCABULARY_SCHEMA,
+            ),
+        ),
         "output_path": bundle / "loader_index",
         "logger": None,
     }
@@ -158,6 +187,8 @@ def test_builds_exact_index_with_all_splits_and_relative_embedding_path(tmp_path
     assert set(metadata["splits"]) == set(SPLITS)
     assert metadata["embedding"]["path"] == "../embeddings.npy"
     assert validation["embedding_count"] == 4
+    assert validation["post_liker_user_table_num_rows"] == 3
+    assert validation["post_liker_event_count"] == 3
     assert not (bundle / "loader_index.partial").exists()
     for split in SPLITS[1:]:
         assert stats["splits"][split] == {
@@ -169,6 +200,12 @@ def test_builds_exact_index_with_all_splits_and_relative_embedding_path(tmp_path
         }
 
     assert load_index_array(paths["output_path"], "post_author_idx").tolist() == [2, 3, 4, 5]
+    assert load_index_array(
+        paths["output_path"], "post_liker_offsets"
+    ).tolist() == [0, 2, 2, 3, 3]
+    assert load_index_array(
+        paths["output_path"], "post_liker_user_indices"
+    ).tolist() == [2, 1, 2]
     assert load_index_array(
         paths["output_path"], "history_offsets", split="train"
     ).tolist() == [0, 2, 2]
@@ -346,6 +383,19 @@ def test_validator_rejects_corrupt_offsets(tmp_path):
         validate_loader_index(paths["output_path"])
 
 
+def test_validator_rejects_unsorted_post_liker_timestamp_segment(tmp_path):
+    _, paths = _hydrated_inputs(tmp_path)
+    build_loader_index(**paths)
+    timestamp_path = paths["output_path"] / "post_liker_created_at_us.npy"
+    timestamps = np.load(timestamp_path, mmap_mode="r+")
+    timestamps[0], timestamps[1] = timestamps[1], timestamps[0]
+    timestamps.flush()
+    del timestamps
+
+    with pytest.raises(ValueError, match="sorted within every post segment"):
+        validate_loader_index(paths["output_path"])
+
+
 def test_validator_rejects_invalid_embedding_indices(tmp_path):
     _, paths = _hydrated_inputs(tmp_path)
     build_loader_index(**paths)
@@ -409,6 +459,31 @@ def test_builder_rejects_post_rows_outside_embedding_index_order(tmp_path):
 def test_metadata_rejects_missing_and_unsupported_index(tmp_path):
     with pytest.raises(FileNotFoundError, match="regenerate Stage 7"):
         load_loader_index_metadata(tmp_path)
+
+
+def test_reader_and_validator_accept_existing_v1_index(tmp_path):
+    _, paths = _hydrated_inputs(tmp_path)
+    build_loader_index(**paths)
+    format_path = paths["output_path"] / "format.json"
+    metadata = json.loads(format_path.read_text())
+    metadata["format_version"] = 1
+    for name in (
+        "post_liker_offsets",
+        "post_liker_user_indices",
+        "post_liker_created_at_us",
+    ):
+        array_path = paths["output_path"] / metadata["arrays"].pop(name)["path"]
+        array_path.unlink()
+    metadata.pop("post_liker_user_table_num_rows")
+    metadata.pop("post_liker_event_count")
+    metadata.pop("post_liker_post_count")
+    metadata["total_data_bytes"] = training_index._total_declared_bytes(metadata)
+    format_path.write_text(json.dumps(metadata))
+
+    assert load_loader_index_metadata(paths["output_path"])["format_version"] == 1
+    validation = validate_loader_index(paths["output_path"])
+    assert validation["format_version"] == 1
+    assert validation["post_liker_event_count"] == 0
     (tmp_path / "format.json").write_text(json.dumps({"format_version": 999}))
     with pytest.raises(ValueError, match="Unsupported.*Regenerate Stage 7"):
         load_loader_index_metadata(tmp_path)

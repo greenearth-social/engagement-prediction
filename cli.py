@@ -85,6 +85,8 @@ DEFAULTS: Dict[str, Any] = {
     "embedding_source_batch_size": 64,
     "embedding_partition_worker_count": 4,
     "min_author_training_feature_count": 50,
+    "min_post_liker_user_training_event_count": 2,
+    "max_post_liker_user_vocabulary_size": 1_000_000,
     # Stage 8: Model architecture
     "model_type": "bst-ranker",
     "output_embedding_dim": 128,
@@ -114,6 +116,12 @@ DEFAULTS: Dict[str, Any] = {
     "bst_max_train_batches_per_epoch": None,
     "bst_use_popularity_feature": True,
     "bst_popularity_projection_dim": 8,
+    "bst_use_post_liker_feature": True,
+    "bst_post_liker_user_embedding_dim": 16,
+    "bst_post_liker_projection_dim": 32,
+    "bst_post_liker_pooling_tau_hours": 168.0,
+    "bst_max_post_liker_replay_events_per_post": 128,
+    "bst_post_liker_user_unknown_dropout_rate": 0.20,
     "dropout_rate_two_tower": 0.3,
     "device": "cuda",
     "patience": 50,
@@ -550,6 +558,19 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
     eval_batch_size = int(args.eval_batch_size)
     bst_max_train_batches_per_epoch = args.bst_max_train_batches_per_epoch
     bst_popularity_projection_dim = int(args.bst_popularity_projection_dim)
+    bst_post_liker_user_embedding_dim = int(
+        args.bst_post_liker_user_embedding_dim
+    )
+    bst_post_liker_projection_dim = int(args.bst_post_liker_projection_dim)
+    bst_post_liker_pooling_tau_hours = float(
+        args.bst_post_liker_pooling_tau_hours
+    )
+    bst_max_post_liker_replay_events_per_post = int(
+        args.bst_max_post_liker_replay_events_per_post
+    )
+    bst_post_liker_user_unknown_dropout_rate = float(
+        args.bst_post_liker_user_unknown_dropout_rate
+    )
     author_embedding_dim = int(args.author_embedding_dim)
     author_unknown_dropout_rate = float(args.author_unknown_dropout_rate)
     if model_dim <= 0:
@@ -576,6 +597,20 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
         raise ValueError("--bst-max-train-batches-per-epoch must be positive when provided.")
     if bst_popularity_projection_dim <= 0:
         raise ValueError("--bst-popularity-projection-dim must be positive.")
+    if bst_post_liker_user_embedding_dim <= 0:
+        raise ValueError("--bst-post-liker-user-embedding-dim must be positive.")
+    if bst_post_liker_projection_dim <= 0:
+        raise ValueError("--bst-post-liker-projection-dim must be positive.")
+    if bst_post_liker_pooling_tau_hours <= 0.0:
+        raise ValueError("--bst-post-liker-pooling-tau-hours must be positive.")
+    if bst_max_post_liker_replay_events_per_post <= 0:
+        raise ValueError(
+            "--bst-max-post-liker-replay-events-per-post must be positive."
+        )
+    if not 0.0 <= bst_post_liker_user_unknown_dropout_rate <= 1.0:
+        raise ValueError(
+            "--bst-post-liker-user-unknown-dropout-rate must be in [0, 1]."
+        )
     if author_embedding_dim <= 0:
         raise ValueError("--author-embedding-dim must be positive for the BST ranker.")
     if not 0.0 <= author_unknown_dropout_rate < 1.0:
@@ -890,6 +925,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--min-author-training-feature-count", type=int,
                           default=argparse.SUPPRESS,
                           help_text="Minimum final training-feature occurrences required for a dedicated author index")
+    _add_arg_with_default(p_all, "--min-post-liker-user-training-event-count", type=int,
+                          default=argparse.SUPPRESS,
+                          help_text="Minimum training-visible liker events required for a dedicated liker-user index")
+    _add_arg_with_default(p_all, "--max-post-liker-user-vocabulary-size", type=int,
+                          default=argparse.SUPPRESS,
+                          help_text="Maximum number of dedicated liker-user indices retained by Stage 7")
     _add_arg_with_default(p_all, "--train-start", type=str, default=argparse.SUPPRESS,
                           help_text="UTC start of target eligibility and the training split")
     _add_arg_with_default(p_all, "--val-start", type=str, default=argparse.SUPPRESS,
@@ -952,6 +993,24 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Enable or disable BST prior-cumulative-like popularity features")
     _add_arg_with_default(p_all, "--bst-popularity-projection-dim", type=int, default=argparse.SUPPRESS,
                           help_text="BST popularity feature projection dimension")
+    _add_arg_with_default(p_all, "--bst-use-post-liker-feature", action=argparse.BooleanOptionalAction,
+                          default=argparse.SUPPRESS,
+                          help_text="Enable or disable time-decayed post-liker user features")
+    _add_arg_with_default(p_all, "--bst-post-liker-user-embedding-dim", type=int,
+                          default=argparse.SUPPRESS,
+                          help_text="BST liker-user embedding-table dimension")
+    _add_arg_with_default(p_all, "--bst-post-liker-projection-dim", type=int,
+                          default=argparse.SUPPRESS,
+                          help_text="BST pooled post-liker branch projection dimension")
+    _add_arg_with_default(p_all, "--bst-post-liker-pooling-tau-hours", type=float,
+                          default=argparse.SUPPRESS,
+                          help_text="Exponential-decay time constant for post-liker pooling")
+    _add_arg_with_default(p_all, "--bst-max-post-liker-replay-events-per-post", type=int,
+                          default=argparse.SUPPRESS,
+                          help_text="Maximum latest prior liker events replayed for each unique batch post")
+    _add_arg_with_default(p_all, "--bst-post-liker-user-unknown-dropout-rate", type=float,
+                          default=argparse.SUPPRESS,
+                          help_text="Training probability of mapping a known liker user to UNK")
     # Stage 8 options (shared)
     _add_arg_with_default(p_all, "--epochs", type=int, default=argparse.SUPPRESS,
                           help_text="Training epochs")

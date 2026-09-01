@@ -13,13 +13,13 @@ from engagement_prediction.data.author_indices import AUTHOR_PAD_IDX, AUTHOR_UNK
 class ProjectedPostFeatureEncoder(nn.Module):
     """Map heterogeneous post features into one model-width representation.
 
-    Content, author identity, and optional as-of popularity are normalized in
-    separate branches before fusion.  Keeping the branches separate prevents
-    the much larger pretrained content-vector scale from dominating the small
-    learned categorical and scalar features.
+    Content, author identity, optional as-of popularity, and optional pooled
+    post-liker identity are normalized in separate branches before fusion.
+    Keeping the branches separate prevents the much larger pretrained content
+    vector scale from dominating learned categorical and scalar features.
     """
 
-    __constants__ = ["use_popularity_feature"]
+    __constants__ = ["use_popularity_feature", "use_post_liker_feature"]
 
     def __init__(
         self,
@@ -34,6 +34,9 @@ class ProjectedPostFeatureEncoder(nn.Module):
         popularity_projection_dim: int,
         popularity_log_mean: float,
         popularity_log_std: float,
+        use_post_liker_feature: bool,
+        post_liker_user_embedding_dim: int,
+        post_liker_projection_dim: int,
     ):
         super().__init__()
         if post_embedding_dim <= 0:
@@ -54,6 +57,14 @@ class ProjectedPostFeatureEncoder(nn.Module):
             raise ValueError("popularity_projection_dim must be positive when popularity features are enabled")
         if use_popularity_feature and popularity_log_std <= 0.0:
             raise ValueError("popularity_log_std must be positive when popularity features are enabled")
+        if use_post_liker_feature and post_liker_user_embedding_dim <= 0:
+            raise ValueError(
+                "post_liker_user_embedding_dim must be positive when post-liker features are enabled"
+            )
+        if use_post_liker_feature and post_liker_projection_dim <= 0:
+            raise ValueError(
+                "post_liker_projection_dim must be positive when post-liker features are enabled"
+            )
 
         self.post_embedding_dim = int(post_embedding_dim)
         self.content_projection_dim = int(content_projection_dim)
@@ -65,6 +76,13 @@ class ProjectedPostFeatureEncoder(nn.Module):
         self.popularity_projection_dim = int(popularity_projection_dim) if self.use_popularity_feature else 0
         self.popularity_log_mean = float(popularity_log_mean)
         self.popularity_log_std = float(popularity_log_std)
+        self.use_post_liker_feature: Final[bool] = bool(use_post_liker_feature)
+        self.post_liker_user_embedding_dim = (
+            int(post_liker_user_embedding_dim) if self.use_post_liker_feature else 0
+        )
+        self.post_liker_projection_dim = (
+            int(post_liker_projection_dim) if self.use_post_liker_feature else 0
+        )
         self.author_embedding = nn.Embedding(
             num_embeddings=int(author_table_num_rows),
             embedding_dim=int(author_embedding_dim),
@@ -91,13 +109,26 @@ class ProjectedPostFeatureEncoder(nn.Module):
                 self.popularity_projection_dim,
             )
             self.popularity_projection_norm = nn.LayerNorm(self.popularity_projection_dim)
+        if self.use_post_liker_feature:
+            self.post_liker_projection = nn.Linear(
+                self.post_liker_user_embedding_dim,
+                self.post_liker_projection_dim,
+            )
+            self.post_liker_projection_norm = nn.LayerNorm(
+                self.post_liker_projection_dim
+            )
         self.fusion_layer = nn.Linear(
-            self.content_projection_dim + self.author_projection_dim + self.popularity_projection_dim,
+            self.content_projection_dim
+            + self.author_projection_dim
+            + self.popularity_projection_dim
+            + self.post_liker_projection_dim,
             self.output_dim,
         )
         layers = [self.content_projection, self.author_projection, self.fusion_layer]
         if self.use_popularity_feature:
             layers.append(self.popularity_projection)
+        if self.use_post_liker_feature:
+            layers.append(self.post_liker_projection)
         for layer in layers:
             nn.init.xavier_uniform_(layer.weight)
             if layer.bias is not None:
@@ -108,6 +139,7 @@ class ProjectedPostFeatureEncoder(nn.Module):
         post_embeddings: torch.Tensor,
         author_indices: torch.Tensor,
         prior_cumulative_likes: Optional[torch.Tensor] = None,
+        post_liker_vectors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if post_embeddings.size(-1) != self.post_embedding_dim:
             raise ValueError(
@@ -120,6 +152,21 @@ class ProjectedPostFeatureEncoder(nn.Module):
                 raise ValueError("prior_cumulative_likes is required when popularity features are enabled")
             if post_embeddings.shape[:-1] != prior_cumulative_likes.shape:
                 raise ValueError("prior_cumulative_likes shape must match post_embeddings leading dimensions")
+        if self.use_post_liker_feature:
+            if post_liker_vectors is None:
+                raise ValueError(
+                    "post_liker_vectors is required when post-liker features are enabled"
+                )
+            if post_liker_vectors.shape[:-1] != post_embeddings.shape[:-1]:
+                raise ValueError(
+                    "post_liker_vectors leading dimensions must match post_embeddings"
+                )
+            if post_liker_vectors.size(-1) != self.post_liker_user_embedding_dim:
+                raise ValueError("post_liker_vectors has the wrong feature dimension")
+        elif post_liker_vectors is not None:
+            raise ValueError(
+                "post_liker_vectors must be omitted when post-liker features are disabled"
+            )
 
         author_indices = author_indices.to(device=post_embeddings.device, dtype=torch.long)
         if self.training and self.author_unknown_dropout_rate > 0.0:
@@ -142,6 +189,7 @@ class ProjectedPostFeatureEncoder(nn.Module):
         author_features = self.author_projection_norm(
             self.projection_activation(self.author_projection(author_embeddings))
         )
+        feature_parts = [content_features, author_features]
         if self.use_popularity_feature:
             # Counts are raw cumulative likes as of the scoring hour.  The
             # training stage fits the log-space mean/std using training rows
@@ -153,9 +201,19 @@ class ProjectedPostFeatureEncoder(nn.Module):
             popularity_features = self.popularity_projection_norm(
                 self.projection_activation(self.popularity_projection(popularity_scaled.unsqueeze(-1)))
             )
-            fused_inputs = torch.cat([content_features, author_features, popularity_features], dim=-1)
-        else:
-            fused_inputs = torch.cat([content_features, author_features], dim=-1)
+            feature_parts.append(popularity_features)
+        if self.use_post_liker_feature:
+            post_liker_input = torch.jit._unwrap_optional(post_liker_vectors).to(
+                device=post_embeddings.device,
+                dtype=post_embeddings.dtype,
+            )
+            post_liker_features = self.post_liker_projection_norm(
+                self.projection_activation(
+                    self.post_liker_projection(post_liker_input)
+                )
+            )
+            feature_parts.append(post_liker_features)
+        fused_inputs = torch.cat(feature_parts, dim=-1)
         return self.fusion_layer(fused_inputs)
 
 

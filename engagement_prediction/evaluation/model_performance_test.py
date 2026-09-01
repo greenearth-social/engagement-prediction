@@ -92,6 +92,12 @@ def _bst_config(*, max_history_len: int, author_table_num_rows: int) -> dict:
             "popularity_projection_dim": 2,
             "popularity_log_mean": 0.0,
             "popularity_log_std": 1.0,
+            "use_post_liker_feature": False,
+            "post_liker_user_table_num_rows": 2,
+            "post_liker_user_embedding_dim": 2,
+            "post_liker_projection_dim": 2,
+            "post_liker_pooling_tau_hours": 168.0,
+            "post_liker_user_unknown_dropout_rate": 0.0,
         },
     }
 
@@ -228,7 +234,7 @@ def _write_legacy_bst_artifact(
         max_history_len=2,
         author_table_num_rows=author_table_num_rows,
     )
-    module = script_module or BSTRanker(**config["constructor_args"])
+    module = script_module or _LegacyBSTEightArguments()
     torch.jit.script(module).save(str(checkpoints / "ranker.pt"))
     (path / "training_config.json").write_text(json.dumps({
         "model_type": "bst-ranker",
@@ -296,6 +302,27 @@ class _LegacyBSTWithExtraArgument(torch.nn.Module):
         del history_mask, history_time_deltas_hours, history_author_indices
         del candidate_post_author_idx, history_prior_cumulative_likes
         del candidate_prior_cumulative_likes, target_user_embeddings
+        users = history_embeddings.sum(dim=(1, 2)).unsqueeze(1)
+        candidates = candidate_post_embeddings.sum(dim=1).unsqueeze(0)
+        return users + candidates
+
+
+class _LegacyBSTEightArguments(torch.nn.Module):
+    @torch.jit.export
+    def score_candidate_matrix(
+        self,
+        history_embeddings: torch.Tensor,
+        history_mask: torch.Tensor,
+        history_time_deltas_hours: torch.Tensor,
+        candidate_post_embeddings: torch.Tensor,
+        history_author_indices: torch.Tensor,
+        candidate_post_author_idx: torch.Tensor,
+        history_prior_cumulative_likes: Optional[torch.Tensor] = None,
+        candidate_prior_cumulative_likes: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        del history_mask, history_time_deltas_hours, history_author_indices
+        del candidate_post_author_idx, history_prior_cumulative_likes
+        del candidate_prior_cumulative_likes
         users = history_embeddings.sum(dim=(1, 2)).unsqueeze(1)
         candidates = candidate_post_embeddings.sum(dim=1).unsqueeze(0)
         return users + candidates
@@ -427,6 +454,24 @@ def test_model_resolution_rejects_author_map_override_for_canonical_artifact(
             model_path,
             author_map_override=model_path / "ranker_author_idx.parquet",
         )
+
+
+def test_model_resolution_rejects_post_liker_feature_enabled_bst(tmp_path):
+    stage7, _ = _write_stage7_artifact(tmp_path)
+    model_path = _write_model_artifact(
+        tmp_path / "canonical-bst-post-likers",
+        model_type="bst-ranker",
+        max_history_len=2,
+        author_dids=["author0"],
+        stage7_dir=stage7,
+    )
+    model_config_path = model_path / "model_config.json"
+    model_config = json.loads(model_config_path.read_text())
+    model_config["constructor_args"]["use_post_liker_feature"] = True
+    model_config_path.write_text(json.dumps(model_config) + "\n")
+
+    with pytest.raises(ValueError, match="does not yet support BST models with post-liker"):
+        resolve_model_artifact("post-liker-bst", model_path)
 
 
 def test_model_resolution_rejects_legacy_bst_with_extra_script_argument(tmp_path):
