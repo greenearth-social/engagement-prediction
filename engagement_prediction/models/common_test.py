@@ -17,6 +17,9 @@ def _encoder(*, use_popularity_feature: bool, author_unknown_dropout_rate: float
         popularity_projection_dim=2 if use_popularity_feature else 0,
         popularity_log_mean=1.0,
         popularity_log_std=2.0,
+        use_post_liker_feature=False,
+        post_liker_user_embedding_dim=3,
+        post_liker_projection_dim=2,
     )
 
 

@@ -288,6 +288,9 @@ class TwoTowerModel(nn.Module):
             popularity_projection_dim=0,
             popularity_log_mean=0.0,
             popularity_log_std=1.0,
+            use_post_liker_feature=False,
+            post_liker_user_embedding_dim=1,
+            post_liker_projection_dim=1,
         )
         self.user_tower = TwoTowerUserTower(
             post_feature_encoder=post_feature_encoder,

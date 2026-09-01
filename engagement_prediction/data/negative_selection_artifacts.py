@@ -28,15 +28,26 @@ from engagement_prediction.data.parquet import (
 )
 
 
-class NegativeSelectionConfig(Protocol):
+class NegativeSelectionConfigLike(Protocol):
     """Structural settings required by Stage 4 artifact construction."""
 
-    negative_candidates_per_hour: int
-    min_likes_for_popular_candidate: int
-    popular_candidate_fraction: float
-    max_candidate_age_hours: int
-    partition_count: int
-    random_seed: int
+    @property
+    def negative_candidates_per_hour(self) -> int: ...
+
+    @property
+    def min_likes_for_popular_candidate(self) -> int: ...
+
+    @property
+    def popular_candidate_fraction(self) -> float: ...
+
+    @property
+    def max_candidate_age_hours(self) -> int: ...
+
+    @property
+    def partition_count(self) -> int: ...
+
+    @property
+    def random_seed(self) -> int: ...
 
 
 def _public_partition_path(dataset_path: Path, partition_id: int) -> list[Path]:
@@ -116,7 +127,7 @@ def process_uri_partitions(
     normalized_likes_path: Path,
     query_hours_df: pl.DataFrame,
     local_finalists_path: Path,
-    config: NegativeSelectionConfig,
+    config: NegativeSelectionConfigLike,
     logger: logging.Logger,
 ) -> dict[str, Any]:
     """Calculate popularity and write bounded method finalists per URI partition.
@@ -246,7 +257,7 @@ def process_hour_partitions(
     routed_finalists_path: Path,
     hourly_candidates_path: Path,
     query_hours_df: pl.DataFrame,
-    config: NegativeSelectionConfig,
+    config: NegativeSelectionConfigLike,
     logger: logging.Logger,
 ) -> dict[str, Any]:
     """Apply global quotas and write deterministic public hour partitions.
@@ -377,7 +388,7 @@ def build_negative_post_uris(
     uri_routes_path: Path,
     posts_path: Path,
     candidate_sources_path: Path,
-    config: NegativeSelectionConfig,
+    config: NegativeSelectionConfigLike,
 ) -> int:
     """Globally deduplicate selected URIs and validate them against Stage 3."""
     hourly_parts = sorted(hourly_candidates_path.glob("*.parquet"))

@@ -9,6 +9,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from engagement_prediction.models.common import LinearPredictionHead, ProjectedPostFeatureEncoder
+from engagement_prediction.data.post_liker_users import (
+    POST_LIKER_USER_PAD_IDX,
+    POST_LIKER_USER_UNK_IDX,
+)
 
 
 def _validate_time_delta_bucket_boundaries(
@@ -29,10 +33,124 @@ def _validate_time_delta_bucket_boundaries(
     return boundaries
 
 
+class PostLikerUserPooler(nn.Module):
+    """Pool packed liker-user events into one decayed vector per post.
+
+    The dataloader supplies events grouped by post plus ages relative to the
+    newest retained event.  Relative ages are sufficient for a normalized
+    exponential mean because the common query-time decay factor cancels.
+    """
+
+    def __init__(
+        self,
+        user_table_num_rows: int,
+        user_embedding_dim: int,
+        pooling_tau_hours: float,
+        unknown_dropout_rate: float,
+    ):
+        super().__init__()
+        if user_table_num_rows < 2:
+            raise ValueError("post-liker user table must reserve PAD=0 and UNK=1")
+        if user_embedding_dim <= 0:
+            raise ValueError("post-liker user embedding dimension must be positive")
+        if pooling_tau_hours <= 0.0:
+            raise ValueError("post-liker pooling tau must be positive")
+        if not 0.0 <= unknown_dropout_rate <= 1.0:
+            raise ValueError("post-liker unknown dropout rate must be in [0, 1]")
+
+        self.user_embedding_dim = int(user_embedding_dim)
+        self.pooling_tau_hours = float(pooling_tau_hours)
+        self.unknown_dropout_rate = float(unknown_dropout_rate)
+        self.user_embedding = nn.Embedding(
+            num_embeddings=int(user_table_num_rows),
+            embedding_dim=self.user_embedding_dim,
+            padding_idx=POST_LIKER_USER_PAD_IDX,
+        )
+        nn.init.xavier_uniform_(self.user_embedding.weight)
+        with torch.no_grad():
+            self.user_embedding.weight[POST_LIKER_USER_PAD_IDX].zero_()
+
+    def lookup(self, user_indices: torch.Tensor) -> torch.Tensor:
+        """Return frozen-table rows without applying training-time UNK dropout."""
+
+        return self.user_embedding(user_indices.to(dtype=torch.long))
+
+    def forward(
+        self,
+        event_user_indices: torch.Tensor,
+        event_age_from_latest_hours: torch.Tensor,
+        event_offsets: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return ``[P, L]`` pooled vectors for packed post-event segments."""
+
+        if event_user_indices.dim() != 1:
+            raise ValueError("post-liker event user indices must be one-dimensional")
+        if event_age_from_latest_hours.dim() != 1:
+            raise ValueError("post-liker event ages must be one-dimensional")
+        if event_offsets.dim() != 1 or event_offsets.numel() == 0:
+            raise ValueError("post-liker event offsets must be a nonempty vector")
+        if event_user_indices.numel() != event_age_from_latest_hours.numel():
+            raise ValueError("post-liker event indices and ages must be aligned")
+
+        device = self.user_embedding.weight.device
+        user_indices = event_user_indices.to(device=device, dtype=torch.long)
+        event_ages = event_age_from_latest_hours.to(
+            device=device,
+            dtype=self.user_embedding.weight.dtype,
+        )
+        offsets = event_offsets.to(device=device, dtype=torch.long)
+        num_posts = int(offsets.numel()) - 1
+        if num_posts < 0:
+            raise ValueError("post-liker event offsets are invalid")
+
+        if self.training and self.unknown_dropout_rate > 0.0:
+            # TorchScript cannot close over the module-level vocabulary
+            # constants here. Indices 0 and 1 are the fixed PAD/UNK contract.
+            eligible = user_indices > 1
+            dropout_mask = (
+                torch.rand(user_indices.shape, device=device)
+                < self.unknown_dropout_rate
+            )
+            user_indices = torch.where(
+                eligible & dropout_mask,
+                torch.full_like(user_indices, 1),
+                user_indices,
+            )
+
+        event_embeddings = self.user_embedding(user_indices)
+        weights = torch.exp(
+            -torch.clamp(event_ages, min=0.0) / self.pooling_tau_hours
+        )
+        lengths = offsets[1:] - offsets[:-1]
+        segment_ids = torch.repeat_interleave(
+            torch.arange(num_posts, device=device, dtype=torch.long),
+            lengths,
+        )
+        if segment_ids.numel() != event_embeddings.size(0):
+            raise ValueError("post-liker event offsets do not match event rows")
+
+        weighted_sums = torch.zeros(
+            (num_posts, self.user_embedding_dim),
+            device=device,
+            dtype=event_embeddings.dtype,
+        ).index_add(0, segment_ids, event_embeddings * weights.unsqueeze(-1))
+        weight_sums = torch.zeros(
+            (num_posts,),
+            device=device,
+            dtype=event_embeddings.dtype,
+        ).index_add(0, segment_ids, weights)
+        pooled = weighted_sums / torch.clamp(weight_sums, min=1.0e-12).unsqueeze(-1)
+        return torch.where(
+            (weight_sums > 0.0).unsqueeze(-1),
+            pooled,
+            torch.zeros_like(pooled),
+        )
+
+
 class BSTRanker(nn.Module):
     """Behavior Sequence Transformer encoder for one user-history/candidate pair."""
 
-    __constants__ = ["use_popularity_feature"]
+    __constants__ = ["use_popularity_feature", "use_post_liker_feature"]
 
     def __init__(
         self,
@@ -55,6 +173,12 @@ class BSTRanker(nn.Module):
         popularity_projection_dim: int,
         popularity_log_mean: float,
         popularity_log_std: float,
+        use_post_liker_feature: bool,
+        post_liker_user_table_num_rows: int,
+        post_liker_user_embedding_dim: int,
+        post_liker_projection_dim: int,
+        post_liker_pooling_tau_hours: float,
+        post_liker_user_unknown_dropout_rate: float,
     ):
         super().__init__()
         if time_embedding_dim <= 0:
@@ -71,6 +195,16 @@ class BSTRanker(nn.Module):
             raise ValueError("popularity_projection_dim must be positive when popularity features are enabled")
         if use_popularity_feature and popularity_log_std <= 0.0:
             raise ValueError("popularity_log_std must be positive when popularity features are enabled")
+        if use_post_liker_feature and post_liker_user_table_num_rows < 2:
+            raise ValueError("post-liker user table must reserve PAD=0 and UNK=1")
+        if post_liker_user_embedding_dim <= 0:
+            raise ValueError("post-liker user embedding dimension must be positive")
+        if use_post_liker_feature and post_liker_projection_dim <= 0:
+            raise ValueError("post-liker projection dimension must be positive")
+        if post_liker_pooling_tau_hours <= 0.0:
+            raise ValueError("post-liker pooling tau must be positive")
+        if not 0.0 <= post_liker_user_unknown_dropout_rate <= 1.0:
+            raise ValueError("post-liker user unknown dropout rate must be in [0, 1]")
 
         self.post_embedding_dim = int(post_embedding_dim)
         self.content_projection_dim = int(content_projection_dim)
@@ -82,6 +216,11 @@ class BSTRanker(nn.Module):
         self.popularity_projection_dim = int(popularity_projection_dim) if self.use_popularity_feature else 0
         self.popularity_log_mean = float(popularity_log_mean)
         self.popularity_log_std = float(popularity_log_std)
+        self.use_post_liker_feature: Final[bool] = bool(use_post_liker_feature)
+        self.post_liker_user_embedding_dim = int(post_liker_user_embedding_dim)
+        self.post_liker_projection_dim = (
+            int(post_liker_projection_dim) if self.use_post_liker_feature else 0
+        )
         self.time_delta_bucket_boundaries_hours = _validate_time_delta_bucket_boundaries(
             time_delta_bucket_boundaries_hours
         )
@@ -107,6 +246,15 @@ class BSTRanker(nn.Module):
             popularity_projection_dim=popularity_projection_dim,
             popularity_log_mean=popularity_log_mean,
             popularity_log_std=popularity_log_std,
+            use_post_liker_feature=use_post_liker_feature,
+            post_liker_user_embedding_dim=post_liker_user_embedding_dim,
+            post_liker_projection_dim=post_liker_projection_dim,
+        )
+        self.post_liker_user_pooler = PostLikerUserPooler(
+            user_table_num_rows=post_liker_user_table_num_rows,
+            user_embedding_dim=post_liker_user_embedding_dim,
+            pooling_tau_hours=post_liker_pooling_tau_hours,
+            unknown_dropout_rate=post_liker_user_unknown_dropout_rate,
         )
         self.time_delta_embedding = nn.Embedding(
             num_embeddings=self.num_time_delta_buckets,
@@ -189,6 +337,70 @@ class BSTRanker(nn.Module):
         history_mask[:, 0] = history_mask[:, 0] | inject
         return history_input, history_mask
 
+    def _prepare_post_liker_vectors(
+        self,
+        history_embeddings: torch.Tensor,
+        candidate_post_embeddings: torch.Tensor,
+        history_post_liker_vectors: Optional[torch.Tensor],
+        candidate_post_liker_vectors: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Validate the optional serving vectors against the model feature flag."""
+
+        if self.use_post_liker_feature:
+            if history_post_liker_vectors is None:
+                raise RuntimeError(
+                    "history_post_liker_vectors is required when post-liker features are enabled"
+                )
+            if candidate_post_liker_vectors is None:
+                raise RuntimeError(
+                    "candidate_post_liker_vectors is required when post-liker features are enabled"
+                )
+            history_vectors = torch.jit._unwrap_optional(
+                history_post_liker_vectors
+            )
+            candidate_vectors = torch.jit._unwrap_optional(
+                candidate_post_liker_vectors
+            )
+            if history_vectors.dim() != 3:
+                raise RuntimeError(
+                    "history_post_liker_vectors must have shape [U, H, L]"
+                )
+            if candidate_vectors.dim() != 2:
+                raise RuntimeError(
+                    "candidate_post_liker_vectors must have shape [C, L]"
+                )
+            if (
+                history_vectors.size(0) != history_embeddings.size(0)
+                or history_vectors.size(1) != history_embeddings.size(1)
+                or history_vectors.size(2) != self.post_liker_user_embedding_dim
+            ):
+                raise RuntimeError(
+                    "history_post_liker_vectors must have shape [U, H, post_liker_user_embedding_dim]"
+                )
+            if (
+                candidate_vectors.size(0) != candidate_post_embeddings.size(0)
+                or candidate_vectors.size(1) != self.post_liker_user_embedding_dim
+            ):
+                raise RuntimeError(
+                    "candidate_post_liker_vectors must have shape [C, post_liker_user_embedding_dim]"
+                )
+            return (
+                history_vectors.to(
+                    device=history_embeddings.device,
+                    dtype=history_embeddings.dtype,
+                ),
+                candidate_vectors.to(
+                    device=history_embeddings.device,
+                    dtype=history_embeddings.dtype,
+                ),
+            )
+
+        if history_post_liker_vectors is not None or candidate_post_liker_vectors is not None:
+            raise RuntimeError(
+                "post-liker vectors must be omitted when post-liker features are disabled"
+            )
+        return None, None
+
     def _forward_transformer(
         self,
         history_embeddings: torch.Tensor,
@@ -199,6 +411,8 @@ class BSTRanker(nn.Module):
         candidate_post_author_idx: torch.Tensor,
         history_prior_cumulative_likes: Optional[torch.Tensor] = None,
         candidate_prior_cumulative_likes: Optional[torch.Tensor] = None,
+        history_post_liker_vectors: Optional[torch.Tensor] = None,
+        candidate_post_liker_vectors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Encode aligned history/candidate pairs and return candidate states.
 
@@ -247,16 +461,26 @@ class BSTRanker(nn.Module):
         if self.use_popularity_feature:
             history_prior_cumulative_likes_tensor = torch.jit._unwrap_optional(history_prior_cumulative_likes).to(device=device, dtype=torch.float32)
             candidate_prior_cumulative_likes_tensor = torch.jit._unwrap_optional(candidate_prior_cumulative_likes).to(device=device, dtype=torch.float32)
+        history_post_liker_vectors_tensor, candidate_post_liker_vectors_tensor = (
+            self._prepare_post_liker_vectors(
+                history_embeddings,
+                candidate_post_embeddings,
+                history_post_liker_vectors,
+                candidate_post_liker_vectors,
+            )
+        )
 
         history_post_vectors = self.post_feature_encoder(
             history_embeddings,
             history_author_indices,
             history_prior_cumulative_likes_tensor,
+            history_post_liker_vectors_tensor,
         )
         candidate_post_vector = self.post_feature_encoder(
             candidate_post_embeddings,
             candidate_post_author_idx,
             candidate_prior_cumulative_likes_tensor,
+            candidate_post_liker_vectors_tensor,
         ).unsqueeze(1)
         history_time_bucket_ids = self._bucketize_time_deltas_hours(history_time_deltas_hours)
         history_time_embeddings = self.time_delta_embedding(history_time_bucket_ids)
@@ -398,6 +622,8 @@ class BSTRanker(nn.Module):
         candidate_post_author_idx: torch.Tensor,
         history_prior_cumulative_likes: Optional[torch.Tensor] = None,
         candidate_prior_cumulative_likes: Optional[torch.Tensor] = None,
+        history_post_liker_vectors: Optional[torch.Tensor] = None,
+        candidate_post_liker_vectors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Validate inputs for, then delegate to, the optimized matrix scorer."""
 
@@ -441,6 +667,8 @@ class BSTRanker(nn.Module):
             candidate_post_author_idx=candidate_post_author_idx,
             history_prior_cumulative_likes=history_prior_cumulative_likes,
             candidate_prior_cumulative_likes=candidate_prior_cumulative_likes,
+            history_post_liker_vectors=history_post_liker_vectors,
+            candidate_post_liker_vectors=candidate_post_liker_vectors,
         )
 
     @torch.jit.export
@@ -454,6 +682,8 @@ class BSTRanker(nn.Module):
         candidate_post_author_idx: torch.Tensor,
         history_prior_cumulative_likes: Optional[torch.Tensor] = None,
         candidate_prior_cumulative_likes: Optional[torch.Tensor] = None,
+        history_post_liker_vectors: Optional[torch.Tensor] = None,
+        candidate_post_liker_vectors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Score a shared candidate set for every user without a U*C expansion.
 
@@ -487,16 +717,26 @@ class BSTRanker(nn.Module):
                 raise RuntimeError("candidate_prior_cumulative_likes must have shape [C]")
             history_prior_cumulative_likes_tensor = torch.jit._unwrap_optional(history_prior_cumulative_likes).to(device=device, dtype=torch.float32)
             candidate_prior_cumulative_likes_tensor = torch.jit._unwrap_optional(candidate_prior_cumulative_likes).to(device=device, dtype=torch.float32)
+        history_post_liker_vectors_tensor, candidate_post_liker_vectors_tensor = (
+            self._prepare_post_liker_vectors(
+                history_embeddings,
+                candidate_post_embeddings,
+                history_post_liker_vectors,
+                candidate_post_liker_vectors,
+            )
+        )
 
         history_post_vectors = self.post_feature_encoder(
             history_embeddings,
             history_author_indices,
             history_prior_cumulative_likes_tensor,
+            history_post_liker_vectors_tensor,
         )
         candidate_post_vectors = self.post_feature_encoder(
             candidate_post_embeddings,
             candidate_post_author_idx,
             candidate_prior_cumulative_likes_tensor,
+            candidate_post_liker_vectors_tensor,
         )
         history_time_bucket_ids = self._bucketize_time_deltas_hours(history_time_deltas_hours)
         history_time_embeddings = self.time_delta_embedding(history_time_bucket_ids)
@@ -576,6 +816,85 @@ class BSTRanker(nn.Module):
             raise RuntimeError("prediction_head must return logits with shape [U*C] or [U*C, 1]")
         return logits.reshape(num_users, num_candidates)
 
+    @torch.jit.export
+    def lookup_post_liker_user_embeddings(
+        self,
+        user_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Expose frozen liker-user table rows for state builders and validation."""
+
+        return self.post_liker_user_pooler.lookup(user_indices)
+
+    @torch.jit.export
+    def score_candidate_matrix_from_post_liker_events(
+        self,
+        history_embeddings: torch.Tensor,
+        history_mask: torch.Tensor,
+        history_time_deltas_hours: torch.Tensor,
+        candidate_post_embeddings: torch.Tensor,
+        history_author_indices: torch.Tensor,
+        candidate_post_author_idx: torch.Tensor,
+        history_prior_cumulative_likes: Optional[torch.Tensor],
+        candidate_prior_cumulative_likes: Optional[torch.Tensor],
+        post_liker_event_user_indices: torch.Tensor,
+        post_liker_event_age_from_latest_hours: torch.Tensor,
+        post_liker_event_offsets: torch.Tensor,
+        history_post_liker_rows: torch.Tensor,
+        candidate_post_liker_rows: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pool packed events using current user weights, then score the slate."""
+
+        if not self.use_post_liker_feature:
+            raise RuntimeError(
+                "post-liker event scoring requires post-liker features to be enabled"
+            )
+        pooled_vectors = self.post_liker_user_pooler(
+            post_liker_event_user_indices,
+            post_liker_event_age_from_latest_hours,
+            post_liker_event_offsets,
+        )
+        history_rows = history_post_liker_rows.to(
+            device=pooled_vectors.device,
+            dtype=torch.long,
+        )
+        candidate_rows = candidate_post_liker_rows.to(
+            device=pooled_vectors.device,
+            dtype=torch.long,
+        )
+        if (
+            history_rows.dim() != 2
+            or history_rows.size(0) != history_embeddings.size(0)
+            or history_rows.size(1) != history_embeddings.size(1)
+        ):
+            raise RuntimeError("history_post_liker_rows must have shape [U, H]")
+        if (
+            candidate_rows.dim() != 1
+            or candidate_rows.size(0) != candidate_post_embeddings.size(0)
+        ):
+            raise RuntimeError("candidate_post_liker_rows must have shape [C]")
+
+        history_vectors = pooled_vectors.index_select(
+            0,
+            history_rows.reshape(-1),
+        ).reshape(
+            history_embeddings.size(0),
+            history_embeddings.size(1),
+            self.post_liker_user_embedding_dim,
+        )
+        candidate_vectors = pooled_vectors.index_select(0, candidate_rows)
+        return self.score_candidate_matrix(
+            history_embeddings=history_embeddings,
+            history_mask=history_mask,
+            history_time_deltas_hours=history_time_deltas_hours,
+            candidate_post_embeddings=candidate_post_embeddings,
+            history_author_indices=history_author_indices,
+            candidate_post_author_idx=candidate_post_author_idx,
+            history_prior_cumulative_likes=history_prior_cumulative_likes,
+            candidate_prior_cumulative_likes=candidate_prior_cumulative_likes,
+            history_post_liker_vectors=history_vectors,
+            candidate_post_liker_vectors=candidate_vectors,
+        )
+
     def forward(
         self,
         history_embeddings: torch.Tensor,
@@ -586,6 +905,8 @@ class BSTRanker(nn.Module):
         candidate_post_author_idx: torch.Tensor,
         history_prior_cumulative_likes: Optional[torch.Tensor] = None,
         candidate_prior_cumulative_likes: Optional[torch.Tensor] = None,
+        history_post_liker_vectors: Optional[torch.Tensor] = None,
+        candidate_post_liker_vectors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Score one aligned candidate per user through the ordinary BST path."""
 
@@ -598,6 +919,8 @@ class BSTRanker(nn.Module):
             candidate_post_author_idx=candidate_post_author_idx,
             history_prior_cumulative_likes=history_prior_cumulative_likes,
             candidate_prior_cumulative_likes=candidate_prior_cumulative_likes,
+            history_post_liker_vectors=history_post_liker_vectors,
+            candidate_post_liker_vectors=candidate_post_liker_vectors,
         )
         logits = self.prediction_head(transformer_output)
         if logits.dim() == 2 and logits.shape == (transformer_output.size(0), 1):

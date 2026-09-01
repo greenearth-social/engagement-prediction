@@ -12,6 +12,7 @@ import torch
 from engagement_prediction.data import dataset_hydration
 from engagement_prediction.data import author_vocabulary
 from engagement_prediction.data import training_index
+from engagement_prediction.data import post_liker_users
 from engagement_prediction.data.datasets import HydratedBucketedEngagementDataset
 from engagement_prediction.models.bst_ranker import BSTRanker
 from engagement_prediction.pipeline.core import Context
@@ -83,6 +84,8 @@ def _build_loader_index(bundle: Path) -> None:
         hourly_negative_candidates_path=bundle / "hourly_negative_candidates",
         embeddings_path=bundle / "embeddings.npy",
         authors_path=bundle / "authors",
+        indexed_post_liker_events_path=bundle / "indexed_post_liker_events",
+        post_liker_users_path=bundle / "post_liker_users",
         output_path=bundle / "loader_index",
         logger=None,
     )
@@ -180,6 +183,34 @@ def _stage7_fixture(tmp_path: Path) -> tuple[Path, Path]:
             "training_negative_count": [0, 0, 0, 1],
         }, schema=author_vocabulary.AUTHOR_VOCABULARY_SCHEMA),
     )
+    _write_dataset(
+        bundle,
+        "post_liker_users",
+        pl.DataFrame(
+            {
+                "liker_did": ["liker-1"],
+                "liker_idx": [2],
+                "training_event_count": [2],
+            },
+            schema=post_liker_users.POST_LIKER_USER_VOCABULARY_SCHEMA,
+        ),
+    )
+    _write_dataset(
+        bundle,
+        "indexed_post_liker_events",
+        pl.DataFrame(
+            {
+                "emb_idx": [0, 2, 3],
+                "liker_idx": [2, 1, 2],
+                "like_created_at": [
+                    datetime(2026, 1, 1, 10, tzinfo=timezone.utc),
+                    datetime(2026, 1, 1, 9, tzinfo=timezone.utc),
+                    datetime(2026, 1, 1, 11, tzinfo=timezone.utc),
+                ],
+            },
+            schema=post_liker_users.INDEXED_POST_LIKER_EVENT_SCHEMA,
+        ),
+    )
     _build_loader_index(bundle)
     (stage7_dir / "summary.json").write_text(json.dumps({
         "parameters": {
@@ -190,7 +221,12 @@ def _stage7_fixture(tmp_path: Path) -> tuple[Path, Path]:
     return stage7_dir, bundle
 
 
-def _args(*, save_model: bool, plots: bool) -> SimpleNamespace:
+def _args(
+    *,
+    save_model: bool,
+    plots: bool,
+    post_liker_feature: bool = False,
+) -> SimpleNamespace:
     return SimpleNamespace(
         run_tag=None,
         random_seed=7,
@@ -204,6 +240,12 @@ def _args(*, save_model: bool, plots: bool) -> SimpleNamespace:
         dataloader_prefetch_factor=1,
         metrics_top_ks=[1],
         bst_use_popularity_feature=True,
+        bst_use_post_liker_feature=post_liker_feature,
+        bst_post_liker_user_embedding_dim=3,
+        bst_post_liker_projection_dim=2,
+        bst_post_liker_pooling_tau_hours=24.0,
+        bst_max_post_liker_replay_events_per_post=128,
+        bst_post_liker_user_unknown_dropout_rate=0.0,
         no_save_model=not save_model,
         no_plots=not plots,
         disable_progress=True,
@@ -342,6 +384,8 @@ def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
         split="train",
         max_history_len=2,
         bst_additional_batch_negatives=2,
+        use_post_liker_feature=False,
+        max_post_liker_replay_events_per_post=None,
         seed=7,
         logger=None,
     )
@@ -493,6 +537,76 @@ def test_stage8_keeps_local_manifest_when_manifest_upload_fails(tmp_path, monkey
     assert "clearml_publication_status: incomplete" in (
         output_dir / "stage_info.txt"
     ).read_text()
+
+
+def test_stage8_post_liker_feature_exports_reloadable_serving_companions(
+    tmp_path,
+    monkeypatch,
+):
+    stage7_dir, bundle = _stage7_fixture(tmp_path)
+    monkeypatch.setattr(
+        train_bst_ranker,
+        "resolve_recorded_stage_lineage",
+        lambda *args, **kwargs: {"07_dataset_hydration": stage7_dir},
+    )
+    tracker = _RecordingTracker(task_id="")
+
+    result = train_bst_ranker.run(
+        _context(tmp_path, tracker),
+        _args(
+            save_model=True,
+            plots=False,
+            post_liker_feature=True,
+        ),
+    )
+
+    output_dir = Path(result["output_dir"])
+    user_map_path = output_dir / "ranker_liker_user_idx.parquet"
+    table_path = output_dir / "ranker_liker_user_embeddings.npy"
+    state_path = output_dir / "post_liker_state_config.json"
+    assert user_map_path.is_file()
+    assert table_path.is_file()
+    assert state_path.is_file()
+    assert (output_dir / "post_liker_users").is_dir()
+    assert result["artifacts"]["serving_manifest_path"] is None
+    assert np.load(table_path).shape == (3, 3)
+    state = json.loads(state_path.read_text())
+    assert state["ranker_contract_version"] == 2
+    assert state["post_liker_feature_enabled"] is True
+    assert state["max_post_liker_replay_events_per_post"] == 128
+
+    dataset = HydratedBucketedEngagementDataset(
+        bundle,
+        split="train",
+        max_history_len=2,
+        bst_additional_batch_negatives=2,
+        use_post_liker_feature=True,
+        max_post_liker_replay_events_per_post=128,
+        seed=7,
+        logger=None,
+    )
+    batch = dataset.collate_tensor_batch([dataset[0], dataset[1]])
+    scripted_model = torch.jit.load(
+        str(output_dir / "checkpoints" / "ranker.pt")
+    ).eval()
+    with torch.inference_mode():
+        scores = scripted_model.score_candidate_matrix_from_post_liker_events(
+            batch["history_embeddings"],
+            batch["history_mask"],
+            batch["history_time_deltas_hours"],
+            batch["candidate_post_embeddings"],
+            batch["history_author_indices"],
+            batch["candidate_post_author_idx"],
+            batch["history_prior_cumulative_likes"],
+            batch["candidate_prior_cumulative_likes"],
+            batch["post_liker_event_user_indices"],
+            batch["post_liker_event_age_from_latest_hours"],
+            batch["post_liker_event_offsets"],
+            batch["history_post_liker_rows"],
+            batch["candidate_post_liker_rows"],
+        )
+    assert scores.shape == batch["label_matrix"].shape
+    assert torch.isfinite(scores).all()
 
 
 def test_stage8_requires_every_training_split(tmp_path, monkeypatch):
