@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import logging
 from pathlib import Path
 import struct
+import threading
 import zlib
 
 import numpy as np
@@ -91,10 +92,12 @@ def test_embedding_source_batching_scans_each_file_once_and_writes_only_selected
     )
 
     source_scans = []
+    source_scan_barrier = threading.Barrier(2)
     original_source_scan = dataset_hydration_artifacts.ingex.scan_parquet_files
 
     def recording_source_scan(paths, **kwargs):
         source_scans.append((list(paths), kwargs.get("include_file_paths")))
+        source_scan_barrier.wait(timeout=5)
         return original_source_scan(paths, **kwargs)
 
     monkeypatch.setattr(
@@ -133,21 +136,25 @@ def test_embedding_source_batching_scans_each_file_once_and_writes_only_selected
         temporary_routes_root=temporary_routes_root,
         partition_count=1,
         source_batch_size=2,
+        worker_count=2,
         logger=logging.getLogger("dataset-hydration-test"),
     )
 
     assert selected_metadata_scans == [selected_metadata_path]
-    assert source_scans == [
-        ([str(selected_source_path), str(unselected_source_path)], None),
-        ([str(other_unselected_source_path)], None),
-    ]
+    assert sorted(
+        (tuple(paths), file_column) for paths, file_column in source_scans
+    ) == sorted([
+        ((str(selected_source_path), str(unselected_source_path)), None),
+        ((str(other_unselected_source_path),), None),
+    ])
     assert len(routed_inputs) == 2
-    assert "embeddings" in routed_inputs[0].columns
-    assert routed_inputs[0].get_column("subject_uri").to_list() == [
+    assert all("embeddings" in frame.columns for frame in routed_inputs)
+    selected_routed_input = next(frame for frame in routed_inputs if not frame.is_empty())
+    assert selected_routed_input.get_column("subject_uri").to_list() == [
         "selected",
         "selected",
     ]
-    assert routed_inputs[1].is_empty()
+    assert sum(frame.is_empty() for frame in routed_inputs) == 1
 
     selected_rows = scan_parquet_artifact(output_path).collect()
     assert selected_rows.get_column("subject_uri").to_list() == [
@@ -157,6 +164,7 @@ def test_embedding_source_batching_scans_each_file_once_and_writes_only_selected
     assert stats == {
         "embedding_source_file_count": 3,
         "embedding_source_batch_count": 2,
+        "embedding_source_worker_count": 2,
         "payload_embedding_source_file_count": 3,
         "selected_embedding_source_row_count": 2,
     }

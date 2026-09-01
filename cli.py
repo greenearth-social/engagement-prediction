@@ -83,7 +83,7 @@ DEFAULTS: Dict[str, Any] = {
     "author_statistics_partition_count": 16,
     # Stage 7: Dataset hydration
     "embedding_source_batch_size": 64,
-    "embedding_partition_worker_count": 4,
+    "dataset_hydration_worker_count": 4,
     "min_author_training_feature_count": 50,
     "min_post_liker_user_training_event_count": 2,
     "max_post_liker_user_vocabulary_size": 1_000_000,
@@ -919,9 +919,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--embedding-source-batch-size", type=int,
                           default=argparse.SUPPRESS,
                           help_text="Raw post/reply files processed per Stage 7 embedding scan")
-    _add_arg_with_default(p_all, "--embedding-partition-worker-count", type=int,
+    _add_arg_with_default(p_all, "--dataset-hydration-worker-count", type=int,
                           default=argparse.SUPPRESS,
-                          help_text="Worker processes used for Stage 7 URI-partition embedding decoding")
+                          help_text="Worker budget for Stage 7 source filtering and embedding decoding")
     _add_arg_with_default(p_all, "--min-author-training-feature-count", type=int,
                           default=argparse.SUPPRESS,
                           help_text="Minimum final training-feature occurrences required for a dedicated author index")

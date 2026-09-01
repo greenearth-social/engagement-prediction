@@ -23,7 +23,7 @@ the intentional resident exceptions.
 from __future__ import annotations
 
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import multiprocessing
 from pathlib import Path
 import logging
@@ -160,19 +160,24 @@ def materialize_selected_embedding_rows(
     temporary_routes_root: Path,
     partition_count: int,
     source_batch_size: int,
+    worker_count: int,
     logger: logging.Logger,
 ) -> dict[str, int]:
-    """Route selected embedding payloads in one bounded pass per file batch.
+    """Route selected embedding payloads in bounded parallel file batches.
 
     The narrow selected-URI lookup is loaded once. Each source batch is then
     scanned once with its encoded payloads, semi-joined to those selected keys,
-    and streamed into URI partitions. This keeps memory bounded without the
+    and streamed into its own temporary URI partitions. A thread pool lets
+    independent scans overlap while sharing the immutable lookup instead of
+    copying it into worker processes. This keeps memory bounded without the
     prior discovery pass, which was ineffective when selected URIs appeared in
     almost every physical source file. Batch payload routes are deleted after
     their files are moved into the shared URI-partitioned output.
     """
     if source_batch_size <= 0:
         raise ValueError("embedding_source_batch_size must be positive")
+    if worker_count <= 0:
+        raise ValueError("dataset_hydration_worker_count must be positive")
     output_path.mkdir(parents=True, exist_ok=False)
     selected_keys_df = (
         scan_parquet_artifact(selected_metadata_path)
@@ -202,9 +207,7 @@ def materialize_selected_embedding_rows(
     del selected_keys_df
 
     total_source_files = len(post_paths) + len(reply_paths)
-    total_source_batches = 0
-    payload_source_files = 0
-    selected_rows = 0
+    batch_tasks: list[dict[str, Any]] = []
     for label, paths, is_reply in (
         ("root", post_paths, False),
         ("reply", reply_paths, True),
@@ -221,76 +224,128 @@ def materialize_selected_embedding_rows(
         for batch_index, batch_start in enumerate(
             range(0, len(paths), source_batch_size)
         ):
-            total_source_batches += 1
             batch_paths = paths[batch_start:batch_start + source_batch_size]
-            batch_name = f"{label}-batch-{batch_index:06d}"
-            logger.info(
-                "Filtering embedding %s batch %s/%s: files=%s",
-                label,
-                batch_index + 1,
-                batch_count,
-                len(batch_paths),
-            )
+            batch_tasks.append({
+                "label": label,
+                "batch_index": batch_index,
+                "batch_count": batch_count,
+                "batch_paths": batch_paths,
+                "is_reply": is_reply,
+                "source_keys_df": source_keys_df,
+                "posts_start": posts_start,
+                "posts_end": posts_end,
+                "output_path": output_path,
+                "temporary_routes_root": temporary_routes_root,
+                "partition_count": partition_count,
+                "logger": logger,
+            })
 
-            payload_routes_path = temporary_routes_root / f"{batch_name}-payloads"
-            # The semi-join is part of the same streaming plan as the payload
-            # scan and partition sink, so unselected payload rows are read but
-            # never materialized on disk or retained across batches.
-            selected_payloads_lf = (
-                dataset_hydration.normalize_embedding_source_rows(
-                    ingex.scan_parquet_files(batch_paths),
-                    posts_start=posts_start,
-                    posts_end=posts_end,
-                    is_reply=is_reply,
-                )
-                .join(source_keys_df.lazy(), on="subject_uri", how="semi")
-                .select(
-                    "subject_uri",
-                    "post_created_at",
-                    "author_did",
-                    "embeddings",
-                )
-                .with_columns(post_selection.post_partition_expr(partition_count))
-            )
-            sink_partitioned_parquet(
-                selected_payloads_lf,
-                output_path=payload_routes_path,
-                key="_post_partition",
-            )
-            batch_selected_rows = 0
-            for partition_id in range(partition_count):
-                payload_parts = _partition_paths(payload_routes_path, partition_id)
-                if not payload_parts:
-                    continue
-                partition_dir = output_path / f"partition-{partition_id:05d}"
-                partition_dir.mkdir(parents=True, exist_ok=True)
-                for part_index, payload_part in enumerate(payload_parts):
-                    batch_selected_rows += pq.read_metadata(payload_part).num_rows
-                    payload_part.replace(
-                        partition_dir
-                        / f"{batch_name}-{part_index:05d}.parquet"
-                    )
-            shutil.rmtree(payload_routes_path)
+    effective_worker_count = min(worker_count, len(batch_tasks))
+    logger.info(
+        "Filtering %s embedding source batches with %s worker threads",
+        len(batch_tasks),
+        effective_worker_count,
+    )
+    if effective_worker_count <= 1:
+        results = [
+            _filter_embedding_source_batch(**task)
+            for task in batch_tasks
+        ]
+    else:
+        with ThreadPoolExecutor(max_workers=effective_worker_count) as executor:
+            futures = [
+                executor.submit(_filter_embedding_source_batch, **task)
+                for task in batch_tasks
+            ]
+            results = [future.result() for future in as_completed(futures)]
 
-            payload_source_files += len(batch_paths)
-            selected_rows += batch_selected_rows
-            logger.info(
-                "Filtered embedding %s batch %s/%s in one pass: files=%s "
-                "selected_rows=%s selected_rows_so_far=%s",
-                label,
-                batch_index + 1,
-                batch_count,
-                len(batch_paths),
-                f"{batch_selected_rows:,}",
-                f"{selected_rows:,}",
-            )
+    payload_source_files = sum(result["source_file_count"] for result in results)
+    selected_rows = sum(result["selected_row_count"] for result in results)
     if temporary_routes_root.exists():
         temporary_routes_root.rmdir()
     return {
         "embedding_source_file_count": total_source_files,
-        "embedding_source_batch_count": total_source_batches,
+        "embedding_source_batch_count": len(batch_tasks),
+        "embedding_source_worker_count": effective_worker_count,
         "payload_embedding_source_file_count": payload_source_files,
         "selected_embedding_source_row_count": selected_rows,
+    }
+
+
+def _filter_embedding_source_batch(
+    *,
+    label: str,
+    batch_index: int,
+    batch_count: int,
+    batch_paths: list[str],
+    is_reply: bool,
+    source_keys_df: pl.DataFrame,
+    posts_start: Any,
+    posts_end: Any,
+    output_path: Path,
+    temporary_routes_root: Path,
+    partition_count: int,
+    logger: logging.Logger,
+) -> dict[str, int]:
+    """Filter and route one independent raw embedding source batch."""
+
+    batch_name = f"{label}-batch-{batch_index:06d}"
+    logger.info(
+        "Filtering embedding %s batch %s/%s: files=%s",
+        label,
+        batch_index + 1,
+        batch_count,
+        len(batch_paths),
+    )
+    payload_routes_path = temporary_routes_root / f"{batch_name}-payloads"
+    # The semi-join is part of the same streaming plan as the payload scan and
+    # partition sink, so unselected payload rows are read but never retained
+    # across batches or materialized outside this batch's temporary route.
+    selected_payloads_lf = (
+        dataset_hydration.normalize_embedding_source_rows(
+            ingex.scan_parquet_files(batch_paths),
+            posts_start=posts_start,
+            posts_end=posts_end,
+            is_reply=is_reply,
+        )
+        .join(source_keys_df.lazy(), on="subject_uri", how="semi")
+        .select(
+            "subject_uri",
+            "post_created_at",
+            "author_did",
+            "embeddings",
+        )
+        .with_columns(post_selection.post_partition_expr(partition_count))
+    )
+    sink_partitioned_parquet(
+        selected_payloads_lf,
+        output_path=payload_routes_path,
+        key="_post_partition",
+    )
+    selected_row_count = 0
+    for partition_id in range(partition_count):
+        payload_parts = _partition_paths(payload_routes_path, partition_id)
+        if not payload_parts:
+            continue
+        partition_dir = output_path / f"partition-{partition_id:05d}"
+        partition_dir.mkdir(parents=True, exist_ok=True)
+        for part_index, payload_part in enumerate(payload_parts):
+            selected_row_count += pq.read_metadata(payload_part).num_rows
+            payload_part.replace(
+                partition_dir / f"{batch_name}-{part_index:05d}.parquet"
+            )
+    shutil.rmtree(payload_routes_path)
+    logger.info(
+        "Filtered embedding %s batch %s/%s in one pass: files=%s selected_rows=%s",
+        label,
+        batch_index + 1,
+        batch_count,
+        len(batch_paths),
+        f"{selected_row_count:,}",
+    )
+    return {
+        "source_file_count": len(batch_paths),
+        "selected_row_count": selected_row_count,
     }
 
 
@@ -392,7 +447,7 @@ def write_embedding_shards(
     if partition_count <= 0:
         raise ValueError("partition_count must be positive")
     if worker_count <= 0:
-        raise ValueError("embedding_partition_worker_count must be positive")
+        raise ValueError("dataset_hydration_worker_count must be positive")
     valid_embedding_rows_path.mkdir(parents=True, exist_ok=False)
     embedding_shards_path.mkdir(parents=True, exist_ok=False)
     effective_worker_count = min(worker_count, partition_count)

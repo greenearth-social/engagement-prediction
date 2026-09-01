@@ -134,7 +134,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     embedding_model = str(args.embedding_model)
     embedding_dim = get_embedding_dim_for_known_model(embedding_model)
     embedding_source_batch_size = int(args.embedding_source_batch_size)
-    embedding_partition_worker_count = int(args.embedding_partition_worker_count)
+    dataset_hydration_worker_count = int(args.dataset_hydration_worker_count)
     min_author_training_feature_count = int(args.min_author_training_feature_count)
     min_post_liker_user_training_event_count = int(
         args.min_post_liker_user_training_event_count
@@ -144,8 +144,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     )
     if embedding_source_batch_size <= 0:
         raise ValueError("embedding_source_batch_size must be positive")
-    if embedding_partition_worker_count <= 0:
-        raise ValueError("embedding_partition_worker_count must be positive")
+    if dataset_hydration_worker_count <= 0:
+        raise ValueError("dataset_hydration_worker_count must be positive")
     if min_author_training_feature_count < 1:
         raise ValueError("min_author_training_feature_count must be at least 1")
     if min_post_liker_user_training_event_count < 1:
@@ -206,7 +206,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "Starting dataset hydration: source_window=[%s, %s) model=%s dim=%s "
         "post_partitions=%s liker_partitions=%s user_partitions=%s "
         "author_partitions=%s embedding_source_batch_size=%s "
-        "embedding_partition_worker_count=%s min_author_training_feature_count=%s "
+        "dataset_hydration_worker_count=%s min_author_training_feature_count=%s "
         "min_post_liker_user_training_event_count=%s "
         "max_post_liker_user_vocabulary_size=%s",
         source_start.isoformat(),
@@ -218,7 +218,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         stage2_partition_count,
         author_partition_count,
         embedding_source_batch_size,
-        embedding_partition_worker_count,
+        dataset_hydration_worker_count,
         min_author_training_feature_count,
         min_post_liker_user_training_event_count,
         max_post_liker_user_vocabulary_size,
@@ -349,6 +349,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         temporary_routes_root=source_scan_staging_path,
         partition_count=stage3_partition_count,
         source_batch_size=embedding_source_batch_size,
+        worker_count=dataset_hydration_worker_count,
         logger=logger,
     )
 
@@ -364,7 +365,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         embedding_model=embedding_model,
         embedding_dim=embedding_dim,
         partition_count=stage3_partition_count,
-        worker_count=embedding_partition_worker_count,
+        worker_count=dataset_hydration_worker_count,
         logger=logger,
     )
     # From this point onward the selected payload Parquet is redundant: every
@@ -586,7 +587,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "embedding_model": embedding_model,
             "embedding_dim": embedding_dim,
             "embedding_source_batch_size": embedding_source_batch_size,
-            "embedding_partition_worker_count": embedding_partition_worker_count,
+            "dataset_hydration_worker_count": dataset_hydration_worker_count,
             "min_author_training_feature_count": min_author_training_feature_count,
             "min_post_liker_user_training_event_count": (
                 min_post_liker_user_training_event_count
@@ -655,7 +656,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             f"embedding_model: {embedding_model}",
             f"embedding_dim: {embedding_dim}",
             f"embedding_source_batch_size: {embedding_source_batch_size}",
-            f"embedding_partition_worker_count: {embedding_partition_worker_count}",
+            f"dataset_hydration_worker_count: {dataset_hydration_worker_count}",
+            "effective_embedding_source_worker_count: "
+            f"{source_stats['embedding_source_worker_count']}",
             f"effective_embedding_partition_worker_count: {embedding_stats['embedding_partition_worker_count']}",
             f"min_author_training_feature_count: {min_author_training_feature_count}",
             "min_post_liker_user_training_event_count: "
