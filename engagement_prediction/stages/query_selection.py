@@ -17,6 +17,7 @@ from engagement_prediction.data import (
     ingex,
     likes,
     query_selection_artifacts,
+    raw_source_diagnostics,
     source_metadata_artifacts,
     timestamps,
 )
@@ -717,6 +718,27 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     )
     logger.info("Saved exact likes source-file manifest")
 
+    like_diagnostics = raw_source_diagnostics.count_daily_rows(
+        ingex.scan_parquet_files(like_paths).select("record_created_at"),
+        timestamp_column="record_created_at",
+        posts_start=config.posts_start,
+        posts_end=config.posts_end,
+    )
+    raw_source_diagnostics.log_daily_counts(
+        logger,
+        source_name="likes",
+        diagnostics=like_diagnostics,
+    )
+    context.tracker.log_histogram(
+        title="Raw likes by day",
+        series="Raw rows",
+        values=like_diagnostics["counts"],
+        iteration=0,
+        xlabels=raw_source_diagnostics.daily_count_labels(like_diagnostics),
+        xaxis="Creation date (UTC)",
+        yaxis="Raw rows",
+    )
+
     # Materializing the narrow counts prevents later ranking and capping plans
     # from repeatedly executing the all-like user-hour aggregation.
     candidate_query_counts_path = out_dir / f"_candidate_query_counts_{artifact_suffix}.parquet"
@@ -861,6 +883,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "positive_count": positives_df.height,
         },
         "selection_stats": stats,
+        "raw_source_diagnostics": {"likes": like_diagnostics},
         "runtime_seconds": runtime_seconds,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")

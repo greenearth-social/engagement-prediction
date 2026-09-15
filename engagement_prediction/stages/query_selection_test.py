@@ -7,12 +7,21 @@ import polars as pl
 import pytest
 
 from engagement_prediction.data import ingex, source_metadata
+from engagement_prediction.experiment_tracking import NoOpExperimentTracker
 from engagement_prediction.pipeline.core import Context
 from engagement_prediction.pipeline import registry
 from engagement_prediction.stages import query_selection as stage
 
 
 UTC = timezone.utc
+
+
+class _RecordingTracker(NoOpExperimentTracker):
+    def __init__(self):
+        self.histograms = []
+
+    def log_histogram(self, **kwargs):
+        self.histograms.append(kwargs)
 
 
 def _config(**overrides):
@@ -812,6 +821,9 @@ def test_registry_run_writes_query_artifacts_and_manifest(tmp_path, monkeypatch)
         source_metadata_dir / "source_metadata_stage0"
     )
     assert summary["input"]["source_metadata_dir"] == str(source_metadata_dir.resolve())
+    assert summary["raw_source_diagnostics"]["likes"]["counts"] == [
+        0, 2, 0, 0, 0, 0, 0, 0, 0,
+    ]
     assert summary["selection_stats"]["positive_filter_by_split"]["train"] == {
         "selected_like_row_count": 2,
         "provisional_positive_count": 2,
@@ -897,3 +909,156 @@ def test_partition_failure_does_not_publish_final_artifacts_or_manifest(tmp_path
     assert not list(output_dir.glob("queries_*.parquet"))
     assert not list(output_dir.glob("query_positives_*.parquet"))
     assert list(output_dir.glob("*.partial"))
+
+
+@pytest.fixture
+def raw_likes_run(tmp_path, monkeypatch):
+    rows = [
+        ("did:one", "at://post/one", "2026-01-01T00:00:00Z"),
+        ("did:one", "at://post/one", "2026-01-02T01:05:00Z"),
+        ("did:one", "at://post/one", "2026-01-02T01:05:00Z"),
+        (None, "at://post/one", "2026-01-02T01:10:00Z"),
+        ("did:one", None, "2026-01-02T01:15:00Z"),
+        ("did:one", "at://post/missing", "2026-01-03T01:00:00+02:00"),
+        ("did:one", "at://post/one", "malformed"),
+        ("did:one", "at://post/one", None),
+        ("did:one", "at://post/one", "2025-12-31T23:59:59Z"),
+        ("did:one", "at://post/one", "2026-01-10T00:00:00Z"),
+        ("did:one", "at://post/missing", "2026-01-09T23:00:00Z"),
+    ]
+    like_paths = []
+    for index, batch in enumerate((rows[:5], rows[5:])):
+        path = tmp_path / f"likes-{index}.parquet"
+        pl.DataFrame(
+            batch,
+            schema={
+                "did": pl.String,
+                "subject_uri": pl.String,
+                "record_created_at": pl.String,
+            },
+            orient="row",
+        ).write_parquet(path)
+        like_paths.append(str(path))
+    posts_path = tmp_path / "posts.parquet"
+    pl.DataFrame({
+        "at_uri": ["at://post/one"],
+        "record_created_at": ["2026-01-01T00:00:00Z"],
+        "did": ["did:author"],
+    }).write_parquet(posts_path)
+
+    def list_sources(**kwargs):
+        assert kwargs["blob_prefix"] == "bsky_likes"
+        return like_paths, [
+            datetime(2026, 1, 2, hour, tzinfo=UTC) for hour in (1, 2)
+        ]
+
+    monkeypatch.setattr(stage.ingex, "list_ingex_parquet_files", list_sources)
+    args = SimpleNamespace(
+        **_config(train_start=datetime(2026, 1, 2, tzinfo=UTC)).__dict__,
+        gcs_bucket="unused",
+        no_plots=True,
+        _argv=["--no-plots", "--stop-after", "query_selection"],
+    )
+    tracker = _RecordingTracker()
+    context = Context(
+        run_dir=tmp_path / "runs" / "run",
+        artifacts_dir=tmp_path / "artifacts",
+        runs_dir=tmp_path / "runs",
+        pipeline_run_id="run",
+        tracker=tracker,
+    )
+    context.prior_outputs["00_source_metadata"] = _write_source_metadata(
+        tmp_path, posts_path
+    )
+    return context, args, tracker, like_paths
+
+
+def test_raw_likes_coverage_includes_duplicates_invalid_ids_and_warmup(raw_likes_run):
+    context, args, tracker, like_paths = raw_likes_run
+
+    result = registry.run_stage("query_selection", context, args)
+
+    summary = json.loads((Path(result["output_dir"]) / "summary.json").read_text())
+    diagnostics = summary["raw_source_diagnostics"]["likes"]
+    dates = [f"2026-01-{day:02d}" for day in range(1, 10)]
+    counts = [1, 5, 0, 0, 0, 0, 0, 0, 1]
+    assert diagnostics == {
+        "posts_start": "2026-01-01T00:00:00+00:00",
+        "posts_end": "2026-01-10T00:00:00+00:00",
+        "dates": dates,
+        "counts": counts,
+        "partial_dates": [],
+        "total_row_count": 11,
+        "in_window_row_count": 7,
+        "invalid_timestamp_count": 2,
+        "before_window_row_count": 1,
+        "at_or_after_end_row_count": 1,
+    }
+    assert tracker.histograms == [{
+        "title": "Raw likes by day",
+        "series": "Raw rows",
+        "values": counts,
+        "iteration": 0,
+        "xlabels": dates,
+        "xaxis": "Creation date (UTC)",
+        "yaxis": "Raw rows",
+    }]
+    like_sources = json.loads(Path(result["artifacts"]["like_sources_path"]).read_text())
+    assert [entry["uri"] for entry in like_sources["files"]] == like_paths
+    queries = pl.read_parquet(result["artifacts"]["queries_path"])
+    positives = pl.read_parquet(result["artifacts"]["query_positives_path"])
+    assert queries["query_hour"].to_list() == [datetime(2026, 1, 2, 1, tzinfo=UTC)]
+    assert queries["positive_count"].to_list() == [1]
+    assert positives["subject_uri"].to_list() == ["at://post/one"]
+
+
+def test_raw_likes_coverage_is_reported_before_target_preparation(raw_likes_run, monkeypatch):
+    context, args, tracker, _ = raw_likes_run
+
+    def fail_preparation(*args):
+        assert len(tracker.histograms) == 1
+        raise RuntimeError("target preparation failed")
+
+    monkeypatch.setattr(stage, "_prepare_likes", fail_preparation)
+
+    with pytest.raises(RuntimeError, match="target preparation failed"):
+        stage.run(context, args)
+
+    assert tracker.histograms[0]["values"] == [1, 5, 0, 0, 0, 0, 0, 0, 1]
+
+
+def test_empty_likes_file_reports_zero_days_before_selection_failure(raw_likes_run):
+    context, args, tracker, like_paths = raw_likes_run
+    for path in like_paths:
+        pl.read_parquet(path).clear().write_parquet(path)
+
+    with pytest.raises(ValueError, match="no provisionally sampled query-hours"):
+        registry.run_stage("query_selection", context, args)
+
+    assert tracker.histograms[0]["values"] == [0] * 9
+
+
+def test_raw_likes_reporting_failure_propagates(raw_likes_run, monkeypatch):
+    context, args, tracker, _ = raw_likes_run
+
+    def fail_reporting(**kwargs):
+        raise RuntimeError("tracker failed")
+
+    def unexpected_preparation(*args):
+        pytest.fail("Target preparation must follow successful reporting")
+
+    monkeypatch.setattr(tracker, "log_histogram", fail_reporting)
+    monkeypatch.setattr(stage, "_prepare_likes", unexpected_preparation)
+
+    with pytest.raises(RuntimeError, match="tracker failed"):
+        stage.run(context, args)
+
+
+def test_missing_likes_sources_still_fail_before_reporting(raw_likes_run, monkeypatch):
+    context, args, tracker, _ = raw_likes_run
+    monkeypatch.setattr(stage.ingex, "list_ingex_parquet_files", lambda **kwargs: ([], []))
+
+    with pytest.raises(ValueError, match="No likes Parquet files found"):
+        registry.run_stage("query_selection", context, args)
+
+    assert tracker.histograms == []
