@@ -25,11 +25,15 @@ class _RecordingTracker:
         self.manifest_uploaded = manifest_uploaded
         self.scalar_calls = []
         self.histogram_calls = []
+        self.plot_calls = []
         self.file_artifacts = []
         self.model_artifacts = []
 
     def log_scalar(self, title, series, value, iteration):
         self.scalar_calls.append((title, series, value, iteration))
+
+    def log_plot(self, title, series, figure, iteration):
+        self.plot_calls.append((title, series, figure, iteration))
 
     def log_histogram(
         self,
@@ -239,6 +243,7 @@ def _args(
         dataloader_persistent_workers=False,
         dataloader_prefetch_factor=1,
         metrics_top_ks=[1],
+        history_length_bucket_boundaries=[0, 1, 2],
         bst_use_popularity_feature=True,
         bst_use_post_liker_feature=post_liker_feature,
         bst_post_liker_user_embedding_dim=3,
@@ -288,6 +293,26 @@ def _context(tmp_path: Path, tracker: _RecordingTracker) -> Context:
     )
 
 
+def _assert_history_length_outputs(output_dir, training_results, summary, tracker):
+    final_metrics = training_results["final_metrics"]
+    assert summary["final_metrics"] == final_metrics
+    assert "history_length_breakdown" not in final_metrics["train"]
+    assert not any("history_length" in key for key in training_results["training_history"])
+    for split in ("val", "val_unseen_users"):
+        buckets = final_metrics[split]["history_length_breakdown"]
+        assert [bucket["label"] for bucket in buckets] == ["0", "1", "2", ">2"]
+        assert [bucket["query_count"] for bucket in buckets] == [0, 1, 0, 0]
+        assert buckets[1]["ndcg@1"] == pytest.approx(final_metrics[split]["ndcg@1"])
+        assert all(buckets[index]["ndcg@1"] is None for index in (0, 2, 3))
+    plot_path = output_dir / "history_length_ndcg_at_1.png"
+    assert plot_path.stat().st_size > 0
+    assert summary["outputs"]["history_length_plot_paths"] == {"ndcg@1": plot_path.name}
+    assert len(tracker.plot_calls) == 1
+    assert tracker.plot_calls[0][1] == "ndcg@1"
+    assert tracker.plot_calls[0][3] == training_results["best_epoch"]
+    assert plot_path in [path for _, path in tracker.file_artifacts]
+
+
 def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
     tmp_path,
     monkeypatch,
@@ -309,8 +334,12 @@ def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
     monkeypatch.setattr(train_bst_ranker, "_create_loader", record_loader)
     final_metrics = train_bst_ranker._final_metrics
     final_metric_loader_batch_sizes = {}
+    final_model_state = {}
 
     def record_final_metrics(**kwargs):
+        final_model_state.update({
+            name: value.clone() for name, value in kwargs["model"].state_dict().items()
+        })
         final_metric_loader_batch_sizes.update({
             split: loader.batch_sampler.batch_size
             for split, loader in kwargs["loaders"].items()
@@ -336,6 +365,9 @@ def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
     assert checkpoint["metadata"]["model_config"] == model_config
     assert checkpoint["metadata"]["popularity_stats"] == popularity
     assert training_results["best_epoch"] == 1
+    for name, value in final_model_state.items():
+        torch.testing.assert_close(value, checkpoint["model_state_dict"][name])
+    _assert_history_length_outputs(output_dir, training_results, summary, tracker)
     assert set(training_results["final_metrics"]) == {
         "train",
         "val",
@@ -465,6 +497,7 @@ def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
     )
     assert training_config["batch_size"] == 2
     assert training_config["eval_batch_size"] == 3
+    assert training_config["history_length_bucket_boundaries"] == [0, 1, 2]
     assert summary["parameters"]["batch_size"] == 2
     assert summary["parameters"]["eval_batch_size"] == 3
     assert final_metric_loader_batch_sizes == {
@@ -499,12 +532,16 @@ def test_stage8_ignores_no_save_model_and_respects_no_plots(tmp_path, monkeypatc
     assert "save_model" not in training_config
     assert "no_save_model_requested_but_ignored" not in training_config
     assert not (output_dir / "training_history.png").exists()
+    assert not list(output_dir.glob("history_length_ndcg_at_*.png"))
+    assert tracker.plot_calls == []
     assert tracker.model_artifacts == []
     assert tracker.file_artifacts == []
     training_results = json.loads((output_dir / "training_results.json").read_text())
     summary = json.loads((output_dir / "summary.json").read_text())
     assert training_results["clearml_publication"]["status"] == "not_configured"
     assert summary["clearml_publication"]["status"] == "not_configured"
+    assert summary["outputs"]["history_length_plot_paths"] == {}
+    assert training_results["final_metrics"]["val"]["history_length_breakdown"][1]["query_count"] == 1
     assert "clearml_publication_status: not_configured" in (
         output_dir / "stage_info.txt"
     ).read_text()

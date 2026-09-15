@@ -8,6 +8,7 @@ import pytest
 
 from engagement_prediction.data import source_metadata
 from engagement_prediction.data.parquet import scan_parquet_artifact
+from engagement_prediction.experiment_tracking import NoOpExperimentTracker
 from engagement_prediction.pipeline import registry
 from engagement_prediction.pipeline.core import Context
 from engagement_prediction.stages import source_metadata as stage
@@ -15,6 +16,14 @@ from engagement_prediction.pipeline import logging as pipeline_logging
 
 
 UTC = timezone.utc
+
+
+class _RecordingTracker(NoOpExperimentTracker):
+    def __init__(self):
+        self.histogram_calls = []
+
+    def log_histogram(self, **kwargs):
+        self.histogram_calls.append(kwargs)
 
 
 def _sources(tmp_path: Path) -> tuple[Path, Path]:
@@ -53,6 +62,7 @@ def _args(partition_count: int, worker_count: int = 1) -> SimpleNamespace:
         posts_end="2026-01-02T00:00:00Z",
         source_metadata_partition_count=partition_count,
         data_partition_worker_count=worker_count,
+        no_plots=True,
         _argv=["--stop-after", "source_metadata"],
     )
 
@@ -73,7 +83,14 @@ def _reset_logger() -> None:
             handler.close()
 
 
-def _run(tmp_path: Path, monkeypatch, partition_count: int, worker_count: int = 1):
+def _run(
+    tmp_path: Path,
+    monkeypatch,
+    partition_count: int,
+    worker_count: int = 1,
+    *,
+    tracker=None,
+):
     tmp_path.mkdir(parents=True, exist_ok=True)
     posts, replies = _sources(tmp_path)
 
@@ -83,9 +100,12 @@ def _run(tmp_path: Path, monkeypatch, partition_count: int, worker_count: int = 
 
     monkeypatch.setattr(stage.ingex, "list_ingex_parquet_files", list_files)
     _reset_logger()
+    context = _context(tmp_path, f"run-{partition_count}")
+    if tracker is not None:
+        context.tracker = tracker
     return registry.run_stage(
         "source_metadata",
-        _context(tmp_path, f"run-{partition_count}"),
+        context,
         _args(partition_count, worker_count),
     )
 
@@ -110,9 +130,132 @@ def test_publishes_canonical_metadata_and_exact_snapshots(tmp_path, monkeypatch)
     assert summary["parameters"]["source_metadata_partition_count"] == 3
     assert summary["parameters"]["data_partition_worker_count"] == 1
     assert summary["index"]["partition_worker_count"] == 1
+    assert summary["raw_source_diagnostics"]["root_posts"] == {
+        "posts_start": "2026-01-01T00:00:00+00:00",
+        "posts_end": "2026-01-02T00:00:00+00:00",
+        "dates": ["2026-01-01"],
+        "counts": [7],
+        "partial_dates": [],
+        "total_row_count": 8,
+        "in_window_row_count": 7,
+        "invalid_timestamp_count": 0,
+        "before_window_row_count": 0,
+        "at_or_after_end_row_count": 1,
+    }
+    reply_diagnostics = summary["raw_source_diagnostics"]["replies"]
+    assert reply_diagnostics["total_row_count"] == 3
+    assert reply_diagnostics["counts"] == [3]
     assert not list(output_dir.glob("*.partial"))
     assert not list(output_dir.glob("_source_metadata_staging_*"))
     assert json.loads((output_dir / "manifest.json").read_text())["inputs"] == {}
+
+
+def test_reports_grouped_raw_counts_with_training_plots_disabled(tmp_path, monkeypatch):
+    tracker = _RecordingTracker()
+    _run(tmp_path, monkeypatch, 3, tracker=tracker)
+
+    assert tracker.histogram_calls == [{
+        "title": "Raw posts by day",
+        "series": "Raw rows",
+        "values": [[7], [3]],
+        "labels": ["Root posts", "Replies"],
+        "xlabels": ["2026-01-01"],
+        "xaxis": "Creation date (UTC)",
+        "yaxis": "Raw rows",
+        "mode": "group",
+        "iteration": 0,
+    }]
+
+
+def test_counts_all_raw_files_with_partial_days_and_exclusions(tmp_path, monkeypatch):
+    first_posts = tmp_path / "posts-first.parquet"
+    second_posts = tmp_path / "posts-second.parquet"
+    replies = tmp_path / "replies.parquet"
+    pl.DataFrame({
+        "at_uri": ["same", "same", "", None, "early", "invalid"],
+        "record_created_at": [
+            "2026-01-01T12:00:00Z",
+            "2026-01-01T12:00:00Z",
+            "2026-01-01T12:00:00Z",
+            "2026-01-01T12:00:00Z",
+            "2026-01-01T11:59:59Z",
+            "bad-timestamp",
+        ],
+        "did": ["a"] * 6,
+    }).write_parquet(first_posts)
+    pl.DataFrame({
+        "at_uri": ["offset", "end", "invalid-author"],
+        "record_created_at": [
+            "2026-01-04T01:00:00+02:00",
+            "2026-01-04T01:00:00Z",
+            "2026-01-04T00:30:00Z",
+        ],
+        "did": ["a", "a", ""],
+    }).write_parquet(second_posts)
+    pl.DataFrame({
+        "at_uri": ["reply", "outside"],
+        "record_created_at": ["2026-01-03T23:00:00Z", "2026-01-05T00:00:00Z"],
+        "did": ["a", "a"],
+    }).write_parquet(replies)
+
+    def list_files(**kwargs):
+        paths = [first_posts, second_posts] if kwargs["blob_prefix"] == "bsky_posts" else [replies]
+        return [str(path) for path in paths], [datetime(2026, 1, 2, tzinfo=UTC)] * len(paths)
+
+    monkeypatch.setattr(stage.ingex, "list_ingex_parquet_files", list_files)
+    tracker = _RecordingTracker()
+    context = _context(tmp_path, "partial")
+    context.tracker = tracker
+    args = _args(2)
+    args.posts_start = "2026-01-01T12:00:00Z"
+    args.posts_end = "2026-01-04T01:00:00Z"
+    _reset_logger()
+
+    result = registry.run_stage("source_metadata", context, args)
+
+    assert tracker.histogram_calls[0]["values"] == [[4, 0, 1, 1], [0, 0, 1, 0]]
+    assert tracker.histogram_calls[0]["xlabels"] == [
+        "2026-01-01 (partial)", "2026-01-02", "2026-01-03", "2026-01-04 (partial)"
+    ]
+    summary = json.loads((Path(result["output_dir"]) / "summary.json").read_text())
+    diagnostics = summary["raw_source_diagnostics"]["root_posts"]
+    assert diagnostics["total_row_count"] == 9
+    assert diagnostics["in_window_row_count"] == 6
+    assert diagnostics["invalid_timestamp_count"] == 1
+    assert diagnostics["before_window_row_count"] == 1
+    assert diagnostics["at_or_after_end_row_count"] == 1
+    assert summary["index"]["canonical_record_count"] == 3
+
+
+@pytest.mark.parametrize("empty_source", ["posts", "replies", "both"])
+def test_reports_zero_counts_for_empty_staged_sources(tmp_path, monkeypatch, empty_source):
+    posts, replies = _sources(tmp_path)
+    for name, path in (("posts", posts), ("replies", replies)):
+        if empty_source in (name, "both"):
+            pl.DataFrame(schema=pl.read_parquet_schema(path)).write_parquet(path)
+    monkeypatch.setattr(
+        stage.ingex,
+        "list_ingex_parquet_files",
+        lambda **kwargs: (
+            [str(posts if kwargs["blob_prefix"] == "bsky_posts" else replies)],
+            [datetime(2026, 1, 1, tzinfo=UTC)],
+        ),
+    )
+    tracker = _RecordingTracker()
+    context = _context(tmp_path, "empty")
+    context.tracker = tracker
+    _reset_logger()
+
+    result = registry.run_stage("source_metadata", context, _args(2))
+
+    expected_counts = [
+        [0 if empty_source in ("posts", "both") else 7],
+        [0 if empty_source in ("replies", "both") else 3],
+    ]
+    assert tracker.histogram_calls[0]["values"] == expected_counts
+    summary = json.loads((Path(result["output_dir"]) / "summary.json").read_text())
+    assert summary["raw_source_diagnostics"]["root_posts"]["counts"] == expected_counts[0]
+    assert summary["raw_source_diagnostics"]["replies"]["counts"] == expected_counts[1]
 
 
 def test_logical_output_is_partition_count_independent(tmp_path, monkeypatch):
@@ -154,10 +297,15 @@ def test_failed_partition_does_not_publish_bundle_or_manifest(tmp_path, monkeypa
         lambda **kwargs: (_ for _ in ()).throw(RuntimeError("partition failed")),
     )
     _reset_logger()
+    tracker = _RecordingTracker()
+    context = _context(tmp_path, "failed")
+    context.tracker = tracker
 
     with pytest.raises(RuntimeError, match="partition failed"):
-        registry.run_stage("source_metadata", _context(tmp_path, "failed"), _args(2))
+        registry.run_stage("source_metadata", context, _args(2))
 
+    assert tracker.histogram_calls[0]["title"] == "Raw posts by day"
+    assert tracker.histogram_calls[0]["values"] == [[7], [3]]
     output_dir = next((tmp_path / "artifacts" / "00_source_metadata").iterdir())
     assert list(output_dir.glob("source_metadata_*.partial"))
     assert not [

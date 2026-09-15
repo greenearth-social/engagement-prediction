@@ -1,6 +1,9 @@
 from pathlib import Path
 import base64
+import json
 import struct
+import subprocess
+import sys
 import textwrap
 from datetime import datetime, timezone
 import zlib
@@ -47,6 +50,63 @@ def test_merge_args_with_config_prioritizes_cli_over_config(tmp_path, argv):
     assert merged.embedding_model == "all_MiniLM_L12_v2"  # Config overrides defaults
     assert merged.batch_size == 512  # CLI overrides default
     assert merged.learning_rate == cli.DEFAULTS["learning_rate"]
+
+
+def test_history_length_bucket_defaults_are_copied():
+    args = cli._merge_args_with_config(cli.build_parser().parse_args([]))
+
+    assert args.history_length_bucket_boundaries == [0, 1, 2, 4, 8, 16, 32]
+    assert args.history_length_bucket_boundaries is not cli.DEFAULTS["history_length_bucket_boundaries"]
+
+
+@pytest.mark.parametrize("command", [[], ["run-all"]])
+def test_history_length_bucket_cli_overrides_config(tmp_path, command):
+    config_path = tmp_path / "history_lengths.json"
+    config_path.write_text(json.dumps({"history_length_bucket_boundaries": [0, 3, 7]}))
+    parser = cli.build_parser()
+
+    configured = cli._merge_args_with_config(parser.parse_args([
+        "--config", str(config_path), *command,
+    ]))
+    overridden = cli._merge_args_with_config(parser.parse_args([
+        "--config", str(config_path), *command,
+        "--history-length-bucket-boundaries", "0", "5", "10",
+    ]))
+
+    assert configured.history_length_bucket_boundaries == [0, 3, 7]
+    assert overridden.history_length_bucket_boundaries == [0, 5, 10]
+
+
+@pytest.mark.parametrize(
+    "boundaries",
+    [[], None, [1, 2], [-1, 0], [0, -1], [0, 2, 1], [0, 1, 1], [False, 1], [0, True], [0, 1.0], "0,1"],
+)
+def test_history_length_bucket_invalid_config_is_rejected(tmp_path, boundaries):
+    config_path = tmp_path / "invalid_history_lengths.json"
+    config_path.write_text(json.dumps({"history_length_bucket_boundaries": boundaries}))
+    raw = cli.build_parser().parse_args(["--config", str(config_path)])
+
+    with pytest.raises(ValueError, match="history_length_bucket_boundaries"):
+        cli._merge_args_with_config(raw)
+
+
+@pytest.mark.parametrize("boundaries", [["0", "2", "1"], ["0", "0"], ["1"]])
+def test_history_length_bucket_invalid_cli_is_rejected(boundaries):
+    raw = cli.build_parser().parse_args(["--history-length-bucket-boundaries", *boundaries])
+
+    with pytest.raises(ValueError, match="history_length_bucket_boundaries"):
+        cli._merge_args_with_config(raw)
+
+
+def test_cli_argument_merge_does_not_import_torch():
+    result = subprocess.run(
+        [sys.executable, "-c", "import sys; import cli; cli._merge_args_with_config(cli.build_parser().parse_args([])); assert 'torch' not in sys.modules"],
+        cwd=Path(cli.__file__).parent,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize(

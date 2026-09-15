@@ -216,6 +216,7 @@ def test_two_tower_epoch_uses_topk_ndcg_only_and_updates_weights(monkeypatch):
             metrics_top_ks=[1, 2],
             calc_baseline_metrics=True,
             max_batches=None,
+            history_length_bucket_boundaries=None,
         )
     )
 
@@ -235,6 +236,28 @@ def test_two_tower_epoch_uses_topk_ndcg_only_and_updates_weights(monkeypatch):
     assert not any(key.startswith("dcg@") for key in metrics)
     assert not any("recall" in key or "average_precision" in key for key in metrics)
     assert not torch.equal(before, model.user_projection.weight)
+
+
+def test_two_tower_epoch_collects_history_buckets_for_validation():
+    _, metrics, _ = two_tower_training.run_two_tower_listwise_epoch(
+        train=False,
+        split_name="Validation",
+        model=_TinyTwoTower(),
+        device="cpu",
+        dataloader=_loader(),
+        optimizer=None,
+        disable_progress=True,
+        gradient_clip_max_norm=1.0,
+        metrics_top_ks=[1, 2],
+        calc_baseline_metrics=False,
+        max_batches=None,
+        history_length_bucket_boundaries=[0, 1, 2],
+    )
+
+    buckets = metrics["history_length_breakdown"]
+    assert [bucket["query_count"] for bucket in buckets] == [1, 0, 1, 0]
+    assert buckets[0]["ndcg@2"] == metrics["zero_history_ndcg@2"]
+    assert "dcg@2" not in buckets[0]
 
 
 def test_canonical_two_tower_runs_one_native_batch_optimizer_step():
@@ -269,6 +292,7 @@ def test_canonical_two_tower_runs_one_native_batch_optimizer_step():
             metrics_top_ks=[1, 2],
             calc_baseline_metrics=True,
             max_batches=None,
+            history_length_bucket_boundaries=None,
         )
     )
 

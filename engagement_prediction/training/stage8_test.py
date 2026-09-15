@@ -44,6 +44,7 @@ def test_evaluate_listwise_splits_uses_split_specific_limits():
         disable_progress=True,
         gradient_clip_max_norm=1.0,
         metrics_top_ks=[30],
+        history_length_bucket_boundaries=[0, 1, 4],
         max_batches_by_split={"train": 4},
     )
 
@@ -56,6 +57,9 @@ def test_evaluate_listwise_splits_uses_split_specific_limits():
         "Final val_unseen_users",
     ]
     assert [call["max_batches"] for call in calls] == [4, None, None]
+    assert [call["history_length_bucket_boundaries"] for call in calls] == [
+        None, [0, 1, 4], [0, 1, 4],
+    ]
     assert all(call["train"] is False for call in calls)
     assert all(call["calc_baseline_metrics"] is False for call in calls)
 
@@ -70,6 +74,7 @@ def test_evaluate_listwise_splits_rejects_unknown_limit():
             disable_progress=True,
             gradient_clip_max_norm=1.0,
             metrics_top_ks=[30],
+            history_length_bucket_boundaries=[0, 1, 4],
             max_batches_by_split={"train": 1},
         )
 
