@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import json
 import pickle
 
 import numpy as np
@@ -6,7 +7,11 @@ import polars as pl
 import pytest
 import torch
 
-from engagement_prediction.data import dataset_hydration, datasets as datasets_module
+from engagement_prediction.data import (
+    dataset_hydration,
+    datasets as datasets_module,
+    post_liker_users,
+)
 from engagement_prediction.data.datasets import (
     HydratedBucketedBatchSampler,
     HydratedBucketedEngagementDataset,
@@ -109,6 +114,20 @@ def _bundle(tmp_path, *, many_negatives=False):
         "authors",
         pl.DataFrame({"author_idx": list(range(2, len(post_uris) + 2))}),
     )
+    _write_dataset(
+        bundle,
+        "indexed_post_liker_events",
+        post_liker_users.empty_frame(
+            post_liker_users.INDEXED_POST_LIKER_EVENT_SCHEMA
+        ),
+    )
+    _write_dataset(
+        bundle,
+        "post_liker_users",
+        post_liker_users.empty_frame(
+            post_liker_users.POST_LIKER_USER_VOCABULARY_SCHEMA
+        ),
+    )
     build_loader_index(
         posts_path=bundle / "posts",
         queries_path=bundle / "queries",
@@ -117,6 +136,8 @@ def _bundle(tmp_path, *, many_negatives=False):
         hourly_negative_candidates_path=bundle / "hourly_negative_candidates",
         embeddings_path=bundle / "embeddings.npy",
         authors_path=bundle / "authors",
+        indexed_post_liker_events_path=bundle / "indexed_post_liker_events",
+        post_liker_users_path=bundle / "post_liker_users",
         output_path=bundle / "loader_index",
         logger=None,
     )
@@ -131,12 +152,50 @@ def _dataset(bundle, *, negative_cap=None):
         bst_additional_batch_negatives=negative_cap,
         seed=7,
         logger=None,
+        use_post_liker_feature=False,
+        max_post_liker_replay_events_per_post=None,
     )
 
 
 def _write_author_override(path, values, *, dtype="<u4"):
     np.save(path, np.asarray(values, dtype=dtype))
     return path
+
+
+def _write_post_liker_arrays(bundle, events_by_emb_idx, *, user_table_num_rows):
+    """Install a small format-v2 liker-event index beside the base fixture."""
+
+    index_path = bundle / "loader_index"
+    metadata_path = index_path / "format.json"
+    metadata = json.loads(metadata_path.read_text())
+    offsets = [0]
+    user_indices = []
+    timestamps_us = []
+    for emb_idx in range(metadata["embedding"]["shape"][0]):
+        events = events_by_emb_idx.get(emb_idx, [])
+        for user_idx, created_at in events:
+            user_indices.append(user_idx)
+            timestamps_us.append(int(created_at.timestamp() * 1_000_000))
+        offsets.append(len(user_indices))
+
+    arrays = {
+        "post_liker_offsets": np.asarray(offsets, dtype="<u8"),
+        "post_liker_user_indices": np.asarray(user_indices, dtype="<u4"),
+        "post_liker_created_at_us": np.asarray(timestamps_us, dtype="<i8"),
+    }
+    for name, values in arrays.items():
+        path = index_path / f"{name}.npy"
+        np.save(path, values)
+        metadata.setdefault("arrays", {})[name] = {
+            "path": path.name,
+            "dtype": values.dtype.str,
+            "shape": list(values.shape),
+            "file_size_bytes": path.stat().st_size,
+        }
+    metadata["format_version"] = 2
+    metadata["post_liker_event_count"] = len(user_indices)
+    metadata["post_liker_user_table_num_rows"] = user_table_num_rows
+    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
 
 
 def test_native_dataset_builds_parity_batch_from_memory_mapped_index(tmp_path):
@@ -167,6 +226,201 @@ def test_native_dataset_builds_parity_batch_from_memory_mapped_index(tmp_path):
         batch["candidate_post_embeddings"],
         torch.tensor([[1.0, -1.0], [2.0, -2.0], [5.0, -5.0]]),
     )
+
+
+def test_post_liker_collation_replays_each_unique_post_once_with_strict_as_of_cap(
+    tmp_path,
+):
+    bundle = _bundle(tmp_path)
+    hour = datetime(2026, 1, 1, 12, tzinfo=UTC)
+    _write_post_liker_arrays(
+        bundle,
+        {
+            # p1 has three prior events, one same-boundary event, and one future
+            # event. The replay cap retains only the latest two prior events.
+            0: [
+                (2, datetime(2026, 1, 1, 8, tzinfo=UTC)),
+                (3, datetime(2026, 1, 1, 9, tzinfo=UTC)),
+                (4, datetime(2026, 1, 1, 11, tzinfo=UTC)),
+                (5, hour),
+                (6, datetime(2026, 1, 1, 13, tzinfo=UTC)),
+            ],
+            # p2 has no event visible at scoring time.
+            1: [(6, datetime(2026, 1, 1, 13, tzinfo=UTC))],
+            # h1 occurs twice in one history but must be pooled once.
+            2: [(7, datetime(2026, 1, 1, 10, tzinfo=UTC))],
+            4: [
+                (8, datetime(2026, 1, 1, 10, tzinfo=UTC)),
+                (9, datetime(2026, 1, 1, 11, 30, tzinfo=UTC)),
+            ],
+        },
+        user_table_num_rows=10,
+    )
+    dataset = HydratedBucketedEngagementDataset(
+        bundle,
+        split="train",
+        max_history_len=2,
+        seed=7,
+        logger=None,
+        use_post_liker_feature=True,
+        max_post_liker_replay_events_per_post=2,
+    )
+
+    batch = dataset.collate_tensor_batch([dataset[0], dataset[1]])
+
+    # Unique sorted posts are p1, p2, h1, n1; row zero is reserved for padding.
+    assert batch["history_post_liker_rows"].tolist() == [[3, 3], [0, 0]]
+    assert batch["candidate_post_liker_rows"].tolist() == [1, 2, 4]
+    assert batch["post_liker_event_offsets"].tolist() == [0, 0, 2, 2, 3, 5]
+    assert batch["post_liker_event_user_indices"].tolist() == [3, 4, 7, 8, 9]
+    torch.testing.assert_close(
+        batch["post_liker_event_age_from_latest_hours"],
+        torch.tensor([2.0, 0.0, 0.0, 1.5, 0.0]),
+    )
+    assert batch["post_liker_event_user_indices"].dtype == torch.int64
+    assert batch["post_liker_event_offsets"].dtype == torch.int64
+
+
+def test_feature_disabled_does_not_open_format_v2_post_liker_arrays(
+    tmp_path,
+    monkeypatch,
+):
+    bundle = _bundle(tmp_path)
+    _write_post_liker_arrays(bundle, {}, user_table_num_rows=2)
+    dataset = HydratedBucketedEngagementDataset(
+        bundle,
+        split="train",
+        max_history_len=2,
+        seed=7,
+        logger=None,
+        use_post_liker_feature=False,
+        max_post_liker_replay_events_per_post=None,
+    )
+    original_loader = datasets_module.load_index_array
+
+    def load_array(index_path, name, split=None, *, metadata=None):
+        assert name not in datasets_module._POST_LIKER_ARRAY_NAMES
+        return original_loader(index_path, name, split, metadata=metadata)
+
+    monkeypatch.setattr(datasets_module, "load_index_array", load_array)
+
+    batch = dataset.collate_two_tower_batch([dataset[0], dataset[1]])
+
+    assert not {
+        "post_liker_event_user_indices",
+        "post_liker_event_age_from_latest_hours",
+        "post_liker_event_offsets",
+        "history_post_liker_rows",
+        "candidate_post_liker_rows",
+    }.intersection(batch)
+
+
+def test_feature_enabled_requires_v2_index_and_positive_replay_cap(tmp_path):
+    bundle = _bundle(tmp_path)
+    metadata_path = bundle / "loader_index" / "format.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["format_version"] = 1
+    metadata_path.write_text(json.dumps(metadata))
+
+    with pytest.raises(ValueError, match="requires Stage 7 loader-index format"):
+        HydratedBucketedEngagementDataset(
+            bundle,
+            split="train",
+            max_history_len=2,
+            seed=7,
+            logger=None,
+            use_post_liker_feature=True,
+            max_post_liker_replay_events_per_post=128,
+        )
+
+    with pytest.raises(ValueError, match="must be positive"):
+        HydratedBucketedEngagementDataset(
+            bundle,
+            split="train",
+            max_history_len=2,
+            seed=7,
+            logger=None,
+            use_post_liker_feature=True,
+            max_post_liker_replay_events_per_post=0,
+        )
+
+
+def test_post_liker_mappings_reopen_after_dataset_pickling(tmp_path):
+    bundle = _bundle(tmp_path)
+    _write_post_liker_arrays(
+        bundle,
+        {0: [(2, datetime(2026, 1, 1, 11, tzinfo=UTC))]},
+        user_table_num_rows=3,
+    )
+    dataset = HydratedBucketedEngagementDataset(
+        bundle,
+        split="train",
+        max_history_len=2,
+        seed=7,
+        logger=None,
+        use_post_liker_feature=True,
+        max_post_liker_replay_events_per_post=128,
+    )
+    expected = dataset.collate_tensor_batch([dataset[0], dataset[1]])
+
+    restored = pickle.loads(pickle.dumps(dataset))
+
+    assert restored._owner_pid is None
+    assert restored._arrays is None
+    actual = restored.collate_tensor_batch([restored[0], restored[1]])
+    for name in (
+        "post_liker_event_user_indices",
+        "post_liker_event_age_from_latest_hours",
+        "post_liker_event_offsets",
+        "history_post_liker_rows",
+        "candidate_post_liker_rows",
+    ):
+        torch.testing.assert_close(actual[name], expected[name])
+    assert all(not array.flags.writeable for array in restored._arrays.values())
+
+
+def test_post_liker_tensor_loader_matches_with_zero_and_multiple_workers(tmp_path):
+    bundle = _bundle(tmp_path)
+    _write_post_liker_arrays(
+        bundle,
+        {
+            0: [(2, datetime(2026, 1, 1, 11, tzinfo=UTC))],
+            2: [(3, datetime(2026, 1, 1, 10, tzinfo=UTC))],
+        },
+        user_table_num_rows=4,
+    )
+    dataset = HydratedBucketedEngagementDataset(
+        bundle,
+        split="train",
+        max_history_len=2,
+        seed=7,
+        logger=None,
+        use_post_liker_feature=True,
+        max_post_liker_replay_events_per_post=128,
+    )
+
+    def load(num_workers):
+        loader = create_hydrated_data_loader(
+            dataset,
+            batch_size=2,
+            shuffle=False,
+            drop_last=False,
+            num_workers=num_workers,
+            pin_memory=False,
+            persistent_workers=False,
+            prefetch_factor=1,
+            seed=7,
+            resample_candidates_each_epoch=False,
+            tensor_only=True,
+        )
+        return next(iter(loader))
+
+    single_process = load(0)
+    multiple_workers = load(2)
+
+    assert single_process.keys() == multiple_workers.keys()
+    for name in single_process:
+        torch.testing.assert_close(multiple_workers[name], single_process[name])
 
 
 def test_dataset_reuses_one_metadata_descriptor_when_opening_arrays(
@@ -225,6 +479,8 @@ def test_model_author_override_remaps_posts_and_preserves_pad_and_unk(tmp_path):
         max_history_len=2,
         seed=7,
         logger=None,
+        use_post_liker_feature=False,
+        max_post_liker_replay_events_per_post=None,
         post_author_idx_override_path=override_path,
         author_table_num_rows_override=5,
     )
@@ -252,6 +508,8 @@ def test_model_author_override_requires_path_and_table_size_together(tmp_path):
             max_history_len=2,
             seed=7,
             logger=None,
+            use_post_liker_feature=False,
+            max_post_liker_replay_events_per_post=None,
             post_author_idx_override_path=override_path,
         )
     with pytest.raises(ValueError, match="must be provided together"):
@@ -261,6 +519,8 @@ def test_model_author_override_requires_path_and_table_size_together(tmp_path):
             max_history_len=2,
             seed=7,
             logger=None,
+            use_post_liker_feature=False,
+            max_post_liker_replay_events_per_post=None,
             author_table_num_rows_override=5,
         )
 
@@ -295,6 +555,8 @@ def test_model_author_override_validates_shape_dtype_and_range(
             max_history_len=2,
             seed=7,
             logger=None,
+            use_post_liker_feature=False,
+            max_post_liker_replay_events_per_post=None,
             post_author_idx_override_path=override_path,
             author_table_num_rows_override=author_table_num_rows,
         )
@@ -367,6 +629,8 @@ def test_two_tower_collation_uses_all_hourly_negatives_and_skips_bst_features(
         additional_batch_negatives=None,
         seed=7,
         logger=None,
+        use_post_liker_feature=False,
+        max_post_liker_replay_events_per_post=None,
     )
     accessed_arrays = []
     original_array = dataset._array
@@ -421,6 +685,8 @@ def test_two_tower_tensor_loader_routes_to_canonical_collation(tmp_path):
         additional_batch_negatives=None,
         seed=7,
         logger=None,
+        use_post_liker_feature=False,
+        max_post_liker_replay_events_per_post=None,
     )
     loader = create_hydrated_data_loader(
         dataset,
@@ -464,6 +730,8 @@ def test_generic_negative_cap_preserves_seeded_epoch_resampling(tmp_path):
         additional_batch_negatives=1,
         seed=11,
         logger=None,
+        use_post_liker_feature=False,
+        max_post_liker_replay_events_per_post=None,
     )
     sampler = HydratedBucketedBatchSampler(
         dataset,
@@ -503,6 +771,8 @@ def test_dataset_rejects_both_generic_and_legacy_negative_caps(tmp_path):
             bst_additional_batch_negatives=1,
             seed=7,
             logger=None,
+            use_post_liker_feature=False,
+            max_post_liker_replay_events_per_post=None,
         )
 
 
@@ -537,6 +807,8 @@ def test_model_author_override_is_reopened_after_pickling(tmp_path):
         max_history_len=2,
         seed=7,
         logger=None,
+        use_post_liker_feature=False,
+        max_post_liker_replay_events_per_post=None,
         post_author_idx_override_path=override_path,
         author_table_num_rows_override=5,
     )
@@ -589,6 +861,8 @@ def test_model_author_override_closes_and_reopens_after_pid_change(
         max_history_len=2,
         seed=7,
         logger=None,
+        use_post_liker_feature=False,
+        max_post_liker_replay_events_per_post=None,
         post_author_idx_override_path=override_path,
         author_table_num_rows_override=5,
     )
@@ -813,6 +1087,8 @@ def test_empty_split_has_schema_correct_compact_index(tmp_path):
         bst_additional_batch_negatives=None,
         seed=7,
         logger=None,
+        use_post_liker_feature=False,
+        max_post_liker_replay_events_per_post=None,
     )
     sampler = HydratedBucketedBatchSampler(
         dataset,

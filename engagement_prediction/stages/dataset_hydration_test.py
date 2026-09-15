@@ -297,8 +297,10 @@ def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
         SimpleNamespace(
             embedding_model="all_MiniLM_L12_v2",
             embedding_source_batch_size=64,
-            embedding_partition_worker_count=2,
+            dataset_hydration_worker_count=2,
             min_author_training_feature_count=1,
+            min_post_liker_user_training_event_count=1,
+            max_post_liker_user_vocabulary_size=100,
             _argv=["--stop-after", "dataset_hydration"],
         ),
     )
@@ -324,9 +326,12 @@ def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
         {"author_did": "c", "author_idx": 4},
     ]
     summary = json.loads(Path(result["output_dir"], "summary.json").read_text())
-    assert summary["parameters"]["embedding_partition_worker_count"] == 2
+    assert summary["parameters"]["dataset_hydration_worker_count"] == 2
+    assert summary["embedding_sources"]["embedding_source_worker_count"] == 2
     assert summary["embeddings"]["embedding_partition_worker_count"] == 1
     assert summary["parameters"]["min_author_training_feature_count"] == 1
+    assert summary["parameters"]["min_post_liker_user_training_event_count"] == 1
+    assert summary["parameters"]["max_post_liker_user_vocabulary_size"] == 100
     assert summary["author_vocabulary"]["training_positive_count"] == 1
     assert summary["author_vocabulary"]["training_history_count"] == 1
     assert summary["author_vocabulary"]["training_negative_count"] == 1
@@ -345,6 +350,14 @@ def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
     loader_format = json.loads((loader_index_path / "format.json").read_text())
     assert loader_format["format_version"] == training_index.FORMAT_VERSION
     assert summary["loader_index"]["format_version"] == training_index.FORMAT_VERSION
+    assert loader_format["post_liker_event_count"] == 2
+    assert loader_format["post_liker_user_table_num_rows"] == 3
+    post_liker_vocabulary = scan_parquet_artifact(
+        Path(result["artifacts"]["post_liker_users_path"])
+    ).collect()
+    assert post_liker_vocabulary.to_dicts() == [
+        {"liker_did": "liker", "liker_idx": 2, "training_event_count": 2}
+    ]
     assert summary["loader_index"]["splits"]["train"] == {
         "query_count": 1,
         "history_count": 1,
@@ -406,8 +419,10 @@ def test_stage_failure_retains_partial_diagnostics_without_publishing(tmp_path, 
             SimpleNamespace(
                 embedding_model="all_MiniLM_L12_v2",
                 embedding_source_batch_size=64,
-                embedding_partition_worker_count=2,
+                dataset_hydration_worker_count=2,
                 min_author_training_feature_count=1,
+                min_post_liker_user_training_event_count=1,
+                max_post_liker_user_vocabulary_size=100,
                 _argv=["--stop-after", "dataset_hydration"],
             ),
         )
@@ -450,8 +465,10 @@ def test_loader_index_failure_keeps_outer_bundle_partial(tmp_path, monkeypatch):
             SimpleNamespace(
                 embedding_model="all_MiniLM_L12_v2",
                 embedding_source_batch_size=64,
-                embedding_partition_worker_count=2,
+                dataset_hydration_worker_count=2,
                 min_author_training_feature_count=1,
+                min_post_liker_user_training_event_count=1,
+                max_post_liker_user_vocabulary_size=100,
                 _argv=["--stop-after", "dataset_hydration"],
             ),
         )
@@ -492,8 +509,10 @@ def test_stage_rejects_obsolete_indexed_stage6_schema(tmp_path):
             SimpleNamespace(
                 embedding_model="all_MiniLM_L12_v2",
                 embedding_source_batch_size=64,
-                embedding_partition_worker_count=2,
+                dataset_hydration_worker_count=2,
                 min_author_training_feature_count=1,
+                min_post_liker_user_training_event_count=1,
+                max_post_liker_user_vocabulary_size=100,
                 _argv=["--stop-after", "dataset_hydration"],
             ),
         )

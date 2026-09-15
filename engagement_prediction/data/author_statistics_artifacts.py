@@ -27,13 +27,20 @@ from engagement_prediction.data.parquet import (
 )
 
 
-class AuthorStatisticsConfig(Protocol):
+class AuthorStatisticsConfigLike(Protocol):
     """Structural settings required by Stage 6 artifact helpers."""
 
-    support_start: datetime
-    support_end: datetime
-    partition_count: int
-    source_metadata_partition_count: int
+    @property
+    def support_start(self) -> datetime: ...
+
+    @property
+    def support_end(self) -> datetime: ...
+
+    @property
+    def partition_count(self) -> int: ...
+
+    @property
+    def source_metadata_partition_count(self) -> int: ...
 
 
 def _count_rows(lf: pl.LazyFrame) -> int:
@@ -62,7 +69,7 @@ def materialize_like_routes(
     *,
     like_paths: list[str],
     normalized_likes_path: Path,
-    config: AuthorStatisticsConfig,
+    config: AuthorStatisticsConfigLike,
     logger: logging.Logger,
 ) -> None:
     """Normalize the exact like snapshot and route rows to Stage 00 URI partitions."""
@@ -98,7 +105,7 @@ def process_uri_partitions(
     post_metadata_path: Path,
     normalized_likes_path: Path,
     per_post_shards_path: Path,
-    config: AuthorStatisticsConfig,
+    config: AuthorStatisticsConfigLike,
     logger: logging.Logger,
 ) -> dict[str, object]:
     """Filter canonical metadata and collapse raw likes to one row per post URI.
@@ -266,7 +273,7 @@ def process_author_partitions(
     *,
     per_post_by_author_path: Path,
     author_statistics_path: Path,
-    config: AuthorStatisticsConfig,
+    config: AuthorStatisticsConfigLike,
     logger: logging.Logger,
 ) -> dict[str, object]:
     """Aggregate and publish every author one stable hash partition at a time."""

@@ -10,6 +10,11 @@ from engagement_prediction.experiment_tracking import ModelPublicationTracker
 from engagement_prediction.training.model_artifacts import write_json_atomically
 
 
+POST_LIKER_USER_MAP_ARTIFACT_NAME = "post_liker_user_idx_mapping"
+POST_LIKER_USER_EMBEDDINGS_ARTIFACT_NAME = "post_liker_user_embeddings"
+POST_LIKER_STATE_CONFIG_ARTIFACT_NAME = "post_liker_state_config"
+
+
 def publish_ranker_to_tracker(
     *,
     tracker: ModelPublicationTracker,
@@ -17,12 +22,37 @@ def publish_ranker_to_tracker(
     torchscript_path: Path,
     author_map_path: Path,
     manifest_path: Path,
+    post_liker_feature_enabled: bool,
+    post_liker_user_map_path: Path | None,
+    post_liker_user_embeddings_path: Path | None,
+    post_liker_state_config_path: Path | None,
 ) -> Dict[str, Any]:
     """Best-effort publish a complete ranker serving set to the tracker.
 
     The serving manifest is a deployment marker. It is not created unless the
     registered model and its matching author vocabulary both reached ClearML.
     """
+
+    companion_paths = {
+        POST_LIKER_USER_MAP_ARTIFACT_NAME: post_liker_user_map_path,
+        POST_LIKER_USER_EMBEDDINGS_ARTIFACT_NAME: post_liker_user_embeddings_path,
+        POST_LIKER_STATE_CONFIG_ARTIFACT_NAME: post_liker_state_config_path,
+    }
+    if post_liker_feature_enabled:
+        missing_paths = [
+            name
+            for name, path in companion_paths.items()
+            if path is None or not Path(path).is_file()
+        ]
+        if missing_paths:
+            raise FileNotFoundError(
+                "Feature-enabled BST publication requires all local post-liker "
+                f"companions; missing={missing_paths}"
+            )
+    elif any(path is not None for path in companion_paths.values()):
+        raise ValueError(
+            "Feature-disabled BST publication must not receive post-liker companions"
+        )
 
     task_id = str(tracker.id or "")
     result: Dict[str, Any] = {
@@ -32,6 +62,10 @@ def publish_ranker_to_tracker(
         "ranker_uri": "",
         "model_registered": False,
         "author_map_uploaded": False,
+        "post_liker_feature_enabled": bool(post_liker_feature_enabled),
+        "post_liker_user_map_uploaded": False,
+        "post_liker_user_embeddings_uploaded": False,
+        "post_liker_state_config_uploaded": False,
         "manifest_created": False,
         "manifest_uploaded": False,
         "manifest_path": None,
@@ -39,7 +73,7 @@ def publish_ranker_to_tracker(
     }
     if not task_id:
         logger.info(
-            "Experiment tracker is disabled; keeping local ranker and author map only"
+            "Experiment tracker is disabled; keeping local BST serving files only"
         )
         return result
 
@@ -76,7 +110,44 @@ def publish_ranker_to_tracker(
         result["errors"].append(message)
         logger.warning(message, exc_info=True)
 
-    if not result["model_registered"] or not result["author_map_uploaded"]:
+    if post_liker_feature_enabled:
+        result_keys = {
+            POST_LIKER_USER_MAP_ARTIFACT_NAME: "post_liker_user_map_uploaded",
+            POST_LIKER_USER_EMBEDDINGS_ARTIFACT_NAME: (
+                "post_liker_user_embeddings_uploaded"
+            ),
+            POST_LIKER_STATE_CONFIG_ARTIFACT_NAME: (
+                "post_liker_state_config_uploaded"
+            ),
+        }
+        for artifact_name, path in companion_paths.items():
+            result_key = result_keys[artifact_name]
+            try:
+                result[result_key] = bool(
+                    tracker.log_file_artifact(artifact_name, Path(path))
+                )
+                if not result[result_key]:
+                    message = (
+                        f"ClearML did not upload the ranker {artifact_name} artifact"
+                    )
+                    result["errors"].append(message)
+                    logger.warning(message)
+            except Exception as exc:
+                message = f"ClearML ranker {artifact_name} upload failed: {exc}"
+                result["errors"].append(message)
+                logger.warning(message, exc_info=True)
+
+    required_uploads = [
+        result["model_registered"],
+        result["author_map_uploaded"],
+    ]
+    if post_liker_feature_enabled:
+        required_uploads.extend([
+            result["post_liker_user_map_uploaded"],
+            result["post_liker_user_embeddings_uploaded"],
+            result["post_liker_state_config_uploaded"],
+        ])
+    if not all(required_uploads):
         return result
 
     manifest = {
@@ -84,6 +155,20 @@ def publish_ranker_to_tracker(
         "ranker_uri": result["ranker_uri"],
         "clearml_task_id": task_id,
     }
+    if post_liker_feature_enabled:
+        manifest.update({
+            "ranker_contract_version": 2,
+            "post_liker_feature_enabled": True,
+            "post_liker_user_idx_mapping_artifact_name": (
+                POST_LIKER_USER_MAP_ARTIFACT_NAME
+            ),
+            "post_liker_user_embeddings_artifact_name": (
+                POST_LIKER_USER_EMBEDDINGS_ARTIFACT_NAME
+            ),
+            "post_liker_state_config_artifact_name": (
+                POST_LIKER_STATE_CONFIG_ARTIFACT_NAME
+            ),
+        })
     try:
         write_json_atomically(manifest_path, manifest)
         result["manifest_created"] = True

@@ -23,7 +23,7 @@ the intentional resident exceptions.
 from __future__ import annotations
 
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import multiprocessing
 from pathlib import Path
 import logging
@@ -38,6 +38,7 @@ from engagement_prediction.data import author_vocabulary
 from engagement_prediction.data import dataset_hydration
 from engagement_prediction.data import ingex
 from engagement_prediction.data import like_counts
+from engagement_prediction.data import post_liker_users
 from engagement_prediction.data import post_selection
 from engagement_prediction.data import user_history
 from engagement_prediction.data.author_indices import AUTHOR_UNK_IDX
@@ -159,19 +160,24 @@ def materialize_selected_embedding_rows(
     temporary_routes_root: Path,
     partition_count: int,
     source_batch_size: int,
+    worker_count: int,
     logger: logging.Logger,
 ) -> dict[str, int]:
-    """Route selected embedding payloads in one bounded pass per file batch.
+    """Route selected embedding payloads in bounded parallel file batches.
 
     The narrow selected-URI lookup is loaded once. Each source batch is then
     scanned once with its encoded payloads, semi-joined to those selected keys,
-    and streamed into URI partitions. This keeps memory bounded without the
+    and streamed into its own temporary URI partitions. A thread pool lets
+    independent scans overlap while sharing the immutable lookup instead of
+    copying it into worker processes. This keeps memory bounded without the
     prior discovery pass, which was ineffective when selected URIs appeared in
     almost every physical source file. Batch payload routes are deleted after
     their files are moved into the shared URI-partitioned output.
     """
     if source_batch_size <= 0:
         raise ValueError("embedding_source_batch_size must be positive")
+    if worker_count <= 0:
+        raise ValueError("dataset_hydration_worker_count must be positive")
     output_path.mkdir(parents=True, exist_ok=False)
     selected_keys_df = (
         scan_parquet_artifact(selected_metadata_path)
@@ -201,9 +207,7 @@ def materialize_selected_embedding_rows(
     del selected_keys_df
 
     total_source_files = len(post_paths) + len(reply_paths)
-    total_source_batches = 0
-    payload_source_files = 0
-    selected_rows = 0
+    batch_tasks: list[dict[str, Any]] = []
     for label, paths, is_reply in (
         ("root", post_paths, False),
         ("reply", reply_paths, True),
@@ -220,76 +224,128 @@ def materialize_selected_embedding_rows(
         for batch_index, batch_start in enumerate(
             range(0, len(paths), source_batch_size)
         ):
-            total_source_batches += 1
             batch_paths = paths[batch_start:batch_start + source_batch_size]
-            batch_name = f"{label}-batch-{batch_index:06d}"
-            logger.info(
-                "Filtering embedding %s batch %s/%s: files=%s",
-                label,
-                batch_index + 1,
-                batch_count,
-                len(batch_paths),
-            )
+            batch_tasks.append({
+                "label": label,
+                "batch_index": batch_index,
+                "batch_count": batch_count,
+                "batch_paths": batch_paths,
+                "is_reply": is_reply,
+                "source_keys_df": source_keys_df,
+                "posts_start": posts_start,
+                "posts_end": posts_end,
+                "output_path": output_path,
+                "temporary_routes_root": temporary_routes_root,
+                "partition_count": partition_count,
+                "logger": logger,
+            })
 
-            payload_routes_path = temporary_routes_root / f"{batch_name}-payloads"
-            # The semi-join is part of the same streaming plan as the payload
-            # scan and partition sink, so unselected payload rows are read but
-            # never materialized on disk or retained across batches.
-            selected_payloads_lf = (
-                dataset_hydration.normalize_embedding_source_rows(
-                    ingex.scan_parquet_files(batch_paths),
-                    posts_start=posts_start,
-                    posts_end=posts_end,
-                    is_reply=is_reply,
-                )
-                .join(source_keys_df.lazy(), on="subject_uri", how="semi")
-                .select(
-                    "subject_uri",
-                    "post_created_at",
-                    "author_did",
-                    "embeddings",
-                )
-                .with_columns(post_selection.post_partition_expr(partition_count))
-            )
-            sink_partitioned_parquet(
-                selected_payloads_lf,
-                output_path=payload_routes_path,
-                key="_post_partition",
-            )
-            batch_selected_rows = 0
-            for partition_id in range(partition_count):
-                payload_parts = _partition_paths(payload_routes_path, partition_id)
-                if not payload_parts:
-                    continue
-                partition_dir = output_path / f"partition-{partition_id:05d}"
-                partition_dir.mkdir(parents=True, exist_ok=True)
-                for part_index, payload_part in enumerate(payload_parts):
-                    batch_selected_rows += pq.read_metadata(payload_part).num_rows
-                    payload_part.replace(
-                        partition_dir
-                        / f"{batch_name}-{part_index:05d}.parquet"
-                    )
-            shutil.rmtree(payload_routes_path)
+    effective_worker_count = min(worker_count, len(batch_tasks))
+    logger.info(
+        "Filtering %s embedding source batches with %s worker threads",
+        len(batch_tasks),
+        effective_worker_count,
+    )
+    if effective_worker_count <= 1:
+        results = [
+            _filter_embedding_source_batch(**task)
+            for task in batch_tasks
+        ]
+    else:
+        with ThreadPoolExecutor(max_workers=effective_worker_count) as executor:
+            futures = [
+                executor.submit(_filter_embedding_source_batch, **task)
+                for task in batch_tasks
+            ]
+            results = [future.result() for future in as_completed(futures)]
 
-            payload_source_files += len(batch_paths)
-            selected_rows += batch_selected_rows
-            logger.info(
-                "Filtered embedding %s batch %s/%s in one pass: files=%s "
-                "selected_rows=%s selected_rows_so_far=%s",
-                label,
-                batch_index + 1,
-                batch_count,
-                len(batch_paths),
-                f"{batch_selected_rows:,}",
-                f"{selected_rows:,}",
-            )
+    payload_source_files = sum(result["source_file_count"] for result in results)
+    selected_rows = sum(result["selected_row_count"] for result in results)
     if temporary_routes_root.exists():
         temporary_routes_root.rmdir()
     return {
         "embedding_source_file_count": total_source_files,
-        "embedding_source_batch_count": total_source_batches,
+        "embedding_source_batch_count": len(batch_tasks),
+        "embedding_source_worker_count": effective_worker_count,
         "payload_embedding_source_file_count": payload_source_files,
         "selected_embedding_source_row_count": selected_rows,
+    }
+
+
+def _filter_embedding_source_batch(
+    *,
+    label: str,
+    batch_index: int,
+    batch_count: int,
+    batch_paths: list[str],
+    is_reply: bool,
+    source_keys_df: pl.DataFrame,
+    posts_start: Any,
+    posts_end: Any,
+    output_path: Path,
+    temporary_routes_root: Path,
+    partition_count: int,
+    logger: logging.Logger,
+) -> dict[str, int]:
+    """Filter and route one independent raw embedding source batch."""
+
+    batch_name = f"{label}-batch-{batch_index:06d}"
+    logger.info(
+        "Filtering embedding %s batch %s/%s: files=%s",
+        label,
+        batch_index + 1,
+        batch_count,
+        len(batch_paths),
+    )
+    payload_routes_path = temporary_routes_root / f"{batch_name}-payloads"
+    # The semi-join is part of the same streaming plan as the payload scan and
+    # partition sink, so unselected payload rows are read but never retained
+    # across batches or materialized outside this batch's temporary route.
+    selected_payloads_lf = (
+        dataset_hydration.normalize_embedding_source_rows(
+            ingex.scan_parquet_files(batch_paths),
+            posts_start=posts_start,
+            posts_end=posts_end,
+            is_reply=is_reply,
+        )
+        .join(source_keys_df.lazy(), on="subject_uri", how="semi")
+        .select(
+            "subject_uri",
+            "post_created_at",
+            "author_did",
+            "embeddings",
+        )
+        .with_columns(post_selection.post_partition_expr(partition_count))
+    )
+    sink_partitioned_parquet(
+        selected_payloads_lf,
+        output_path=payload_routes_path,
+        key="_post_partition",
+    )
+    selected_row_count = 0
+    for partition_id in range(partition_count):
+        payload_parts = _partition_paths(payload_routes_path, partition_id)
+        if not payload_parts:
+            continue
+        partition_dir = output_path / f"partition-{partition_id:05d}"
+        partition_dir.mkdir(parents=True, exist_ok=True)
+        for part_index, payload_part in enumerate(payload_parts):
+            selected_row_count += pq.read_metadata(payload_part).num_rows
+            payload_part.replace(
+                partition_dir / f"{batch_name}-{part_index:05d}.parquet"
+            )
+    shutil.rmtree(payload_routes_path)
+    logger.info(
+        "Filtered embedding %s batch %s/%s in one pass: files=%s selected_rows=%s",
+        label,
+        batch_index + 1,
+        batch_count,
+        len(batch_paths),
+        f"{selected_row_count:,}",
+    )
+    return {
+        "source_file_count": len(batch_paths),
+        "selected_row_count": selected_row_count,
     }
 
 
@@ -391,7 +447,7 @@ def write_embedding_shards(
     if partition_count <= 0:
         raise ValueError("partition_count must be positive")
     if worker_count <= 0:
-        raise ValueError("embedding_partition_worker_count must be positive")
+        raise ValueError("dataset_hydration_worker_count must be positive")
     valid_embedding_rows_path.mkdir(parents=True, exist_ok=False)
     embedding_shards_path.mkdir(parents=True, exist_ok=False)
     effective_worker_count = min(worker_count, partition_count)
@@ -803,12 +859,141 @@ def route_hydrated_usage_for_counts(
         )
 
 
+def materialize_post_liker_use_windows(
+    *,
+    queries_lf: pl.LazyFrame,
+    positive_routes_path: Path,
+    history_routes_path: Path,
+    negative_routes_path: Path,
+    output_path: Path,
+    partition_count: int,
+) -> dict[str, int]:
+    """Record the final training and all-split use horizon for each post.
+
+    Only queries retaining at least one hydrated positive are model-facing.
+    Their positive and history occurrences are keyed by the complete query;
+    shared negatives are keyed by query hour. A like event before a post's
+    maximum use hour is visible to at least one use, so these narrow windows
+    let the Stage 5 scan discard events that no model example can consume.
+    """
+
+    positive_parts = sorted(positive_routes_path.rglob("*.parquet"))
+    if not positive_parts:
+        raise ValueError("Cannot build post-liker use windows without surviving positives")
+    positive_lf = pl.scan_parquet(positive_parts)
+    surviving_keys_lf = positive_lf.select("did", "query_hour").unique()
+    retained_queries_df = (
+        queries_lf.join(
+            surviving_keys_lf,
+            on=["did", "query_hour"],
+            how="semi",
+        )
+        .select("did", "query_hour", "split")
+        .unique()
+        .collect(engine="streaming")
+    )
+    retained_hours_df = retained_queries_df.group_by("query_hour").agg(
+        (pl.col("split") == "train").any().alias("_is_training_use")
+    )
+
+    def query_usage(df: pl.DataFrame) -> pl.DataFrame:
+        return (
+            df.join(retained_queries_df, on=["did", "query_hour"], how="inner")
+            .select(
+                "subject_uri",
+                "emb_idx",
+                "query_hour",
+                (pl.col("split") == "train").alias("_is_training_use"),
+            )
+        )
+
+    output_path.mkdir(parents=True, exist_ok=False)
+    post_count = 0
+    training_post_count = 0
+    for partition_id in range(partition_count):
+        usage_frames = []
+        positive_df = read_parquet_parts(
+            _partition_paths(positive_routes_path, partition_id),
+            empty=pl.DataFrame(),
+        )
+        if not positive_df.is_empty():
+            usage_frames.append(query_usage(positive_df))
+        history_df = read_parquet_parts(
+            _partition_paths(history_routes_path, partition_id),
+            empty=pl.DataFrame(),
+        )
+        if not history_df.is_empty():
+            usage_frames.append(query_usage(history_df))
+        negative_df = read_parquet_parts(
+            _partition_paths(negative_routes_path, partition_id),
+            empty=pl.DataFrame(),
+        )
+        if not negative_df.is_empty():
+            usage_frames.append(
+                negative_df.join(retained_hours_df, on="query_hour", how="inner")
+                .select(
+                    "subject_uri",
+                    "emb_idx",
+                    "query_hour",
+                    "_is_training_use",
+                )
+            )
+        nonempty_usage_frames = [frame for frame in usage_frames if not frame.is_empty()]
+        if not nonempty_usage_frames:
+            continue
+        windows_df = (
+            pl.concat(nonempty_usage_frames, how="vertical")
+            .group_by("subject_uri")
+            .agg(
+                pl.col("emb_idx").first().cast(pl.UInt32),
+                pl.col("emb_idx").n_unique().alias("_embedding_index_count"),
+                pl.col("query_hour").max().alias("final_use_query_hour"),
+                pl.when(pl.col("_is_training_use"))
+                .then(pl.col("query_hour"))
+                .otherwise(None)
+                .max()
+                .alias("final_training_use_query_hour"),
+            )
+        )
+        conflicting_count = windows_df.filter(
+            pl.col("_embedding_index_count") != 1
+        ).height
+        if conflicting_count:
+            raise ValueError(
+                f"Post-liker use windows contain {conflicting_count} URIs with conflicting emb_idx values"
+            )
+        public_windows_df = windows_df.select(
+            post_liker_users.POST_LIKER_USE_WINDOW_COLUMNS
+        ).sort("subject_uri")
+        partition_path = output_path / f"_post_partition={partition_id}"
+        write_parquet_part_if_not_empty(
+            public_windows_df,
+            partition_path / "part-00000.parquet",
+        )
+        post_count += public_windows_df.height
+        training_post_count += int(
+            public_windows_df.get_column("final_training_use_query_hour")
+            .is_not_null()
+            .sum()
+        )
+    ensure_typed_parquet_dataset(
+        output_path,
+        post_liker_users.POST_LIKER_USE_WINDOW_SCHEMA,
+    )
+    return {
+        "post_count": post_count,
+        "training_post_count": training_post_count,
+    }
+
+
 def attach_prior_counts(
     *,
     positive_routes_path: Path,
     history_routes_path: Path,
     negative_routes_path: Path,
     post_liker_events_path: Path,
+    post_liker_use_windows_path: Path,
+    post_liker_feature_events_path: Path,
     counted_positives_path: Path,
     counted_histories_path: Path,
     counted_negatives_path: Path,
@@ -824,9 +1009,18 @@ def attach_prior_counts(
     are cross-checked against Stage 4 before its private column is discarded.
     """
 
-    for path in (counted_positives_path, counted_histories_path, counted_negatives_path):
+    for path in (
+        counted_positives_path,
+        counted_histories_path,
+        counted_negatives_path,
+        post_liker_feature_events_path,
+    ):
         path.mkdir(parents=True, exist_ok=False)
     pair_count = 0
+    raw_event_count = 0
+    deduplicated_event_count = 0
+    retained_feature_event_count = 0
+    training_visible_event_count = 0
     for partition_id in range(partition_count):
         relation_partitions = []
         for source_path, output_path, is_negative in (
@@ -855,10 +1049,47 @@ def attach_prior_counts(
                 "like_created_at": dataset_hydration.UTC_DATETIME,
             })
         )
+        raw_event_count += events_df.height
         # One cumulative row per event timestamp supports strict as-of lookups
         # for all uses in this partition via the shared join-asof algorithm.
         cumulative_likes_df = like_counts.build_cumulative_like_counts(events_df)
-        del events_df
+
+        window_parts = _partition_paths(post_liker_use_windows_path, partition_id)
+        windows_df = read_parquet_parts(
+            window_parts,
+            empty=post_liker_users.empty_frame(
+                post_liker_users.POST_LIKER_USE_WINDOW_SCHEMA
+            ),
+        )
+        deduplicated_events_df = events_df.unique(
+            ["subject_uri", "liker_did", "like_created_at"],
+            keep="first",
+        )
+        deduplicated_event_count += deduplicated_events_df.height
+        feature_events_df = (
+            deduplicated_events_df.join(windows_df, on="subject_uri", how="inner")
+            .filter(pl.col("like_created_at") < pl.col("final_use_query_hour"))
+            .with_columns(
+                (
+                    pl.col("final_training_use_query_hour").is_not_null()
+                    & (
+                        pl.col("like_created_at")
+                        < pl.col("final_training_use_query_hour")
+                    )
+                ).alias("is_training_visible")
+            )
+            .select(post_liker_users.POST_LIKER_FEATURE_EVENT_COLUMNS)
+            .sort("emb_idx", "like_created_at", "liker_did")
+        )
+        write_parquet_part_if_not_empty(
+            feature_events_df,
+            post_liker_feature_events_path / f"part-{partition_id:05d}.parquet",
+        )
+        retained_feature_event_count += feature_events_df.height
+        training_visible_event_count += int(
+            feature_events_df.get_column("is_training_visible").sum() or 0
+        )
+        del events_df, deduplicated_events_df, feature_events_df, windows_df
 
         pair_frames = []
         for parts, output_path, is_negative in relation_partitions:
@@ -897,7 +1128,205 @@ def attach_prior_counts(
             partition_count,
             f"{partition_pair_count:,}",
         )
-    return {"post_query_hour_pair_count": pair_count}
+    ensure_typed_parquet_dataset(
+        post_liker_feature_events_path,
+        post_liker_users.POST_LIKER_FEATURE_EVENT_SCHEMA,
+    )
+    return {
+        "post_query_hour_pair_count": pair_count,
+        "raw_post_liker_event_count": raw_event_count,
+        "deduplicated_post_liker_event_count": deduplicated_event_count,
+        "retained_post_liker_feature_event_count": retained_feature_event_count,
+        "training_visible_post_liker_event_count": training_visible_event_count,
+    }
+
+
+def _liker_support_partition_paths(path: Path, partition_id: int) -> list[Path]:
+    """Return training-visible events routed to one liker-DID partition."""
+
+    partition_dir = Path(path) / f"_liker_partition={partition_id}"
+    return sorted(partition_dir.rglob("*.parquet")) if partition_dir.exists() else []
+
+
+def build_post_liker_user_vocabulary(
+    *,
+    feature_events_path: Path,
+    support_routes_path: Path,
+    support_shards_path: Path,
+    vocabulary_path: Path,
+    min_training_event_count: int,
+    max_vocabulary_size: int,
+    partition_count: int,
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    """Build a bounded vocabulary from exact events visible to train uses."""
+
+    if min_training_event_count < 1:
+        raise ValueError("min_post_liker_user_training_event_count must be at least 1")
+    if max_vocabulary_size < 0:
+        raise ValueError("max_post_liker_user_vocabulary_size may not be negative")
+    event_parts = sorted(feature_events_path.glob("*.parquet"))
+    events_lf = (
+        pl.scan_parquet(event_parts)
+        if event_parts
+        else post_liker_users.empty_frame(
+            post_liker_users.POST_LIKER_FEATURE_EVENT_SCHEMA
+        ).lazy()
+    )
+    training_events_lf = events_lf.filter(pl.col("is_training_visible")).select(
+        "liker_did"
+    )
+    sink_partitioned_parquet(
+        training_events_lf.with_columns(
+            post_liker_users.support_partition_expr(partition_count)
+        ),
+        output_path=support_routes_path,
+        key="_liker_partition",
+    )
+
+    support_shards_path.mkdir(parents=True, exist_ok=False)
+    pre_threshold_user_count = 0
+    threshold_eligible_user_count = 0
+    training_event_count = 0
+    for partition_id in range(partition_count):
+        rows_df = read_parquet_parts(
+            _liker_support_partition_paths(support_routes_path, partition_id),
+            empty=pl.DataFrame(schema={"liker_did": pl.String}),
+        )
+        support_df = (
+            rows_df.group_by("liker_did")
+            .len(name="training_event_count")
+            .with_columns(pl.col("training_event_count").cast(pl.UInt64))
+            .sort("liker_did")
+        )
+        eligible_df = support_df.filter(
+            pl.col("training_event_count") >= min_training_event_count
+        )
+        write_parquet_part_if_not_empty(
+            eligible_df,
+            support_shards_path / f"part-{partition_id:05d}.parquet",
+        )
+        pre_threshold_user_count += support_df.height
+        threshold_eligible_user_count += eligible_df.height
+        training_event_count += int(support_df.get_column("training_event_count").sum() or 0)
+        logger.info(
+            "Aggregated post-liker user support partition %s/%s: users=%s eligible=%s",
+            partition_id + 1,
+            partition_count,
+            f"{support_df.height:,}",
+            f"{eligible_df.height:,}",
+        )
+
+    vocabulary_path.mkdir(parents=True, exist_ok=False)
+    vocabulary_part_path = vocabulary_path / "part-00000.parquet"
+    support_parts = sorted(support_shards_path.glob("*.parquet"))
+    if support_parts and max_vocabulary_size:
+        selected_support_path = support_shards_path.parent / "selected_liker_support.parquet"
+        (
+            pl.scan_parquet(support_parts)
+            .sort(
+                ["training_event_count", "liker_did"],
+                descending=[True, False],
+            )
+            .head(max_vocabulary_size)
+            .sink_parquet(
+                selected_support_path,
+                compression="zstd",
+                maintain_order=True,
+                engine="streaming",
+            )
+        )
+        post_liker_users.add_liker_indices(
+            pl.scan_parquet(selected_support_path)
+        ).sink_parquet(
+            vocabulary_part_path,
+            compression="zstd",
+            maintain_order=True,
+            engine="streaming",
+        )
+    else:
+        post_liker_users.empty_frame(
+            post_liker_users.POST_LIKER_USER_VOCABULARY_SCHEMA
+        ).write_parquet(vocabulary_part_path, compression="zstd")
+    validation = post_liker_users.validate_post_liker_user_vocabulary(
+        pl.scan_parquet(vocabulary_part_path),
+        min_training_event_count=min_training_event_count,
+        max_vocabulary_size=max_vocabulary_size,
+    )
+    return {
+        **validation,
+        "pre_threshold_user_count": pre_threshold_user_count,
+        "threshold_eligible_user_count": threshold_eligible_user_count,
+        "excluded_below_threshold_user_count": (
+            pre_threshold_user_count - threshold_eligible_user_count
+        ),
+        "excluded_by_cap_user_count": (
+            threshold_eligible_user_count - validation["user_count"]
+        ),
+        "all_training_event_count": training_event_count,
+        "known_training_event_count": validation["training_event_count"],
+        "unk_training_event_count": (
+            training_event_count - validation["training_event_count"]
+        ),
+    }
+
+
+def attach_post_liker_user_indices(
+    *,
+    feature_events_path: Path,
+    vocabulary_path: Path,
+    indexed_events_path: Path,
+    partition_count: int,
+) -> dict[str, int]:
+    """Map retained raw DIDs to known indices or the shared UNK row."""
+
+    vocabulary_df = scan_parquet_artifact(vocabulary_path).collect(engine="streaming")
+    indexed_events_path.mkdir(parents=True, exist_ok=False)
+    event_count = 0
+    unknown_event_count = 0
+    post_count = 0
+    for partition_id in range(partition_count):
+        parts = _public_part(feature_events_path, partition_id)
+        if not parts:
+            continue
+        events_df = pl.read_parquet(parts)
+        indexed_df = (
+            events_df.join(
+                vocabulary_df.select("liker_did", "liker_idx"),
+                on="liker_did",
+                how="left",
+            )
+            .with_columns(
+                pl.col("liker_idx")
+                .fill_null(post_liker_users.POST_LIKER_USER_UNK_IDX)
+                .cast(pl.UInt32)
+            )
+            # Raw DID is the stable final tie-breaker before it is omitted from
+            # the compact loader relation. Distinct OOV users at the same time
+            # therefore remain distinct, deterministic UNK events.
+            .sort("emb_idx", "like_created_at", "liker_did")
+            .select(post_liker_users.INDEXED_POST_LIKER_EVENT_COLUMNS)
+        )
+        write_parquet_part_if_not_empty(
+            indexed_df,
+            indexed_events_path / f"part-{partition_id:05d}.parquet",
+        )
+        event_count += indexed_df.height
+        unknown_event_count += int(
+            (indexed_df.get_column("liker_idx") == post_liker_users.POST_LIKER_USER_UNK_IDX)
+            .sum()
+        )
+        post_count += indexed_df.get_column("emb_idx").n_unique()
+    ensure_typed_parquet_dataset(
+        indexed_events_path,
+        post_liker_users.INDEXED_POST_LIKER_EVENT_SCHEMA,
+    )
+    return {
+        "event_count": event_count,
+        "unknown_event_count": unknown_event_count,
+        "known_event_count": event_count - unknown_event_count,
+        "post_count": post_count,
+    }
 
 
 def _author_support_distribution(df: pl.DataFrame) -> dict[str, int]:

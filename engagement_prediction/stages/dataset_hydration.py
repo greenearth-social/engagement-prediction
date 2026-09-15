@@ -28,6 +28,7 @@ from engagement_prediction.data import author_vocabulary
 from engagement_prediction.data import dataset_hydration as dataset_data
 from engagement_prediction.data import dataset_hydration_artifacts
 from engagement_prediction.data import ingex
+from engagement_prediction.data import post_liker_users
 from engagement_prediction.data import source_manifests
 from engagement_prediction.data import training_index
 from engagement_prediction.data.embeddings import get_embedding_dim_for_known_model
@@ -133,16 +134,28 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     embedding_model = str(args.embedding_model)
     embedding_dim = get_embedding_dim_for_known_model(embedding_model)
     embedding_source_batch_size = int(args.embedding_source_batch_size)
-    embedding_partition_worker_count = int(args.embedding_partition_worker_count)
+    dataset_hydration_worker_count = int(args.dataset_hydration_worker_count)
     min_author_training_feature_count = int(args.min_author_training_feature_count)
+    min_post_liker_user_training_event_count = int(
+        args.min_post_liker_user_training_event_count
+    )
+    max_post_liker_user_vocabulary_size = int(
+        args.max_post_liker_user_vocabulary_size
+    )
     if embedding_source_batch_size <= 0:
         raise ValueError("embedding_source_batch_size must be positive")
-    if embedding_partition_worker_count <= 0:
-        raise ValueError("embedding_partition_worker_count must be positive")
+    if dataset_hydration_worker_count <= 0:
+        raise ValueError("dataset_hydration_worker_count must be positive")
     if min_author_training_feature_count < 1:
         raise ValueError("min_author_training_feature_count must be at least 1")
+    if min_post_liker_user_training_event_count < 1:
+        raise ValueError(
+            "min_post_liker_user_training_event_count must be at least 1"
+        )
+    if max_post_liker_user_vocabulary_size < 0:
+        raise ValueError("max_post_liker_user_vocabulary_size may not be negative")
 
-    logger.info("Phase 1/10: resolving and validating Stage 00-6 lineage")
+    logger.info("Phase 1/11: resolving and validating Stage 00-6 lineage")
     lineage = resolve_recorded_stage_lineage(
         context,
         terminal_stage_folder="06_author_statistics",
@@ -193,7 +206,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "Starting dataset hydration: source_window=[%s, %s) model=%s dim=%s "
         "post_partitions=%s liker_partitions=%s user_partitions=%s "
         "author_partitions=%s embedding_source_batch_size=%s "
-        "embedding_partition_worker_count=%s min_author_training_feature_count=%s",
+        "dataset_hydration_worker_count=%s min_author_training_feature_count=%s "
+        "min_post_liker_user_training_event_count=%s "
+        "max_post_liker_user_vocabulary_size=%s",
         source_start.isoformat(),
         source_end.isoformat(),
         embedding_model,
@@ -203,8 +218,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         stage2_partition_count,
         author_partition_count,
         embedding_source_batch_size,
-        embedding_partition_worker_count,
+        dataset_hydration_worker_count,
         min_author_training_feature_count,
+        min_post_liker_user_training_event_count,
+        max_post_liker_user_vocabulary_size,
     )
 
     # Stage 3 owns canonical selected-post metadata; Stage 4 owns the final
@@ -259,6 +276,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "query_histories": dataset_data.QUERY_HISTORY_SCHEMA,
             "hourly_negative_candidates": dataset_data.HOURLY_NEGATIVE_SCHEMA,
             "authors": author_vocabulary.AUTHOR_VOCABULARY_SCHEMA,
+            "post_liker_users": post_liker_users.POST_LIKER_USER_VOCABULARY_SCHEMA,
         },
     )
     bundle_path = publication.final_path
@@ -269,6 +287,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     histories_path = publication.public_path("query_histories")
     negatives_path = publication.public_path("hourly_negative_candidates")
     authors_path = publication.public_path("authors")
+    post_liker_users_path = publication.public_path("post_liker_users")
     loader_index_path = publication.public_path("loader_index")
     copied_manifests = []
     for prefix, manifest in (
@@ -299,7 +318,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # Stage 5 defines the exact selected URI universe and role flags; Stage 3
     # supplies authoritative creation, author, and root/reply metadata.
-    logger.info("Phase 2/10: preparing Stage 5 selected-post metadata")
+    logger.info("Phase 2/11: preparing Stage 5 selected-post metadata")
     dataset_hydration_artifacts.route_selected_posts(
         post_liker_posts_path=post_liker_posts_path,
         output_path=selected_routes_path,
@@ -317,7 +336,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # multi-file batches. Full selected metadata remains partitioned for the
     # URI-aligned memmap publication in Phase 4.
     logger.info(
-        "Phase 3/10: bounded one-pass filtering of exact root/reply snapshots "
+        "Phase 3/11: bounded one-pass filtering of exact root/reply snapshots "
         "to selected embedding rows"
     )
     source_stats = dataset_hydration_artifacts.materialize_selected_embedding_rows(
@@ -330,6 +349,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         temporary_routes_root=source_scan_staging_path,
         partition_count=stage3_partition_count,
         source_batch_size=embedding_source_batch_size,
+        worker_count=dataset_hydration_worker_count,
         logger=logger,
     )
 
@@ -337,7 +357,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     # partition and write NumPy shards. Partition-order concatenation keeps
     # emb_idx dense and aligned with the public posts rows regardless of worker
     # completion order.
-    logger.info("Phase 4/10: selecting vectors and publishing the exact memmap/post index")
+    logger.info("Phase 4/11: selecting vectors and publishing the exact memmap/post index")
     embedding_stats = dataset_hydration_artifacts.write_embedding_shards(
         selected_embedding_rows_path=selected_embedding_rows_path,
         valid_embedding_rows_path=valid_embedding_rows_path,
@@ -345,7 +365,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         embedding_model=embedding_model,
         embedding_dim=embedding_dim,
         partition_count=stage3_partition_count,
-        worker_count=embedding_partition_worker_count,
+        worker_count=dataset_hydration_worker_count,
         logger=logger,
     )
     # From this point onward the selected payload Parquet is redundant: every
@@ -367,7 +387,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # Missing embeddings remove individual uses without replacement. Queries
     # are dropped later only if every positive use disappeared.
-    logger.info("Phase 5/10: filtering positive, history, and negative uses by hydrated posts")
+    logger.info("Phase 5/11: filtering positive, history, and negative uses by hydrated posts")
     positive_routes_path = staging_root / "positive_routes"
     history_routes_path = staging_root / "history_routes"
     negative_routes_path = staging_root / "negative_routes"
@@ -396,7 +416,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # Stage 5 events are the source of truth for all roles. Recomputing counts
     # here gives one strict as-of contract and checks Stage 4 negative counts.
-    logger.info("Phase 6/10: calculating strict as-of like counts from Stage 5 events")
+    logger.info(
+        "Phase 6/11: calculating strict as-of counts and retaining model-facing liker events"
+    )
     liker_positive_routes = staging_root / "liker_positive_routes"
     liker_history_routes = staging_root / "liker_history_routes"
     liker_negative_routes = staging_root / "liker_negative_routes"
@@ -405,14 +427,28 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         output_paths=(liker_positive_routes, liker_history_routes, liker_negative_routes),
         partition_count=stage5_partition_count,
     )
+    post_liker_use_windows_path = staging_root / "post_liker_use_windows"
+    post_liker_use_window_stats = (
+        dataset_hydration_artifacts.materialize_post_liker_use_windows(
+            queries_lf=queries_lf,
+            positive_routes_path=liker_positive_routes,
+            history_routes_path=liker_history_routes,
+            negative_routes_path=liker_negative_routes,
+            output_path=post_liker_use_windows_path,
+            partition_count=stage5_partition_count,
+        )
+    )
     counted_positives_path = staging_root / "counted_positives"
     counted_histories_path = staging_root / "counted_histories"
     counted_negatives_path = staging_root / "counted_negatives"
+    post_liker_feature_events_path = staging_root / "post_liker_feature_events"
     count_stats = dataset_hydration_artifacts.attach_prior_counts(
         positive_routes_path=liker_positive_routes,
         history_routes_path=liker_history_routes,
         negative_routes_path=liker_negative_routes,
         post_liker_events_path=post_liker_events_path,
+        post_liker_use_windows_path=post_liker_use_windows_path,
+        post_liker_feature_events_path=post_liker_feature_events_path,
         counted_positives_path=counted_positives_path,
         counted_histories_path=counted_histories_path,
         counted_negatives_path=counted_negatives_path,
@@ -421,7 +457,34 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     )
 
     logger.info(
-        "Phase 7/10: building the training-exposure author vocabulary and applying indices"
+        "Phase 7/11: building the training-only liker vocabulary and indexing events"
+    )
+    post_liker_support_routes_path = staging_root / "post_liker_support_routes"
+    post_liker_support_shards_path = staging_root / "post_liker_support_shards"
+    post_liker_vocabulary_stats = (
+        dataset_hydration_artifacts.build_post_liker_user_vocabulary(
+            feature_events_path=post_liker_feature_events_path,
+            support_routes_path=post_liker_support_routes_path,
+            support_shards_path=post_liker_support_shards_path,
+            vocabulary_path=post_liker_users_path,
+            min_training_event_count=min_post_liker_user_training_event_count,
+            max_vocabulary_size=max_post_liker_user_vocabulary_size,
+            partition_count=author_partition_count,
+            logger=logger,
+        )
+    )
+    indexed_post_liker_events_path = staging_root / "indexed_post_liker_events"
+    indexed_post_liker_event_stats = (
+        dataset_hydration_artifacts.attach_post_liker_user_indices(
+            feature_events_path=post_liker_feature_events_path,
+            vocabulary_path=post_liker_users_path,
+            indexed_events_path=indexed_post_liker_events_path,
+            partition_count=stage5_partition_count,
+        )
+    )
+
+    logger.info(
+        "Phase 8/11: building the training-exposure author vocabulary and applying indices"
     )
     author_exposure_routes_path = staging_root / "author_exposure_routes"
     eligible_author_shards_path = staging_root / "eligible_author_shards"
@@ -465,7 +528,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # Histories were relationalized for filtering. Rebuild their lists using
     # explicit original positions so all feature arrays remain aligned.
-    logger.info("Phase 8/10: rebuilding aligned public query artifacts")
+    logger.info("Phase 9/11: rebuilding aligned public query artifacts")
     query_stats = dataset_hydration_artifacts.publish_query_artifacts(
         queries_lf=queries_lf,
         counted_positives_path=indexed_positives_path,
@@ -490,7 +553,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         )
     )
 
-    logger.info("Phase 9/10: validating the canonical Parquet and memmap artifacts")
+    logger.info("Phase 10/11: validating the canonical Parquet and memmap artifacts")
     validation_stats = dataset_hydration_artifacts.validate_public_bundle(
         embeddings_path=embeddings_path,
         posts_path=posts_path,
@@ -503,7 +566,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         embedding_dim=embedding_dim,
     )
     logger.info(
-        "Phase 10/10: building the compact loader index and atomically publishing the bundle"
+        "Phase 11/11: building the compact loader index and atomically publishing the bundle"
     )
     loader_index_stats = training_index.build_loader_index(
         posts_path=posts_path,
@@ -513,6 +576,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         hourly_negative_candidates_path=negatives_path,
         embeddings_path=embeddings_path,
         authors_path=authors_path,
+        indexed_post_liker_events_path=indexed_post_liker_events_path,
+        post_liker_users_path=post_liker_users_path,
         output_path=loader_index_path,
         logger=logger,
     )
@@ -522,8 +587,14 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "embedding_model": embedding_model,
             "embedding_dim": embedding_dim,
             "embedding_source_batch_size": embedding_source_batch_size,
-            "embedding_partition_worker_count": embedding_partition_worker_count,
+            "dataset_hydration_worker_count": dataset_hydration_worker_count,
             "min_author_training_feature_count": min_author_training_feature_count,
+            "min_post_liker_user_training_event_count": (
+                min_post_liker_user_training_event_count
+            ),
+            "max_post_liker_user_vocabulary_size": (
+                max_post_liker_user_vocabulary_size
+            ),
             "source_metadata_partition_count": stage3_partition_count,
             "post_liker_history_partition_count": stage5_partition_count,
             "user_history_partition_count": stage2_partition_count,
@@ -546,6 +617,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "posts": post_stats,
         "usage": usage_stats,
         "popularity": count_stats,
+        "post_liker_use_windows": post_liker_use_window_stats,
+        "post_liker_user_vocabulary": post_liker_vocabulary_stats,
+        "indexed_post_liker_events": indexed_post_liker_event_stats,
         "author_vocabulary": vocabulary_stats,
         "author_mapping": author_mapping_stats,
         "author_index_usage_by_split": author_usage_by_split,
@@ -565,6 +639,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "query_histories_path": str(Path(bundle_path.name) / "query_histories"),
             "hourly_negative_candidates_path": str(Path(bundle_path.name) / "hourly_negative_candidates"),
             "authors_path": str(Path(bundle_path.name) / "authors"),
+            "post_liker_users_path": str(
+                Path(bundle_path.name) / "post_liker_users"
+            ),
             "loader_index_path": str(Path(bundle_path.name) / "loader_index"),
             **{
                 name: str(Path(bundle_path.name) / path.name)
@@ -579,12 +656,21 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             f"embedding_model: {embedding_model}",
             f"embedding_dim: {embedding_dim}",
             f"embedding_source_batch_size: {embedding_source_batch_size}",
-            f"embedding_partition_worker_count: {embedding_partition_worker_count}",
+            f"dataset_hydration_worker_count: {dataset_hydration_worker_count}",
+            "effective_embedding_source_worker_count: "
+            f"{source_stats['embedding_source_worker_count']}",
             f"effective_embedding_partition_worker_count: {embedding_stats['embedding_partition_worker_count']}",
             f"min_author_training_feature_count: {min_author_training_feature_count}",
+            "min_post_liker_user_training_event_count: "
+            f"{min_post_liker_user_training_event_count}",
+            "max_post_liker_user_vocabulary_size: "
+            f"{max_post_liker_user_vocabulary_size}",
             f"hydrated_post_count: {post_stats['hydrated_post_count']}",
             f"author_vocabulary_count: {vocabulary_stats['eligible_author_count']}",
             f"author_table_num_rows: {vocabulary_stats['public_validation']['author_table_num_rows']}",
+            f"post_liker_user_vocabulary_count: {post_liker_vocabulary_stats['user_count']}",
+            f"post_liker_user_table_num_rows: {post_liker_vocabulary_stats['user_table_num_rows']}",
+            f"retained_post_liker_event_count: {indexed_post_liker_event_stats['event_count']}",
             f"retained_query_count: {query_stats['retained_query_count']}",
             f"retained_positive_count: {query_stats['retained_positive_count']}",
             f"retained_history_item_count: {query_stats['retained_history_item_count']}",
@@ -600,6 +686,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "query_histories_path: query_histories",
             "hourly_negative_candidates_path: hourly_negative_candidates",
             "authors_path: authors",
+            "post_liker_users_path: post_liker_users",
             "loader_index_path: loader_index",
             *[
                 f"{name}: {path.name}"
@@ -613,7 +700,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         stage_info=stage_info,
     )
     logger.info(
-        "Dataset hydration completed in %.2fs: posts=%s queries=%s positives=%s histories=%s negatives=%s authors=%s loader_index_bytes=%s",
+        "Dataset hydration completed in %.2fs: posts=%s queries=%s positives=%s histories=%s negatives=%s authors=%s liker_users=%s liker_events=%s loader_index_bytes=%s",
         runtime_seconds,
         f"{post_stats['hydrated_post_count']:,}",
         f"{query_stats['retained_query_count']:,}",
@@ -621,6 +708,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"{query_stats['retained_history_item_count']:,}",
         f"{negative_stats['retained_negative_count']:,}",
         f"{vocabulary_stats['eligible_author_count']:,}",
+        f"{post_liker_vocabulary_stats['user_count']:,}",
+        f"{indexed_post_liker_event_stats['event_count']:,}",
         f"{loader_index_stats['total_bytes']:,}",
     )
     return {
@@ -634,6 +723,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "query_histories_path": str(bundle_path / "query_histories"),
             "hourly_negative_candidates_path": str(bundle_path / "hourly_negative_candidates"),
             "authors_path": str(bundle_path / "authors"),
+            "post_liker_users_path": str(bundle_path / "post_liker_users"),
             "loader_index_path": str(bundle_path / "loader_index"),
             **{
                 name: str(path)

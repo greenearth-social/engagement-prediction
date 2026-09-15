@@ -105,6 +105,8 @@ def _create_dataset(
         split=split,
         max_history_len=max_history_len,
         additional_batch_negatives=None,
+        use_post_liker_feature=False,
+        max_post_liker_replay_events_per_post=None,
         seed=random_seed,
         logger=logger,
     )

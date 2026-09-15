@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import numpy as np
+import polars as pl
 import pytest
 import torch
 
@@ -11,11 +14,16 @@ from engagement_prediction.models.bst_ranker import BSTRanker
 from engagement_prediction.training import bst_export
 from engagement_prediction.training.bst_export import (
     export_bst_ranker_checkpoint,
+    export_post_liker_serving_artifacts,
     validate_bst_ranker_export,
 )
 
 
-def _model_config(*, use_popularity_feature: bool) -> dict:
+def _model_config(
+    *,
+    use_popularity_feature: bool,
+    use_post_liker_feature: bool = False,
+) -> dict:
     return {
         "model_type": "bst-ranker",
         "embedding_model": "fixture",
@@ -42,6 +50,12 @@ def _model_config(*, use_popularity_feature: bool) -> dict:
             "popularity_projection_dim": 2,
             "popularity_log_mean": 1.25 if use_popularity_feature else 0.0,
             "popularity_log_std": 2.5 if use_popularity_feature else 1.0,
+            "use_post_liker_feature": use_post_liker_feature,
+            "post_liker_user_table_num_rows": 4 if use_post_liker_feature else 2,
+            "post_liker_user_embedding_dim": 3,
+            "post_liker_projection_dim": 2,
+            "post_liker_pooling_tau_hours": 24.0,
+            "post_liker_user_unknown_dropout_rate": 0.0,
         },
     }
 
@@ -63,9 +77,11 @@ def _write_checkpoint(
     use_popularity_feature: bool,
     model_config: dict | None = None,
     state_dict: dict | None = None,
+    use_post_liker_feature: bool = False,
 ) -> tuple[dict, dict]:
     model_config = model_config or _model_config(
-        use_popularity_feature=use_popularity_feature
+        use_popularity_feature=use_popularity_feature,
+        use_post_liker_feature=use_post_liker_feature,
     )
     popularity_stats = _popularity_stats(
         use_popularity_feature=use_popularity_feature
@@ -256,3 +272,84 @@ def test_validator_detects_checkpoint_weights_changed_after_export(tmp_path):
             expected_model_config=model_config,
             expected_popularity_stats=popularity_stats,
         )
+
+
+def test_feature_enabled_export_validates_events_vectors_lookup_and_companions(
+    tmp_path,
+):
+    checkpoint_path = tmp_path / "bst_ranker_best.pth"
+    output_path = tmp_path / "ranker.pt"
+    model_config, popularity_stats = _write_checkpoint(
+        checkpoint_path,
+        use_popularity_feature=True,
+        use_post_liker_feature=True,
+    )
+
+    export = export_bst_ranker_checkpoint(
+        checkpoint_path=checkpoint_path,
+        output_path=output_path,
+        expected_model_config=model_config,
+        expected_popularity_stats=popularity_stats,
+    )
+
+    assert export["parity"]["case_count"] == 4
+    assert export["parity"]["all_exact"] is True
+    assert export["parity"]["post_liker_lookup"] == {
+        "row_count": 3,
+        "exact_match": True,
+        "finite": True,
+    }
+    assert all(
+        case["event_and_prepooled_exact_match"]
+        for case in export["parity"]["cases"]
+    )
+
+    vocabulary_path = tmp_path / "post_liker_users"
+    vocabulary_path.mkdir()
+    pl.DataFrame({
+        "liker_did": ["did:plc:a", "did:plc:z"],
+        "liker_idx": pl.Series([2, 3], dtype=pl.UInt32),
+        "training_event_count": pl.Series([9, 3], dtype=pl.UInt64),
+    }).write_parquet(vocabulary_path / "part-00000.parquet")
+    user_map_path = tmp_path / "ranker_liker_user_idx.parquet"
+    embeddings_path = tmp_path / "ranker_liker_user_embeddings.npy"
+    state_config_path = tmp_path / "post_liker_state_config.json"
+
+    companions = export_post_liker_serving_artifacts(
+        checkpoint_path=checkpoint_path,
+        scripted_model_path=output_path,
+        expected_model_config=model_config,
+        expected_popularity_stats=popularity_stats,
+        vocabulary_path=vocabulary_path,
+        user_map_output_path=user_map_path,
+        embeddings_output_path=embeddings_path,
+        state_config_output_path=state_config_path,
+        max_replay_events_per_post=128,
+    )
+
+    assert companions["best_epoch"] == 3
+    assert companions["embeddings_shape"] == [4, 3]
+    assert companions["checkpoint_script_lookup_exact_match"] is True
+    assert pl.read_parquet(user_map_path).to_dict(as_series=False) == {
+        "liker_did": ["did:plc:a", "did:plc:z"],
+        "liker_idx": [2, 3],
+    }
+    table = np.load(embeddings_path, allow_pickle=False)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    expected_table = checkpoint["model_state_dict"][
+        "post_liker_user_pooler.user_embedding.weight"
+    ].numpy()
+    assert np.array_equal(table, expected_table)
+    state_config = json.loads(state_config_path.read_text())
+    assert state_config["ranker_contract_version"] == 2
+    assert state_config["post_liker_feature_enabled"] is True
+    assert state_config["post_liker_user_pad_idx"] == 0
+    assert state_config["post_liker_user_unk_idx"] == 1
+    assert state_config["post_liker_pooling_tau_hours"] == 24.0
+    assert state_config["max_post_liker_replay_events_per_post"] == 128
+    assert state_config["incremental_state"]["stored_fields"] == [
+        "pooled_embedding_mean",
+        "decayed_weight",
+        "reference_timestamp",
+        "liker_embedding_model_version",
+    ]

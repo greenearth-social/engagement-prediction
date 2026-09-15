@@ -35,7 +35,8 @@ from engagement_prediction.data.parquet import (
 )
 
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
+SUPPORTED_FORMAT_VERSIONS = (1, 2)
 SPLITS = (
     "train",
     "val",
@@ -52,6 +53,13 @@ EMBEDDING_DTYPE = np.dtype("<f4")
 ARROW_BATCH_SIZE = 65_536
 
 GLOBAL_ARRAY_DTYPES = {
+    "post_created_at_us": TIMESTAMP_DTYPE,
+    "post_author_idx": INDEX_DTYPE,
+    "post_liker_offsets": OFFSET_DTYPE,
+    "post_liker_user_indices": INDEX_DTYPE,
+    "post_liker_created_at_us": TIMESTAMP_DTYPE,
+}
+V1_GLOBAL_ARRAY_DTYPES = {
     "post_created_at_us": TIMESTAMP_DTYPE,
     "post_author_idx": INDEX_DTYPE,
 }
@@ -386,10 +394,10 @@ def load_loader_index_metadata(index_path: Path) -> dict[str, Any]:
     except (json.JSONDecodeError, OSError) as exc:
         raise ValueError(f"Could not read Stage 7 loader-index metadata: {metadata_path}") from exc
     version = metadata.get("format_version")
-    if version != FORMAT_VERSION:
+    if version not in SUPPORTED_FORMAT_VERSIONS:
         raise ValueError(
-            f"Unsupported Stage 7 loader-index format {version!r}; expected "
-            f"{FORMAT_VERSION}. Regenerate Stage 7."
+            f"Unsupported Stage 7 loader-index format {version!r}; supported versions are "
+            f"{SUPPORTED_FORMAT_VERSIONS}. Regenerate Stage 7."
         )
     return metadata
 
@@ -507,6 +515,124 @@ def _write_global_post_index(
         )
     }
     return arrays, arrow_tables
+
+
+def _write_global_post_liker_index(
+    *,
+    root: Path,
+    event_parts: Sequence[Path],
+    embedding_count: int,
+    user_table_num_rows: int,
+) -> tuple[dict[str, Any], int, int]:
+    """Write one timestamp-sorted ragged liker-event segment per ``emb_idx``.
+
+    Stage 7's indexed event parts are bounded URI partitions. This writer makes
+    one counting pass for exact allocation and one filling pass, scattering
+    each partition directly into the dense embedding-index address space.
+    """
+
+    event_lengths = np.zeros(embedding_count, dtype=OFFSET_DTYPE)
+    for event_part in event_parts:
+        emb_indices = pl.read_parquet(event_part, columns=["emb_idx"]).get_column(
+            "emb_idx"
+        ).to_numpy().astype(np.int64, copy=False)
+        if emb_indices.size and (
+            np.any(emb_indices < 0) or int(np.max(emb_indices)) >= embedding_count
+        ):
+            raise ValueError("Post-liker events contain an invalid embedding index")
+        if emb_indices.size:
+            unique_indices, counts = np.unique(emb_indices, return_counts=True)
+            if np.any(event_lengths[unique_indices.astype(np.intp)] != 0):
+                raise ValueError(
+                    "One post's liker events may not span multiple URI partitions"
+                )
+            event_lengths[unique_indices.astype(np.intp)] += counts.astype(
+                OFFSET_DTYPE, copy=False
+            )
+
+    event_count = int(event_lengths.sum(dtype=OFFSET_DTYPE))
+    paths = {
+        "post_liker_offsets": root / "post_liker_offsets.npy",
+        "post_liker_user_indices": root / "post_liker_user_indices.npy",
+        "post_liker_created_at_us": root / "post_liker_created_at_us.npy",
+    }
+    offsets = _allocate_array(
+        paths["post_liker_offsets"], OFFSET_DTYPE, embedding_count + 1
+    )
+    offsets[0] = 0
+    np.cumsum(event_lengths, dtype=OFFSET_DTYPE, out=offsets[1:])
+    user_indices = _allocate_array(
+        paths["post_liker_user_indices"], INDEX_DTYPE, event_count
+    )
+    created_ats = _allocate_array(
+        paths["post_liker_created_at_us"], TIMESTAMP_DTYPE, event_count
+    )
+    filled_event_count = 0
+    for event_part in event_parts:
+        events = pl.read_parquet(
+            event_part,
+            columns=["emb_idx", "liker_idx", "like_created_at"],
+        )
+        if events.is_empty():
+            continue
+        emb_values = events.get_column("emb_idx").to_numpy().astype(np.int64, copy=False)
+        liker_values = events.get_column("liker_idx").to_numpy().astype(
+            INDEX_DTYPE, copy=False
+        )
+        if (
+            np.any(liker_values < 1)
+            or int(np.max(liker_values)) >= user_table_num_rows
+        ):
+            raise ValueError("Post-liker events contain an invalid liker index")
+        timestamp_values = _timestamp_values(
+            events.rechunk().to_arrow().column("like_created_at").chunk(0)
+        )
+        # Each URI is local to one Stage 5 partition, and the indexed staging
+        # rows were sorted by emb_idx/time. Check that contract before relying
+        # on binary search over an event segment in DataLoader workers.
+        if emb_values.size > 1:
+            same_post = emb_values[1:] == emb_values[:-1]
+            if np.any(
+                (emb_values[1:] < emb_values[:-1])
+                | (same_post & (timestamp_values[1:] < timestamp_values[:-1]))
+            ):
+                raise ValueError("Post-liker event rows are not sorted by post and time")
+        group_starts = np.maximum.accumulate(
+            np.where(
+                np.concatenate(([True], emb_values[1:] != emb_values[:-1])),
+                np.arange(emb_values.size, dtype=np.int64),
+                0,
+            )
+        )
+        destinations = (
+            np.asarray(offsets[emb_values], dtype=np.int64)
+            + np.arange(emb_values.size, dtype=np.int64)
+            - group_starts
+        )
+        user_indices[destinations] = liker_values
+        created_ats[destinations] = timestamp_values
+        filled_event_count += events.height
+
+    if filled_event_count != event_count:
+        raise ValueError("Post-liker events did not fill their exact allocated ranges")
+    for array in (offsets, user_indices, created_ats):
+        array.flush()
+    del offsets, user_indices, created_ats
+    post_count = int(np.count_nonzero(event_lengths))
+    del event_lengths
+    lengths = {
+        "post_liker_offsets": embedding_count + 1,
+        "post_liker_user_indices": event_count,
+        "post_liker_created_at_us": event_count,
+    }
+    return (
+        {
+            name: _array_metadata(root, path, GLOBAL_ARRAY_DTYPES[name], lengths[name])
+            for name, path in paths.items()
+        },
+        event_count,
+        post_count,
+    )
 
 
 def _write_query_core(
@@ -1166,6 +1292,8 @@ def build_loader_index(
     hourly_negative_candidates_path: Path,
     embeddings_path: Path,
     authors_path: Path,
+    indexed_post_liker_events_path: Path,
+    post_liker_users_path: Path,
     output_path: Path,
     logger: logging.Logger | None,
 ) -> dict[str, Any]:
@@ -1232,6 +1360,36 @@ def build_loader_index(
         .item()
     )
     author_table_num_rows = max(int(author_max or 1) + 1, 2)
+    post_liker_user_stats = (
+        scan_parquet_artifact(Path(post_liker_users_path))
+        .select(
+            pl.len().alias("user_count"),
+            pl.col("liker_idx").min().alias("min_liker_idx"),
+            pl.col("liker_idx").max().alias("max_liker_idx"),
+            pl.col("liker_idx").n_unique().alias("unique_liker_idx_count"),
+        )
+        .collect(engine="streaming")
+        .row(0, named=True)
+    )
+    post_liker_user_count = int(post_liker_user_stats["user_count"])
+    if post_liker_user_count and (
+        int(post_liker_user_stats["min_liker_idx"]) != 2
+        or int(post_liker_user_stats["max_liker_idx"]) != post_liker_user_count + 1
+        or int(post_liker_user_stats["unique_liker_idx_count"])
+        != post_liker_user_count
+    ):
+        raise ValueError("Stage 7 post-liker user indices must be unique and dense from 2")
+    post_liker_user_table_num_rows = post_liker_user_count + 2
+    indexed_event_parts = sorted(Path(indexed_post_liker_events_path).glob("*.parquet"))
+    liker_arrays, post_liker_event_count, post_liker_post_count = (
+        _write_global_post_liker_index(
+            root=partial_path,
+            event_parts=indexed_event_parts,
+            embedding_count=embedding_count,
+            user_table_num_rows=post_liker_user_table_num_rows,
+        )
+    )
+    arrays.update(liker_arrays)
     metadata: dict[str, Any] = {
         "format_version": FORMAT_VERSION,
         "embedding": {
@@ -1240,6 +1398,9 @@ def build_loader_index(
             "shape": [embedding_count, embedding_dim],
         },
         "author_table_num_rows": author_table_num_rows,
+        "post_liker_user_table_num_rows": post_liker_user_table_num_rows,
+        "post_liker_event_count": post_liker_event_count,
+        "post_liker_post_count": post_liker_post_count,
         "arrays": arrays,
         "arrow_tables": arrow_tables,
         "splits": {},
@@ -1281,6 +1442,9 @@ def build_loader_index(
         "embedding_count": embedding_count,
         "embedding_dim": embedding_dim,
         "author_table_num_rows": author_table_num_rows,
+        "post_liker_user_table_num_rows": post_liker_user_table_num_rows,
+        "post_liker_event_count": post_liker_event_count,
+        "post_liker_post_count": post_liker_post_count,
         "splits": {
             split: dict(metadata["splits"][split]["counts"]) for split in SPLITS
         },
@@ -1329,6 +1493,33 @@ def _validate_offsets(offsets: np.ndarray, value_count: int, name: str) -> None:
         raise ValueError(f"{name} must be monotonic")
 
 
+def _validate_segmented_timestamps(
+    offsets: np.ndarray,
+    timestamps: np.ndarray,
+    name: str,
+) -> None:
+    """Check timestamp order within ragged segments using bounded slices."""
+
+    chunk_size = 1_000_000
+    for start in range(0, timestamps.size, chunk_size):
+        left = max(start - 1, 0)
+        end = min(start + chunk_size, timestamps.size)
+        values = np.asarray(timestamps[left:end])
+        if values.size < 2:
+            continue
+        descent_positions = np.flatnonzero(values[1:] < values[:-1]) + left + 1
+        if not descent_positions.size:
+            continue
+        offset_positions = np.searchsorted(offsets, descent_positions)
+        safe_offset_positions = np.minimum(offset_positions, offsets.size - 1)
+        is_boundary = (
+            (offset_positions < offsets.size)
+            & (offsets[safe_offset_positions] == descent_positions)
+        )
+        if not np.all(is_boundary):
+            raise ValueError(f"{name} must be sorted within every post segment")
+
+
 def _validate_arrow_table(root: Path, entry: dict[str, Any], expected_rows: int) -> None:
     """Validate a declared identifier file without materializing its strings."""
 
@@ -1354,7 +1545,11 @@ def validate_loader_index(index_path: Path) -> dict[str, Any]:
 
     index_path = Path(index_path)
     metadata = load_loader_index_metadata(index_path)
-    if set(metadata.get("arrays", {})) != set(GLOBAL_ARRAY_DTYPES):
+    format_version = int(metadata["format_version"])
+    expected_global_dtypes = (
+        GLOBAL_ARRAY_DTYPES if format_version >= 2 else V1_GLOBAL_ARRAY_DTYPES
+    )
+    if set(metadata.get("arrays", {})) != set(expected_global_dtypes):
         raise ValueError("Loader index has unexpected global arrays")
     if set(metadata.get("arrow_tables", {})) != {"post_uris"}:
         raise ValueError("Loader index has unexpected global Arrow tables")
@@ -1396,6 +1591,62 @@ def validate_loader_index(index_path: Path) -> dict[str, Any]:
     ):
         raise ValueError("Post author index is outside the declared author table")
     del post_authors, embeddings
+    post_liker_user_table_num_rows = 0
+    post_liker_event_count = 0
+    post_liker_post_count = 0
+    if format_version >= 2:
+        post_liker_user_table_num_rows = int(
+            metadata.get("post_liker_user_table_num_rows", 0)
+        )
+        post_liker_event_count = int(metadata.get("post_liker_event_count", -1))
+        post_liker_post_count = int(metadata.get("post_liker_post_count", -1))
+        if (
+            post_liker_user_table_num_rows < 2
+            or post_liker_event_count < 0
+            or post_liker_post_count < 0
+            or post_liker_post_count > embedding_count
+        ):
+            raise ValueError("Loader-index post-liker metadata is invalid")
+        post_liker_offsets = _validate_array(
+            root=index_path,
+            entry=metadata["arrays"]["post_liker_offsets"],
+            expected_dtype=OFFSET_DTYPE,
+            expected_length=embedding_count + 1,
+        )
+        post_liker_user_indices = _validate_array(
+            root=index_path,
+            entry=metadata["arrays"]["post_liker_user_indices"],
+            expected_dtype=INDEX_DTYPE,
+            expected_length=post_liker_event_count,
+        )
+        post_liker_created_ats = _validate_array(
+            root=index_path,
+            entry=metadata["arrays"]["post_liker_created_at_us"],
+            expected_dtype=TIMESTAMP_DTYPE,
+            expected_length=post_liker_event_count,
+        )
+        _validate_offsets(
+            post_liker_offsets,
+            post_liker_event_count,
+            "post_liker_offsets",
+        )
+        _validate_segmented_timestamps(
+            post_liker_offsets,
+            post_liker_created_ats,
+            "post_liker_created_at_us",
+        )
+        actual_post_count = int(
+            np.count_nonzero(post_liker_offsets[1:] > post_liker_offsets[:-1])
+        )
+        if actual_post_count != post_liker_post_count:
+            raise ValueError("Loader-index post-liker post count is inconsistent")
+        if post_liker_user_indices.size and (
+            int(np.min(post_liker_user_indices)) < 1
+            or int(np.max(post_liker_user_indices))
+            >= post_liker_user_table_num_rows
+        ):
+            raise ValueError("Loader-index post-liker user index is out of range")
+        del post_liker_offsets, post_liker_user_indices, post_liker_created_ats
     _validate_arrow_table(
         index_path,
         metadata["arrow_tables"]["post_uris"],
@@ -1494,11 +1745,14 @@ def validate_loader_index(index_path: Path) -> dict[str, Any]:
         raise ValueError("Loader-index byte count does not match declared files")
     return {
         "metadata": metadata,
-        "format_version": FORMAT_VERSION,
+        "format_version": format_version,
         "total_data_bytes": total_data_bytes,
         "post_count": embedding_count,
         "embedding_count": embedding_count,
         "embedding_dim": embedding_dim,
         "author_table_num_rows": author_table_num_rows,
+        "post_liker_user_table_num_rows": post_liker_user_table_num_rows,
+        "post_liker_event_count": post_liker_event_count,
+        "post_liker_post_count": post_liker_post_count,
         "splits": split_counts,
     }

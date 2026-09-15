@@ -20,6 +20,8 @@ def _make_model(
     prediction_hidden_dims=(8, 4),
     use_popularity_feature: bool = False,
     popularity_projection_dim: int | None = None,
+    use_post_liker_feature: bool = False,
+    post_liker_user_unknown_dropout_rate: float = 0.0,
 ) -> BSTRanker:
     torch.manual_seed(123)
     return BSTRanker(
@@ -42,6 +44,12 @@ def _make_model(
         popularity_projection_dim=(2 if popularity_projection_dim is None else popularity_projection_dim) if use_popularity_feature else 0,
         popularity_log_mean=1.0,
         popularity_log_std=2.0,
+        use_post_liker_feature=use_post_liker_feature,
+        post_liker_user_table_num_rows=7,
+        post_liker_user_embedding_dim=3,
+        post_liker_projection_dim=2,
+        post_liker_pooling_tau_hours=24.0,
+        post_liker_user_unknown_dropout_rate=post_liker_user_unknown_dropout_rate,
     )
 
 
@@ -98,6 +106,22 @@ def _batch_with_popularity() -> dict[str, torch.Tensor]:
             dtype=torch.float32,
         ),
         "candidate_prior_cumulative_likes": torch.tensor([2.0, 20.0], dtype=torch.float32),
+    }
+
+
+def _packed_post_liker_batch() -> dict[str, torch.Tensor]:
+    """Create row zero plus three post segments, one of which is empty."""
+
+    return {
+        "post_liker_event_user_indices": torch.tensor([2, 3, 1], dtype=torch.long),
+        "post_liker_event_age_from_latest_hours": torch.tensor(
+            [24.0, 0.0, 0.0], dtype=torch.float32
+        ),
+        "post_liker_event_offsets": torch.tensor([0, 0, 2, 2, 3], dtype=torch.long),
+        "history_post_liker_rows": torch.tensor(
+            [[1, 2, 0], [3, 0, 0]], dtype=torch.long
+        ),
+        "candidate_post_liker_rows": torch.tensor([1, 3], dtype=torch.long),
     }
 
 
@@ -285,6 +309,12 @@ def test_bst_ranker_rejects_attention_head_mismatch():
             popularity_projection_dim=0,
             popularity_log_mean=0.0,
             popularity_log_std=1.0,
+            use_post_liker_feature=False,
+            post_liker_user_table_num_rows=2,
+            post_liker_user_embedding_dim=3,
+            post_liker_projection_dim=2,
+            post_liker_pooling_tau_hours=24.0,
+            post_liker_user_unknown_dropout_rate=0.0,
         )
 
 
@@ -516,6 +546,12 @@ def test_bst_ranker_can_script_differently_shaped_models_in_one_process():
         popularity_projection_dim=2,
         popularity_log_mean=1.0,
         popularity_log_std=2.0,
+        use_post_liker_feature=False,
+        post_liker_user_table_num_rows=2,
+        post_liker_user_embedding_dim=3,
+        post_liker_projection_dim=2,
+        post_liker_pooling_tau_hours=24.0,
+        post_liker_user_unknown_dropout_rate=0.0,
     ).eval()
 
     first_scripted = torch.jit.script(first_model)
@@ -588,6 +624,118 @@ def test_bst_ranker_torchscript_supports_popularity_features():
 
     torch.testing.assert_close(scripted_output, eager_output, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(scripted_scores, eager_scores, atol=1e-5, rtol=1e-5)
+
+
+def test_post_liker_pooling_matches_naive_weighted_mean_and_scores():
+    model = _make_model(use_post_liker_feature=True).eval()
+    batch = _batch()
+    packed = _packed_post_liker_batch()
+
+    with torch.inference_mode():
+        pooled = model.post_liker_user_pooler(
+            packed["post_liker_event_user_indices"],
+            packed["post_liker_event_age_from_latest_hours"],
+            packed["post_liker_event_offsets"],
+        )
+        table = model.lookup_post_liker_user_embeddings(torch.tensor([1, 2, 3]))
+        expected_first_post = (
+            torch.exp(torch.tensor(-1.0)) * table[1] + table[2]
+        ) / (torch.exp(torch.tensor(-1.0)) + 1.0)
+        torch.testing.assert_close(pooled[0], torch.zeros_like(pooled[0]))
+        torch.testing.assert_close(pooled[1], expected_first_post)
+        torch.testing.assert_close(pooled[2], torch.zeros_like(pooled[2]))
+        torch.testing.assert_close(pooled[3], table[0])
+
+        history_vectors = pooled.index_select(
+            0, packed["history_post_liker_rows"].reshape(-1)
+        ).reshape(2, 3, 3)
+        candidate_vectors = pooled.index_select(
+            0, packed["candidate_post_liker_rows"]
+        )
+        vector_scores = model.score_candidate_matrix(
+            **batch,
+            history_post_liker_vectors=history_vectors,
+            candidate_post_liker_vectors=candidate_vectors,
+        )
+        event_scores = model.score_candidate_matrix_from_post_liker_events(
+            **batch,
+            history_prior_cumulative_likes=None,
+            candidate_prior_cumulative_likes=None,
+            **packed,
+        )
+
+    torch.testing.assert_close(event_scores, vector_scores)
+
+
+def test_post_liker_feature_requires_both_pooled_vector_inputs():
+    model = _make_model(use_post_liker_feature=True).eval()
+    batch = _batch()
+    history_vectors = torch.zeros((2, 3, 3))
+
+    with pytest.raises(RuntimeError, match="history_post_liker_vectors is required"):
+        model.score_candidate_matrix(**batch)
+    with pytest.raises(RuntimeError, match="candidate_post_liker_vectors is required"):
+        model.score_candidate_matrix(
+            **batch,
+            history_post_liker_vectors=history_vectors,
+        )
+
+
+def test_post_liker_event_scoring_backpropagates_to_user_table_and_scripts():
+    model = _make_model(use_post_liker_feature=True)
+    batch = _batch()
+    packed = _packed_post_liker_batch()
+
+    scores = model.score_candidate_matrix_from_post_liker_events(
+        **batch,
+        history_prior_cumulative_likes=None,
+        candidate_prior_cumulative_likes=None,
+        **packed,
+    )
+    scores.sum().backward()
+    assert model.post_liker_user_pooler.user_embedding.weight.grad is not None
+    assert model.post_feature_encoder.post_liker_projection.weight.grad is not None
+
+    model.eval()
+    scripted = torch.jit.script(model)
+    with torch.inference_mode():
+        expected = model.score_candidate_matrix_from_post_liker_events(
+            **batch,
+            history_prior_cumulative_likes=None,
+            candidate_prior_cumulative_likes=None,
+            **packed,
+        )
+        actual = scripted.score_candidate_matrix_from_post_liker_events(
+            batch["history_embeddings"],
+            batch["history_mask"],
+            batch["history_time_deltas_hours"],
+            batch["candidate_post_embeddings"],
+            batch["history_author_indices"],
+            batch["candidate_post_author_idx"],
+            None,
+            None,
+            packed["post_liker_event_user_indices"],
+            packed["post_liker_event_age_from_latest_hours"],
+            packed["post_liker_event_offsets"],
+            packed["history_post_liker_rows"],
+            packed["candidate_post_liker_rows"],
+        )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_post_liker_unknown_dropout_maps_known_users_but_not_natural_unk():
+    model = _make_model(
+        use_post_liker_feature=True,
+        post_liker_user_unknown_dropout_rate=1.0,
+    ).train()
+    offsets = torch.tensor([0, 2], dtype=torch.long)
+    pooled = model.post_liker_user_pooler(
+        torch.tensor([1, 2]),
+        torch.zeros(2),
+        offsets,
+    )
+    unk = model.lookup_post_liker_user_embeddings(torch.tensor([1]))[0]
+    torch.testing.assert_close(pooled[0], unk)
 
 
 def test_bst_ranker_rejects_invalid_prediction_hidden_dims():

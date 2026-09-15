@@ -28,6 +28,11 @@ _GLOBAL_ARRAY_NAMES = (
     "post_created_at_us",
     "post_author_idx",
 )
+_POST_LIKER_ARRAY_NAMES = (
+    "post_liker_offsets",
+    "post_liker_user_indices",
+    "post_liker_created_at_us",
+)
 _SPLIT_ARRAY_NAMES = (
     "query_hours_us",
     "history_offsets",
@@ -78,6 +83,8 @@ class HydratedBucketedEngagementDataset(Dataset):
         bst_additional_batch_negatives: Optional[int] = None,
         seed: int,
         logger: Optional[logging.Logger],
+        use_post_liker_feature: bool,
+        max_post_liker_replay_events_per_post: Optional[int],
         post_author_idx_override_path: Optional[Path] = None,
         author_table_num_rows_override: Optional[int] = None,
     ):
@@ -85,6 +92,14 @@ class HydratedBucketedEngagementDataset(Dataset):
 
         if max_history_len <= 0:
             raise ValueError("max_history_len must be positive")
+        if use_post_liker_feature and (
+            max_post_liker_replay_events_per_post is None
+            or int(max_post_liker_replay_events_per_post) <= 0
+        ):
+            raise ValueError(
+                "max_post_liker_replay_events_per_post must be positive when "
+                "the post-liker feature is enabled"
+            )
         if (
             additional_batch_negatives is not None
             and bst_additional_batch_negatives is not None
@@ -128,10 +143,15 @@ class HydratedBucketedEngagementDataset(Dataset):
 
         metadata = load_loader_index_metadata(loader_index_path)
         format_version = int(metadata.get("format_version", -1))
-        if format_version != FORMAT_VERSION:
+        if format_version not in {1, FORMAT_VERSION}:
             raise ValueError(
                 "Unsupported Stage 7 loader_index format version "
                 f"{format_version}; regenerate Stage 7"
+            )
+        if use_post_liker_feature and format_version < 2:
+            raise ValueError(
+                "The BST post-liker feature requires Stage 7 loader-index format "
+                "version 2; regenerate Stage 7"
             )
 
         self.split = str(split)
@@ -151,7 +171,14 @@ class HydratedBucketedEngagementDataset(Dataset):
 
         self.bundle_path = bundle_path
         self.loader_index_path = loader_index_path
+        self.loader_index_format_version = format_version
         self.max_history_len = int(max_history_len)
+        self.use_post_liker_feature = bool(use_post_liker_feature)
+        self.max_post_liker_replay_events_per_post = (
+            int(max_post_liker_replay_events_per_post)
+            if max_post_liker_replay_events_per_post is not None
+            else None
+        )
         self.additional_batch_negatives = (
             int(negative_cap)
             if negative_cap is not None
@@ -170,6 +197,24 @@ class HydratedBucketedEngagementDataset(Dataset):
         self.positive_count = int(counts["positive_count"])
         self.hour_count = int(counts["hour_count"])
         self.negative_count = int(counts["negative_count"])
+        try:
+            self.post_liker_user_table_num_rows = (
+                int(metadata["post_liker_user_table_num_rows"])
+                if self.use_post_liker_feature
+                else None
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "Stage 7 loader_index is missing valid post-liker user metadata; "
+                "regenerate Stage 7"
+            ) from exc
+        if (
+            self.post_liker_user_table_num_rows is not None
+            and self.post_liker_user_table_num_rows < 2
+        ):
+            raise ValueError(
+                "Stage 7 loader_index records an invalid post-liker user table size"
+            )
 
         self._embeddings_path = loader_index_path / str(embedding_metadata["path"])
         self._post_uri_path = loader_index_path / str(post_uri_metadata["path"])
@@ -331,6 +376,13 @@ class HydratedBucketedEngagementDataset(Dataset):
                     name,
                     metadata=metadata,
                 )
+            if self.use_post_liker_feature:
+                for name in _POST_LIKER_ARRAY_NAMES:
+                    arrays[name] = load_index_array(
+                        self.loader_index_path,
+                        name,
+                        metadata=metadata,
+                    )
             for name in _SPLIT_ARRAY_NAMES:
                 arrays[name] = load_index_array(
                     self.loader_index_path,
@@ -427,7 +479,7 @@ class HydratedBucketedEngagementDataset(Dataset):
         row_indices: np.ndarray,
         *,
         include_bst_features: bool,
-    ) -> dict[str, torch.Tensor]:
+    ) -> tuple[dict[str, torch.Tensor], np.ndarray, np.ndarray]:
         """Gather and pad all ragged histories with one vectorized operation."""
 
         batch_size = int(row_indices.size)
@@ -442,6 +494,9 @@ class HydratedBucketedEngagementDataset(Dataset):
         )
         mask = np.zeros((batch_size, self.max_history_len), dtype=bool)
         author_indices = np.zeros((batch_size, self.max_history_len), dtype=np.int64)
+        padded_emb_indices = np.zeros(
+            (batch_size, self.max_history_len), dtype=np.int64
+        )
         if include_bst_features:
             time_deltas = np.zeros((batch_size, self.max_history_len), dtype=np.float32)
             prior_counts = np.zeros((batch_size, self.max_history_len), dtype=np.int64)
@@ -460,6 +515,7 @@ class HydratedBucketedEngagementDataset(Dataset):
             history_emb_indices = np.asarray(
                 self._array("history_emb_indices")[source_positions], dtype=np.int64
             )
+            padded_emb_indices[batch_rows, history_positions] = history_emb_indices
             padded_embeddings[batch_rows, history_positions] = self.embeddings[
                 history_emb_indices
             ]
@@ -494,7 +550,113 @@ class HydratedBucketedEngagementDataset(Dataset):
                 "history_time_deltas_hours": torch.from_numpy(time_deltas),
                 "history_prior_cumulative_likes": torch.from_numpy(prior_counts),
             })
-        return tensors
+        return tensors, padded_emb_indices, mask
+
+    def _post_liker_tensors(
+        self,
+        *,
+        query_hour_us: int,
+        history_emb_indices: np.ndarray,
+        history_mask: np.ndarray,
+        candidate_emb_indices: np.ndarray,
+    ) -> dict[str, torch.Tensor]:
+        """Pack one as-of liker-event segment per unique post in the batch.
+
+        Row zero is a guaranteed empty segment used by padded history positions.
+        Actual posts receive rows one through N, even when they have no prior
+        events, so repeated history/candidate occurrences share one replay.
+        """
+
+        if not self.use_post_liker_feature:
+            return {}
+        replay_cap = self.max_post_liker_replay_events_per_post
+        assert replay_cap is not None
+
+        valid_history_emb_indices = history_emb_indices[history_mask]
+        if valid_history_emb_indices.size:
+            unique_emb_indices = np.unique(
+                np.concatenate((valid_history_emb_indices, candidate_emb_indices))
+            )
+        else:
+            unique_emb_indices = np.unique(candidate_emb_indices)
+
+        history_rows = np.zeros(history_emb_indices.shape, dtype=np.int64)
+        candidate_rows = np.zeros(candidate_emb_indices.shape, dtype=np.int64)
+        if unique_emb_indices.size:
+            if valid_history_emb_indices.size:
+                history_rows[history_mask] = np.searchsorted(
+                    unique_emb_indices,
+                    valid_history_emb_indices,
+                ) + 1
+            if candidate_emb_indices.size:
+                candidate_rows[:] = np.searchsorted(
+                    unique_emb_indices,
+                    candidate_emb_indices,
+                ) + 1
+
+        source_offsets = self._array("post_liker_offsets")
+        source_timestamps = self._array("post_liker_created_at_us")
+        selected_starts = np.empty(unique_emb_indices.size, dtype=np.int64)
+        selected_ends = np.empty(unique_emb_indices.size, dtype=np.int64)
+        selected_counts = np.empty(unique_emb_indices.size, dtype=np.uint64)
+        for position, emb_idx in enumerate(unique_emb_indices):
+            source_start = int(source_offsets[int(emb_idx)])
+            source_end = int(source_offsets[int(emb_idx) + 1])
+            # ``side='left'`` enforces the production as-of boundary: likes in
+            # the scoring hour are not visible to this query.
+            visible_end = source_start + int(np.searchsorted(
+                source_timestamps[source_start:source_end],
+                np.int64(query_hour_us),
+                side="left",
+            ))
+            visible_start = max(source_start, visible_end - replay_cap)
+            selected_starts[position] = visible_start
+            selected_ends[position] = visible_end
+            selected_counts[position] = visible_end - visible_start
+
+        # Offsets describe row zero (empty) followed by each unique post row.
+        packed_offsets = np.zeros(unique_emb_indices.size + 2, dtype=np.uint64)
+        if selected_counts.size:
+            packed_offsets[2:] = np.cumsum(selected_counts, dtype=np.uint64)
+        packed_count = int(packed_offsets[-1])
+        packed_users = np.empty(packed_count, dtype=np.int64)
+        packed_age_hours = np.empty(packed_count, dtype=np.float32)
+        source_users = self._array("post_liker_user_indices")
+        destination = 0
+        for source_start, source_end in zip(
+            selected_starts,
+            selected_ends,
+            strict=True,
+        ):
+            count = int(source_end - source_start)
+            if not count:
+                continue
+            destination_end = destination + count
+            timestamps = np.asarray(
+                source_timestamps[source_start:source_end],
+                dtype=np.int64,
+            )
+            packed_users[destination:destination_end] = np.asarray(
+                source_users[source_start:source_end],
+                dtype=np.int64,
+            )
+            packed_age_hours[destination:destination_end] = (
+                (int(timestamps[-1]) - timestamps).astype(np.float64)
+                / MICROSECONDS_PER_HOUR
+            ).astype(np.float32)
+            destination = destination_end
+
+        return {
+            "post_liker_event_user_indices": torch.from_numpy(packed_users),
+            "post_liker_event_age_from_latest_hours": torch.from_numpy(
+                packed_age_hours
+            ),
+            "post_liker_event_offsets": torch.from_numpy(
+                packed_offsets.astype(np.int64)
+            ),
+            "history_post_liker_rows": torch.from_numpy(history_rows),
+            "candidate_post_liker_rows": torch.from_numpy(candidate_rows),
+        }
 
     def _negative_positions(
         self,
@@ -551,7 +713,7 @@ class HydratedBucketedEngagementDataset(Dataset):
         if np.any(query_hours != query_hour_us):
             raise ValueError("Bucketed batches must contain one query hour")
 
-        history_tensors = self._history_tensors(
+        history_tensors, history_emb_indices, history_mask = self._history_tensors(
             row_indices,
             include_bst_features=include_bst_features,
         )
@@ -636,6 +798,13 @@ class HydratedBucketedEngagementDataset(Dataset):
             ),
             "label_matrix": labels,
         }
+        if include_bst_features and self.use_post_liker_feature:
+            batch.update(self._post_liker_tensors(
+                query_hour_us=query_hour_us,
+                history_emb_indices=history_emb_indices,
+                history_mask=history_mask,
+                candidate_emb_indices=candidate_emb_array,
+            ))
         if include_bst_features:
             batch["candidate_prior_cumulative_likes"] = torch.tensor(
                 candidate_prior_counts, dtype=torch.float32

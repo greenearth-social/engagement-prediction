@@ -80,16 +80,64 @@ def compute_bst_listwise_loss_and_scores(
             "candidate_prior_cumulative_likes"
         ].to(device, dtype=torch.float32, non_blocking=True)
 
-    scores = model.score_candidate_matrix_one_layer(
-        history_embeddings=history_embeddings,
-        history_mask=history_mask,
-        history_time_deltas_hours=history_time_deltas_hours,
-        candidate_post_embeddings=candidate_post_embeddings,
-        history_author_indices=history_author_indices,
-        candidate_post_author_idx=candidate_post_author_idx,
-        history_prior_cumulative_likes=history_prior_cumulative_likes,
-        candidate_prior_cumulative_likes=candidate_prior_cumulative_likes,
-    )
+    if model.use_post_liker_feature:
+        required_post_liker_fields = (
+            "post_liker_event_user_indices",
+            "post_liker_event_age_from_latest_hours",
+            "post_liker_event_offsets",
+            "history_post_liker_rows",
+            "candidate_post_liker_rows",
+        )
+        missing_fields = [
+            field for field in required_post_liker_fields if field not in batch
+        ]
+        if missing_fields:
+            raise RuntimeError(
+                "BST listwise batches are missing post-liker tensors: "
+                + ", ".join(missing_fields)
+            )
+        scores = model.score_candidate_matrix_from_post_liker_events(
+            history_embeddings=history_embeddings,
+            history_mask=history_mask,
+            history_time_deltas_hours=history_time_deltas_hours,
+            candidate_post_embeddings=candidate_post_embeddings,
+            history_author_indices=history_author_indices,
+            candidate_post_author_idx=candidate_post_author_idx,
+            history_prior_cumulative_likes=history_prior_cumulative_likes,
+            candidate_prior_cumulative_likes=candidate_prior_cumulative_likes,
+            post_liker_event_user_indices=batch[
+                "post_liker_event_user_indices"
+            ].to(device, dtype=torch.long, non_blocking=True),
+            post_liker_event_age_from_latest_hours=batch[
+                "post_liker_event_age_from_latest_hours"
+            ].to(device, dtype=torch.float32, non_blocking=True),
+            post_liker_event_offsets=batch["post_liker_event_offsets"].to(
+                device,
+                dtype=torch.long,
+                non_blocking=True,
+            ),
+            history_post_liker_rows=batch["history_post_liker_rows"].to(
+                device,
+                dtype=torch.long,
+                non_blocking=True,
+            ),
+            candidate_post_liker_rows=batch["candidate_post_liker_rows"].to(
+                device,
+                dtype=torch.long,
+                non_blocking=True,
+            ),
+        )
+    else:
+        scores = model.score_candidate_matrix_one_layer(
+            history_embeddings=history_embeddings,
+            history_mask=history_mask,
+            history_time_deltas_hours=history_time_deltas_hours,
+            candidate_post_embeddings=candidate_post_embeddings,
+            history_author_indices=history_author_indices,
+            candidate_post_author_idx=candidate_post_author_idx,
+            history_prior_cumulative_likes=history_prior_cumulative_likes,
+            candidate_prior_cumulative_likes=candidate_prior_cumulative_likes,
+        )
     if scores.shape != labels.shape:
         raise RuntimeError(
             "Expected BST scores and label_matrix to have matching "

@@ -7,7 +7,12 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from engagement_prediction.data import author_vocabulary, dataset_hydration, training_index
+from engagement_prediction.data import (
+    author_vocabulary,
+    dataset_hydration,
+    post_liker_users,
+    training_index,
+)
 from engagement_prediction.data.datasets import (
     HydratedBucketedEngagementDataset,
     create_hydrated_data_loader,
@@ -38,6 +43,12 @@ def _model(*, use_popularity_feature: bool) -> BSTRanker:
         popularity_projection_dim=2 if use_popularity_feature else 0,
         popularity_log_mean=1.0,
         popularity_log_std=2.0,
+        use_post_liker_feature=False,
+        post_liker_user_table_num_rows=2,
+        post_liker_user_embedding_dim=3,
+        post_liker_projection_dim=2,
+        post_liker_pooling_tau_hours=24.0,
+        post_liker_user_unknown_dropout_rate=0.0,
     )
 
 
@@ -180,6 +191,16 @@ def _native_bundle(tmp_path):
         "training_history_count": [0, 0, 1, 0],
         "training_negative_count": [0, 0, 0, 1],
     }, schema=author_vocabulary.AUTHOR_VOCABULARY_SCHEMA))
+    _write_dataset(
+        bundle,
+        "post_liker_users",
+        pl.DataFrame(schema=post_liker_users.POST_LIKER_USER_VOCABULARY_SCHEMA),
+    )
+    _write_dataset(
+        bundle,
+        "indexed_post_liker_events",
+        pl.DataFrame(schema=post_liker_users.INDEXED_POST_LIKER_EVENT_SCHEMA),
+    )
     training_index.build_loader_index(
         posts_path=bundle / "posts",
         queries_path=bundle / "queries",
@@ -188,6 +209,8 @@ def _native_bundle(tmp_path):
         hourly_negative_candidates_path=bundle / "hourly_negative_candidates",
         embeddings_path=bundle / "embeddings.npy",
         authors_path=bundle / "authors",
+        indexed_post_liker_events_path=bundle / "indexed_post_liker_events",
+        post_liker_users_path=bundle / "post_liker_users",
         output_path=bundle / "loader_index",
         logger=None,
     )
@@ -230,6 +253,8 @@ def test_native_stage7_batch_runs_one_optimizer_step(tmp_path):
         split="train",
         max_history_len=2,
         bst_additional_batch_negatives=None,
+        use_post_liker_feature=False,
+        max_post_liker_replay_events_per_post=None,
         seed=7,
         logger=None,
     )

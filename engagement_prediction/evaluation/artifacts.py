@@ -15,7 +15,7 @@ from engagement_prediction.data.author_indices import (
     AUTHOR_UNK_IDX,
 )
 from engagement_prediction.data.training_index import (
-    FORMAT_VERSION,
+    SUPPORTED_FORMAT_VERSIONS,
     validate_loader_index,
 )
 from engagement_prediction.evaluation.author_mapping import validate_model_author_map
@@ -37,6 +37,11 @@ _BST_SCORE_ARGUMENT_NAMES = (
     "candidate_post_author_idx",
     "history_prior_cumulative_likes",
     "candidate_prior_cumulative_likes",
+)
+_BST_EXTENDED_SCORE_ARGUMENT_NAMES = (
+    *_BST_SCORE_ARGUMENT_NAMES,
+    "history_post_liker_vectors",
+    "candidate_post_liker_vectors",
 )
 
 
@@ -241,6 +246,32 @@ def _validate_torchscript_method(
     del module
 
 
+def _validate_torchscript_method_signatures(
+    path: Path,
+    *,
+    method_name: str,
+    expected_argument_signatures: Sequence[Sequence[str]],
+) -> None:
+    """Accept one of several versioned method signatures for a ScriptModule."""
+
+    errors: list[str] = []
+    for signature in expected_argument_signatures:
+        try:
+            _validate_torchscript_method(
+                path,
+                method_name=method_name,
+                expected_argument_names=signature,
+            )
+            return
+        except ValueError as exc:
+            errors.append(str(exc))
+    raise ValueError(
+        f"TorchScript artifact {path} has no supported {method_name} signature; "
+        f"expected one of {[list(value) for value in expected_argument_signatures]}. "
+        f"Details: {errors[-1] if errors else 'no signatures configured'}"
+    )
+
+
 def resolve_stage7_artifact(path: Path) -> Stage7Artifact:
     """Resolve either a Stage 7 run directory or its hydrated bundle."""
 
@@ -405,19 +436,29 @@ def _resolve_canonical_model_artifact(
         author_table_num_rows,
         similarity_temperature,
     ) = _validate_model_config(model_config)
+    constructor = _require_mapping(
+        model_config.get("constructor_args"),
+        description="model_config constructor_args",
+    )
     # Filenames and callable signatures are deployment contracts, not merely
     # conventions: the inference service consumes these exact artifacts.
     if model_type == BST_MODEL_TYPE:
+        use_post_liker_feature = constructor.get("use_post_liker_feature", False)
+        if not isinstance(use_post_liker_feature, bool):
+            raise ValueError(
+                "Canonical BST use_post_liker_feature must be a boolean"
+            )
+        if use_post_liker_feature:
+            raise ValueError(
+                "The model-comparison tool does not yet support BST models with "
+                "post-liker user features; those models require query-time pooled "
+                "post-liker vectors"
+            )
         expected_stage_key = "train_bst_ranker"
         expected_stage_folder = "08_train_bst_ranker"
         script_paths = {"ranker": root / "checkpoints" / "ranker.pt"}
         author_map_path = root / "ranker_author_idx.parquet"
-        script_methods = {
-            "ranker": (
-                "score_candidate_matrix",
-                _BST_SCORE_ARGUMENT_NAMES,
-            )
-        }
+        script_methods = {}
     else:
         expected_stage_key = "train_two_tower"
         expected_stage_folder = "08_train_two_tower"
@@ -446,7 +487,7 @@ def _resolve_canonical_model_artifact(
         root / "training_config.json", description="Stage 8 training configuration"
     )
     format_version = training_config.get("loader_index_format_version")
-    if format_version != FORMAT_VERSION:
+    if format_version not in SUPPORTED_FORMAT_VERSIONS:
         raise ValueError(
             "Model training configuration uses an unsupported Stage 7 loader-index version"
         )
@@ -473,6 +514,15 @@ def _resolve_canonical_model_artifact(
             "Stage 8 training configuration records an invalid Stage 7 bundle"
         )
 
+    if model_type == BST_MODEL_TYPE:
+        _validate_torchscript_method_signatures(
+            script_paths["ranker"],
+            method_name="score_candidate_matrix",
+            expected_argument_signatures=(
+                _BST_SCORE_ARGUMENT_NAMES,
+                _BST_EXTENDED_SCORE_ARGUMENT_NAMES,
+            ),
+        )
     for key, (method_name, arguments) in script_methods.items():
         _validate_torchscript_method(
             script_paths[key],

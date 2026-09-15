@@ -19,11 +19,14 @@ from engagement_prediction.data.parquet import (
 )
 
 
-class PostSelectionConfig(Protocol):
+class PostSelectionConfigLike(Protocol):
     """Structural settings required by the Stage 3 artifact helpers."""
 
-    random_candidate_sampling_fraction: float
-    random_seed: int
+    @property
+    def random_candidate_sampling_fraction(self) -> float: ...
+
+    @property
+    def random_seed(self) -> int: ...
 
 
 def materialize_required_rows(
@@ -235,7 +238,7 @@ def process_uri_partitions(
     required_posts_path: Path,
     candidate_sources_path: Path,
     missing_required_posts_path: Path,
-    config: PostSelectionConfig,
+    config: PostSelectionConfigLike,
     partition_count: int,
     worker_count: int,
     logger: logging.Logger,

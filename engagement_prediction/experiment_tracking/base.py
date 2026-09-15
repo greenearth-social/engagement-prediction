@@ -10,7 +10,8 @@ from typing import Any, Dict, List, Optional, Protocol, Union
 class ModelPublicationTracker(Protocol):
     """Tracker surface needed to publish serving models and companion files."""
 
-    id: str
+    @property
+    def id(self) -> str: ...
 
     def log_artifact(self, name: str, path: Path) -> dict[str, str]:
         ...

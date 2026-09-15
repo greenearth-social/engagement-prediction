@@ -38,13 +38,20 @@ from engagement_prediction.data.parquet import (
 )
 
 
-class SourceMetadataConfig(Protocol):
+class SourceMetadataConfigLike(Protocol):
     """Structural settings required to build the Stage 00 metadata index."""
 
-    posts_start: datetime
-    posts_end: datetime
-    source_metadata_partition_count: int
-    data_partition_worker_count: int
+    @property
+    def posts_start(self) -> datetime: ...
+
+    @property
+    def posts_end(self) -> datetime: ...
+
+    @property
+    def source_metadata_partition_count(self) -> int: ...
+
+    @property
+    def data_partition_worker_count(self) -> int: ...
 
 
 @dataclass(frozen=True)
@@ -129,7 +136,7 @@ def materialize_source_routes(
     reply_paths: list[str],
     normalized_posts_path: Path,
     normalized_replies_path: Path,
-    config: SourceMetadataConfig,
+    config: SourceMetadataConfigLike,
     logger: logging.Logger,
 ) -> None:
     """Scan each exact source once and route narrow rows by stable URI hash.

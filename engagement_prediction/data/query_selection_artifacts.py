@@ -59,7 +59,7 @@ def materialize_provisional_positive_rows(
     started = time.monotonic()
     provisional_lf = (
         positive_rows_lf
-        .join(sampled_queries_lf.select(QUERY_KEY), on=QUERY_KEY, how="inner")
+        .join(sampled_queries_lf.select(QUERY_KEY), on=QUERY_KEY, how="semi")
         .select(INTERNAL_POSITIVE_COLUMNS)
         .with_columns(post_data.post_partition_expr(partition_count))
     )
