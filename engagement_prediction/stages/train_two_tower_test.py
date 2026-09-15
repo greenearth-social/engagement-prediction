@@ -13,7 +13,10 @@ from engagement_prediction.data.datasets import HydratedBucketedEngagementDatase
 from engagement_prediction.models.two_tower import TwoTowerModel
 from engagement_prediction.pipeline.core import Context
 from engagement_prediction.stages import train_two_tower
-from engagement_prediction.stages.train_bst_ranker_test import _stage7_fixture
+from engagement_prediction.stages.train_bst_ranker_test import (
+    _assert_history_length_outputs,
+    _stage7_fixture,
+)
 
 
 class _RecordingTracker:
@@ -21,11 +24,15 @@ class _RecordingTracker:
         self.id = task_id
         self.scalar_calls = []
         self.histogram_calls = []
+        self.plot_calls = []
         self.model_artifacts = []
         self.file_artifacts = []
 
     def log_scalar(self, title, series, value, iteration):
         self.scalar_calls.append((title, series, value, iteration))
+
+    def log_plot(self, title, series, figure, iteration):
+        self.plot_calls.append((title, series, figure, iteration))
 
     def log_histogram(
         self,
@@ -77,6 +84,7 @@ def _args(*, plots: bool = False, output_embedding_dim: int = 3):
         dataloader_persistent_workers=False,
         dataloader_prefetch_factor=1,
         metrics_top_ks=[1],
+        history_length_bucket_boundaries=[0, 1, 2],
         no_plots=not plots,
         no_save_model=True,
         disable_progress=True,
@@ -131,6 +139,16 @@ def test_stage8_trains_native_two_tower_and_publishes_serving_artifacts(
         return create_loader(**kwargs)
 
     monkeypatch.setattr(train_two_tower, "_create_loader", record_loader)
+    final_metrics = train_two_tower._final_metrics
+    final_model_state = {}
+
+    def record_final_metrics(**kwargs):
+        final_model_state.update({
+            name: value.clone() for name, value in kwargs["model"].state_dict().items()
+        })
+        return final_metrics(**kwargs)
+
+    monkeypatch.setattr(train_two_tower, "_final_metrics", record_final_metrics)
     result = train_two_tower.run(
         _context(tmp_path, tracker),
         _args(plots=True, output_embedding_dim=3),
@@ -145,7 +163,11 @@ def test_stage8_trains_native_two_tower_and_publishes_serving_artifacts(
     model_config = json.loads((output_dir / "model_config.json").read_text())
     training_config = json.loads((output_dir / "training_config.json").read_text())
     training_results = json.loads((output_dir / "training_results.json").read_text())
+    summary = json.loads((output_dir / "summary.json").read_text())
     checkpoint = torch.load(checkpoint_path, weights_only=False)
+    for name, value in final_model_state.items():
+        torch.testing.assert_close(value, checkpoint["model_state_dict"][name])
+    _assert_history_length_outputs(output_dir, training_results, summary, tracker)
 
     assert model_config["output_embedding_dim"] == 3
     assert model_config["user_encoder_type"] == "cross_attention"
@@ -155,6 +177,7 @@ def test_stage8_trains_native_two_tower_and_publishes_serving_artifacts(
     assert training_config["candidate_pool"] == "all_hourly_negatives"
     assert training_config["batch_size"] == 2
     assert training_config["eval_batch_size"] == 3
+    assert training_config["history_length_bucket_boundaries"] == [0, 1, 2]
     assert "save_model" not in training_config
     assert training_results["output_embedding_dim"] == 3
     assert checkpoint["metadata"]["model_config"] == model_config
@@ -269,8 +292,9 @@ def test_stage8_saves_locally_when_tracker_is_disabled(tmp_path, monkeypatch):
         lambda *args, **kwargs: {"07_dataset_hydration": stage7_dir},
     )
 
+    tracker = _RecordingTracker(task_id="")
     result = train_two_tower.run(
-        _context(tmp_path, _RecordingTracker(task_id="")),
+        _context(tmp_path, tracker),
         _args(),
     )
 
@@ -281,6 +305,10 @@ def test_stage8_saves_locally_when_tracker_is_disabled(tmp_path, monkeypatch):
     assert (output_dir / "two_tower_author_idx.parquet").is_file()
     assert result["artifacts"]["serving_manifest_path"] is None
     assert result["clearml_publication"]["status"] == "not_configured"
+    assert not list(output_dir.glob("history_length_ndcg_at_*.png"))
+    assert tracker.plot_calls == []
+    training_results = json.loads((output_dir / "training_results.json").read_text())
+    assert training_results["final_metrics"]["val"]["history_length_breakdown"][1]["query_count"] == 1
 
 
 def test_stage8_rejects_stage7_without_loader_index(tmp_path, monkeypatch):

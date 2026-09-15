@@ -12,6 +12,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from engagement_prediction.training.history_length import history_length_bucket_specs
 from engagement_prediction.training.model_artifacts import (
     write_torch_checkpoint_atomically,
 )
@@ -83,6 +84,7 @@ def run_listwise_epoch(
     metrics_top_ks: list[int],
     calc_baseline_metrics: bool,
     max_batches: Optional[int],
+    history_length_bucket_boundaries: list[int] | None,
 ) -> tuple[float, dict[str, Any], dict[str, Any]]:
     """Run one listwise epoch with one packed device-to-host metric transfer."""
 
@@ -116,6 +118,23 @@ def run_listwise_epoch(
     zero_history_metric_user_count = torch.zeros(
         (), device=device, dtype=torch.int64
     )
+    history_buckets = (
+        history_length_bucket_specs(history_length_bucket_boundaries)
+        if history_length_bucket_boundaries is not None
+        else []
+    )
+    ndcg_metric_names = [name for name in metric_sums if name.startswith("ndcg@")]
+    history_bucket_metric_sums = [
+        {
+            name: torch.zeros((), device=device, dtype=torch.float64)
+            for name in ndcg_metric_names
+        }
+        for _ in history_buckets
+    ]
+    history_bucket_query_counts = [
+        torch.zeros((), device=device, dtype=torch.int64)
+        for _ in history_buckets
+    ]
 
     with nullcontext() if train else torch.inference_mode():
         for batch_idx, batch in enumerate(
@@ -136,11 +155,17 @@ def run_listwise_epoch(
                 raise RuntimeError(
                     "history_mask must have shape [num_users, history_len]"
                 )
-            zero_history_mask = (~history_mask.any(dim=1)).to(
-                device,
-                dtype=torch.bool,
-                non_blocking=True,
-            )
+            if history_buckets:
+                history_lengths = history_mask.sum(dim=1).to(
+                    device, non_blocking=True
+                )
+                zero_history_mask = history_lengths == 0
+            else:
+                zero_history_mask = (~history_mask.any(dim=1)).to(
+                    device,
+                    dtype=torch.bool,
+                    non_blocking=True,
+                )
             loss, scores, labels = compute_loss_and_scores(model, batch, device)
 
             if calc_baseline_metrics:
@@ -189,6 +214,19 @@ def run_listwise_epoch(
                 metrics_top_ks,
                 row_mask=zero_history_mask,
             )
+            for bucket_idx, (_, lower_bound, upper_bound) in enumerate(history_buckets):
+                bucket_mask = history_lengths >= lower_bound
+                if upper_bound is not None:
+                    bucket_mask = bucket_mask & (history_lengths <= upper_bound)
+                bucket_sums, bucket_count = ndcg_metric_tensor_sums_for_batch(
+                    top_ranked_labels,
+                    total_relevant,
+                    metrics_top_ks,
+                    row_mask=bucket_mask,
+                )
+                history_bucket_query_counts[bucket_idx].add_(bucket_count)
+                for name in ndcg_metric_names:
+                    history_bucket_metric_sums[bucket_idx][name].add_(bucket_sums[name])
 
             if train and optimizer is not None:
                 loss.backward()
@@ -224,6 +262,16 @@ def run_listwise_epoch(
             *(baseline_zero_history_metric_sums[name] for name in metric_names),
             *(metric_sums[name] for name in metric_names),
             *(zero_history_metric_sums[name] for name in metric_names),
+            *(
+                value
+                for bucket_sums, bucket_count in zip(
+                    history_bucket_metric_sums, history_bucket_query_counts
+                )
+                for value in (
+                    bucket_count.to(dtype=torch.float64),
+                    *(bucket_sums[name] for name in ndcg_metric_names),
+                )
+            ),
         ]
     ).cpu().tolist()
     loss = float(packed_statistics[0]) / max(batches, 1)
@@ -275,6 +323,29 @@ def run_listwise_epoch(
     )
     metrics["loss"] = loss
     metrics["rank_metric_user_count"] = metric_user_count_value
+    if history_buckets:
+        cursor += len(metric_names)
+        breakdown = []
+        for label, lower_bound, upper_bound in history_buckets:
+            query_count = int(packed_statistics[cursor])
+            cursor += 1
+            bucket_metrics = {
+                name: float(packed_statistics[cursor + idx]) / query_count
+                if query_count
+                else None
+                for idx, name in enumerate(ndcg_metric_names)
+            }
+            cursor += len(ndcg_metric_names)
+            breakdown.append(
+                {
+                    "label": label,
+                    "lower_bound": lower_bound,
+                    "upper_bound": upper_bound,
+                    "query_count": query_count,
+                    **bucket_metrics,
+                }
+            )
+        metrics["history_length_breakdown"] = breakdown
     return loss, metrics, baseline_metrics
 
 
@@ -553,6 +624,7 @@ def train_listwise_model(
                 metrics_top_ks=metrics_top_ks,
                 calc_baseline_metrics=calc_baseline_metrics,
                 max_batches=max_batches,
+                history_length_bucket_boundaries=None,
             )
 
         losses = {

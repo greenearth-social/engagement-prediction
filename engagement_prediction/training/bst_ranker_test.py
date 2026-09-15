@@ -287,6 +287,7 @@ def test_native_stage7_batch_runs_one_optimizer_step(tmp_path):
         metrics_top_ks=[1, 2],
         calc_baseline_metrics=True,
         max_batches=None,
+        history_length_bucket_boundaries=None,
     )
 
     assert "candidate_post_age_hours" in batch
@@ -302,7 +303,8 @@ def test_native_stage7_batch_runs_one_optimizer_step(tmp_path):
     assert not torch.equal(before, model.post_feature_encoder.content_projection.weight)
 
 
-def test_bst_epoch_metrics_do_not_require_full_argsort(monkeypatch):
+@pytest.mark.parametrize("history_boundaries", [None, [0, 1, 4]])
+def test_bst_epoch_metrics_do_not_require_full_argsort(monkeypatch, history_boundaries):
     model = _model(use_popularity_feature=False)
     loader = DataLoader(_SingleBatchDataset(_batch()), batch_size=None, shuffle=False)
 
@@ -323,12 +325,19 @@ def test_bst_epoch_metrics_do_not_require_full_argsort(monkeypatch):
         metrics_top_ks=[1, 2],
         calc_baseline_metrics=True,
         max_batches=None,
+        history_length_bucket_boundaries=history_boundaries,
     )
 
     assert loss >= 0.0
     assert metrics["rank_metric_user_count"] == 2
     assert metrics["ndcg@2"] >= 0.0
     assert baseline_metrics["ndcg@2"] >= 0.0
+    if history_boundaries is not None:
+        buckets = metrics["history_length_breakdown"]
+        assert [bucket["query_count"] for bucket in buckets] == [1, 1, 0, 0]
+        assert buckets[0]["ndcg@2"] == metrics["zero_history_ndcg@2"]
+    else:
+        assert "history_length_breakdown" not in metrics
 
 
 def test_train_bst_piggybacks_baseline_histogram_on_epoch_one_and_logs_detailed_early_stopping(
