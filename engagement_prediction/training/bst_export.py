@@ -33,7 +33,7 @@ def _require_mapping(value: Any, *, description: str) -> Mapping[str, Any]:
     return value
 
 
-def _load_checkpoint_model(
+def load_bst_checkpoint_model(
     *,
     checkpoint_path: Path,
     expected_model_config: Mapping[str, Any],
@@ -475,7 +475,7 @@ def validate_bst_ranker_export(
 ) -> dict[str, Any]:
     """Verify that a saved ScriptModule exactly represents its best checkpoint."""
 
-    eager_model, best_epoch = _load_checkpoint_model(
+    eager_model, best_epoch = load_bst_checkpoint_model(
         checkpoint_path=checkpoint_path,
         expected_model_config=expected_model_config,
         expected_popularity_stats=expected_popularity_stats,
@@ -513,7 +513,7 @@ def export_bst_ranker_checkpoint(
 ) -> dict[str, Any]:
     """Script, validate, and atomically publish one canonical BST checkpoint."""
 
-    eager_model, _ = _load_checkpoint_model(
+    eager_model, _ = load_bst_checkpoint_model(
         checkpoint_path=checkpoint_path,
         expected_model_config=expected_model_config,
         expected_popularity_stats=expected_popularity_stats,
@@ -650,7 +650,7 @@ def export_post_liker_serving_artifacts(
 
     if max_replay_events_per_post <= 0:
         raise ValueError("max_replay_events_per_post must be positive")
-    eager_model, best_epoch = _load_checkpoint_model(
+    eager_model, best_epoch = load_bst_checkpoint_model(
         checkpoint_path=checkpoint_path,
         expected_model_config=expected_model_config,
         expected_popularity_stats=expected_popularity_stats,

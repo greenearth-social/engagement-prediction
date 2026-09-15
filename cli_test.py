@@ -239,7 +239,7 @@ def test_query_sampling_defaults():
     assert merged.post_liker_history_partition_count == 16
     assert merged.author_statistics_partition_count == 16
     assert merged.embedding_source_batch_size == 64
-    assert merged.dataset_hydration_worker_count == 4
+    assert merged.dataset_hydration_worker_count == 8
     assert merged.min_author_training_feature_count == 50
     assert merged.min_post_liker_user_training_event_count == 2
     assert merged.max_post_liker_user_vocabulary_size == 1_000_000

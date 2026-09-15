@@ -83,7 +83,7 @@ DEFAULTS: Dict[str, Any] = {
     "author_statistics_partition_count": 16,
     # Stage 7: Dataset hydration
     "embedding_source_batch_size": 64,
-    "dataset_hydration_worker_count": 4,
+    "dataset_hydration_worker_count": 8,
     "min_author_training_feature_count": 50,
     "min_post_liker_user_training_event_count": 2,
     "max_post_liker_user_vocabulary_size": 1_000_000,
