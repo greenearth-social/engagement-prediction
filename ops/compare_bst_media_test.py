@@ -18,7 +18,7 @@ def test_defaults_and_one_or_more_named_models():
         arguments = [value for i in range(count) for value in ("--model", f"m{i}=/models/{i}")]
         args = parser.parse_args(arguments)
         assert len(args.model) == count
-        assert args.es_url == "https://localhost:9202"
+        assert args.es_url == "https://localhost:9200"
         assert args.metrics_top_ks == [30]
         assert args.es_verify_ssl is False
         assert args.output_dir == Path("/mnt/data/dave/outputs/compare")
@@ -62,9 +62,9 @@ def test_cli_overrides():
     ["--es-request-timeout", "0"],
     ["--num-dataloader-workers", "-1"],
     ["--dataloader-prefetch-factor", "0"],
-    ["--es-url", "localhost:9202"],
-    ["--es-url", "https://user:secret@localhost:9202"],
-    ["--es-url", "https://localhost:9202?api_key=secret"],
+    ["--es-url", "localhost:9200"],
+    ["--es-url", "https://user:secret@localhost:9200"],
+    ["--es-url", "https://localhost:9200?api_key=secret"],
     ["--es-index", "posts/_search"],
 ])
 def test_invalid_arguments(extra):
@@ -114,11 +114,11 @@ def _patch_pipeline(monkeypatch, *, failure):
     def hydrate(frame, **kwargs):
         observed.append("hydrate")
         assert frame.equals(candidates)
-        assert kwargs["es_url"] == "https://localhost:9202"
+        assert kwargs["es_url"] == "https://localhost:9200"
         assert kwargs["verify_ssl"] is False
         assert kwargs["api_key"] == "test-private-key"
         if failure == "hydrate":
-            raise RuntimeError("Elasticsearch connection failed at https://localhost:9202")
+            raise RuntimeError("Elasticsearch connection failed at https://localhost:9200")
         return media
 
     def evaluate(actual_dataset, actual_models, actual_settings, actual_media, **kwargs):
