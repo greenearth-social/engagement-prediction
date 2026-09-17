@@ -792,12 +792,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "bst_training_config": training_config_path,
         "bst_popularity_stats": popularity_stats_path,
         "bst_training_results": training_results_path,
-        "bst_ranker_best_checkpoint": checkpoint_path,
         "bst_stage_summary": summary_path,
         "bst_stage_info": stage_info_path,
     }
-    if plot_path is not None:
-        artifact_paths["bst_training_history_plot"] = plot_path
     upload_reproducibility_artifacts(
         tracker=context.tracker,
         logger=logger,

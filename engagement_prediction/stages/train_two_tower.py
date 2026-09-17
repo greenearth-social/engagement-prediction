@@ -604,12 +604,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "two_tower_model_config": model_config_path,
         "two_tower_training_config": training_config_path,
         "two_tower_training_results": training_results_path,
-        "two_tower_best_checkpoint": checkpoint_path,
         "two_tower_stage_summary": summary_path,
         "two_tower_stage_info": stage_info_path,
     }
-    if plot_path is not None:
-        artifact_paths["two_tower_training_history_plot"] = plot_path
     upload_reproducibility_artifacts(
         tracker=context.tracker,
         logger=logger,

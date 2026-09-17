@@ -189,6 +189,15 @@ def test_stage8_trains_native_two_tower_and_publishes_serving_artifacts(
         "engagement_user_tower",
         "engagement_post_tower",
     ]
+    assert {name for name, _ in tracker.file_artifacts} == {
+        "author_idx_mapping",
+        "two_tower_serving_manifest",
+        "two_tower_model_config",
+        "two_tower_training_config",
+        "two_tower_training_results",
+        "two_tower_stage_summary",
+        "two_tower_stage_info",
+    }
     assert len(tracker.histogram_calls) == 1
     histogram_call = dict(tracker.histogram_calls[0])
     histogram_values = histogram_call.pop("values")
