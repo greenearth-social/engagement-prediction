@@ -103,6 +103,17 @@ By default, outputs are written under `outputs/` in two coordinated views:
 
 Each stage writes `manifest.json`, `resolved_config.json`, `stage.log`, and `stage_info.txt` when it completes.
 
+### Raw Source Coverage
+
+The ingestion stages report daily bar charts in ClearML's **Plots** tab at iteration `0`:
+
+- **Raw posts by day**: Stage 00 reports grouped **Root posts** and **Replies** bars from its normalized staging rows after routing and before deduplication, without rescanning GCS.
+- **Raw likes by day**: Stage 1 scans only `record_created_at` from its exact recorded like-file snapshot and reports counts before query filtering or sampling.
+
+Both charts count raw rows by `record_created_at`, normalized to UTC, within `[posts_start, posts_end)`. Duplicate rows and rows with invalid identifiers count independently. Every calendar day in the window appears, including zero-count days; partially covered boundary days are marked as partial. Malformed or missing timestamps and rows before or after the window are excluded from the bars and counted separately in `stage.log` and `summary.json`.
+
+Each stage's `summary.json` stores daily counts, source-window boundaries, and exclusion counters under `raw_source_diagnostics`, with `root_posts` and `replies` entries for Stage 00 and a `likes` entry for Stage 1. Charts are generated whenever their ingestion stage executes; reusing prior artifacts does not replay them. `--no-plots` disables training plots only, so ingestion charts remain enabled. With `--experiment-tracker none`, the local summary counts are still saved.
+
 ### Stage 00: Source Metadata
 
 Stage 00 owns the exact `bsky_posts` and `bsky_replies` snapshots for the common half-open `[posts_start, posts_end)` source window. It normalizes narrow metadata, deduplicates each source by URI using latest creation time and ascending-author tie-breaking, applies root precedence to cross-source collisions, and publishes stable URI-hash partitions.
@@ -413,6 +424,24 @@ Legacy support is limited to standard BST TorchScript models exposing the same e
 Canonical feature-enabled BST models are also rejected by the comparison tool for now because comparison does not construct their query-time pooled post-liker vectors.
 
 The dataset argument may also point directly to its `hydrated_training_data_*` bundle. By default the tool evaluates `val`, `val_unseen_users`, `holdout_unseen_users`, and `holdout_seen_users`, using all Stage 7 hourly negatives and each model's configured history length. Results are built atomically under `outputs/comparisons/<run-id>/`; pass `--output-dir` to use another parent directory. Each completed comparison contains `metrics.json`, long-form `metrics.csv`, model-B-minus-model-A `metric_deltas.csv`, `model_specs.json`, `stage_info.txt`, and `comparison.log`. Floating-point result values are rounded to five decimal places while exact model and training configuration metadata remains unchanged. The tool does not create pipeline manifests, tracking tasks, uploads, or ranking-row artifacts.
+
+## Compare BST Performance By Media Type
+
+Use `ops/compare_bst_media.py` to evaluate one or more canonical Stage 8 BST best checkpoints on `val` and `val_unseen_users`, including models with post-liker features:
+
+```bash
+conda run -n eng-pred python ops/compare_bst_media.py \
+  --model baseline=/path/to/08_train_bst_ranker/<baseline-run-id> \
+  --model candidate=/path/to/08_train_bst_ranker/<candidate-run-id>
+```
+
+The tool discovers Stage 7 and the upstream input lineage from each model's saved metadata. All models must reference the same resolved input directories and agree on the recorded evaluation batch size, negative-candidate limit, and random seed. Each model retains its saved history length and feature settings. No `--dataset` argument or `config.yml` is used.
+
+Elasticsearch defaults to `https://localhost:9202`, the `posts` alias, and disabled TLS verification. Override these with `--es-url`, `--es-index`, and `--es-verify-ssl`. Authentication uses `GE_ELASTICSEARCH_API_KEY` when set. The tool checks the configured endpoint and fails on connection or search errors. `--es-batch-size` defaults to 1,000 URIs and `--es-request-timeout` to 30 seconds.
+
+Candidate media flags are fetched once for both splits and shared across models. After scoring each original validation slate, NDCG is recomputed among image candidates, video candidates, or candidates with both media flags false (`text_only`). Images and videos can overlap. Text-only includes link cards and quoted posts without their own image/video attachments. Missing documents or either missing flag are excluded from every media group, with coverage and exclusion counts reported. Queries without a positive in a group do not contribute to that group's average; empty groups have blank metrics.
+
+Results are published under `/mnt/data/dave/outputs/compare/<run-id>/`; change the parent with `--output-dir`. Each run contains `metrics.csv`, `hydration_coverage.csv`, `missing_media.csv`, the shared `media_metadata.parquet` snapshot, `run.json`, `comparison.log`, and `val_ndcg.png` / `val_unseen_users_ndcg.png`. Each plot has three media panels. The default `--metrics-top-ks 30` produces one marked point per model; pass, for example, `--metrics-top-ks 1 5 10 30` for comparison lines. Failed runs remain in a `.partial` directory. Models are evaluated sequentially on CUDA when available, otherwise CPU; use `--device` and `--num-dataloader-workers` to control evaluation resources.
 
 ## Legacy References
 
