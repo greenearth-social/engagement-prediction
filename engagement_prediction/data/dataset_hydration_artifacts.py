@@ -303,7 +303,7 @@ def _filter_embedding_source_batch(
     # across batches or materialized outside this batch's temporary route.
     selected_payloads_lf = (
         dataset_hydration.normalize_embedding_source_rows(
-            ingex.scan_parquet_files(batch_paths),
+            ingex.scan_post_parquet_files(batch_paths),
             posts_start=posts_start,
             posts_end=posts_end,
             is_reply=is_reply,

@@ -167,7 +167,10 @@ def test_reports_grouped_raw_counts_with_training_plots_disabled(tmp_path, monke
     }]
 
 
-def test_counts_all_raw_files_with_partial_days_and_exclusions(tmp_path, monkeypatch):
+@pytest.mark.parametrize("media_columns_first", [False, True])
+def test_counts_mixed_schema_raw_files_with_partial_days_and_exclusions(
+    tmp_path, monkeypatch, media_columns_first,
+):
     first_posts = tmp_path / "posts-first.parquet"
     second_posts = tmp_path / "posts-second.parquet"
     replies = tmp_path / "replies.parquet"
@@ -191,15 +194,20 @@ def test_counts_all_raw_files_with_partial_days_and_exclusions(tmp_path, monkeyp
             "2026-01-04T00:30:00Z",
         ],
         "did": ["a", "a", ""],
+        "contains_images": [True, False, False],
+        "contains_video": [False, True, False],
     }).write_parquet(second_posts)
     pl.DataFrame({
         "at_uri": ["reply", "outside"],
         "record_created_at": ["2026-01-03T23:00:00Z", "2026-01-05T00:00:00Z"],
         "did": ["a", "a"],
+        "contains_images": [False, True],
+        "contains_video": [True, False],
     }).write_parquet(replies)
 
     def list_files(**kwargs):
-        paths = [first_posts, second_posts] if kwargs["blob_prefix"] == "bsky_posts" else [replies]
+        post_paths = [second_posts, first_posts] if media_columns_first else [first_posts, second_posts]
+        paths = post_paths if kwargs["blob_prefix"] == "bsky_posts" else [replies]
         return [str(path) for path in paths], [datetime(2026, 1, 2, tzinfo=UTC)] * len(paths)
 
     monkeypatch.setattr(stage.ingex, "list_ingex_parquet_files", list_files)

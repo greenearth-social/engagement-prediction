@@ -87,6 +87,27 @@ def scan_parquet_files(
     )
 
 
+def scan_post_parquet_files(
+    paths: Sequence[str],
+    *,
+    include_file_paths: str | None = None,
+) -> pl.LazyFrame:
+    """Scan post/reply exports across the addition of boolean media flags.
+
+    Infer existing columns from the first file, then explicitly expect both
+    media flags so newer exports are accepted even when an older file comes
+    first. Missing flags in historical exports remain null (unknown).
+    """
+    schema = dict(scan_parquet_files(paths[:1]).collect_schema())
+    schema.update({"contains_images": pl.Boolean, "contains_video": pl.Boolean})
+    return pl.scan_parquet(
+        list(paths),
+        schema=schema,
+        missing_columns="insert",
+        include_file_paths=include_file_paths,
+    )
+
+
 def build_source_manifest(
     *,
     gcs_bucket: str,
