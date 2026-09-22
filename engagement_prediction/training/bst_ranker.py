@@ -164,6 +164,7 @@ def run_bst_listwise_epoch(
     metrics_top_ks: List[int],
     calc_baseline_metrics: bool,
     max_batches: Optional[int],
+    history_length_bucket_boundaries: list[int] | None,
 ) -> Tuple[float, Dict[str, Any], Dict[str, Any]]:
     """Run the shared listwise epoch while retaining BST's DCG fields."""
 
@@ -182,6 +183,7 @@ def run_bst_listwise_epoch(
         metrics_top_ks=metrics_top_ks,
         calc_baseline_metrics=calc_baseline_metrics,
         max_batches=max_batches,
+        history_length_bucket_boundaries=history_length_bucket_boundaries,
     )
 
 

@@ -2,6 +2,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import polars as pl
+import pytest
+
 from engagement_prediction.data import ingex
 
 
@@ -68,3 +71,68 @@ def test_source_manifest_round_trip_records_exact_files(tmp_path):
     ingex.write_source_manifest(path, manifest)
 
     assert ingex.load_source_manifest(path) == manifest
+
+
+@pytest.mark.parametrize("new_first", [False, True])
+def test_scan_post_parquet_files_accepts_mixed_media_schemas(tmp_path, new_first):
+    legacy_path = tmp_path / "legacy.parquet"
+    current_path = tmp_path / "current.parquet"
+    pl.DataFrame({"at_uri": ["legacy"]}).write_parquet(legacy_path)
+    pl.DataFrame({
+        "at_uri": ["images", "video", "both", "neither"],
+        "contains_images": [True, False, True, False],
+        "contains_video": [False, True, True, False],
+    }).write_parquet(current_path)
+    paths = [str(legacy_path), str(current_path)]
+    if new_first:
+        paths.reverse()
+
+    result = ingex.scan_post_parquet_files(
+        paths, include_file_paths="source_file"
+    ).collect(engine="streaming").sort("at_uri")
+
+    assert result.schema == pl.Schema({
+        "at_uri": pl.String,
+        "contains_images": pl.Boolean,
+        "contains_video": pl.Boolean,
+        "source_file": pl.String,
+    })
+    assert result.select("at_uri", "contains_images", "contains_video").to_dicts() == [
+        {"at_uri": "both", "contains_images": True, "contains_video": True},
+        {"at_uri": "images", "contains_images": True, "contains_video": False},
+        {"at_uri": "legacy", "contains_images": None, "contains_video": None},
+        {"at_uri": "neither", "contains_images": False, "contains_video": False},
+        {"at_uri": "video", "contains_images": False, "contains_video": True},
+    ]
+    assert result.filter(pl.col("at_uri") == "legacy")["source_file"].item() == str(
+        legacy_path
+    )
+
+
+def test_scan_post_parquet_files_expects_boolean_media_flags(tmp_path):
+    path = tmp_path / "invalid.parquet"
+    pl.DataFrame({
+        "at_uri": ["post"],
+        "contains_images": ["true"],
+        "contains_video": [False],
+    }).write_parquet(path)
+
+    with pytest.raises(pl.exceptions.SchemaError, match="contains_images"):
+        ingex.scan_post_parquet_files([str(path)]).collect(engine="streaming")
+
+
+def test_scan_post_parquet_files_rejects_unexpected_extra_columns(tmp_path):
+    legacy_path = tmp_path / "legacy.parquet"
+    current_path = tmp_path / "unexpected.parquet"
+    pl.DataFrame({"at_uri": ["legacy"]}).write_parquet(legacy_path)
+    pl.DataFrame({"at_uri": ["new"], "unexpected": [True]}).write_parquet(current_path)
+
+    with pytest.raises(pl.exceptions.SchemaError, match="unexpected"):
+        ingex.scan_post_parquet_files(
+            [str(legacy_path), str(current_path)]
+        ).collect(engine="streaming")
+
+
+def test_scan_post_parquet_files_rejects_empty_paths():
+    with pytest.raises(ValueError, match="empty collection"):
+        ingex.scan_post_parquet_files([])

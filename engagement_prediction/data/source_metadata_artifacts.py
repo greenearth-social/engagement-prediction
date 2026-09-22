@@ -158,7 +158,7 @@ def materialize_source_routes(
             config.source_metadata_partition_count,
         )
         normalized_lf = source_metadata.normalize_source_records(
-            ingex.scan_parquet_files(paths),
+            ingex.scan_post_parquet_files(paths),
             posts_start=config.posts_start,
             posts_end=config.posts_end,
             is_reply=is_reply,

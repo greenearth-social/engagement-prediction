@@ -331,6 +331,7 @@ learning_rate: 3e-4
 patience: 10
 early_stopping_min_delta: 0.002
 metrics_top_ks: [30]
+history_length_bucket_boundaries: [0, 1, 2, 4, 8, 16, 32]
 num_dataloader_workers: 4
 dataloader_pin_memory: true
 dataloader_prefetch_factor: 1
@@ -397,6 +398,16 @@ Useful options include `--output-embedding-dim` (default `128`), `--user-hidden-
 The `08_train_two_tower/<stage_run_id>/` artifact contains `checkpoints/two_tower_best.pth`, `checkpoints/engagement_user_tower.pt`, `checkpoints/engagement_post_tower.pt`, `two_tower_author_idx.parquet`, model/training/results JSON, an exact copy of `authors/`, and an optional training plot. Every new best refreshes both local TorchScript towers and verifies eager/script parity, output shapes, finiteness, unit norms, and combined scores. Canonical training always writes these artifacts.
 
 After final evaluation, the towers are registered once as the ClearML OutputModels `engagement_user_tower` and `engagement_post_tower`, and the author map is uploaded as `author_idx_mapping`. A successful complete upload writes `checkpoints/two_tower_serving_manifest.json`, including `output_embedding_dim` and the post-tower model ID as `embedding_space_id`. Remote publication is best-effort and never invalidates the verified local outputs. Deploying a non-128-dimensional model requires a coordinated Elasticsearch index migration and full post re-embedding.
+
+### Final Validation by History Length
+
+Both BST and two-tower training evaluate NDCG by history length after restoring the best checkpoint. The final `val` and `val_unseen_users` passes each report every configured `metrics_top_ks` value. Grouping reuses those passes' scores and candidate sets. History length is `history_mask.sum(dim=1)` after `max_history_len` truncation; padding and learned empty-history tokens do not count. Each validation query row is one observation, so a user with several query hours contributes several observations.
+
+Set `history_length_bucket_boundaries` in a configuration file or pass `--history-length-bucket-boundaries 0 1 2 4 8 16 32`. Boundaries must be a nonempty, strictly increasing list of integers starting at zero. They are inclusive upper limits, with an automatic overflow bucket. The defaults produce `0`, `1`, `2`, `3–4`, `5–8`, `9–16`, `17–32`, and `>32`.
+
+The boundaries are saved in `training_config.json`. Each final validation split has a `history_length_breakdown` in the saved results and summaries, with ordered bucket labels, bounds, eligible query-row counts, and mean NDCG values. Empty buckets have count `0` and NDCG `null`.
+
+For each K, `history_length_ndcg_at_{k}.png` shows separate validation and unseen-user validation curves above their query-row counts and identifies the best checkpoint's epoch. Empty buckets keep their labels and leave gaps in the curves. Figures are saved locally and logged to ClearML; the numerical breakdown is included in the existing result artifact uploads. `--no-plots` suppresses these figures while still calculating and saving the breakdown. `--experiment-tracker none` retains local results and enabled figures.
 
 ## Compare Model Performance
 

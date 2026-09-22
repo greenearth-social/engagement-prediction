@@ -41,12 +41,18 @@ from engagement_prediction.training.bst_export import (
     validate_bst_ranker_export,
 )
 from engagement_prediction.training.bst_publication import publish_ranker_to_tracker
+from engagement_prediction.training.history_length import (
+    validate_history_length_bucket_boundaries,
+)
 from engagement_prediction.training.model_artifacts import (
     write_author_map,
     write_json_atomically,
 )
 from engagement_prediction.training.popularity import fit_popularity_normalization
-from engagement_prediction.training.reporting import write_bst_training_history_plot
+from engagement_prediction.training.reporting import (
+    write_bst_training_history_plot,
+    write_history_length_plots,
+)
 from engagement_prediction.training.runtime import (
     clear_cuda_memory,
     get_device,
@@ -163,6 +169,7 @@ def _final_metrics(
     disable_progress: bool,
     gradient_clip_max_norm: float,
     metrics_top_ks: list[int],
+    history_length_bucket_boundaries: list[int],
     max_train_batches: int | None,
 ) -> Dict[str, Dict[str, Any]]:
     """Evaluate the reloaded best state on deterministic split loaders."""
@@ -175,6 +182,7 @@ def _final_metrics(
         disable_progress=disable_progress,
         gradient_clip_max_norm=gradient_clip_max_norm,
         metrics_top_ks=metrics_top_ks,
+        history_length_bucket_boundaries=history_length_bucket_boundaries,
         max_batches_by_split={"train": max_train_batches},
     )
 
@@ -216,6 +224,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     persistent_workers = bool(args.dataloader_persistent_workers)
     prefetch_factor = int(args.dataloader_prefetch_factor)
     metrics_top_ks = [int(value) for value in args.metrics_top_ks]
+    history_length_bucket_boundaries = validate_history_length_bucket_boundaries(
+        args.history_length_bucket_boundaries
+    )
     use_popularity_feature = bool(args.bst_use_popularity_feature)
     use_post_liker_feature = bool(args.bst_use_post_liker_feature)
     max_post_liker_replay_events_per_post = int(
@@ -431,6 +442,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "lr_scheduler_patience": int(args.lr_scheduler_patience),
         "gradient_clip_max_norm": float(args.gradient_clip_max_norm),
         "metrics_top_ks": metrics_top_ks,
+        "history_length_bucket_boundaries": history_length_bucket_boundaries,
         "num_dataloader_workers": num_workers,
         "dataloader_pin_memory": pin_memory,
         "dataloader_persistent_workers": persistent_workers,
@@ -546,6 +558,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         disable_progress=disable_progress,
         gradient_clip_max_norm=float(args.gradient_clip_max_norm),
         metrics_top_ks=metrics_top_ks,
+        history_length_bucket_boundaries=history_length_bucket_boundaries,
         max_train_batches=max_train_batches,
     )
 
@@ -605,12 +618,20 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     )
 
     plot_path = None
+    history_length_plot_paths = {}
     if generate_plots:
         plot_path = out_dir / "training_history.png"
         write_bst_training_history_plot(
             training_results["history"],
             plot_path,
             training_results["best_epoch"],
+        )
+        history_length_plot_paths = write_history_length_plots(
+            final_metrics=final_metrics,
+            metrics_top_ks=metrics_top_ks,
+            output_dir=out_dir,
+            best_epoch=training_results["best_epoch"],
+            tracker=context.tracker,
         )
 
     logger.info("Phase 7/8: publishing the final serving set to ClearML")
@@ -722,6 +743,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "training_results_path": training_results_path.name,
             "authors_path": authors_path.name,
             "training_plot_path": plot_path.name if plot_path else None,
+            "history_length_plot_paths": {
+                metric: path.name for metric, path in history_length_plot_paths.items()
+            },
         },
         runtime_seconds=runtime_seconds,
         extra_sections={
@@ -846,6 +870,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "training_results_path": str(training_results_path),
             "authors_path": str(authors_path),
             "training_plot_path": str(plot_path) if plot_path else None,
+            "history_length_plot_paths": {
+                metric: str(path) for metric, path in history_length_plot_paths.items()
+            },
         },
         "torchscript_export": result_payload["torchscript_export"],
         "post_liker_serving_artifacts": post_liker_serving_artifacts,

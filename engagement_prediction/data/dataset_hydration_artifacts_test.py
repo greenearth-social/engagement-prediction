@@ -8,6 +8,7 @@ import zlib
 
 import numpy as np
 import polars as pl
+import pytest
 
 from engagement_prediction.data import dataset_hydration
 from engagement_prediction.data import dataset_hydration_artifacts
@@ -33,9 +34,11 @@ def _embedding(values: list[float]) -> list[dict[str, str]]:
     return [{"key": "all_MiniLM_L12_v2", "value": _compressed(values)}]
 
 
+@pytest.mark.parametrize("media_columns_first", [False, True])
 def test_embedding_source_batching_scans_each_file_once_and_writes_only_selected_payloads(
     tmp_path,
     monkeypatch,
+    media_columns_first,
 ):
     selected_source_path = tmp_path / "selected-posts.parquet"
     unselected_source_path = tmp_path / "unselected-posts.parquet"
@@ -56,7 +59,10 @@ def test_embedding_source_batching_scans_each_file_once_and_writes_only_selected
             [{"key": "model", "value": "payload-4"}],
         ],
     })
-    source_rows.filter(pl.col("at_uri") == "selected").write_parquet(
+    source_rows.filter(pl.col("at_uri") == "selected").with_columns(
+        pl.Series("contains_images", [True, False]),
+        pl.Series("contains_video", [False, True]),
+    ).write_parquet(
         selected_source_path
     )
     source_rows.filter(pl.col("at_uri") == "unselected").write_parquet(
@@ -93,7 +99,7 @@ def test_embedding_source_batching_scans_each_file_once_and_writes_only_selected
 
     source_scans = []
     source_scan_barrier = threading.Barrier(2)
-    original_source_scan = dataset_hydration_artifacts.ingex.scan_parquet_files
+    original_source_scan = dataset_hydration_artifacts.ingex.scan_post_parquet_files
 
     def recording_source_scan(paths, **kwargs):
         source_scans.append((list(paths), kwargs.get("include_file_paths")))
@@ -102,7 +108,7 @@ def test_embedding_source_batching_scans_each_file_once_and_writes_only_selected
 
     monkeypatch.setattr(
         dataset_hydration_artifacts.ingex,
-        "scan_parquet_files",
+        "scan_post_parquet_files",
         recording_source_scan,
     )
 
@@ -122,12 +128,11 @@ def test_embedding_source_batching_scans_each_file_once_and_writes_only_selected
 
     output_path = tmp_path / "selected-embedding-rows"
     temporary_routes_root = tmp_path / "temporary-routes"
+    first_batch_paths = [str(selected_source_path), str(unselected_source_path)]
+    if not media_columns_first:
+        first_batch_paths.reverse()
     stats = dataset_hydration_artifacts.materialize_selected_embedding_rows(
-        post_paths=[
-            str(selected_source_path),
-            str(unselected_source_path),
-            str(other_unselected_source_path),
-        ],
+        post_paths=[*first_batch_paths, str(other_unselected_source_path)],
         reply_paths=[],
         posts_start=datetime(2026, 1, 1, tzinfo=UTC),
         posts_end=datetime(2026, 1, 2, tzinfo=UTC),
@@ -144,7 +149,7 @@ def test_embedding_source_batching_scans_each_file_once_and_writes_only_selected
     assert sorted(
         (tuple(paths), file_column) for paths, file_column in source_scans
     ) == sorted([
-        ((str(selected_source_path), str(unselected_source_path)), None),
+        (tuple(first_batch_paths), None),
         ((str(other_unselected_source_path),), None),
     ])
     assert len(routed_inputs) == 2

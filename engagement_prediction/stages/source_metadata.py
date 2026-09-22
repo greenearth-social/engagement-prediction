@@ -21,6 +21,7 @@ from typing import Any, Dict
 
 from engagement_prediction.data import (
     ingex,
+    raw_source_diagnostics,
     source_metadata,
     source_metadata_artifacts,
     timestamps,
@@ -163,6 +164,37 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         config=config,
         logger=logger,
     )
+    daily_counts = {}
+    for source_name, staged_path in (
+        ("root_posts", normalized_posts_path),
+        ("replies", normalized_replies_path),
+    ):
+        diagnostics = raw_source_diagnostics.count_daily_rows(
+            raw_source_diagnostics.scan_staged_timestamps(
+                staged_path,
+                timestamp_column="post_created_at",
+            ),
+            timestamp_column="post_created_at",
+            posts_start=config.posts_start,
+            posts_end=config.posts_end,
+        )
+        daily_counts[source_name] = diagnostics
+        raw_source_diagnostics.log_daily_counts(
+            logger,
+            source_name=source_name,
+            diagnostics=diagnostics,
+        )
+    context.tracker.log_histogram(
+        title="Raw posts by day",
+        series="Raw rows",
+        values=[daily_counts["root_posts"]["counts"], daily_counts["replies"]["counts"]],
+        labels=["Root posts", "Replies"],
+        xlabels=raw_source_diagnostics.daily_count_labels(daily_counts["root_posts"]),
+        xaxis="Creation date (UTC)",
+        yaxis="Raw rows",
+        mode="group",
+        iteration=0,
+    )
     # Each partition now contains every source row needed to choose one
     # canonical record for its URIs. If a URI exists in both sources, its root
     # row wins and the reply row is counted as an overlap.
@@ -193,6 +225,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "post_file_count": len(post_paths),
             "reply_file_count": len(reply_paths),
         },
+        "raw_source_diagnostics": daily_counts,
         "index": index_stats,
         "outputs": {
             "source_metadata_path": bundle_path.name,

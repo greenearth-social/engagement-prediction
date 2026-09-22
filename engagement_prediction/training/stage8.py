@@ -21,6 +21,7 @@ def evaluate_listwise_splits(
     disable_progress: bool,
     gradient_clip_max_norm: float,
     metrics_top_ks: list[int],
+    history_length_bucket_boundaries: list[int],
     max_batches_by_split: Mapping[str, Optional[int]],
 ) -> dict[str, dict[str, Any]]:
     """Evaluate a reloaded best model over deterministic split loaders."""
@@ -43,6 +44,11 @@ def evaluate_listwise_splits(
             disable_progress=disable_progress,
             gradient_clip_max_norm=gradient_clip_max_norm,
             metrics_top_ks=metrics_top_ks,
+            history_length_bucket_boundaries=(
+                history_length_bucket_boundaries
+                if split_name in {"val", "val_unseen_users"}
+                else None
+            ),
             calc_baseline_metrics=False,
             max_batches=max_batches_by_split.get(split_name),
         )

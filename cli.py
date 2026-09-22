@@ -130,6 +130,7 @@ DEFAULTS: Dict[str, Any] = {
     "no_plots": False,
     "disable_progress": False,  # Disable progress bars during training
     "metrics_top_ks": [30],
+    "history_length_bucket_boundaries": [0, 1, 2, 4, 8, 16, 32],
     # Stage 8 - DataLoader settings
     "num_dataloader_workers": 4,
     "dataloader_pin_memory": True,
@@ -232,6 +233,8 @@ def _load_config_file(path_str: str) -> Dict[str, Any]:
 
 def _merge_args_with_config(raw_args: argparse.Namespace) -> argparse.Namespace:
     """Apply defaults, then config file values, then CLI overrides."""
+    from engagement_prediction.training.history_length import validate_history_length_bucket_boundaries
+
     args_dict = vars(raw_args).copy()
     command = args_dict.get("command")
     func = args_dict.get("func")
@@ -252,6 +255,9 @@ def _merge_args_with_config(raw_args: argparse.Namespace) -> argparse.Namespace:
             f"Unknown model_type: {merged['model_type']!r}. "
             "Choose 'bst-ranker' or 'two-tower'."
         )
+    merged["history_length_bucket_boundaries"] = validate_history_length_bucket_boundaries(
+        merged["history_length_bucket_boundaries"]
+    )
     final_ns = argparse.Namespace(**merged)
     # Preserve argparse-injected metadata
     setattr(final_ns, "command", command)
@@ -1036,6 +1042,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Disable progress bars during training")
     _add_arg_with_default(p_all, "--metrics-top-ks", type=int, nargs="+", default=argparse.SUPPRESS,
                           help_text="Values of K to use for training NDCG@K metrics")
+    _add_arg_with_default(p_all, "--history-length-bucket-boundaries", type=int, nargs="+", default=argparse.SUPPRESS,
+                          help_text="Inclusive upper bounds for final validation history-length buckets; start at zero, increase strictly, and add an automatic overflow bucket")
     # Stage 8 - DataLoader settings
     _add_arg_with_default(p_all, "--num-dataloader-workers", type=int, default=argparse.SUPPRESS,
                           help_text="Number of DataLoader worker processes")
