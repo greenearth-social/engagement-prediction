@@ -310,7 +310,7 @@ def _assert_history_length_outputs(output_dir, training_results, summary, tracke
     assert len(tracker.plot_calls) == 1
     assert tracker.plot_calls[0][1] == "ndcg@1"
     assert tracker.plot_calls[0][3] == training_results["best_epoch"]
-    assert plot_path in [path for _, path in tracker.file_artifacts]
+    assert plot_path not in [path for _, path in tracker.file_artifacts]
 
 
 def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
