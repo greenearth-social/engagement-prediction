@@ -479,11 +479,16 @@ def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
         for title, series, _, _ in tracker.scalar_calls
     )
     assert tracker.model_artifacts == [("ranker", torchscript_path)]
-    assert {
+    assert {name for name, _ in tracker.file_artifacts} == {
         "author_idx_mapping",
         "ranker_serving_manifest",
-        "bst_ranker_best_checkpoint",
-    }.issubset({name for name, _ in tracker.file_artifacts})
+        "bst_model_config",
+        "bst_training_config",
+        "bst_popularity_stats",
+        "bst_training_results",
+        "bst_stage_summary",
+        "bst_stage_info",
+    }
     assert len(loader_calls) == 3
     assert [call["batch_size"] for call in loader_calls] == [2, 3, 3]
     assert [call["shuffle"] for call in loader_calls] == [True, False, False]
