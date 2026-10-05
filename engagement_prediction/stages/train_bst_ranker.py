@@ -8,6 +8,7 @@ both reproducibility files and the serving TorchScript artifact.
 from __future__ import annotations
 
 import argparse
+from functools import partial
 import json
 from pathlib import Path
 import shutil
@@ -165,6 +166,7 @@ def _final_metrics(
     *,
     model: BSTRanker,
     device: str,
+    loss_type: str,
     loaders: Dict[str, Any],
     disable_progress: bool,
     gradient_clip_max_norm: float,
@@ -176,7 +178,7 @@ def _final_metrics(
 
     return evaluate_listwise_splits(
         model=model,
-        epoch_runner=run_bst_listwise_epoch,
+        epoch_runner=partial(run_bst_listwise_epoch, loss_type=loss_type),
         device=device,
         loaders=loaders,
         disable_progress=disable_progress,
@@ -215,6 +217,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     loader_index_validation = _require_loader_index(bundle_path)
 
     random_seed = int(args.random_seed)
+    loss_type = args.loss_type
     max_history_len = int(args.max_history_len)
     additional_negatives = int(args.bst_additional_batch_negatives)
     batch_size = int(args.batch_size)
@@ -429,6 +432,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             for stage_folder, stage_dir in lineage.items()
         },
         "random_seed": random_seed,
+        "loss_type": loss_type,
         "batch_size": batch_size,
         "eval_batch_size": eval_batch_size,
         "bst_additional_batch_negatives": additional_negatives,
@@ -526,6 +530,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         val_loader=val_loader,
         val_unseen_loader=val_unseen_loader,
         device=device,
+        loss_type=loss_type,
         epochs=int(args.epochs),
         learning_rate=float(args.learning_rate),
         weight_decay=float(args.bst_weight_decay),
@@ -550,6 +555,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     final_metrics = _final_metrics(
         model=trained_model,
         device=device,
+        loss_type=loss_type,
         loaders={
             "train": train_loader,
             "val": val_loader,

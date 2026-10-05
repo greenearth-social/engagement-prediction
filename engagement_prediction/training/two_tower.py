@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -22,9 +23,13 @@ def compute_two_tower_listwise_loss_and_scores(
     model: nn.Module,
     batch: Dict[str, Any],
     device: str,
+    *,
+    loss_type: str,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Encode each user and candidate once, then compute matrix listwise loss."""
+    """Encode each user and candidate once, then compute the selected loss."""
 
+    if loss_type not in ("listwise", "bce"):
+        raise ValueError("loss_type must be 'listwise' or 'bce'")
     label_matrix = batch["label_matrix"]
     # Stage 7 batches are host tensors. Validate labels before the asynchronous
     # device transfer so bad input does not introduce a CUDA synchronization.
@@ -87,6 +92,8 @@ def compute_two_tower_listwise_loss_and_scores(
             "[num_users, num_candidates] shapes"
         )
 
+    if loss_type == "bce":
+        return F.binary_cross_entropy_with_logits(scores, labels, reduction="mean"), scores, labels
     positive_counts = input_positive_counts.to(
         device, dtype=torch.float32, non_blocking=True
     )
@@ -101,6 +108,7 @@ def run_two_tower_listwise_epoch(
     split_name: str,
     model: nn.Module,
     device: str,
+    loss_type: str,
     dataloader: DataLoader,
     optimizer: Optional[torch.optim.Optimizer],
     disable_progress: bool,
@@ -113,7 +121,9 @@ def run_two_tower_listwise_epoch(
     """Run the shared listwise epoch with two-tower's NDCG-only output."""
 
     return run_listwise_epoch(
-        compute_loss_and_scores=compute_two_tower_listwise_loss_and_scores,
+        compute_loss_and_scores=partial(
+            compute_two_tower_listwise_loss_and_scores, loss_type=loss_type
+        ),
         include_dcg_metrics=False,
         zero_grad_set_to_none=True,
         train=train,
@@ -150,6 +160,7 @@ class TwoTowerMatrixScorer:
             self.model,
             batch,
             device,
+            loss_type="listwise",
         )
         return MatrixBatchScores(scores=scores, loss=loss)
 
@@ -161,6 +172,7 @@ def train_two_tower_model(
     val_loader: DataLoader,
     val_unseen_loader: DataLoader,
     device: str,
+    loss_type: str,
     epochs: int,
     learning_rate: float,
     weight_decay: float,
@@ -185,7 +197,7 @@ def train_two_tower_model(
         raise ValueError("model.output_embedding_dim must be positive")
     results = train_listwise_model(
         model=model,
-        epoch_runner=run_two_tower_listwise_epoch,
+        epoch_runner=partial(run_two_tower_listwise_epoch, loss_type=loss_type),
         model_label="Two-tower",
         checkpoint_filename="two_tower_best.pth",
         checkpoint_extra_fields={"output_embedding_dim": output_embedding_dim},

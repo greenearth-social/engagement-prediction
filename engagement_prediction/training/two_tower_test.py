@@ -123,7 +123,8 @@ def _loader():
     )
 
 
-def test_compute_two_tower_listwise_loss_uses_native_author_fields():
+@pytest.mark.parametrize("loss_type", ["listwise", "bce"])
+def test_compute_two_tower_listwise_loss_uses_native_author_fields(loss_type):
     torch.manual_seed(3)
     model = _TinyTwoTower()
     batch = _batch()
@@ -133,6 +134,7 @@ def test_compute_two_tower_listwise_loss_uses_native_author_fields():
             model,
             batch,
             "cpu",
+            loss_type=loss_type,
         )
     )
     user_embeddings = model.encode_user(
@@ -146,18 +148,24 @@ def test_compute_two_tower_listwise_loss_uses_native_author_fields():
     )
     expected_scores = user_embeddings @ post_embeddings.T / 0.5
     targets = labels / labels.sum(dim=1, keepdim=True)
-    expected_loss = -(targets * F.log_softmax(expected_scores, dim=1)).sum(1).mean()
+    expected_loss = (
+        -(targets * F.log_softmax(expected_scores, dim=1)).sum(1).mean()
+        if loss_type == "listwise"
+        else (F.softplus(expected_scores) - expected_scores * labels).mean()
+    )
 
     torch.testing.assert_close(scores, expected_scores)
     torch.testing.assert_close(loss, expected_loss)
+    torch.testing.assert_close(labels, batch["label_matrix"])
     assert scores.shape == labels.shape == (2, 3)
 
 
-def test_compute_two_tower_loss_ignores_non_serving_features():
+@pytest.mark.parametrize("loss_type", ["listwise", "bce"])
+def test_compute_two_tower_loss_ignores_non_serving_features(loss_type):
     model = _TinyTwoTower()
     batch = _batch()
     loss, scores, _ = two_tower_training.compute_two_tower_listwise_loss_and_scores(
-        model, batch, "cpu"
+        model, batch, "cpu", loss_type=loss_type
     )
     changed = {
         **batch,
@@ -168,7 +176,7 @@ def test_compute_two_tower_loss_ignores_non_serving_features():
     }
     changed_loss, changed_scores, _ = (
         two_tower_training.compute_two_tower_listwise_loss_and_scores(
-            model, changed, "cpu"
+            model, changed, "cpu", loss_type=loss_type
         )
     )
 
@@ -176,24 +184,69 @@ def test_compute_two_tower_loss_ignores_non_serving_features():
     torch.testing.assert_close(changed_loss, loss)
 
 
-def test_compute_two_tower_loss_rejects_missing_authors_and_empty_positive_rows():
+@pytest.mark.parametrize("loss_type", ["listwise", "bce"])
+def test_compute_two_tower_loss_rejects_missing_authors_and_empty_positive_rows(loss_type):
     model = _TinyTwoTower()
     missing_authors = _batch()
     del missing_authors["history_author_indices"]
     with pytest.raises(RuntimeError, match="author index tensors"):
         two_tower_training.compute_two_tower_listwise_loss_and_scores(
-            model, missing_authors, "cpu"
+            model, missing_authors, "cpu", loss_type=loss_type
         )
 
     no_positives = _batch()
     no_positives["label_matrix"][1] = 0
     with pytest.raises(RuntimeError, match="at least one positive"):
         two_tower_training.compute_two_tower_listwise_loss_and_scores(
-            model, no_positives, "cpu"
+            model, no_positives, "cpu", loss_type=loss_type
         )
 
 
-def test_two_tower_epoch_uses_topk_ndcg_only_and_updates_weights(monkeypatch):
+def test_compute_two_tower_loss_rejects_unknown_loss_type():
+    with pytest.raises(ValueError, match="loss_type"):
+        two_tower_training.compute_two_tower_listwise_loss_and_scores(
+            _TinyTwoTower(), _batch(), "cpu", loss_type="unknown"
+        )
+
+
+def test_two_tower_loss_modes_preserve_scores_labels_and_ndcg():
+    model = _TinyTwoTower().eval()
+    batch = _batch()
+    results = {}
+    for loss_type in ("listwise", "bce"):
+        loss, scores, labels = two_tower_training.compute_two_tower_listwise_loss_and_scores(
+            model, batch, "cpu", loss_type=loss_type
+        )
+        epoch_loss, metrics, baseline = two_tower_training.run_two_tower_listwise_epoch(
+            train=False,
+            split_name="Validation",
+            model=model,
+            device="cpu",
+            loss_type=loss_type,
+            dataloader=_loader(),
+            optimizer=None,
+            disable_progress=True,
+            gradient_clip_max_norm=1.0,
+            metrics_top_ks=[1, 2],
+            calc_baseline_metrics=True,
+            max_batches=None,
+            history_length_bucket_boundaries=[0, 1, 2],
+        )
+        assert epoch_loss == pytest.approx(loss.item())
+        assert metrics.pop("loss") == pytest.approx(loss.item())
+        results[loss_type] = (loss, scores, labels, metrics, baseline)
+
+    listwise, bce = results["listwise"], results["bce"]
+    torch.testing.assert_close(listwise[1], bce[1])
+    torch.testing.assert_close(listwise[2], bce[2])
+    assert listwise[3:] == bce[3:]
+    scorer_result = two_tower_training.TwoTowerMatrixScorer(model).score_batch(batch, "cpu")
+    torch.testing.assert_close(scorer_result.loss, listwise[0])
+    torch.testing.assert_close(scorer_result.scores, listwise[1])
+
+
+@pytest.mark.parametrize("loss_type", ["listwise", "bce"])
+def test_two_tower_epoch_uses_topk_ndcg_only_and_updates_weights(monkeypatch, loss_type):
     model = _TinyTwoTower()
     loader = _loader()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
@@ -209,6 +262,7 @@ def test_two_tower_epoch_uses_topk_ndcg_only_and_updates_weights(monkeypatch):
             split_name="Train",
             model=model,
             device="cpu",
+            loss_type=loss_type,
             dataloader=loader,
             optimizer=optimizer,
             disable_progress=True,
@@ -238,12 +292,14 @@ def test_two_tower_epoch_uses_topk_ndcg_only_and_updates_weights(monkeypatch):
     assert not torch.equal(before, model.user_projection.weight)
 
 
-def test_two_tower_epoch_collects_history_buckets_for_validation():
+@pytest.mark.parametrize("loss_type", ["listwise", "bce"])
+def test_two_tower_epoch_collects_history_buckets_for_validation(loss_type):
     _, metrics, _ = two_tower_training.run_two_tower_listwise_epoch(
         train=False,
         split_name="Validation",
         model=_TinyTwoTower(),
         device="cpu",
+        loss_type=loss_type,
         dataloader=_loader(),
         optimizer=None,
         disable_progress=True,
@@ -260,7 +316,8 @@ def test_two_tower_epoch_collects_history_buckets_for_validation():
     assert "dcg@2" not in buckets[0]
 
 
-def test_canonical_two_tower_runs_one_native_batch_optimizer_step():
+@pytest.mark.parametrize("loss_type", ["listwise", "bce"])
+def test_canonical_two_tower_runs_one_native_batch_optimizer_step(loss_type):
     torch.manual_seed(9)
     model = TwoTowerModel(
         post_embedding_dim=2,
@@ -285,6 +342,7 @@ def test_canonical_two_tower_runs_one_native_batch_optimizer_step():
             split_name="Train",
             model=model,
             device="cpu",
+            loss_type=loss_type,
             dataloader=_loader(),
             optimizer=optimizer,
             disable_progress=True,
@@ -303,12 +361,19 @@ def test_canonical_two_tower_runs_one_native_batch_optimizer_step():
         before,
         model.user_tower.history_encoder.output_projection[-1].weight,
     )
+    assert all(
+        torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+        if parameter.grad is not None
+    )
 
 
+@pytest.mark.parametrize("loss_type", ["listwise", "bce"])
 def test_train_two_tower_uses_unseen_ndcg_for_checkpoint_and_min_delta_patience(
     tmp_path,
     monkeypatch,
     caplog,
+    loss_type,
 ):
     model = _TinyTwoTower()
     loader = _loader()
@@ -323,6 +388,7 @@ def test_train_two_tower_uses_unseen_ndcg_for_checkpoint_and_min_delta_patience(
     epoch_calls = []
 
     def fake_epoch(**kwargs):
+        assert kwargs["loss_type"] == loss_type
         expected_baseline = len(epoch_calls) < 3
         epoch_calls.append(
             (kwargs["split_name"], kwargs["calc_baseline_metrics"])
@@ -378,6 +444,7 @@ def test_train_two_tower_uses_unseen_ndcg_for_checkpoint_and_min_delta_patience(
         val_loader=loader,
         val_unseen_loader=loader,
         device="cpu",
+        loss_type=loss_type,
         epochs=5,
         learning_rate=1.0e-3,
         weight_decay=0.0,
@@ -492,6 +559,7 @@ def test_train_two_tower_validates_settings(tmp_path, kwargs, message):
         "val_loader": _loader(),
         "val_unseen_loader": _loader(),
         "device": "cpu",
+        "loss_type": "listwise",
         "epochs": 1,
         "learning_rate": 1.0e-3,
         "weight_decay": 0.0,

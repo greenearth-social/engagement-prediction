@@ -98,9 +98,10 @@ def test_history_length_bucket_invalid_cli_is_rejected(boundaries):
         cli._merge_args_with_config(raw)
 
 
-def test_cli_argument_merge_does_not_import_torch():
+@pytest.mark.parametrize("loss_type", ["listwise", "bce"])
+def test_cli_argument_merge_does_not_import_torch(loss_type):
     result = subprocess.run(
-        [sys.executable, "-c", "import sys; import cli; cli._merge_args_with_config(cli.build_parser().parse_args([])); assert 'torch' not in sys.modules"],
+        [sys.executable, "-c", "import sys; import cli; cli._merge_args_with_config(cli.build_parser().parse_args(sys.argv[1:])); assert 'torch' not in sys.modules", "--loss-type", loss_type],
         cwd=Path(cli.__file__).parent,
         capture_output=True,
         text=True,
@@ -320,6 +321,59 @@ def test_bst_ranker_is_the_default_model():
     assert args.model_type == "bst-ranker"
     assert cli._get_train_key(args.model_type) == "train_bst_ranker"
     assert cli._get_stage_order_for_model_type("train_bst_ranker")[-1] == "train_bst_ranker"
+
+
+@pytest.mark.parametrize("model_type", ["bst-ranker", "two-tower"])
+def test_loss_type_defaults_to_listwise(model_type):
+    args = cli._merge_args_with_config(cli.build_parser().parse_args([
+        "--model-type", model_type,
+    ]))
+
+    assert args.loss_type == "listwise"
+
+
+@pytest.mark.parametrize("model_type", ["bst-ranker", "two-tower"])
+@pytest.mark.parametrize("loss_type", ["listwise", "bce"])
+def test_loss_type_cli_for_both_models(model_type, loss_type):
+    args = cli._merge_args_with_config(cli.build_parser().parse_args([
+        "--model-type", model_type, "--loss-type", loss_type,
+    ]))
+
+    assert args.loss_type == loss_type
+
+
+@pytest.mark.parametrize("command", [[], ["run-all"]])
+@pytest.mark.parametrize("extension", ["yml", "json"])
+def test_loss_type_cli_overrides_config(tmp_path, command, extension):
+    config_path = tmp_path / f"loss.{extension}"
+    config_path.write_text(
+        "loss_type: bce\n" if extension == "yml" else json.dumps({"loss_type": "bce"})
+    )
+    parser = cli.build_parser()
+    arguments = ["--config", str(config_path), *command]
+
+    configured = cli._merge_args_with_config(parser.parse_args(arguments))
+    overridden = cli._merge_args_with_config(parser.parse_args([
+        *arguments, "--loss-type", "listwise",
+    ]))
+
+    assert configured.loss_type == "bce"
+    assert overridden.loss_type == "listwise"
+
+
+def test_invalid_loss_type_cli_is_rejected():
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["--loss-type", "unknown"])
+
+
+@pytest.mark.parametrize("loss_type", ["unknown", None, True, [], {}])
+def test_invalid_loss_type_config_is_rejected(tmp_path, loss_type):
+    config_path = tmp_path / "invalid_loss.json"
+    config_path.write_text(json.dumps({"loss_type": loss_type}))
+    raw = cli.build_parser().parse_args(["--config", str(config_path)])
+
+    with pytest.raises(ValueError, match="loss_type"):
+        cli._merge_args_with_config(raw)
 
 
 @pytest.mark.parametrize(

@@ -89,6 +89,7 @@ DEFAULTS: Dict[str, Any] = {
     "max_post_liker_user_vocabulary_size": 1_000_000,
     # Stage 8: Model architecture
     "model_type": "bst-ranker",
+    "loss_type": "listwise",
     "output_embedding_dim": 128,
     "user_hidden_dim": 256,
     "post_hidden_dim": 256,
@@ -254,6 +255,11 @@ def _merge_args_with_config(raw_args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError(
             f"Unknown model_type: {merged['model_type']!r}. "
             "Choose 'bst-ranker' or 'two-tower'."
+        )
+    if merged["loss_type"] not in ("listwise", "bce"):
+        raise ValueError(
+            f"Unknown loss_type: {merged['loss_type']!r}. "
+            "Choose 'listwise' or 'bce'."
         )
     merged["history_length_bucket_boundaries"] = validate_history_length_bucket_boundaries(
         merged["history_length_bucket_boundaries"]
@@ -948,6 +954,8 @@ def build_parser() -> argparse.ArgumentParser:
     # Stage 8 model selection
     _add_arg_with_default(p_all, "--model-type", type=str, choices=["two-tower", "bst-ranker"],
                           default=argparse.SUPPRESS, help_text="Model architecture: two-tower or bst-ranker")
+    _add_arg_with_default(p_all, "--loss-type", type=str, choices=["listwise", "bce"],
+                          default=argparse.SUPPRESS, help_text="Training loss for either model: listwise cross entropy or binary cross entropy")
     # Two-tower specific options
     _add_arg_with_default(p_all, "--output-embedding-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Canonical two-tower user/post output embedding dimension")
