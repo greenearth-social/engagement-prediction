@@ -322,6 +322,8 @@ Stage 8 consumes the required Stage 7 loader index directly. It trains on `train
 
 Shared training options:
 
+Both BST and two-tower default to the existing multi-positive listwise cross-entropy loss (`--loss-type listwise`). Use `--loss-type bce` for binary cross entropy averaged equally over the existing user-candidate pairs. For a manual NDCG@k comparison, train twice against the same Stage 7 inputs with the same seed and settings, changing only `--loss-type`. The existing NDCG reports, checkpoint selection, and exports work with either loss; the selected mode is recorded in `training_config.json`.
+
 ```yaml
 model_type: "bst-ranker"
 max_history_len: 64

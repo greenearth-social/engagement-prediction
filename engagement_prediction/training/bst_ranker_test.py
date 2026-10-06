@@ -5,6 +5,7 @@ import numpy as np
 import polars as pl
 import pytest
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from engagement_prediction.data import (
@@ -217,25 +218,38 @@ def _native_bundle(tmp_path):
     return bundle
 
 
-def test_compute_bst_listwise_loss_uses_native_fields_and_ignores_candidate_age():
+@pytest.mark.parametrize("loss_type", ["listwise", "bce"])
+def test_compute_bst_listwise_loss_uses_native_fields_and_ignores_candidate_age(loss_type):
     model = _model(use_popularity_feature=True)
     batch = _batch()
 
-    loss, scores, labels = bst_training.compute_bst_listwise_loss_and_scores(model, batch, "cpu")
+    loss, scores, labels = bst_training.compute_bst_listwise_loss_and_scores(
+        model, batch, "cpu", loss_type=loss_type
+    )
     changed_age_batch = {**batch, "candidate_post_age_hours": torch.tensor([999.0, 888.0, 777.0])}
     changed_loss, changed_scores, _ = bst_training.compute_bst_listwise_loss_and_scores(
         model,
         changed_age_batch,
         "cpu",
+        loss_type=loss_type,
     )
 
     assert torch.isfinite(loss)
     assert scores.shape == labels.shape == (2, 3)
     torch.testing.assert_close(changed_scores, scores)
     torch.testing.assert_close(changed_loss, loss)
+    targets = labels / labels.sum(dim=1, keepdim=True)
+    expected_loss = (
+        -(targets * F.log_softmax(scores, dim=1)).sum(dim=1).mean()
+        if loss_type == "listwise"
+        else (F.softplus(scores) - scores * labels).mean()
+    )
+    torch.testing.assert_close(loss, expected_loss)
+    torch.testing.assert_close(labels, batch["label_matrix"])
 
 
-def test_compute_bst_listwise_loss_rejects_rows_without_positives():
+@pytest.mark.parametrize("loss_type", ["listwise", "bce"])
+def test_compute_bst_listwise_loss_rejects_rows_without_positives(loss_type):
     batch = _batch()
     batch["label_matrix"][1] = 0
 
@@ -244,10 +258,55 @@ def test_compute_bst_listwise_loss_rejects_rows_without_positives():
             _model(use_popularity_feature=True),
             batch,
             "cpu",
+            loss_type=loss_type,
         )
 
 
-def test_native_stage7_batch_runs_one_optimizer_step(tmp_path):
+def test_compute_bst_loss_rejects_unknown_loss_type():
+    with pytest.raises(ValueError, match="loss_type"):
+        bst_training.compute_bst_listwise_loss_and_scores(
+            _model(use_popularity_feature=False), _batch(), "cpu", loss_type="unknown"
+        )
+
+
+def test_bst_loss_modes_preserve_scores_labels_and_ndcg():
+    model = _model(use_popularity_feature=True).eval()
+    batch = _batch()
+    results = {}
+    for loss_type in ("listwise", "bce"):
+        loss, scores, labels = bst_training.compute_bst_listwise_loss_and_scores(
+            model, batch, "cpu", loss_type=loss_type
+        )
+        epoch_loss, metrics, baseline = bst_training.run_bst_listwise_epoch(
+            train=False,
+            split_name="Validation",
+            model=model,
+            device="cpu",
+            loss_type=loss_type,
+            dataloader=DataLoader(_SingleBatchDataset(batch), batch_size=None),
+            optimizer=None,
+            disable_progress=True,
+            gradient_clip_max_norm=1.0,
+            metrics_top_ks=[1, 2],
+            calc_baseline_metrics=True,
+            max_batches=None,
+            history_length_bucket_boundaries=[0, 1, 4],
+        )
+        assert epoch_loss == pytest.approx(loss.item())
+        assert metrics.pop("loss") == pytest.approx(loss.item())
+        results[loss_type] = (loss, scores, labels, metrics, baseline)
+
+    listwise, bce = results["listwise"], results["bce"]
+    torch.testing.assert_close(listwise[1], bce[1])
+    torch.testing.assert_close(listwise[2], bce[2])
+    assert listwise[3:] == bce[3:]
+    scorer_result = bst_training.BSTRankerMatrixScorer(model).score_batch(batch, "cpu")
+    torch.testing.assert_close(scorer_result.loss, listwise[0])
+    torch.testing.assert_close(scorer_result.scores, listwise[1])
+
+
+@pytest.mark.parametrize("loss_type", ["listwise", "bce"])
+def test_native_stage7_batch_runs_one_optimizer_step(tmp_path, loss_type):
     dataset = HydratedBucketedEngagementDataset(
         _native_bundle(tmp_path),
         split="train",
@@ -280,6 +339,7 @@ def test_native_stage7_batch_runs_one_optimizer_step(tmp_path):
         split_name="Train",
         model=model,
         device="cpu",
+        loss_type=loss_type,
         dataloader=loader,
         optimizer=optimizer,
         disable_progress=True,
@@ -301,10 +361,16 @@ def test_native_stage7_batch_runs_one_optimizer_step(tmp_path):
     assert baseline_metrics["zero_history_ndcg@2"] >= 0.0
     assert not any("recall" in key for key in metrics | baseline_metrics)
     assert not torch.equal(before, model.post_feature_encoder.content_projection.weight)
+    assert all(
+        torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+        if parameter.grad is not None
+    )
 
 
 @pytest.mark.parametrize("history_boundaries", [None, [0, 1, 4]])
-def test_bst_epoch_metrics_do_not_require_full_argsort(monkeypatch, history_boundaries):
+@pytest.mark.parametrize("loss_type", ["listwise", "bce"])
+def test_bst_epoch_metrics_do_not_require_full_argsort(monkeypatch, history_boundaries, loss_type):
     model = _model(use_popularity_feature=False)
     loader = DataLoader(_SingleBatchDataset(_batch()), batch_size=None, shuffle=False)
 
@@ -318,6 +384,7 @@ def test_bst_epoch_metrics_do_not_require_full_argsort(monkeypatch, history_boun
         split_name="Validation",
         model=model,
         device="cpu",
+        loss_type=loss_type,
         dataloader=loader,
         optimizer=None,
         disable_progress=True,
@@ -340,10 +407,12 @@ def test_bst_epoch_metrics_do_not_require_full_argsort(monkeypatch, history_boun
         assert "history_length_breakdown" not in metrics
 
 
+@pytest.mark.parametrize("loss_type", ["listwise", "bce"])
 def test_train_bst_piggybacks_baseline_histogram_on_epoch_one_and_logs_detailed_early_stopping(
     tmp_path,
     monkeypatch,
     caplog,
+    loss_type,
 ):
     model = _model(use_popularity_feature=False)
     loader = DataLoader(_SingleBatchDataset(_batch()), batch_size=None, shuffle=False)
@@ -358,6 +427,7 @@ def test_train_bst_piggybacks_baseline_histogram_on_epoch_one_and_logs_detailed_
     epoch_calls = []
 
     def fake_epoch(**kwargs):
+        assert kwargs["loss_type"] == loss_type
         split_name = kwargs["split_name"]
         epoch_calls.append((split_name, kwargs["calc_baseline_metrics"]))
         ndcg = next(unseen_values) if split_name == "Validation Unseen Users" else 0.25
@@ -398,6 +468,7 @@ def test_train_bst_piggybacks_baseline_histogram_on_epoch_one_and_logs_detailed_
         val_loader=loader,
         val_unseen_loader=loader,
         device="cpu",
+        loss_type=loss_type,
         epochs=5,
         learning_rate=1.0e-3,
         weight_decay=0.0,
@@ -541,6 +612,7 @@ def test_best_checkpoint_callback_failure_propagates(tmp_path, monkeypatch):
             val_loader=loader,
             val_unseen_loader=loader,
             device="cpu",
+            loss_type="listwise",
             epochs=2,
             learning_rate=1.0e-3,
             weight_decay=0.0,
@@ -574,6 +646,7 @@ def test_train_bst_preserves_named_max_batch_validation():
             val_loader=None,
             val_unseen_loader=None,
             device="cpu",
+            loss_type="listwise",
             epochs=1,
             learning_rate=1.0e-3,
             weight_decay=0.0,

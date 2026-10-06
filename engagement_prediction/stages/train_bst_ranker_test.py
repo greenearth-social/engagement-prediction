@@ -9,6 +9,7 @@ import polars as pl
 import pytest
 import torch
 
+from cli import DEFAULTS
 from engagement_prediction.data import dataset_hydration
 from engagement_prediction.data import author_vocabulary
 from engagement_prediction.data import training_index
@@ -17,6 +18,7 @@ from engagement_prediction.data.datasets import HydratedBucketedEngagementDatase
 from engagement_prediction.models.bst_ranker import BSTRanker
 from engagement_prediction.pipeline.core import Context
 from engagement_prediction.stages import train_bst_ranker
+from engagement_prediction.training import bst_ranker as bst_training
 
 
 class _RecordingTracker:
@@ -234,6 +236,7 @@ def _args(
     return SimpleNamespace(
         run_tag=None,
         random_seed=7,
+        loss_type=DEFAULTS["loss_type"],
         max_history_len=2,
         bst_additional_batch_negatives=2,
         batch_size=2,
@@ -313,9 +316,11 @@ def _assert_history_length_outputs(output_dir, training_results, summary, tracke
     assert plot_path not in [path for _, path in tracker.file_artifacts]
 
 
+@pytest.mark.parametrize("loss_type", ["listwise", "bce"])
 def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
     tmp_path,
     monkeypatch,
+    loss_type,
 ):
     stage7_dir, bundle = _stage7_fixture(tmp_path)
     monkeypatch.setattr(
@@ -347,12 +352,31 @@ def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
         return final_metrics(**kwargs)
 
     monkeypatch.setattr(train_bst_ranker, "_final_metrics", record_final_metrics)
+    run_epoch = bst_training.run_bst_listwise_epoch
+    epoch_calls = []
+
+    def record_epoch(**kwargs):
+        epoch_calls.append((kwargs["split_name"], kwargs["train"], kwargs["loss_type"]))
+        return run_epoch(**kwargs)
+
+    monkeypatch.setattr(bst_training, "run_bst_listwise_epoch", record_epoch)
+    monkeypatch.setattr(train_bst_ranker, "run_bst_listwise_epoch", record_epoch)
+    args = _args(save_model=True, plots=True)
+    args.loss_type = loss_type
 
     result = train_bst_ranker.run(
         _context(tmp_path, tracker),
-        _args(save_model=True, plots=True),
+        args,
     )
 
+    assert epoch_calls == [
+        ("Train", True, loss_type),
+        ("Validation", False, loss_type),
+        ("Validation Unseen Users", False, loss_type),
+        ("Final train", False, loss_type),
+        ("Final val", False, loss_type),
+        ("Final val_unseen_users", False, loss_type),
+    ]
     output_dir = Path(result["output_dir"])
     checkpoint_path = output_dir / "checkpoints" / "bst_ranker_best.pth"
     checkpoint = torch.load(checkpoint_path, weights_only=False)
@@ -501,9 +525,11 @@ def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
         (output_dir / "training_config.json").read_text()
     )
     assert training_config["batch_size"] == 2
+    assert training_config["loss_type"] == loss_type
     assert training_config["eval_batch_size"] == 3
     assert training_config["history_length_bucket_boundaries"] == [0, 1, 2]
     assert summary["parameters"]["batch_size"] == 2
+    assert summary["parameters"]["loss_type"] == loss_type
     assert summary["parameters"]["eval_batch_size"] == 3
     assert final_metric_loader_batch_sizes == {
         "train": 2,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -22,14 +23,17 @@ def compute_bst_listwise_loss_and_scores(
     model: BSTRanker,
     batch: Dict[str, Any],
     device: str,
+    *,
+    loss_type: str,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Score one shared slate and compute a multi-positive listwise loss.
+    """Score one shared slate and compute the selected training loss.
 
-    Each user's positive labels are normalized to a probability distribution,
-    so a query with multiple positives contributes the same total target mass
-    as a query with one positive.
+    Listwise loss normalizes each user's positive labels to a probability
+    distribution. BCE averages unweighted binary loss over all pairs.
     """
 
+    if loss_type not in ("listwise", "bce"):
+        raise ValueError("loss_type must be 'listwise' or 'bce'")
     label_matrix = batch["label_matrix"]
     # Native loader batches arrive on the host. Validate them before the
     # asynchronous CUDA copy so invalid-data detection does not introduce a
@@ -143,6 +147,8 @@ def compute_bst_listwise_loss_and_scores(
             "Expected BST scores and label_matrix to have matching "
             "[num_users, num_candidates] shapes"
         )
+    if loss_type == "bce":
+        return F.binary_cross_entropy_with_logits(scores, labels, reduction="mean"), scores, labels
     positive_counts = input_positive_counts.to(
         device, dtype=torch.float32, non_blocking=True
     )
@@ -157,6 +163,7 @@ def run_bst_listwise_epoch(
     split_name: str,
     model: BSTRanker,
     device: str,
+    loss_type: str,
     dataloader: DataLoader,
     optimizer: Optional[torch.optim.Optimizer],
     disable_progress: bool,
@@ -169,7 +176,9 @@ def run_bst_listwise_epoch(
     """Run the shared listwise epoch while retaining BST's DCG fields."""
 
     return run_listwise_epoch(
-        compute_loss_and_scores=compute_bst_listwise_loss_and_scores,
+        compute_loss_and_scores=partial(
+            compute_bst_listwise_loss_and_scores, loss_type=loss_type
+        ),
         include_dcg_metrics=True,
         zero_grad_set_to_none=True,
         train=train,
@@ -203,7 +212,7 @@ class BSTRankerMatrixScorer:
         """Adapt the BST training primitive to the generic matrix evaluator."""
 
         loss, scores, _ = compute_bst_listwise_loss_and_scores(
-            self.model, batch, device
+            self.model, batch, device, loss_type="listwise"
         )
         return MatrixBatchScores(scores=scores, loss=loss)
 
@@ -214,6 +223,7 @@ def train_bst_ranker_model(
     val_loader: DataLoader,
     val_unseen_loader: DataLoader,
     device: str,
+    loss_type: str,
     epochs: int,
     learning_rate: float,
     weight_decay: float,
@@ -242,7 +252,7 @@ def train_bst_ranker_model(
         )
     return train_listwise_model(
         model=model,
-        epoch_runner=run_bst_listwise_epoch,
+        epoch_runner=partial(run_bst_listwise_epoch, loss_type=loss_type),
         model_label="BST",
         checkpoint_filename="bst_ranker_best.pth",
         checkpoint_extra_fields={},

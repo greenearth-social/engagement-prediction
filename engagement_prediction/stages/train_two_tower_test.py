@@ -9,6 +9,7 @@ import polars as pl
 import pytest
 import torch
 
+from cli import DEFAULTS
 from engagement_prediction.data.datasets import HydratedBucketedEngagementDataset
 from engagement_prediction.models.two_tower import TwoTowerModel
 from engagement_prediction.pipeline.core import Context
@@ -17,6 +18,7 @@ from engagement_prediction.stages.train_bst_ranker_test import (
     _assert_history_length_outputs,
     _stage7_fixture,
 )
+from engagement_prediction.training import two_tower as two_tower_training
 
 
 class _RecordingTracker:
@@ -75,6 +77,7 @@ def _args(*, plots: bool = False, output_embedding_dim: int = 3):
     return SimpleNamespace(
         run_tag=None,
         random_seed=7,
+        loss_type=DEFAULTS["loss_type"],
         max_history_len=2,
         output_embedding_dim=output_embedding_dim,
         batch_size=2,
@@ -120,9 +123,11 @@ def _context(tmp_path: Path, tracker: _RecordingTracker) -> Context:
     )
 
 
+@pytest.mark.parametrize("loss_type", ["listwise", "bce"])
 def test_stage8_trains_native_two_tower_and_publishes_serving_artifacts(
     tmp_path,
     monkeypatch,
+    loss_type,
 ):
     stage7_dir, bundle = _stage7_fixture(tmp_path)
     monkeypatch.setattr(
@@ -149,11 +154,30 @@ def test_stage8_trains_native_two_tower_and_publishes_serving_artifacts(
         return final_metrics(**kwargs)
 
     monkeypatch.setattr(train_two_tower, "_final_metrics", record_final_metrics)
+    run_epoch = two_tower_training.run_two_tower_listwise_epoch
+    epoch_calls = []
+
+    def record_epoch(**kwargs):
+        epoch_calls.append((kwargs["split_name"], kwargs["train"], kwargs["loss_type"]))
+        return run_epoch(**kwargs)
+
+    monkeypatch.setattr(two_tower_training, "run_two_tower_listwise_epoch", record_epoch)
+    monkeypatch.setattr(train_two_tower, "run_two_tower_listwise_epoch", record_epoch)
+    args = _args(plots=True, output_embedding_dim=3)
+    args.loss_type = loss_type
     result = train_two_tower.run(
         _context(tmp_path, tracker),
-        _args(plots=True, output_embedding_dim=3),
+        args,
     )
 
+    assert epoch_calls == [
+        ("Train", True, loss_type),
+        ("Validation", False, loss_type),
+        ("Validation Unseen Users", False, loss_type),
+        ("Final train", False, loss_type),
+        ("Final val", False, loss_type),
+        ("Final val_unseen_users", False, loss_type),
+    ]
     output_dir = Path(result["output_dir"])
     checkpoint_path = output_dir / "checkpoints" / "two_tower_best.pth"
     user_tower_path = output_dir / "checkpoints" / "engagement_user_tower.pt"
@@ -174,6 +198,8 @@ def test_stage8_trains_native_two_tower_and_publishes_serving_artifacts(
     assert model_config["l2_normalize_embeddings"] is True
     assert "shared_dim" not in json.dumps(model_config)
     assert training_config["output_embedding_dim"] == 3
+    assert training_config["loss_type"] == loss_type
+    assert summary["parameters"]["loss_type"] == loss_type
     assert training_config["candidate_pool"] == "all_hourly_negatives"
     assert training_config["batch_size"] == 2
     assert training_config["eval_batch_size"] == 3
