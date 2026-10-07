@@ -2,6 +2,10 @@
 
 This file documents conventions for AI agents and contributors working on this repo.
 
+## Python environment
+
+This repository uses Pipenv with Python 3.13.11. Run Pipenv itself with Python 3.13 so dependency markers match the project interpreter. Run Python commands with `pipenv run python ...` and tests with `pipenv run pytest ...`. Install the committed GPU environment with `pipenv sync --dev`; CI uses `PIPENV_PIPFILE=Pipfile.cpu` for its CPU environment. Keep both manifests and lockfiles aligned when changing dependencies, run `pipenv verify` for each manifest, and run `pipenv run python ops/check_env_sync.py` to check shared resolved versions and the allowed GPU/CPU differences.
+
 ## Default values: single source of truth
 
 **All default values for pipeline/training parameters live in `cli.py`** in the `DEFAULTS` dict. The CLI merges user config and CLI flags with `DEFAULTS` to produce the final `args` namespace.
