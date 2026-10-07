@@ -16,35 +16,63 @@ Native BST and two-tower training are active through Stage 8. MLP training has b
 
 ## Setup
 
-Install conda, then create the pinned environment:
+Install Python 3.11.15, then install Pipenv 2026.5.2 and create the pinned environment from this directory:
 
 ```bash
-conda-lock install -n eng-pred conda-lock.yml
-conda activate eng-pred
-python -c "import torch; print(torch.__version__)"
+python3.11 -m pip install --user pipenv==2026.5.2
+export PATH="$HOME/.local/bin:$PATH"
+pipenv verify
+pipenv sync --dev
+pipenv run python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 ```
 
-If dependencies change, update both `environment.yml` and `environment.ci.yml`, then regenerate lock files:
+Run Pipenv itself with Python 3.11, as in the installation command above, so dependency markers are evaluated for the same Python version as the project.
+
+`Pipfile.lock` is the Linux GPU environment, with PyTorch 2.5.1, torchvision 0.20.1, and torchaudio 2.5.1 from the CUDA 12.1 wheel index. The CUDA runtime libraries come with the Python dependencies; the host still needs a compatible NVIDIA driver. `Pipfile.ci.lock` uses the corresponding CPU wheels for CI. Provision the CPU variant in a separate checkout/environment with `PIPENV_PIPFILE=Pipfile.ci pipenv sync --dev`.
+
+The migration preserves application dependency versions from the previous lockfile, including explicit transitive pins. PyTorch 2.5.1's pip dependency constraints require two transitive downgrades: SymPy 1.14.0 to 1.13.1 and mpmath 1.4.1 to 1.3.0. Native CUDA/BLAS libraries use the versions bundled with or required by the upstream wheels, which differ from the previous Conda builds; the CUDA linker remains pinned to 12.1.105.
+
+If dependencies change, update both `Pipfile` and `Pipfile.ci`, then regenerate and commit both lockfiles:
 
 ```bash
-conda-lock -f environment.yml -p linux-64 --mamba --lockfile conda-lock.yml
-conda-lock -f environment.ci.yml -p linux-64 --mamba --lockfile conda-lock.ci.yml
+pipenv lock
+PIPENV_PIPFILE=Pipfile.ci pipenv lock
+pipenv verify
+PIPENV_PIPFILE=Pipfile.ci pipenv verify
 ```
 
-ClearML is the implemented experiment tracker. To use it, run `clearml-init` after activating the environment. For local or test runs without ClearML, pass `--experiment-tracker none`.
+Use `pipenv sync --dev` to install the committed versions without regenerating the lockfile. Commands below use `pipenv run` to select this repository's environment.
+
+ClearML is the implemented experiment tracker. To use it, run `pipenv run clearml-init`. For local or test runs without ClearML, pass `--experiment-tracker none`.
+
+### ClearML remote worker
+
+For a dedicated worker, provision a checkout at the desired lockfile revision and let ClearML reuse its Pipenv environment. Install and configure `clearml-agent` separately, keep `agent.package_manager.type: pip` in its existing configuration, and run the following from the provisioned checkout before starting the worker:
+
+```bash
+pipenv verify
+pipenv sync --dev
+export CLEARML_AGENT_SKIP_PIP_VENV_INSTALL="$(pipenv --py)"
+export CLEARML_AGENT_SKIP_PYTHON_ENV_INSTALL=1
+clearml-agent daemon --queue eng-pred-gpu --gpus 0 --foreground
+```
+
+Replace `eng-pred-gpu` with the dedicated queue your tasks use. Start the worker from the shell with working Git authentication so it inherits `SSH_AUTH_SOCK` when using an SSH agent. The worker also needs the same data access and credentials as a local run. Set `background` to `false` in remote tasks so ClearML tracks the training process.
+
+ClearML still checks out the task's code and applies its hyperparameter overrides, but dependencies come from the provisioned worker environment. It does not install the cloned task's recorded requirements or automatically consume `Pipfile.lock` in this mode. Both environment variables are required to prevent changes to the provisioned environment; stop the worker, sync the appropriate lockfile revision, and restart it when dependencies change. See the [ClearML environment variable reference](https://clear.ml/docs/latest/docs/clearml_agent/clearml_agent_env_var/).
 
 ## Testing
 
-Run tests from this directory with the project conda environment:
+Run tests from this directory with the project Pipenv environment:
 
 ```bash
-conda run -n eng-pred pytest -q
+pipenv run pytest -q
 ```
 
 To keep pytest temporary files inside the repo:
 
 ```bash
-TMPDIR=$PWD conda run -n eng-pred pytest -q
+TMPDIR=$PWD pipenv run pytest -q
 ```
 
 Tests use the `*_test.py` naming convention and live next to the code they cover.
@@ -85,13 +113,13 @@ Tests use the `*_test.py` naming convention and live next to the code they cover
 The CLI merges defaults, an optional YAML/JSON config, and explicit command-line flags. CLI flags win over config values.
 
 ```bash
-python cli.py --config config.yml --model-type bst-ranker --stop-after train_bst_ranker
+pipenv run python cli.py --config config.yml --model-type bst-ranker --stop-after train_bst_ranker
 ```
 
 For foreground local iteration:
 
 ```bash
-python cli.py --config config.yml --model-type bst-ranker --stop-after train_bst_ranker --background false --experiment-tracker none
+pipenv run python cli.py --config config.yml --model-type bst-ranker --stop-after train_bst_ranker --background false --experiment-tracker none
 ```
 
 ### Output Layout
@@ -310,7 +338,7 @@ For the current full dataset, expect the uncompressed loader index to add approx
 Rerun Stage 7 directly with an aligned Stage 6 artifact:
 
 ```bash
-python cli.py --config config.yml \
+pipenv run python cli.py --config config.yml \
   --start-from dataset_hydration \
   --stop-after dataset_hydration \
   --prior-06-author-statistics 20260816_120000_a7b8c9d0
@@ -343,7 +371,7 @@ dataloader_persistent_workers: false
 The BST ranker always fuses content embeddings, Stage 7 author indices, time-delta buckets, optional as-of popularity, and a candidate-aware transformer. By default it also replays each unique post's latest 128 strictly prior liker events and forms a time-decayed mean of learned liker-user embeddings. The raw pooled vector passes through its own Linear, GELU, and LayerNorm branch before fusion. Posts with no prior events use a zero raw vector. Author embeddings are mandatory for the canonical model.
 
 ```bash
-python cli.py --model-type bst-ranker \
+pipenv run python cli.py --model-type bst-ranker \
   --prediction-hidden-dims 64 32 16 \
   --stop-after train_bst_ranker
 ```
@@ -387,7 +415,7 @@ The current inference service does not yet supply the two pooled post-liker tens
 The canonical two-tower model consumes the Stage 7 loader index directly. It uses an author-aware, cross-attention-only user encoder and a learned post projection. Both towers always emit L2-normalized vectors, and exact history times, popularity, and candidate ages are not model inputs. Empty histories use a learned token, while history position carries the newest-first recency signal.
 
 ```bash
-python cli.py --config config.yml \
+pipenv run python cli.py --config config.yml \
   --model-type two-tower \
   --output-embedding-dim 128 \
   --stop-after train_two_tower
@@ -416,7 +444,7 @@ For each K, `history_length_ndcg_at_{k}.png` shows separate validation and unsee
 Use the standalone comparison CLI with one completed Stage 7 artifact and exactly two uniquely named model artifacts. Canonical Stage 8 BST, canonical Stage 8 two-tower, and standard legacy Stage 3 BST artifacts can be mixed in one comparison. Model type is inferred from each artifact's configuration.
 
 ```bash
-python ops/compare_model_performance.py \
+pipenv run python ops/compare_model_performance.py \
   --dataset /path/to/07_dataset_hydration/<run-id> \
   --model baseline=/path/to/08_train_bst_ranker/<run-id> \
   --model candidate=/path/to/08_train_two_tower/<run-id>
@@ -425,7 +453,7 @@ python ops/compare_model_performance.py \
 To compare a standard legacy BST ranker, pass its completed legacy `03_train` directory. The tool normally resolves the aligned legacy author-index artifact from its recorded lineage. If that input has moved or is otherwise unavailable, provide its exact author map explicitly under the same model name:
 
 ```bash
-python ops/compare_model_performance.py \
+pipenv run python ops/compare_model_performance.py \
   --dataset /path/to/07_dataset_hydration/<run-id> \
   --model legacy=/path/to/03_train/<run-id> \
   --author-map legacy=/path/to/author_idx_<run-id>.parquet \
@@ -443,7 +471,7 @@ The dataset argument may also point directly to its `hydrated_training_data_*` b
 Use `ops/compare_bst_media.py` to evaluate one or more canonical Stage 8 BST best checkpoints on `val` and `val_unseen_users`, including models with post-liker features:
 
 ```bash
-conda run -n eng-pred python ops/compare_bst_media.py \
+pipenv run python ops/compare_bst_media.py \
   --model baseline=/path/to/08_train_bst_ranker/<baseline-run-id> \
   --model candidate=/path/to/08_train_bst_ranker/<candidate-run-id>
 ```
@@ -465,7 +493,7 @@ Results are published under `/mnt/data/dave/outputs/compare/<run-id>/`; change t
 Use `--start-from`, `--stop-after`, and prior pins to reuse artifacts:
 
 ```bash
-python cli.py --config config.yml \
+pipenv run python cli.py --config config.yml \
   --start-from query_selection \
   --stop-after query_selection \
   --prior-00-source-metadata 20260810_120000_00112233
@@ -474,7 +502,7 @@ python cli.py --config config.yml \
 Stage 1 validates that the pinned Stage 00 bucket and source window match its configuration. All rewritten downstream stages require Stage 00 lineage; artifacts created before Stage 00 was introduced must be regenerated.
 
 ```bash
-python cli.py --config config.yml \
+pipenv run python cli.py --config config.yml \
   --start-from user_history \
   --stop-after user_history \
   --prior-01-query-selection 20260811_120000_a1b2c3d4
@@ -483,7 +511,7 @@ python cli.py --config config.yml \
 Rerun Stage 3 directly from a new Stage 2 artifact:
 
 ```bash
-python cli.py --config config.yml \
+pipenv run python cli.py --config config.yml \
   --start-from post_selection \
   --stop-after post_selection \
   --prior-02-user-history 20260812_120000_d4c3b2a1
@@ -494,7 +522,7 @@ The Stage 2 manifest supplies and validates the aligned Stage 00 and Stage 1 anc
 Rerun Stage 4 directly from an existing Stage 3 artifact:
 
 ```bash
-python cli.py --config config.yml \
+pipenv run python cli.py --config config.yml \
   --start-from negative_selection \
   --stop-after negative_selection \
   --prior-03-post-selection 20260813_120000_c3d4e5f6
@@ -505,7 +533,7 @@ The Stage 3 manifest supplies and validates the aligned Stage 00 through Stage 2
 Rerun Stage 5 directly from an existing Stage 4 artifact:
 
 ```bash
-python cli.py --config config.yml \
+pipenv run python cli.py --config config.yml \
   --start-from post_liker_history \
   --stop-after post_liker_history \
   --prior-04-negative-selection 20260814_120000_e5f6a7b8
@@ -516,7 +544,7 @@ The Stage 4 manifest supplies and validates the aligned Stage 00 through Stage 3
 Rerun Stage 6 directly from an existing Stage 5 artifact:
 
 ```bash
-python cli.py --config config.yml \
+pipenv run python cli.py --config config.yml \
   --start-from author_statistics \
   --stop-after author_statistics \
   --prior-05-post-liker-history 20260815_120000_f6a7b8c9
@@ -527,7 +555,7 @@ The Stage 5 manifest supplies and validates the aligned Stage 00 through Stage 4
 Rerun Stage 7 directly from an existing Stage 6 artifact:
 
 ```bash
-python cli.py --config config.yml \
+pipenv run python cli.py --config config.yml \
   --start-from dataset_hydration \
   --stop-after dataset_hydration \
   --prior-06-author-statistics 20260816_120000_a7b8c9d0
@@ -538,7 +566,7 @@ The Stage 6 manifest supplies and validates the aligned Stage 00 through Stage 5
 Rerun Stage 8 directly from an aligned Stage 7 artifact:
 
 ```bash
-python cli.py --config config.yml \
+pipenv run python cli.py --config config.yml \
   --model-type bst-ranker \
   --start-from train_bst_ranker \
   --stop-after train_bst_ranker \
@@ -550,7 +578,7 @@ The Stage 7 manifest supplies and validates the complete Stage 00 through Stage 
 For two-tower training, use the same Stage 7 pin with the two-tower stage:
 
 ```bash
-python cli.py --config config.yml \
+pipenv run python cli.py --config config.yml \
   --model-type two-tower \
   --start-from train_two_tower \
   --stop-after train_two_tower \
@@ -578,7 +606,7 @@ By default, `config.yml` may set `background: true`. In background mode, the CLI
 Run in the foreground while iterating:
 
 ```bash
-python cli.py --config config.yml --model-type bst-ranker --stop-after train_bst_ranker --background false
+pipenv run python cli.py --config config.yml --model-type bst-ranker --stop-after train_bst_ranker --background false
 ```
 
 ## Development Notes
