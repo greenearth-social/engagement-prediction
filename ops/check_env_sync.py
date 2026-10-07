@@ -22,6 +22,7 @@ GPU_ONLY_LOCK_PACKAGES = {
     "nvidia-curand-cu12",
     "nvidia-cusolver-cu12",
     "nvidia-cusparse-cu12",
+    "nvidia-cusparselt-cu12",
     "nvidia-nccl-cu12",
     "nvidia-nvjitlink-cu12",
     "nvidia-nvtx-cu12",
@@ -38,15 +39,15 @@ def check_env_sync(env_main: dict, env_cpu: dict) -> list[str]:
     errors = []
     normalized = []
     for filename, env, variant in (
-        ("Pipfile", env_main, "cu121"),
+        ("Pipfile", env_main, "cu124"),
         ("Pipfile.cpu", env_cpu, "cpu"),
     ):
         env = deepcopy(env)
-        # Preserve the existing CUDA linker version without adding it to CPU.
-        if variant == "cu121":
+        # Match the CUDA linker to the GPU runtime without adding it to CPU.
+        if variant == "cu124":
             nvjitlink = env.get("packages", {}).pop("nvidia-nvjitlink-cu12", None)
-            if nvjitlink != "==12.1.105":
-                errors.append("Pipfile must pin nvidia-nvjitlink-cu12 to ==12.1.105.")
+            if nvjitlink != "==12.4.127":
+                errors.append("Pipfile must pin nvidia-nvjitlink-cu12 to ==12.4.127.")
         elif any("nvidia-nvjitlink-cu12" in env.get(section, {}) for section in ("packages", "dev-packages")):
             errors.append("Pipfile.cpu must not include nvidia-nvjitlink-cu12.")
         sources = env.get("source", [])
@@ -85,12 +86,12 @@ def check_lock_sync(lock_main: dict, lock_cpu: dict) -> list[str]:
     for section in ("default", "develop"):
         normalized = []
         for filename, lock, variant in (
-            ("Pipfile.lock", lock_main, "cu121"),
+            ("Pipfile.lock", lock_main, "cu124"),
             ("Pipfile.cpu.lock", lock_cpu, "cpu"),
         ):
             versions = {name: spec["version"] for name, spec in lock.get(section, {}).items()}
             cuda_packages = versions.keys() & GPU_ONLY_LOCK_PACKAGES
-            if variant == "cu121" and section == "default":
+            if variant == "cu124" and section == "default":
                 for name in cuda_packages:
                     del versions[name]
             elif cuda_packages:

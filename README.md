@@ -16,21 +16,27 @@ Native BST and two-tower training are active through Stage 8. MLP training has b
 
 ## Setup
 
-Install Python 3.11.15, then install Pipenv 2026.5.2 and create the pinned environment from this directory:
+Install Python 3.13.11, then install Pipenv 2026.5.2 and create the pinned environment from this directory:
 
 ```bash
-python3.11 -m pip install --user pipenv==2026.5.2
+python3.13 -m pip install --user pipenv==2026.5.2
 export PATH="$HOME/.local/bin:$PATH"
 pipenv verify
 pipenv sync --dev
 pipenv run python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 ```
 
-Run Pipenv itself with Python 3.11, as in the installation command above, so dependency markers are evaluated for the same Python version as the project.
+Run Pipenv itself with Python 3.13, as in the installation command above, so dependency markers are evaluated for the same Python version as the project.
 
-`Pipfile.lock` is the Linux GPU environment, with PyTorch 2.5.1, torchvision 0.20.1, and torchaudio 2.5.1 from the CUDA 12.1 wheel index. The CUDA runtime libraries come with the Python dependencies; the host still needs a compatible NVIDIA driver. `Pipfile.cpu.lock` uses the corresponding CPU wheels for CPU execution, including CI. Provision the CPU variant in a separate checkout/environment with `PIPENV_PIPFILE=Pipfile.cpu pipenv sync --dev`.
+To upgrade an existing Python 3.11 Pipenv environment, stop any worker using it, run `pipenv --rm` and `pipenv --python 3.13.11`, then run `pipenv sync --dev`. Syncing packages alone does not replace the environment's Python interpreter.
 
-The migration preserves application dependency versions from the previous lockfile, including explicit transitive pins. PyTorch 2.5.1's pip dependency constraints require two transitive downgrades: SymPy 1.14.0 to 1.13.1 and mpmath 1.4.1 to 1.3.0. Native CUDA/BLAS libraries use the versions bundled with or required by the upstream wheels, which differ from the previous Conda builds; the CUDA linker remains pinned to 12.1.105.
+`Pipfile.lock` is the Linux GPU environment, with PyTorch 2.6.0, torchvision 0.21.0, and torchaudio 2.6.0 from the CUDA 12.4 wheel index. The CUDA runtime libraries come with the Python dependencies; the host still needs a compatible NVIDIA driver. `Pipfile.cpu.lock` uses the corresponding CPU wheels for CPU execution, including CI. Provision the CPU variant in a separate checkout/environment with `PIPENV_PIPFILE=Pipfile.cpu pipenv sync --dev`.
+
+Switching `PIPENV_PIPFILE` alone does not isolate or replace an existing `.venv`; recreate the environment when switching between CPU and GPU variants.
+
+The Python 3.13 upgrade requires newer torchvision and torchaudio wheels, so the three PyTorch packages are upgraded together. Other Python dependency pins are retained, with setuptools 82.0.1 added for PyTorch on Python 3.12 and later. Native CUDA/BLAS libraries use the versions required by the upstream wheels; the CUDA linker is pinned to 12.4.127.
+
+This upgrade was checked against `inference-service`'s Python 3.13 / PyTorch 2.5.1 CPU stack using newly exported BST and two-tower models, real existing artifacts, and author maps. Supported service predictions were identical. Recheck this boundary when changing PyTorch or model operations; the service's existing lack of post-liker inputs still applies.
 
 If dependencies change, update both `Pipfile` and `Pipfile.cpu`, then regenerate and commit both lockfiles:
 

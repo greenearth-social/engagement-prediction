@@ -4,12 +4,12 @@ verify_ssl = true
 name = "pypi"
 
 [[source]]
-url = "https://download.pytorch.org/whl/cu121"
+url = "https://download.pytorch.org/whl/cu124"
 verify_ssl = true
 name = "pytorch"
 
 [packages]
-# Preserve the versions from the previous environment lock during the migration.
+# Keep application dependencies pinned while upgrading the Python runtime.
 numpy = "==2.4.3"
 pandas = "==3.0.1"
 scikit-learn = "==1.8.0"
@@ -28,15 +28,16 @@ fastapi = "==0.135.1"
 pydantic = "==2.12.5"
 uvicorn = "==0.42.0"
 clearml = "==2.1.2"
-# Select the existing CUDA build explicitly instead of detecting it from the driver.
-torch = {version = "==2.5.1+cu121", index = "pytorch"}
-torchvision = {version = "==0.20.1+cu121", index = "pytorch"}
-torchaudio = {version = "==2.5.1+cu121", index = "pytorch"}
-# Preserve the existing CUDA linker version instead of resolving the newest CUDA 12 release.
-nvidia-nvjitlink-cu12 = "==12.1.105"
-# Upstream PyTorch wheels require these versions; the old solver allowed newer ones.
+# This matching PyTorch stack provides Python 3.13 wheels for all three packages.
+torch = {version = "==2.6.0+cu124", index = "pytorch"}
+torchvision = {version = "==0.21.0+cu124", index = "pytorch"}
+torchaudio = {version = "==2.6.0+cu124", index = "pytorch"}
+# Match the CUDA linker required by the PyTorch wheel.
+nvidia-nvjitlink-cu12 = "==12.4.127"
+# PyTorch requires these versions, plus setuptools on Python 3.12 and newer.
 sympy = "==1.13.1"
 mpmath = "==1.3.0"
+setuptools = "==82.0.1"
 
 # Pin existing transitive dependencies so this migration does not upgrade them.
 annotated-doc = "==0.0.4"
@@ -109,4 +110,4 @@ pluggy = "==1.6.0"
 pygments = "==2.19.2"
 
 [requires]
-python_full_version = "3.11.15"
+python_full_version = "3.13.11"
