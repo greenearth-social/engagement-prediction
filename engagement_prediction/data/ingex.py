@@ -25,8 +25,7 @@ def parse_ingex_blob_timestamp(blob_name: str, blob_prefix: str) -> Optional[dat
     return datetime.strptime(date_part + time_part, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
 
 
-def _list_ingex_parquet_files(
-    client: Any,
+def list_ingex_parquet_files(
     *,
     gcs_bucket: str,
     blob_prefix: str,
@@ -40,6 +39,9 @@ def _list_ingex_parquet_files(
     reproducible even if GCS returns objects in a different order.
     """
 
+    from google.cloud import storage
+
+    client = storage.Client()
     matches: list[tuple[datetime, str]] = []
     for blob in client.list_blobs(gcs_bucket, prefix=f"{blob_prefix}_"):
         timestamp = parse_ingex_blob_timestamp(blob.name, blob_prefix)
@@ -52,25 +54,6 @@ def _list_ingex_parquet_files(
         matches.append((timestamp, f"gs://{gcs_bucket}/{blob.name}"))
     matches.sort(key=lambda item: (item[0], item[1]))
     return [uri for _, uri in matches], [timestamp for timestamp, _ in matches]
-
-
-def list_ingex_parquet_files(
-    *,
-    gcs_bucket: str,
-    blob_prefix: str,
-    start: Optional[datetime],
-    end: Optional[datetime],
-) -> Tuple[list[str], list[datetime]]:
-    """List matching Ingex Parquet URIs in deterministic timestamp order."""
-    from google.cloud import storage
-
-    return _list_ingex_parquet_files(
-        storage.Client(),
-        gcs_bucket=gcs_bucket,
-        blob_prefix=blob_prefix,
-        start=start,
-        end=end,
-    )
 
 
 def scan_parquet_files(

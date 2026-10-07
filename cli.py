@@ -52,7 +52,7 @@ DEFAULTS: Dict[str, Any] = {
     "random_seed": 42,
     "embedding_model": "all_MiniLM_L12_v2",
     # Stage 00: Canonical source metadata
-    "gcs_bucket": 'greenearth-471522-ingex-extract-stage',
+    "gcs_bucket": 'greenearth-471522-ingex-extract-prod',
     "posts_start": None,
     "posts_end": None,
     "source_metadata_partition_count": 16,

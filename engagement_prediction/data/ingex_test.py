@@ -33,27 +33,36 @@ def test_parse_ingex_blob_timestamp_requires_exact_prefix_and_name():
     ) is None
 
 
-def test_list_ingex_parquet_files_filters_and_sorts():
+def test_list_ingex_parquet_files_filters_and_sorts(monkeypatch):
+    from google.cloud import storage
+
     client = _FakeClient(
         [
             "bsky_likes_20260807_030000.parquet",
             "not_likes_20260807_020000.parquet",
+            "bsky_likes_20260807_023000.parquet",
             "bsky_likes_20260807_010000.parquet",
             "bsky_likes_20260807_020000.parquet",
             "bsky_likes_invalid.parquet",
         ]
     )
+    monkeypatch.setattr(storage, "Client", lambda: client)
 
-    uris, timestamps = ingex._list_ingex_parquet_files(
-        client,
+    uris, timestamps = ingex.list_ingex_parquet_files(
         gcs_bucket="test-bucket",
         blob_prefix="bsky_likes",
         start=datetime(2026, 8, 7, 2, tzinfo=timezone.utc),
         end=datetime(2026, 8, 7, 3, tzinfo=timezone.utc),
     )
 
-    assert uris == ["gs://test-bucket/bsky_likes_20260807_020000.parquet"]
-    assert timestamps == [datetime(2026, 8, 7, 2, tzinfo=timezone.utc)]
+    assert uris == [
+        "gs://test-bucket/bsky_likes_20260807_020000.parquet",
+        "gs://test-bucket/bsky_likes_20260807_023000.parquet",
+    ]
+    assert timestamps == [
+        datetime(2026, 8, 7, 2, tzinfo=timezone.utc),
+        datetime(2026, 8, 7, 2, 30, tzinfo=timezone.utc),
+    ]
 
 
 def test_source_manifest_round_trip_records_exact_files(tmp_path):
