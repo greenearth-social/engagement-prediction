@@ -28,18 +28,21 @@ pipenv run python -c "import torch; print(torch.__version__, torch.version.cuda,
 
 Run Pipenv itself with Python 3.11, as in the installation command above, so dependency markers are evaluated for the same Python version as the project.
 
-`Pipfile.lock` is the Linux GPU environment, with PyTorch 2.5.1, torchvision 0.20.1, and torchaudio 2.5.1 from the CUDA 12.1 wheel index. The CUDA runtime libraries come with the Python dependencies; the host still needs a compatible NVIDIA driver. `Pipfile.ci.lock` uses the corresponding CPU wheels for CI. Provision the CPU variant in a separate checkout/environment with `PIPENV_PIPFILE=Pipfile.ci pipenv sync --dev`.
+`Pipfile.lock` is the Linux GPU environment, with PyTorch 2.5.1, torchvision 0.20.1, and torchaudio 2.5.1 from the CUDA 12.1 wheel index. The CUDA runtime libraries come with the Python dependencies; the host still needs a compatible NVIDIA driver. `Pipfile.cpu.lock` uses the corresponding CPU wheels for CPU execution, including CI. Provision the CPU variant in a separate checkout/environment with `PIPENV_PIPFILE=Pipfile.cpu pipenv sync --dev`.
 
 The migration preserves application dependency versions from the previous lockfile, including explicit transitive pins. PyTorch 2.5.1's pip dependency constraints require two transitive downgrades: SymPy 1.14.0 to 1.13.1 and mpmath 1.4.1 to 1.3.0. Native CUDA/BLAS libraries use the versions bundled with or required by the upstream wheels, which differ from the previous Conda builds; the CUDA linker remains pinned to 12.1.105.
 
-If dependencies change, update both `Pipfile` and `Pipfile.ci`, then regenerate and commit both lockfiles:
+If dependencies change, update both `Pipfile` and `Pipfile.cpu`, then regenerate and commit both lockfiles:
 
 ```bash
 pipenv lock
-PIPENV_PIPFILE=Pipfile.ci pipenv lock
+PIPENV_PIPFILE=Pipfile.cpu pipenv lock
 pipenv verify
-PIPENV_PIPFILE=Pipfile.ci pipenv verify
+PIPENV_PIPFILE=Pipfile.cpu pipenv verify
+pipenv run python ops/check_env_sync.py
 ```
+
+The sync check compares both manifests and the resolved versions in both lockfiles, including transitive and development dependencies. Only the expected PyTorch wheel variants and GPU-only CUDA/Triton packages may differ.
 
 Use `pipenv sync --dev` to install the committed versions without regenerating the lockfile. Commands below use `pipenv run` to select this repository's environment.
 
