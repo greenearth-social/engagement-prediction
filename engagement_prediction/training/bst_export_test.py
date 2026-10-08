@@ -23,6 +23,7 @@ def _model_config(
     *,
     use_popularity_feature: bool,
     use_post_liker_feature: bool = False,
+    use_target_user_feature: bool = False,
 ) -> dict:
     return {
         "model_type": "bst-ranker",
@@ -51,7 +52,10 @@ def _model_config(
             "popularity_log_mean": 1.25 if use_popularity_feature else 0.0,
             "popularity_log_std": 2.5 if use_popularity_feature else 1.0,
             "use_post_liker_feature": use_post_liker_feature,
-            "post_liker_user_table_num_rows": 4 if use_post_liker_feature else 2,
+            "use_target_user_feature": use_target_user_feature,
+            "target_user_projection_dim": 2,
+            "target_user_unknown_dropout_rate": 0.1,
+            "post_liker_user_table_num_rows": 4 if (use_post_liker_feature or use_target_user_feature) else 2,
             "post_liker_user_embedding_dim": 3,
             "post_liker_projection_dim": 2,
             "post_liker_pooling_tau_hours": 24.0,
@@ -78,10 +82,12 @@ def _write_checkpoint(
     model_config: dict | None = None,
     state_dict: dict | None = None,
     use_post_liker_feature: bool = False,
+    use_target_user_feature: bool = False,
 ) -> tuple[dict, dict]:
     model_config = model_config or _model_config(
         use_popularity_feature=use_popularity_feature,
         use_post_liker_feature=use_post_liker_feature,
+        use_target_user_feature=use_target_user_feature,
     )
     popularity_stats = _popularity_stats(
         use_popularity_feature=use_popularity_feature
@@ -104,15 +110,18 @@ def _write_checkpoint(
 
 
 @pytest.mark.parametrize("use_popularity_feature", [False, True])
+@pytest.mark.parametrize("use_target_user_feature", [False, True])
 def test_export_scripts_reloads_and_validates_all_serving_paths(
     tmp_path,
     use_popularity_feature,
+    use_target_user_feature,
 ):
     checkpoint_path = tmp_path / "bst_ranker_best.pth"
     output_path = tmp_path / "ranker.pt"
     model_config, popularity_stats = _write_checkpoint(
         checkpoint_path,
         use_popularity_feature=use_popularity_feature,
+        use_target_user_feature=use_target_user_feature,
     )
 
     export = export_bst_ranker_checkpoint(
@@ -274,8 +283,10 @@ def test_validator_detects_checkpoint_weights_changed_after_export(tmp_path):
         )
 
 
+@pytest.mark.parametrize("use_target_user_feature", [False, True])
 def test_feature_enabled_export_validates_events_vectors_lookup_and_companions(
     tmp_path,
+    use_target_user_feature,
 ):
     checkpoint_path = tmp_path / "bst_ranker_best.pth"
     output_path = tmp_path / "ranker.pt"
@@ -283,6 +294,7 @@ def test_feature_enabled_export_validates_events_vectors_lookup_and_companions(
         checkpoint_path,
         use_popularity_feature=True,
         use_post_liker_feature=True,
+        use_target_user_feature=use_target_user_feature,
     )
 
     export = export_bst_ranker_checkpoint(
@@ -353,3 +365,53 @@ def test_feature_enabled_export_validates_events_vectors_lookup_and_companions(
         "reference_timestamp",
         "liker_embedding_model_version",
     ]
+
+
+@pytest.mark.parametrize("use_post_liker_feature", [False, True])
+def test_load_legacy_checkpoint_normalizes_target_feature_without_changing_weights(tmp_path, use_post_liker_feature):
+    checkpoint_path = tmp_path / "legacy.pth"
+    config, popularity = _write_checkpoint(
+        checkpoint_path, use_popularity_feature=False,
+        use_post_liker_feature=use_post_liker_feature,
+    )
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
+    for name in (
+        "use_target_user_feature", "target_user_projection_dim",
+        "target_user_unknown_dropout_rate",
+    ):
+        del config["constructor_args"][name]
+    checkpoint["metadata"]["model_config"] = config
+    torch.save(checkpoint, checkpoint_path)
+
+    loaded, _ = bst_export.load_bst_checkpoint_model(
+        checkpoint_path=checkpoint_path,
+        expected_model_config=config,
+        expected_popularity_stats=popularity,
+    )
+    assert loaded.use_target_user_feature is False
+    assert loaded.state_dict().keys() == checkpoint["model_state_dict"].keys()
+    for name, value in loaded.state_dict().items():
+        assert torch.equal(value, checkpoint["model_state_dict"][name])
+
+
+@pytest.mark.parametrize("legacy_schema", [False, True])
+def test_shared_user_map_supports_target_only_rows_and_legacy_vocabulary(tmp_path, legacy_schema):
+    vocabulary = tmp_path / "users"
+    vocabulary.mkdir()
+    values = {
+        "liker_did": ["target-only"],
+        "liker_idx": pl.Series([2], dtype=pl.UInt32),
+        "training_event_count": pl.Series([0], dtype=pl.UInt64),
+    }
+    if not legacy_schema:
+        values["training_target_query_count"] = pl.Series([3], dtype=pl.UInt64)
+    pl.DataFrame(values).write_parquet(vocabulary / "part-00000.parquet")
+    output_path = tmp_path / "ranker_liker_user_idx.parquet"
+    result = bst_export.write_post_liker_user_map(
+        vocabulary_path=vocabulary, output_path=output_path,
+        expected_user_table_num_rows=3,
+    )
+    assert result["user_count"] == 1
+    assert pl.read_parquet(output_path).to_dict(as_series=False) == {
+        "liker_did": ["target-only"], "liker_idx": [2],
+    }

@@ -159,6 +159,11 @@ def _resolve_model(name: str, path: Path) -> tuple[MediaModelArtifact, Validatio
             raise ValueError(f"model_config.constructor_args.{flag} must be a boolean")
     if training_config.get("bst_use_post_liker_feature") is not constructor["use_post_liker_feature"]:
         raise ValueError(f"Model {name!r} training_config and model post-liker feature flags disagree")
+    target_enabled = constructor.get("use_target_user_feature", False)
+    if not isinstance(target_enabled, bool):
+        raise ValueError("model_config.constructor_args.use_target_user_feature must be a boolean")
+    if training_config.get("bst_use_target_user_feature", False) is not target_enabled:
+        raise ValueError(f"Model {name!r} training_config and model target-user feature flags disagree")
     if popularity_stats.get("enabled") is not constructor["use_popularity_feature"]:
         raise ValueError(f"Model {name!r} popularity configuration disagrees with its feature flag")
     for argument, stat in (("popularity_log_mean", "log_mean"), ("popularity_log_std", "log_std")):
@@ -216,7 +221,10 @@ def _validate_dataset_contract(dataset: Stage7Artifact, model: MediaModelArtifac
     author_columns = ("author_did", "author_idx")
     if not _mapping(author_map_path, author_columns).equals(_mapping(dataset.bundle_path / "authors", author_columns)):
         raise ValueError(f"Model {model.name!r} author vocabulary differs from Stage 7")
-    if not constructor["use_post_liker_feature"]:
+    target_enabled = constructor.get("use_target_user_feature", False)
+    if target_enabled and index["format_version"] < 3:
+        raise ValueError("Target-user BST models require Stage 7 loader-index version >= 3")
+    if not (constructor["use_post_liker_feature"] or target_enabled):
         return
     if index["format_version"] < 2:
         raise ValueError("Post-liker BST models require Stage 7 loader-index version >= 2")
