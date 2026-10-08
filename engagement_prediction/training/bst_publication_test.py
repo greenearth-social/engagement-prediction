@@ -82,6 +82,7 @@ def test_publish_ranker_creates_exact_manifest_after_complete_upload(tmp_path):
         author_map_path=author_map_path,
         manifest_path=manifest_path,
         post_liker_feature_enabled=False,
+        target_user_feature_enabled=False,
         post_liker_user_map_path=None,
         post_liker_user_embeddings_path=None,
         post_liker_state_config_path=None,
@@ -126,6 +127,7 @@ def test_publish_ranker_omits_manifest_when_required_upload_is_missing(
         author_map_path=author_map_path,
         manifest_path=manifest_path,
         post_liker_feature_enabled=False,
+        target_user_feature_enabled=False,
         post_liker_user_map_path=None,
         post_liker_user_embeddings_path=None,
         post_liker_state_config_path=None,
@@ -152,6 +154,7 @@ def test_publish_ranker_keeps_local_manifest_when_manifest_upload_fails(tmp_path
         author_map_path=author_map_path,
         manifest_path=manifest_path,
         post_liker_feature_enabled=False,
+        target_user_feature_enabled=False,
         post_liker_user_map_path=None,
         post_liker_user_embeddings_path=None,
         post_liker_state_config_path=None,
@@ -178,6 +181,7 @@ def test_publish_ranker_rejects_noncanonical_model_uri(tmp_path):
         author_map_path=author_map_path,
         manifest_path=manifest_path,
         post_liker_feature_enabled=False,
+        target_user_feature_enabled=False,
         post_liker_user_map_path=None,
         post_liker_user_embeddings_path=None,
         post_liker_state_config_path=None,
@@ -214,6 +218,7 @@ def test_publish_ranker_does_not_expose_manifest_after_local_write_failure(
         author_map_path=author_map_path,
         manifest_path=manifest_path,
         post_liker_feature_enabled=False,
+        target_user_feature_enabled=False,
         post_liker_user_map_path=None,
         post_liker_user_embeddings_path=None,
         post_liker_state_config_path=None,
@@ -235,6 +240,7 @@ def test_publish_ranker_without_tracker_keeps_only_local_files(tmp_path):
         author_map_path=tmp_path / "ranker_author_idx.parquet",
         manifest_path=manifest_path,
         post_liker_feature_enabled=False,
+        target_user_feature_enabled=False,
         post_liker_user_map_path=None,
         post_liker_user_embeddings_path=None,
         post_liker_state_config_path=None,
@@ -262,6 +268,7 @@ def test_publish_feature_enabled_ranker_uploads_complete_serving_contract(tmp_pa
         author_map_path=author_map_path,
         manifest_path=manifest_path,
         post_liker_feature_enabled=True,
+        target_user_feature_enabled=False,
         post_liker_user_map_path=user_map,
         post_liker_user_embeddings_path=embeddings,
         post_liker_state_config_path=state_config,
@@ -320,6 +327,7 @@ def test_publish_feature_enabled_ranker_omits_manifest_after_companion_failure(
         author_map_path=author_map_path,
         manifest_path=manifest_path,
         post_liker_feature_enabled=True,
+        target_user_feature_enabled=False,
         post_liker_user_map_path=user_map,
         post_liker_user_embeddings_path=embeddings,
         post_liker_state_config_path=state_config,
@@ -338,7 +346,59 @@ def test_publish_feature_enabled_ranker_requires_every_local_companion(tmp_path)
             author_map_path=tmp_path / "ranker_author_idx.parquet",
             manifest_path=tmp_path / "ranker_serving_manifest.json",
             post_liker_feature_enabled=True,
+            target_user_feature_enabled=False,
             post_liker_user_map_path=tmp_path / "missing-map.parquet",
             post_liker_user_embeddings_path=tmp_path / "missing-table.npy",
             post_liker_state_config_path=tmp_path / "missing-state.json",
         )
+
+
+@pytest.mark.parametrize("use_post_liker_feature", [False, True])
+def test_target_feature_publishes_shared_map_and_version_three_contract(tmp_path, use_post_liker_feature):
+    tracker = _Tracker()
+    user_map, embeddings, state_config = _post_liker_paths(tmp_path)
+    manifest_path = tmp_path / "ranker_serving_manifest.json"
+    result = publish_ranker_to_tracker(
+        tracker=tracker, logger=logging.getLogger("test"),
+        torchscript_path=tmp_path / "ranker.pt",
+        author_map_path=tmp_path / "ranker_author_idx.parquet",
+        manifest_path=manifest_path,
+        post_liker_feature_enabled=use_post_liker_feature,
+        target_user_feature_enabled=True,
+        post_liker_user_map_path=user_map,
+        post_liker_user_embeddings_path=embeddings if use_post_liker_feature else None,
+        post_liker_state_config_path=state_config if use_post_liker_feature else None,
+    )
+    assert result["status"] == "complete"
+    names = [name for name, _ in tracker.file_calls]
+    assert names.count(POST_LIKER_USER_MAP_ARTIFACT_NAME) == 1
+    assert (POST_LIKER_USER_EMBEDDINGS_ARTIFACT_NAME in names) is use_post_liker_feature
+    assert (POST_LIKER_STATE_CONFIG_ARTIFACT_NAME in names) is use_post_liker_feature
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["ranker_contract_version"] == 3
+    assert manifest["target_user_feature_enabled"] is True
+    assert manifest["post_liker_feature_enabled"] is use_post_liker_feature
+    assert manifest["target_user_indices_input_name"] == "target_user_indices"
+    assert manifest["post_liker_user_idx_mapping_artifact_name"] == POST_LIKER_USER_MAP_ARTIFACT_NAME
+
+
+@pytest.mark.parametrize("map_present", [False, True])
+def test_target_only_requires_uploaded_shared_user_map(tmp_path, map_present):
+    user_map, _, _ = _post_liker_paths(tmp_path)
+    manifest_path = tmp_path / "ranker_serving_manifest.json"
+    kwargs = dict(
+        tracker=_Tracker(file_results={POST_LIKER_USER_MAP_ARTIFACT_NAME: False}),
+        logger=logging.getLogger("test"),
+        torchscript_path=tmp_path / "ranker.pt",
+        author_map_path=tmp_path / "ranker_author_idx.parquet",
+        manifest_path=manifest_path, post_liker_feature_enabled=False,
+        target_user_feature_enabled=True,
+        post_liker_user_map_path=user_map if map_present else None,
+        post_liker_user_embeddings_path=None, post_liker_state_config_path=None,
+    )
+    if map_present:
+        assert publish_ranker_to_tracker(**kwargs)["status"] == "incomplete"
+    else:
+        with pytest.raises(FileNotFoundError, match="requires all local"):
+            publish_ranker_to_tracker(**kwargs)
+    assert not manifest_path.exists()

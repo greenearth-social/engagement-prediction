@@ -150,7 +150,7 @@ class PostLikerUserPooler(nn.Module):
 class BSTRanker(nn.Module):
     """Behavior Sequence Transformer encoder for one user-history/candidate pair."""
 
-    __constants__ = ["use_popularity_feature", "use_post_liker_feature"]
+    __constants__ = ["use_popularity_feature", "use_post_liker_feature", "use_target_user_feature"]
 
     def __init__(
         self,
@@ -179,6 +179,9 @@ class BSTRanker(nn.Module):
         post_liker_projection_dim: int,
         post_liker_pooling_tau_hours: float,
         post_liker_user_unknown_dropout_rate: float,
+        use_target_user_feature: bool,
+        target_user_projection_dim: int,
+        target_user_unknown_dropout_rate: float,
     ):
         super().__init__()
         if time_embedding_dim <= 0:
@@ -205,6 +208,12 @@ class BSTRanker(nn.Module):
             raise ValueError("post-liker pooling tau must be positive")
         if not 0.0 <= post_liker_user_unknown_dropout_rate <= 1.0:
             raise ValueError("post-liker user unknown dropout rate must be in [0, 1]")
+        if target_user_projection_dim <= 0:
+            raise ValueError("target-user projection dimension must be positive")
+        if not 0.0 <= target_user_unknown_dropout_rate <= 1.0:
+            raise ValueError("target-user unknown dropout rate must be in [0, 1]")
+        if use_target_user_feature and not prediction_hidden_dims:
+            raise ValueError("target-user features require a nonlinear prediction head with at least one hidden layer")
 
         self.post_embedding_dim = int(post_embedding_dim)
         self.content_projection_dim = int(content_projection_dim)
@@ -221,6 +230,11 @@ class BSTRanker(nn.Module):
         self.post_liker_projection_dim = (
             int(post_liker_projection_dim) if self.use_post_liker_feature else 0
         )
+        self.use_target_user_feature: Final[bool] = bool(use_target_user_feature)
+        self.target_user_projection_dim = (
+            int(target_user_projection_dim) if self.use_target_user_feature else 0
+        )
+        self.target_user_unknown_dropout_rate = float(target_user_unknown_dropout_rate)
         self.time_delta_bucket_boundaries_hours = _validate_time_delta_bucket_boundaries(
             time_delta_bucket_boundaries_hours
         )
@@ -279,11 +293,55 @@ class BSTRanker(nn.Module):
             num_layers=int(num_transformer_layers),
             enable_nested_tensor=False,
         )
+        if self.use_target_user_feature:
+            target_projection = nn.Linear(
+                self.post_liker_user_embedding_dim, self.target_user_projection_dim
+            )
+            nn.init.xavier_uniform_(target_projection.weight)
+            nn.init.zeros_(target_projection.bias)
+            self.target_user_projection = nn.Sequential(
+                target_projection,
+                nn.GELU(),
+                nn.LayerNorm(self.target_user_projection_dim),
+            )
+        self.prediction_input_dim = self.transformer_input_dim + self.target_user_projection_dim
         self.prediction_head = LinearPredictionHead(
-            input_dim=self.transformer_input_dim,
+            input_dim=self.prediction_input_dim,
             hidden_dims=prediction_hidden_dims,
             dropout_rate=dropout_rate,
         )
+
+    def _append_target_user_feature(
+        self,
+        candidate_state: torch.Tensor,
+        target_user_indices: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Fuse identity once per query, after candidate attention is complete."""
+
+        if self.use_target_user_feature:
+            if target_user_indices is None:
+                raise RuntimeError("target_user_indices is required when target-user features are enabled")
+            if target_user_indices.dim() != 1 or target_user_indices.size(0) != candidate_state.size(0):
+                raise RuntimeError("target_user_indices must have shape [B] for aligned pairs or [U] for candidate matrices")
+            user_indices = target_user_indices.to(device=candidate_state.device, dtype=torch.long)
+            if self.training and self.target_user_unknown_dropout_rate > 0.0:
+                # Draw before candidate broadcasting so every candidate in a
+                # query sees the same identity. PAD/UNK keep their fixed rows.
+                drop = torch.rand(user_indices.shape, device=user_indices.device) < self.target_user_unknown_dropout_rate
+                user_indices = torch.where(
+                    (user_indices > 1) & drop,
+                    torch.full_like(user_indices, 1),
+                    user_indices,
+                )
+            target_vectors = self.target_user_projection(
+                self.post_liker_user_pooler.lookup(user_indices)
+            )
+            if candidate_state.dim() == 3:
+                target_vectors = target_vectors.unsqueeze(1).expand(
+                    -1, candidate_state.size(1), -1
+                )
+            return torch.cat([candidate_state, target_vectors], dim=-1)
+        return candidate_state
 
     def _bucketize_time_deltas_hours(self, time_deltas_hours: torch.Tensor) -> torch.Tensor:
         """Map history ages to a dedicated zero bucket plus configured ranges."""
@@ -624,6 +682,7 @@ class BSTRanker(nn.Module):
         candidate_prior_cumulative_likes: Optional[torch.Tensor] = None,
         history_post_liker_vectors: Optional[torch.Tensor] = None,
         candidate_post_liker_vectors: Optional[torch.Tensor] = None,
+        target_user_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Validate inputs for, then delegate to, the optimized matrix scorer."""
 
@@ -669,6 +728,7 @@ class BSTRanker(nn.Module):
             candidate_prior_cumulative_likes=candidate_prior_cumulative_likes,
             history_post_liker_vectors=history_post_liker_vectors,
             candidate_post_liker_vectors=candidate_post_liker_vectors,
+            target_user_indices=target_user_indices,
         )
 
     @torch.jit.export
@@ -684,6 +744,7 @@ class BSTRanker(nn.Module):
         candidate_prior_cumulative_likes: Optional[torch.Tensor] = None,
         history_post_liker_vectors: Optional[torch.Tensor] = None,
         candidate_post_liker_vectors: Optional[torch.Tensor] = None,
+        target_user_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Score a shared candidate set for every user without a U*C expansion.
 
@@ -809,7 +870,8 @@ class BSTRanker(nn.Module):
                 layer.norm2.eps,
             )
 
-        logits = self.prediction_head(candidate_state.reshape(num_users * num_candidates, self.transformer_input_dim))
+        prediction_input = self._append_target_user_feature(candidate_state, target_user_indices)
+        logits = self.prediction_head(prediction_input.reshape(num_users * num_candidates, self.prediction_input_dim))
         if logits.dim() == 2 and logits.shape == (num_users * num_candidates, 1):
             logits = logits.squeeze(-1)
         if logits.shape != (num_users * num_candidates,):
@@ -841,6 +903,7 @@ class BSTRanker(nn.Module):
         post_liker_event_offsets: torch.Tensor,
         history_post_liker_rows: torch.Tensor,
         candidate_post_liker_rows: torch.Tensor,
+        target_user_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Pool packed events using current user weights, then score the slate."""
 
@@ -893,6 +956,7 @@ class BSTRanker(nn.Module):
             candidate_prior_cumulative_likes=candidate_prior_cumulative_likes,
             history_post_liker_vectors=history_vectors,
             candidate_post_liker_vectors=candidate_vectors,
+            target_user_indices=target_user_indices,
         )
 
     def forward(
@@ -907,6 +971,7 @@ class BSTRanker(nn.Module):
         candidate_prior_cumulative_likes: Optional[torch.Tensor] = None,
         history_post_liker_vectors: Optional[torch.Tensor] = None,
         candidate_post_liker_vectors: Optional[torch.Tensor] = None,
+        target_user_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Score one aligned candidate per user through the ordinary BST path."""
 
@@ -922,7 +987,8 @@ class BSTRanker(nn.Module):
             history_post_liker_vectors=history_post_liker_vectors,
             candidate_post_liker_vectors=candidate_post_liker_vectors,
         )
-        logits = self.prediction_head(transformer_output)
+        prediction_input = self._append_target_user_feature(transformer_output, target_user_indices)
+        logits = self.prediction_head(prediction_input)
         if logits.dim() == 2 and logits.shape == (transformer_output.size(0), 1):
             logits = logits.squeeze(-1)
         if logits.shape != (transformer_output.size(0),):

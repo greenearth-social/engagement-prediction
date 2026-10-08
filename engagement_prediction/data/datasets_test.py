@@ -29,7 +29,7 @@ def _write_dataset(path, name, df):
     df.write_parquet(dataset_path / "part-00000.parquet")
 
 
-def _bundle(tmp_path, *, many_negatives=False):
+def _bundle(tmp_path, *, many_negatives=False, target_user_vocabulary=False):
     bundle = tmp_path / "hydrated_training_data_test"
     bundle.mkdir()
     hour = datetime(2026, 1, 1, 12, tzinfo=UTC)
@@ -124,7 +124,13 @@ def _bundle(tmp_path, *, many_negatives=False):
     _write_dataset(
         bundle,
         "post_liker_users",
-        post_liker_users.empty_frame(
+        pl.DataFrame({
+            "liker_did": ["u1"],
+            "liker_idx": [2],
+            "training_event_count": [0],
+            "training_target_query_count": [1],
+        }, schema=post_liker_users.POST_LIKER_USER_VOCABULARY_SCHEMA)
+        if target_user_vocabulary else post_liker_users.empty_frame(
             post_liker_users.POST_LIKER_USER_VOCABULARY_SCHEMA
         ),
     )
@@ -144,7 +150,7 @@ def _bundle(tmp_path, *, many_negatives=False):
     return bundle
 
 
-def _dataset(bundle, *, negative_cap=None):
+def _dataset(bundle, *, negative_cap=None, use_target_user_feature=False):
     return HydratedBucketedEngagementDataset(
         bundle,
         split="train",
@@ -152,6 +158,7 @@ def _dataset(bundle, *, negative_cap=None):
         bst_additional_batch_negatives=negative_cap,
         seed=7,
         logger=None,
+        use_target_user_feature=use_target_user_feature,
         use_post_liker_feature=False,
         max_post_liker_replay_events_per_post=None,
     )
@@ -196,6 +203,50 @@ def _write_post_liker_arrays(bundle, events_by_emb_idx, *, user_table_num_rows):
     metadata["post_liker_event_count"] = len(user_indices)
     metadata["post_liker_user_table_num_rows"] = user_table_num_rows
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+
+
+def test_target_only_batch_uses_shared_indices_without_loading_liker_events(tmp_path):
+    dataset = _dataset(
+        _bundle(tmp_path, target_user_vocabulary=True),
+        use_target_user_feature=True,
+    )
+    items = [dataset[1], dataset[0], dataset[1]]
+    batch = dataset.collate_tensor_batch(items)
+    assert batch["target_user_indices"].tolist() == [1, 2, 1]
+    assert batch["target_user_indices"].dtype == torch.int64
+    assert dataset.post_liker_user_table_num_rows == 3
+    assert dataset.target_user_coverage == {
+        "known_query_count": 1,
+        "unknown_query_count": 1,
+    }
+    assert "post_liker_offsets" not in dataset._arrays
+    assert dataset._query_dids is None
+    assert dataset._post_uris is None
+    restored = pickle.loads(pickle.dumps(dataset))
+    assert restored._arrays is None
+    torch.testing.assert_close(
+        restored.collate_tensor_batch(items)["target_user_indices"],
+        batch["target_user_indices"],
+    )
+    dataset.close()
+    restored.close()
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_target_feature_requires_v3_but_legacy_target_off_still_works(tmp_path, version):
+    bundle = _bundle(tmp_path)
+    metadata_path = bundle / "loader_index" / "format.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["format_version"] = version
+    for split in metadata["splits"].values():
+        split["arrays"].pop("query_target_user_indices")
+        split.pop("target_user_coverage")
+    metadata_path.write_text(json.dumps(metadata))
+    dataset = _dataset(bundle)
+    assert "target_user_indices" not in dataset.collate_tensor_batch([dataset[0]])
+    assert dataset.target_user_coverage is None
+    with pytest.raises(ValueError, match="target-user feature requires.*version 3"):
+        _dataset(bundle, use_target_user_feature=True)
 
 
 def test_native_dataset_builds_parity_batch_from_memory_mapped_index(tmp_path):
@@ -262,6 +313,7 @@ def test_post_liker_collation_replays_each_unique_post_once_with_strict_as_of_ca
         max_history_len=2,
         seed=7,
         logger=None,
+        use_target_user_feature=False,
         use_post_liker_feature=True,
         max_post_liker_replay_events_per_post=2,
     )
@@ -293,6 +345,7 @@ def test_feature_disabled_does_not_open_format_v2_post_liker_arrays(
         max_history_len=2,
         seed=7,
         logger=None,
+        use_target_user_feature=False,
         use_post_liker_feature=False,
         max_post_liker_replay_events_per_post=None,
     )
@@ -329,6 +382,7 @@ def test_feature_enabled_requires_v2_index_and_positive_replay_cap(tmp_path):
             max_history_len=2,
             seed=7,
             logger=None,
+            use_target_user_feature=False,
             use_post_liker_feature=True,
             max_post_liker_replay_events_per_post=128,
         )
@@ -340,6 +394,7 @@ def test_feature_enabled_requires_v2_index_and_positive_replay_cap(tmp_path):
             max_history_len=2,
             seed=7,
             logger=None,
+            use_target_user_feature=False,
             use_post_liker_feature=True,
             max_post_liker_replay_events_per_post=0,
         )
@@ -358,6 +413,7 @@ def test_post_liker_mappings_reopen_after_dataset_pickling(tmp_path):
         max_history_len=2,
         seed=7,
         logger=None,
+        use_target_user_feature=False,
         use_post_liker_feature=True,
         max_post_liker_replay_events_per_post=128,
     )
@@ -395,6 +451,7 @@ def test_post_liker_tensor_loader_matches_with_zero_and_multiple_workers(tmp_pat
         max_history_len=2,
         seed=7,
         logger=None,
+        use_target_user_feature=False,
         use_post_liker_feature=True,
         max_post_liker_replay_events_per_post=128,
     )
@@ -479,6 +536,7 @@ def test_model_author_override_remaps_posts_and_preserves_pad_and_unk(tmp_path):
         max_history_len=2,
         seed=7,
         logger=None,
+        use_target_user_feature=False,
         use_post_liker_feature=False,
         max_post_liker_replay_events_per_post=None,
         post_author_idx_override_path=override_path,
@@ -508,6 +566,7 @@ def test_model_author_override_requires_path_and_table_size_together(tmp_path):
             max_history_len=2,
             seed=7,
             logger=None,
+            use_target_user_feature=False,
             use_post_liker_feature=False,
             max_post_liker_replay_events_per_post=None,
             post_author_idx_override_path=override_path,
@@ -519,6 +578,7 @@ def test_model_author_override_requires_path_and_table_size_together(tmp_path):
             max_history_len=2,
             seed=7,
             logger=None,
+            use_target_user_feature=False,
             use_post_liker_feature=False,
             max_post_liker_replay_events_per_post=None,
             author_table_num_rows_override=5,
@@ -555,6 +615,7 @@ def test_model_author_override_validates_shape_dtype_and_range(
             max_history_len=2,
             seed=7,
             logger=None,
+            use_target_user_feature=False,
             use_post_liker_feature=False,
             max_post_liker_replay_events_per_post=None,
             post_author_idx_override_path=override_path,
@@ -629,6 +690,7 @@ def test_two_tower_collation_uses_all_hourly_negatives_and_skips_bst_features(
         additional_batch_negatives=None,
         seed=7,
         logger=None,
+        use_target_user_feature=False,
         use_post_liker_feature=False,
         max_post_liker_replay_events_per_post=None,
     )
@@ -685,6 +747,7 @@ def test_two_tower_tensor_loader_routes_to_canonical_collation(tmp_path):
         additional_batch_negatives=None,
         seed=7,
         logger=None,
+        use_target_user_feature=False,
         use_post_liker_feature=False,
         max_post_liker_replay_events_per_post=None,
     )
@@ -730,6 +793,7 @@ def test_generic_negative_cap_preserves_seeded_epoch_resampling(tmp_path):
         additional_batch_negatives=1,
         seed=11,
         logger=None,
+        use_target_user_feature=False,
         use_post_liker_feature=False,
         max_post_liker_replay_events_per_post=None,
     )
@@ -771,6 +835,7 @@ def test_dataset_rejects_both_generic_and_legacy_negative_caps(tmp_path):
             bst_additional_batch_negatives=1,
             seed=7,
             logger=None,
+            use_target_user_feature=False,
             use_post_liker_feature=False,
             max_post_liker_replay_events_per_post=None,
         )
@@ -807,6 +872,7 @@ def test_model_author_override_is_reopened_after_pickling(tmp_path):
         max_history_len=2,
         seed=7,
         logger=None,
+        use_target_user_feature=False,
         use_post_liker_feature=False,
         max_post_liker_replay_events_per_post=None,
         post_author_idx_override_path=override_path,
@@ -861,6 +927,7 @@ def test_model_author_override_closes_and_reopens_after_pid_change(
         max_history_len=2,
         seed=7,
         logger=None,
+        use_target_user_feature=False,
         use_post_liker_feature=False,
         max_post_liker_replay_events_per_post=None,
         post_author_idx_override_path=override_path,
@@ -1087,6 +1154,7 @@ def test_empty_split_has_schema_correct_compact_index(tmp_path):
         bst_additional_batch_negatives=None,
         seed=7,
         logger=None,
+        use_target_user_feature=False,
         use_post_liker_feature=False,
         max_post_liker_replay_events_per_post=None,
     )

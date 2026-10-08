@@ -545,8 +545,15 @@ def test_post_liker_vocabulary_caps_support_and_maps_remaining_events_to_unk(
         pl.DataFrame(rows, schema=post_liker_users.POST_LIKER_FEATURE_EVENT_SCHEMA),
     )
     vocabulary_path = tmp_path / "post-liker-users"
+    counted_positives_path = tmp_path / "counted-positives"
+    _write_part(counted_positives_path, dataset_hydration.empty_frame(
+        dataset_hydration.QUERY_POSITIVE_SCHEMA
+    ))
+    queries_lf = dataset_hydration.empty_frame(dataset_hydration.QUERY_SCHEMA).lazy()
     stats = dataset_hydration_artifacts.build_post_liker_user_vocabulary(
         feature_events_path=feature_events_path,
+        queries_lf=queries_lf,
+        counted_positives_path=counted_positives_path,
         support_routes_path=tmp_path / "support-routes",
         support_shards_path=tmp_path / "support-shards",
         vocabulary_path=vocabulary_path,
@@ -558,8 +565,8 @@ def test_post_liker_vocabulary_caps_support_and_maps_remaining_events_to_unk(
 
     vocabulary = scan_parquet_artifact(vocabulary_path).collect()
     assert vocabulary.to_dicts() == [
-        {"liker_did": "a", "liker_idx": 2, "training_event_count": 3},
-        {"liker_did": "b", "liker_idx": 3, "training_event_count": 2},
+        {"liker_did": "a", "liker_idx": 2, "training_event_count": 3, "training_target_query_count": 0},
+        {"liker_did": "b", "liker_idx": 3, "training_event_count": 2, "training_target_query_count": 0},
     ]
     assert stats["threshold_eligible_user_count"] == 3
     assert stats["excluded_by_cap_user_count"] == 1
@@ -570,6 +577,8 @@ def test_post_liker_vocabulary_caps_support_and_maps_remaining_events_to_unk(
     other_vocabulary_path = tmp_path / "post-liker-users-one-partition"
     dataset_hydration_artifacts.build_post_liker_user_vocabulary(
         feature_events_path=feature_events_path,
+        queries_lf=queries_lf,
+        counted_positives_path=counted_positives_path,
         support_routes_path=tmp_path / "support-routes-one-partition",
         support_shards_path=tmp_path / "support-shards-one-partition",
         vocabulary_path=other_vocabulary_path,
@@ -614,8 +623,14 @@ def test_post_liker_vocabulary_and_index_are_schema_correct_when_events_are_empt
         ),
     )
     vocabulary_path = tmp_path / "post-liker-users"
+    counted_positives_path = tmp_path / "counted-positives"
+    _write_part(counted_positives_path, dataset_hydration.empty_frame(
+        dataset_hydration.QUERY_POSITIVE_SCHEMA
+    ))
     stats = dataset_hydration_artifacts.build_post_liker_user_vocabulary(
         feature_events_path=feature_events_path,
+        queries_lf=dataset_hydration.empty_frame(dataset_hydration.QUERY_SCHEMA).lazy(),
+        counted_positives_path=counted_positives_path,
         support_routes_path=tmp_path / "support-routes",
         support_shards_path=tmp_path / "support-shards",
         vocabulary_path=vocabulary_path,
@@ -641,6 +656,94 @@ def test_post_liker_vocabulary_and_index_are_schema_correct_when_events_are_empt
     assert scan_parquet_artifact(indexed_path).collect_schema() == pl.Schema(
         post_liker_users.INDEXED_POST_LIKER_EVENT_SCHEMA
     )
+
+
+@pytest.mark.parametrize("partition_count", [1, 3])
+def test_shared_user_vocabulary_reserves_surviving_targets_before_liker_cap(
+    tmp_path, partition_count,
+):
+    hour = datetime(2026, 1, 1, 12, tzinfo=UTC)
+    later_hour = datetime(2026, 1, 1, 13, tzinfo=UTC)
+    queries_lf = pl.DataFrame({
+        "did": ["target-only", "target-only", "overlap", "val-only", "dropped"],
+        "query_hour": [hour, later_hour, hour, hour, hour],
+        "split": ["train", "train", "train", "val", "train"],
+    }).lazy()
+    positives_path = tmp_path / "counted-positives"
+    _write_part(positives_path, pl.DataFrame({
+        # Multiple positives do not multiply target-query support.
+        "did": ["target-only", "target-only", "target-only", "overlap", "val-only"],
+        "query_hour": [hour, hour, later_hour, hour, hour],
+    }))
+    events_path = tmp_path / "feature-events"
+    _write_part(events_path, pl.DataFrame({
+        "emb_idx": [0] * 8,
+        "liker_did": ["liker-a"] * 3 + ["liker-b"] * 3 + ["overlap", "val-only"],
+        "like_created_at": [hour] * 8,
+        "is_training_visible": [True] * 7 + [False],
+    }, schema=post_liker_users.POST_LIKER_FEATURE_EVENT_SCHEMA))
+
+    vocabulary_path = tmp_path / "users"
+    stats = dataset_hydration_artifacts.build_post_liker_user_vocabulary(
+        feature_events_path=events_path,
+        queries_lf=queries_lf,
+        counted_positives_path=positives_path,
+        support_routes_path=tmp_path / "support-routes",
+        support_shards_path=tmp_path / "support-shards",
+        vocabulary_path=vocabulary_path,
+        min_training_event_count=2,
+        max_vocabulary_size=3,
+        partition_count=partition_count,
+        logger=logging.getLogger("shared-user-vocabulary-test"),
+    )
+
+    assert scan_parquet_artifact(vocabulary_path).collect().to_dicts() == [
+        {"liker_did": "liker-a", "liker_idx": 2, "training_event_count": 3, "training_target_query_count": 0},
+        {"liker_did": "overlap", "liker_idx": 3, "training_event_count": 1, "training_target_query_count": 1},
+        {"liker_did": "target-only", "liker_idx": 4, "training_event_count": 0, "training_target_query_count": 2},
+    ]
+    assert stats["training_target_user_count"] == 2
+    assert stats["known_training_target_query_count"] == 3
+    assert stats["unk_training_target_query_count"] == 0
+    assert stats["all_training_event_count"] == 7
+    assert stats["known_training_event_count"] == 4
+    assert stats["unk_training_event_count"] == 3
+    assert stats["excluded_by_cap_user_count"] == 1
+
+    with pytest.raises(ValueError, match="surviving training-target rows.*increase the vocabulary cap"):
+        dataset_hydration_artifacts.build_post_liker_user_vocabulary(
+            feature_events_path=events_path,
+            queries_lf=queries_lf,
+            counted_positives_path=positives_path,
+            support_routes_path=tmp_path / "overflow-routes",
+            support_shards_path=tmp_path / "overflow-shards",
+            vocabulary_path=tmp_path / "overflow-users",
+            min_training_event_count=2,
+            max_vocabulary_size=1,
+            partition_count=partition_count,
+            logger=logging.getLogger("shared-user-vocabulary-test"),
+        )
+
+
+def test_shared_user_vocabulary_validator_accepts_legacy_and_rejects_unsupported_users():
+    legacy = pl.DataFrame({
+        "liker_did": ["liker"],
+        "liker_idx": [2],
+        "training_event_count": [2],
+    }, schema=post_liker_users.LEGACY_POST_LIKER_USER_VOCABULARY_SCHEMA)
+    stats = post_liker_users.validate_post_liker_user_vocabulary(
+        legacy.lazy(), min_training_event_count=2, max_vocabulary_size=1,
+    )
+    assert stats["training_target_user_count"] == 0
+    assert stats["training_target_query_count"] == 0
+    unsupported = legacy.with_columns(
+        pl.lit(0, dtype=pl.UInt64).alias("training_event_count"),
+        pl.lit(0, dtype=pl.UInt64).alias("training_target_query_count"),
+    )
+    with pytest.raises(ValueError, match="below threshold"):
+        post_liker_users.validate_post_liker_user_vocabulary(
+            unsupported.lazy(), min_training_event_count=2, max_vocabulary_size=1,
+        )
 
 
 def test_author_vocabulary_uses_only_surviving_training_feature_occurrences(tmp_path):

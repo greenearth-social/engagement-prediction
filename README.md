@@ -323,7 +323,7 @@ Stage 7 loads the narrow selected-URI lookup once, then scans raw post and reply
 
 After missing-embedding filtering and zero-positive query attrition, Stage 7 counts final training-feature exposure by author. Each retained training positive relation, retained history event, and hourly negative row counts once; validation and holdout rows never contribute. Authors with at least `min_author_training_feature_count` occurrences (default `50`) receive deterministic dense indices starting at 2. All remaining authors map to `1=UNK`, while `0=PAD` remains reserved.
 
-Stage 7 also derives a bounded liker-user vocabulary from exact-deduplicated Stage 5 events that are strictly prior to at least one surviving training use of their post. Users with at least `min_post_liker_user_training_event_count` events (default `2`) compete for `max_post_liker_user_vocabulary_size` rows (default `1,000,000`) by descending support and DID tie-breaking. Selected DIDs receive dense indices from 2; all other valid events remain in the history as `1=UNK`. Events are retained only through each post's final surviving dataset use, while likes at or after a query hour remain unavailable to that query.
+Stage 7 derives a bounded shared target-user/liker vocabulary independently of the model feature switches. Every user with a surviving training query receives a row, regardless of liker-event support. Remaining slots go to other users with at least `min_post_liker_user_training_event_count` exact-deduplicated, training-visible liker events (default `2`), ranked by descending event support and DID tie-breaking. `max_post_liker_user_vocabulary_size` caps the total dedicated rows (default `1,000,000`, excluding PAD/UNK); Stage 7 fails if training targets alone exceed it. Selected DIDs receive dense indices from 2; other valid users map to `1=UNK`. Validation and holdout targets do not contribute target support, though they can qualify through training-visible liker events. Events are retained only through each post's final surviving dataset use, while likes at or after a query hour remain unavailable to that query.
 
 The atomically published `hydrated_training_data_*` bundle contains:
 
@@ -333,8 +333,8 @@ The atomically published `hydrated_training_data_*` bundle contains:
 - `query_histories/`: aligned URI, like-time, embedding-index, author-index, and as-of-like-count lists.
 - `hourly_negative_candidates/`: hydrated Stage 4 candidates and their selection source.
 - `authors/`: the Stage 7 vocabulary with dense `author_idx` plus total and positive/history/negative training-feature counts.
-- `post_liker_users/`: the bounded training-only liker vocabulary with `liker_did`, `liker_idx`, and training event support.
-- `loader_index/`: a versioned training projection with read-only NumPy memmaps for numeric query, history, positive, negative, post metadata, and timestamped post-liker events plus memory-mapped Arrow IPC identifier tables.
+- `post_liker_users/`: the bounded shared vocabulary with `liker_did`, `liker_idx`, separate `training_event_count` and `training_target_query_count` support columns.
+- `loader_index/`: a version-3 training projection with read-only NumPy memmaps for numeric query, target-user index, history, positive, negative, post metadata, and timestamped post-liker events plus memory-mapped Arrow IPC identifier tables.
 - exact copied `post_sources_*`, `reply_sources_*`, and `like_sources_*` manifests.
 
 Rows without a valid embedding are removed without backfilling. Their individual history events and negative candidates disappear; positive labels disappear individually, and only queries left with no positive are dropped. Popularity is recomputed from all Stage 5 raw liker events with the strict `like_created_at < query_hour` rule, using the same cumulative hourly counts and backward as-of join as Stage 4. Stage 4 negative counts must agree exactly.
@@ -342,6 +342,7 @@ Rows without a valid embedding are removed without backfilling. Their individual
 `engagement_prediction.data.datasets.HydratedBucketedEngagementDataset` consumes `loader_index/` directly. Numeric arrays, content embeddings, and Arrow identifier tables are opened read-only and lazily in each process. Histories and positives use flattened values plus offset arrays, and hour offsets drive batching without constructing a Python object per query. Each batch unions its users' positives with shared hourly negatives, deduplicates candidates by dense embedding index, and emits the existing padded tensors, identifiers, and user-by-candidate label matrix. It does not construct legacy `likes_core`, `posts_core`, or `history_posts` frames.
 
 The loader-index format is part of the Stage 7 artifact contract. Stage 8 rejects older Stage 7 bundles without a supported `loader_index/`; regenerate Stage 7 rather than constructing a runtime compatibility cache.
+Target-user features require rebuilding Stage 7 to produce loader-index v3 and the expanded vocabulary. Existing v1/v2 indices remain supported with target-user features disabled (post-liker features require at least v2). Use the same rebuilt Stage 7 bundle for feature comparisons so vocabulary and candidate inputs match.
 For the current full dataset, expect the uncompressed loader index to add approximately 5.5-6.5 GB to the Stage 7 bundle.
 
 Rerun Stage 7 directly with an aligned Stage 6 artifact:
@@ -379,6 +380,8 @@ dataloader_persistent_workers: false
 
 The BST ranker always fuses content embeddings, Stage 7 author indices, time-delta buckets, optional as-of popularity, and a candidate-aware transformer. By default it also replays each unique post's latest 128 strictly prior liker events and forms a time-decayed mean of learned liker-user embeddings. The raw pooled vector passes through its own Linear, GELU, and LayerNorm branch before fusion. Posts with no prior events use a zero raw vector. Author embeddings are mandatory for the canonical model.
 
+The optional target-user feature looks up the viewer in that same trainable embedding table, applies its own Linear/GELU/LayerNorm projection, and concatenates the result with the candidate's transformer output before the prediction head. It is disabled by default and works independently of post-liker pooling. The projection defaults to 32 dimensions; training replaces known target IDs with UNK with probability 0.20, once per query across the whole candidate slate. Evaluation uses the supplied ID without dropout. The prediction head must have at least one nonlinear hidden layer when this feature is enabled. `--bst-post-liker-user-embedding-dim` controls the shared table width for both roles.
+
 ```bash
 pipenv run python cli.py --model-type bst-ranker \
   --prediction-hidden-dims 64 32 16 \
@@ -408,16 +411,19 @@ Useful options:
 - `--bst-post-liker-pooling-tau-hours`
 - `--bst-max-post-liker-replay-events-per-post`
 - `--bst-post-liker-user-unknown-dropout-rate`
+- `--bst-use-target-user-feature` / `--no-bst-use-target-user-feature`
+- `--bst-target-user-projection-dim`
+- `--bst-target-user-unknown-dropout-rate`
 
 Popularity normalization is fit once from training-only model inputs. Retained history events keep their multiplicity; positive and negative candidates are deduplicated by `(query_hour, subject_uri)`. Stage 8 stores the fitted `log1p` mean/std and observation counts in JSON and in the checkpoint.
 
-The `08_train_bst_ranker/<stage_run_id>/` artifact contains `checkpoints/bst_ranker_best.pth`, the serving-ready TorchScript model at `checkpoints/ranker.pt`, `ranker_author_idx.parquet`, `model_config.json`, `training_config.json`, `popularity_stats.json`, `training_results.json`, an exact copy of `authors/`, and an optional training-history plot. Feature-enabled runs additionally contain `post_liker_users/`, `ranker_liker_user_idx.parquet`, `ranker_liker_user_embeddings.npy`, and `post_liker_state_config.json`. Each new best checkpoint refreshes the local TorchScript model through an atomic write, reload, and exact event-replay/pre-pooled scoring parity check. Canonical BST training always writes these local model artifacts. `--no-plots` suppresses the optional plot.
+The `08_train_bst_ranker/<stage_run_id>/` artifact contains `checkpoints/bst_ranker_best.pth`, the TorchScript model at `checkpoints/ranker.pt`, `ranker_author_idx.parquet`, `model_config.json`, `training_config.json`, `popularity_stats.json`, `training_results.json`, an exact copy of `authors/`, and an optional training-history plot. Runs with either user feature additionally contain `post_liker_users/` and `ranker_liker_user_idx.parquet`. Post-liker-enabled runs also contain `ranker_liker_user_embeddings.npy` and `post_liker_state_config.json`; target-only lookup weights are already inside `ranker.pt`. Each new best checkpoint refreshes the local TorchScript model through an atomic write, reload, and exact scoring parity check. Canonical BST training always writes these local model artifacts. `--no-plots` suppresses the optional plot.
 
-After final evaluation, Stage 8 registers `ranker.pt` once as the ClearML OutputModel named `ranker` and uploads `ranker_author_idx.parquet` as `author_idx_mapping`. Feature-enabled runs also upload `post_liker_user_idx_mapping`, `post_liker_user_embeddings`, and `post_liker_state_config`. A serving manifest is written only after every serving-critical upload succeeds; its version-2 fields name those companion artifacts. ClearML publication is best-effort: upload failures are reported but leave the validated local model artifacts intact, and Stage 8 does not create an incomplete serving manifest. With `--experiment-tracker none`, all local artifacts are still produced but no serving manifest is written.
+After final evaluation, Stage 8 registers `ranker.pt` once as the ClearML OutputModel named `ranker` and uploads `ranker_author_idx.parquet` as `author_idx_mapping`. Runs with either user feature also upload `post_liker_user_idx_mapping`; post-liker-enabled runs additionally upload `post_liker_user_embeddings` and `post_liker_state_config`. A serving manifest is written only after every required upload succeeds. Target-enabled manifests use contract version 3 and name the required `target_user_indices` input and shared map; post-liker-only manifests retain version 2. ClearML publication is best-effort: upload failures are reported but leave the validated local model artifacts intact, and Stage 8 does not create an incomplete serving manifest. With `--experiment-tracker none`, all local artifacts are still produced but no serving manifest is written.
 
 The production incremental state for a post is its pooled mean, decayed weight, reference timestamp, and liker-embedding/model version. For a new event at time `t`, decay the existing weight from reference time `r` by `exp(-(t-r)/tau)`, add the new user embedding with unit weight, and update the normalized mean. The decayed weight is required to update state but is not a model input. The latest-128 training replay is a bounded approximation; production may retain exact recursive state without retaining the events themselves.
 
-The current inference service does not yet supply the two pooled post-liker tensors required by a feature-enabled `ranker.pt`. Its version-2 manifest is intentionally forward-looking and must not be promoted until serving implements that request/state contract, including state backfill and model-version handling.
+The current inference service supplies neither target-user indices nor pooled post-liker tensors. Models enabling either feature require future service integration before deployment. Target-enabled scoring requires a trailing `target_user_indices` tensor, shaped `[U]` for candidate matrices or `[B]` for aligned pairs; map unknown DIDs to UNK using the exported shared map. Target-disabled exports preserve existing calls without that argument. Post-liker serving additionally requires pooled-state backfill and model-version handling.
 
 ### Stage 8: Native Two-Tower Training
 
@@ -471,13 +477,13 @@ pipenv run python ops/compare_model_performance.py \
 
 Legacy support is limited to standard BST TorchScript models exposing the same eight-input `score_candidate_matrix` API. Experimental legacy models requiring post-liker or target-user features are rejected. A legacy model is evaluated against the supplied canonical Stage 7 queries, histories, embeddings, and candidate pools; this does not reproduce metrics from its original legacy training dataset.
 
-Canonical feature-enabled BST models are also rejected by the comparison tool for now because comparison does not construct their query-time pooled post-liker vectors.
+Canonical BST models with post-liker or target-user features are also rejected by the generic comparison tool because it does not construct their additional inputs. Use `ops/compare_bst_media.py` for these models.
 
 The dataset argument may also point directly to its `hydrated_training_data_*` bundle. By default the tool evaluates `val`, `val_unseen_users`, `holdout_unseen_users`, and `holdout_seen_users`, using all Stage 7 hourly negatives and each model's configured history length. Results are built atomically under `outputs/comparisons/<run-id>/`; pass `--output-dir` to use another parent directory. Each completed comparison contains `metrics.json`, long-form `metrics.csv`, model-B-minus-model-A `metric_deltas.csv`, `model_specs.json`, `stage_info.txt`, and `comparison.log`. Floating-point result values are rounded to five decimal places while exact model and training configuration metadata remains unchanged. The tool does not create pipeline manifests, tracking tasks, uploads, or ranking-row artifacts.
 
 ## Compare BST Performance By Media Type
 
-Use `ops/compare_bst_media.py` to evaluate one or more canonical Stage 8 BST best checkpoints on `val` and `val_unseen_users`, including models with post-liker features:
+Use `ops/compare_bst_media.py` to evaluate one or more canonical Stage 8 BST best checkpoints on `val` and `val_unseen_users`, including models with post-liker and/or target-user features:
 
 ```bash
 pipenv run python ops/compare_bst_media.py \

@@ -40,6 +40,7 @@ from engagement_prediction.training.bst_export import (
     export_bst_ranker_checkpoint,
     export_post_liker_serving_artifacts,
     validate_bst_ranker_export,
+    write_post_liker_user_map,
 )
 from engagement_prediction.training.bst_publication import publish_ranker_to_tracker
 from engagement_prediction.training.history_length import (
@@ -108,6 +109,7 @@ def _create_dataset(
     max_history_len: int,
     additional_negatives: int,
     use_post_liker_feature: bool,
+    use_target_user_feature: bool,
     max_post_liker_replay_events_per_post: int,
     random_seed: int,
     logger: Any,
@@ -120,6 +122,7 @@ def _create_dataset(
         max_history_len=max_history_len,
         bst_additional_batch_negatives=additional_negatives,
         use_post_liker_feature=use_post_liker_feature,
+        use_target_user_feature=use_target_user_feature,
         max_post_liker_replay_events_per_post=(
             max_post_liker_replay_events_per_post
             if use_post_liker_feature
@@ -232,6 +235,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     )
     use_popularity_feature = bool(args.bst_use_popularity_feature)
     use_post_liker_feature = bool(args.bst_use_post_liker_feature)
+    use_target_user_feature = bool(args.bst_use_target_user_feature)
+    target_user_projection_dim = int(args.bst_target_user_projection_dim)
+    target_user_unknown_dropout_rate = float(args.bst_target_user_unknown_dropout_rate)
+    use_shared_user_table = use_post_liker_feature or use_target_user_feature
     max_post_liker_replay_events_per_post = int(
         args.bst_max_post_liker_replay_events_per_post
     )
@@ -257,6 +264,11 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "BST post-liker features require Stage 7 loader-index format version 2; "
             "regenerate Stage 7"
         )
+    if use_target_user_feature and int(loader_index_validation["format_version"]) < 3:
+        raise ValueError(
+            "BST target-user features require Stage 7 loader-index format version 3; "
+            "regenerate Stage 7"
+        )
 
     device = get_device(args.device)
     if device.startswith("cuda") and not torch.cuda.is_available():
@@ -265,7 +277,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     logger.info(
         "Starting native BST training: dataset=%s device=%s history_len=%s "
         "train_batch_size=%s eval_batch_size=%s negatives_per_batch_pool=%s "
-        "popularity=%s post_liker_feature=%s",
+        "popularity=%s post_liker_feature=%s target_user_feature=%s",
         bundle_path,
         device,
         max_history_len,
@@ -274,6 +286,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         additional_negatives,
         use_popularity_feature,
         use_post_liker_feature,
+        use_target_user_feature,
     )
 
     logger.info("Phase 2/8: fitting training-only popularity normalization")
@@ -306,6 +319,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             max_history_len=max_history_len,
             additional_negatives=additional_negatives,
             use_post_liker_feature=use_post_liker_feature,
+            use_target_user_feature=use_target_user_feature,
             max_post_liker_replay_events_per_post=(
                 max_post_liker_replay_events_per_post
             ),
@@ -318,14 +332,14 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     author_table_num_rows = datasets["train"].author_table_num_rows
     post_liker_user_table_num_rows = (
         int(datasets["train"].post_liker_user_table_num_rows)
-        if use_post_liker_feature
+        if use_shared_user_table
         else 2
     )
     if embed_dim != int(loader_index_validation["embedding_dim"]):
         raise ValueError("Stage 7 dataset embedding dimension does not match loader_index")
     if author_table_num_rows != int(loader_index_validation["author_table_num_rows"]):
         raise ValueError("Stage 7 dataset author vocabulary size does not match loader_index")
-    if use_post_liker_feature and post_liker_user_table_num_rows != int(
+    if use_shared_user_table and post_liker_user_table_num_rows != int(
         loader_index_validation["post_liker_user_table_num_rows"]
     ):
         raise ValueError(
@@ -336,7 +350,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             raise ValueError(f"Stage 7 split '{split}' has a different embedding dimension")
         if dataset.author_table_num_rows != author_table_num_rows:
             raise ValueError(f"Stage 7 split '{split}' has a different author vocabulary size")
-        if use_post_liker_feature and (
+        if use_shared_user_table and (
             dataset.post_liker_user_table_num_rows
             != post_liker_user_table_num_rows
         ):
@@ -401,6 +415,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "popularity_log_mean": popularity_stats.log_mean,
         "popularity_log_std": popularity_stats.log_std,
         "use_post_liker_feature": use_post_liker_feature,
+        "use_target_user_feature": use_target_user_feature,
+        "target_user_projection_dim": target_user_projection_dim,
+        "target_user_unknown_dropout_rate": target_user_unknown_dropout_rate,
         "post_liker_user_table_num_rows": post_liker_user_table_num_rows,
         "post_liker_user_embedding_dim": int(
             args.bst_post_liker_user_embedding_dim
@@ -452,6 +469,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "dataloader_persistent_workers": persistent_workers,
         "dataloader_prefetch_factor": prefetch_factor,
         "bst_use_post_liker_feature": use_post_liker_feature,
+        "bst_use_target_user_feature": use_target_user_feature,
+        "bst_target_user_projection_dim": target_user_projection_dim,
+        "bst_target_user_unknown_dropout_rate": target_user_unknown_dropout_rate,
         "bst_post_liker_user_embedding_dim": int(
             args.bst_post_liker_user_embedding_dim
         ),
@@ -482,7 +502,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         raise FileNotFoundError(f"Stage 7 authors artifact is missing: {authors_source_path}")
     shutil.copytree(authors_source_path, authors_path)
     post_liker_users_path = None
-    if use_post_liker_feature:
+    if use_shared_user_table:
         post_liker_users_source_path = bundle_path / "post_liker_users"
         post_liker_users_path = out_dir / "post_liker_users"
         if not post_liker_users_source_path.is_dir():
@@ -593,9 +613,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     ranker_liker_user_embeddings_path = None
     post_liker_state_config_path = None
     post_liker_serving_artifacts = None
+    if use_shared_user_table:
+        ranker_liker_user_idx_path = out_dir / "ranker_liker_user_idx.parquet"
     if use_post_liker_feature:
         assert post_liker_users_path is not None
-        ranker_liker_user_idx_path = out_dir / "ranker_liker_user_idx.parquet"
         ranker_liker_user_embeddings_path = (
             out_dir / "ranker_liker_user_embeddings.npy"
         )
@@ -615,6 +636,14 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             raise RuntimeError(
                 "Post-liker serving artifacts do not match the selected BST checkpoint"
             )
+    elif use_target_user_feature:
+        assert post_liker_users_path is not None
+        assert ranker_liker_user_idx_path is not None
+        write_post_liker_user_map(
+            vocabulary_path=post_liker_users_path,
+            output_path=ranker_liker_user_idx_path,
+            expected_user_table_num_rows=post_liker_user_table_num_rows,
+        )
     logger.info(
         "Validated final BST serving artifacts: best_epoch=%s ranker_bytes=%s "
         "author_count=%s",
@@ -650,6 +679,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         author_map_path=ranker_author_idx_path,
         manifest_path=serving_manifest_path,
         post_liker_feature_enabled=use_post_liker_feature,
+        target_user_feature_enabled=use_target_user_feature,
         post_liker_user_map_path=ranker_liker_user_idx_path,
         post_liker_user_embeddings_path=ranker_liker_user_embeddings_path,
         post_liker_state_config_path=post_liker_state_config_path,
@@ -691,6 +721,16 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         local_pipeline_runtime_seconds=local_pipeline_runtime_seconds,
         runtime_seconds=runtime_seconds,
         extra_fields={
+            "target_user_feature": {
+                "enabled": use_target_user_feature,
+                "projection_dim": target_user_projection_dim,
+                "unknown_dropout_rate": target_user_unknown_dropout_rate,
+                "user_table_num_rows": post_liker_user_table_num_rows,
+                "coverage_by_split": {
+                    split: dataset.target_user_coverage
+                    for split, dataset in datasets.items()
+                },
+            },
             "post_liker_feature": {
                 "enabled": use_post_liker_feature,
                 "user_table_num_rows": post_liker_user_table_num_rows,
@@ -756,6 +796,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         runtime_seconds=runtime_seconds,
         extra_sections={
             "popularity": popularity_payload,
+            "target_user_feature": result_payload["target_user_feature"],
             "post_liker_feature": {
                 "enabled": use_post_liker_feature,
                 "user_table_num_rows": post_liker_user_table_num_rows,
@@ -781,6 +822,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"embedding_dim: {embed_dim}",
         f"author_table_num_rows: {author_table_num_rows}",
         f"post_liker_feature_enabled: {use_post_liker_feature}",
+        f"target_user_feature_enabled: {use_target_user_feature}",
         f"post_liker_user_table_num_rows: {post_liker_user_table_num_rows}",
         "post_liker_max_replay_events_per_post: "
         f"{max_post_liker_replay_events_per_post}",

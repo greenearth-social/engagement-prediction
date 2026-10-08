@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 
 from engagement_prediction.data.parquet import find_artifact_path
 from engagement_prediction.data.training_index import (
-    FORMAT_VERSION,
+    SUPPORTED_FORMAT_VERSIONS,
     MemoryMappedUtf8Table,
     load_index_array,
     load_loader_index_metadata,
@@ -84,6 +84,7 @@ class HydratedBucketedEngagementDataset(Dataset):
         seed: int,
         logger: Optional[logging.Logger],
         use_post_liker_feature: bool,
+        use_target_user_feature: bool,
         max_post_liker_replay_events_per_post: Optional[int],
         post_author_idx_override_path: Optional[Path] = None,
         author_table_num_rows_override: Optional[int] = None,
@@ -143,7 +144,7 @@ class HydratedBucketedEngagementDataset(Dataset):
 
         metadata = load_loader_index_metadata(loader_index_path)
         format_version = int(metadata.get("format_version", -1))
-        if format_version not in {1, FORMAT_VERSION}:
+        if format_version not in SUPPORTED_FORMAT_VERSIONS:
             raise ValueError(
                 "Unsupported Stage 7 loader_index format version "
                 f"{format_version}; regenerate Stage 7"
@@ -152,6 +153,11 @@ class HydratedBucketedEngagementDataset(Dataset):
             raise ValueError(
                 "The BST post-liker feature requires Stage 7 loader-index format "
                 "version 2; regenerate Stage 7"
+            )
+        if use_target_user_feature and format_version < 3:
+            raise ValueError(
+                "The BST target-user feature requires Stage 7 loader-index format "
+                "version 3; regenerate Stage 7"
             )
 
         self.split = str(split)
@@ -174,6 +180,11 @@ class HydratedBucketedEngagementDataset(Dataset):
         self.loader_index_format_version = format_version
         self.max_history_len = int(max_history_len)
         self.use_post_liker_feature = bool(use_post_liker_feature)
+        self.use_target_user_feature = bool(use_target_user_feature)
+        self.target_user_coverage = (
+            dict(split_metadata["target_user_coverage"])
+            if format_version >= 3 else None
+        )
         self.max_post_liker_replay_events_per_post = (
             int(max_post_liker_replay_events_per_post)
             if max_post_liker_replay_events_per_post is not None
@@ -200,7 +211,7 @@ class HydratedBucketedEngagementDataset(Dataset):
         try:
             self.post_liker_user_table_num_rows = (
                 int(metadata["post_liker_user_table_num_rows"])
-                if self.use_post_liker_feature
+                if self.use_post_liker_feature or self.use_target_user_feature
                 else None
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -387,6 +398,13 @@ class HydratedBucketedEngagementDataset(Dataset):
                 arrays[name] = load_index_array(
                     self.loader_index_path,
                     name,
+                    split=self.split,
+                    metadata=metadata,
+                )
+            if self.use_target_user_feature:
+                arrays["query_target_user_indices"] = load_index_array(
+                    self.loader_index_path,
+                    "query_target_user_indices",
                     split=self.split,
                     metadata=metadata,
                 )
@@ -804,6 +822,11 @@ class HydratedBucketedEngagementDataset(Dataset):
                 history_emb_indices=history_emb_indices,
                 history_mask=history_mask,
                 candidate_emb_indices=candidate_emb_array,
+            ))
+        if include_bst_features and self.use_target_user_feature:
+            batch["target_user_indices"] = torch.from_numpy(np.asarray(
+                self._array("query_target_user_indices")[row_indices],
+                dtype=np.int64,
             ))
         if include_bst_features:
             batch["candidate_prior_cumulative_likes"] = torch.tensor(

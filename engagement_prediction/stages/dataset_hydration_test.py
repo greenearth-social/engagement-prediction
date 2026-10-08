@@ -351,13 +351,19 @@ def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
     assert loader_format["format_version"] == training_index.FORMAT_VERSION
     assert summary["loader_index"]["format_version"] == training_index.FORMAT_VERSION
     assert loader_format["post_liker_event_count"] == 2
-    assert loader_format["post_liker_user_table_num_rows"] == 3
+    assert loader_format["post_liker_user_table_num_rows"] == 4
     post_liker_vocabulary = scan_parquet_artifact(
         Path(result["artifacts"]["post_liker_users_path"])
     ).collect()
     assert post_liker_vocabulary.to_dicts() == [
-        {"liker_did": "liker", "liker_idx": 2, "training_event_count": 2}
+        {"liker_did": "liker", "liker_idx": 2, "training_event_count": 2, "training_target_query_count": 0},
+        {"liker_did": "user", "liker_idx": 3, "training_event_count": 0, "training_target_query_count": 1},
     ]
+    assert summary["post_liker_user_vocabulary"]["known_training_target_query_count"] == 1
+    assert summary["loader_index"]["target_user_coverage_by_split"]["train"] == {
+        "known_query_count": 1,
+        "unknown_query_count": 0,
+    }
     assert summary["loader_index"]["splits"]["train"] == {
         "query_count": 1,
         "history_count": 1,

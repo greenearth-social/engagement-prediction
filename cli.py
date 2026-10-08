@@ -86,7 +86,7 @@ DEFAULTS: Dict[str, Any] = {
     "dataset_hydration_worker_count": 8,
     "min_author_training_feature_count": 50,
     "min_post_liker_user_training_event_count": 2,
-    "max_post_liker_user_vocabulary_size": 1_000_000,
+    "max_post_liker_user_vocabulary_size": 10_000_000,
     # Stage 8: Model architecture
     "model_type": "bst-ranker",
     "loss_type": "listwise",
@@ -123,6 +123,9 @@ DEFAULTS: Dict[str, Any] = {
     "bst_post_liker_pooling_tau_hours": 168.0,
     "bst_max_post_liker_replay_events_per_post": 128,
     "bst_post_liker_user_unknown_dropout_rate": 0.20,
+    "bst_use_target_user_feature": False,
+    "bst_target_user_projection_dim": 32,
+    "bst_target_user_unknown_dropout_rate": 0.20,
     "dropout_rate_two_tower": 0.3,
     "device": "cuda",
     "patience": 50,
@@ -558,6 +561,8 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
         raise ValueError("--prediction-hidden-dims must be a list of integers.") from exc
     if any(dim <= 0 for dim in prediction_hidden_dims):
         raise ValueError("--prediction-hidden-dims values must be positive integers.")
+    if args.bst_use_target_user_feature and not prediction_hidden_dims:
+        raise ValueError("--bst-use-target-user-feature requires a nonlinear prediction head with at least one hidden dimension.")
 
     model_dim = int(args.bst_model_dim)
     content_projection_dim = int(args.content_projection_dim)
@@ -623,6 +628,10 @@ def _validate_bst_config(args: argparse.Namespace) -> None:
         raise ValueError(
             "--bst-post-liker-user-unknown-dropout-rate must be in [0, 1]."
         )
+    if int(args.bst_target_user_projection_dim) <= 0:
+        raise ValueError("--bst-target-user-projection-dim must be positive.")
+    if not 0.0 <= float(args.bst_target_user_unknown_dropout_rate) <= 1.0:
+        raise ValueError("--bst-target-user-unknown-dropout-rate must be in [0, 1].")
     if author_embedding_dim <= 0:
         raise ValueError("--author-embedding-dim must be positive for the BST ranker.")
     if not 0.0 <= author_unknown_dropout_rate < 1.0:
@@ -939,10 +948,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Minimum final training-feature occurrences required for a dedicated author index")
     _add_arg_with_default(p_all, "--min-post-liker-user-training-event-count", type=int,
                           default=argparse.SUPPRESS,
-                          help_text="Minimum training-visible liker events required for a dedicated liker-user index")
+                          help_text="Minimum training-visible liker events for users without a surviving training target query")
     _add_arg_with_default(p_all, "--max-post-liker-user-vocabulary-size", type=int,
                           default=argparse.SUPPRESS,
-                          help_text="Maximum number of dedicated liker-user indices retained by Stage 7")
+                          help_text="Maximum shared user vocabulary size; Stage 7 reserves rows for all surviving training targets")
     _add_arg_with_default(p_all, "--train-start", type=str, default=argparse.SUPPRESS,
                           help_text="UTC start of target eligibility and the training split")
     _add_arg_with_default(p_all, "--val-start", type=str, default=argparse.SUPPRESS,
@@ -1012,7 +1021,7 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Enable or disable time-decayed post-liker user features")
     _add_arg_with_default(p_all, "--bst-post-liker-user-embedding-dim", type=int,
                           default=argparse.SUPPRESS,
-                          help_text="BST liker-user embedding-table dimension")
+                          help_text="BST shared post-liker and target-user embedding-table dimension")
     _add_arg_with_default(p_all, "--bst-post-liker-projection-dim", type=int,
                           default=argparse.SUPPRESS,
                           help_text="BST pooled post-liker branch projection dimension")
@@ -1025,6 +1034,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--bst-post-liker-user-unknown-dropout-rate", type=float,
                           default=argparse.SUPPRESS,
                           help_text="Training probability of mapping a known liker user to UNK")
+    _add_arg_with_default(p_all, "--bst-use-target-user-feature", action=argparse.BooleanOptionalAction,
+                          default=argparse.SUPPRESS,
+                          help_text="Enable or disable shared target-user embeddings before the BST prediction head")
+    _add_arg_with_default(p_all, "--bst-target-user-projection-dim", type=int,
+                          default=argparse.SUPPRESS,
+                          help_text="BST target-user projection dimension")
+    _add_arg_with_default(p_all, "--bst-target-user-unknown-dropout-rate", type=float,
+                          default=argparse.SUPPRESS,
+                          help_text="Training probability of mapping a known target user to UNK once per query")
     # Stage 8 options (shared)
     _add_arg_with_default(p_all, "--epochs", type=int, default=argparse.SUPPRESS,
                           help_text="Training epochs")

@@ -457,13 +457,15 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     )
 
     logger.info(
-        "Phase 7/11: building the training-only liker vocabulary and indexing events"
+        "Phase 7/11: building the shared training-user vocabulary and indexing events"
     )
     post_liker_support_routes_path = staging_root / "post_liker_support_routes"
     post_liker_support_shards_path = staging_root / "post_liker_support_shards"
     post_liker_vocabulary_stats = (
         dataset_hydration_artifacts.build_post_liker_user_vocabulary(
             feature_events_path=post_liker_feature_events_path,
+            queries_lf=queries_lf,
+            counted_positives_path=counted_positives_path,
             support_routes_path=post_liker_support_routes_path,
             support_shards_path=post_liker_support_shards_path,
             vocabulary_path=post_liker_users_path,

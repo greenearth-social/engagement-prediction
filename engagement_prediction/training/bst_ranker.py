@@ -84,6 +84,14 @@ def compute_bst_listwise_loss_and_scores(
             "candidate_prior_cumulative_likes"
         ].to(device, dtype=torch.float32, non_blocking=True)
 
+    target_user_indices = None
+    if model.use_target_user_feature:
+        if "target_user_indices" not in batch:
+            raise RuntimeError("BST listwise batches must include target_user_indices when target-user features are enabled; rebuild Stage 7")
+        target_user_indices = batch["target_user_indices"].to(
+            device, dtype=torch.long, non_blocking=True
+        )
+
     if model.use_post_liker_feature:
         required_post_liker_fields = (
             "post_liker_event_user_indices",
@@ -130,6 +138,7 @@ def compute_bst_listwise_loss_and_scores(
                 dtype=torch.long,
                 non_blocking=True,
             ),
+            target_user_indices=target_user_indices,
         )
     else:
         scores = model.score_candidate_matrix_one_layer(
@@ -141,6 +150,7 @@ def compute_bst_listwise_loss_and_scores(
             candidate_post_author_idx=candidate_post_author_idx,
             history_prior_cumulative_likes=history_prior_cumulative_likes,
             candidate_prior_cumulative_likes=candidate_prior_cumulative_likes,
+            target_user_indices=target_user_indices,
         )
     if scores.shape != labels.shape:
         raise RuntimeError(

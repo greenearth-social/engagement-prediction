@@ -159,6 +159,7 @@ def _hydrated_inputs(tmp_path):
                     "liker_did": ["known-liker"],
                     "liker_idx": [2],
                     "training_event_count": [2],
+                    "training_target_query_count": [0],
                 },
                 schema=post_liker_users.POST_LIKER_USER_VOCABULARY_SCHEMA,
             ),
@@ -444,6 +445,80 @@ def test_builder_leaves_partial_output_when_source_integrity_fails(tmp_path):
     assert (bundle / "loader_index.partial").exists()
 
 
+def test_target_user_indices_follow_sorted_queries_and_shared_vocabulary(tmp_path):
+    _, paths = _hydrated_inputs(tmp_path)
+    vocabulary_path = paths["post_liker_users_path"] / "part-00000.parquet"
+    vocabulary = pl.read_parquet(vocabulary_path)
+    pl.concat([
+        vocabulary,
+        pl.DataFrame({
+            "liker_did": ["u1"],
+            "liker_idx": [3],
+            "training_event_count": [0],
+            "training_target_query_count": [1],
+        }, schema=post_liker_users.POST_LIKER_USER_VOCABULARY_SCHEMA),
+    ]).write_parquet(vocabulary_path)
+
+    stats = build_loader_index(**paths)
+    # Source queries are [u2, u1]; the canonical index sorts them to [u1, u2].
+    indices = load_index_array(
+        paths["output_path"], "query_target_user_indices", split="train"
+    )
+    assert indices.dtype == np.dtype("<u4")
+    assert indices.tolist() == [3, 1]
+    assert stats["target_user_coverage_by_split"]["train"] == {
+        "known_query_count": 1,
+        "unknown_query_count": 1,
+    }
+    for split in SPLITS[1:]:
+        assert load_index_array(
+            paths["output_path"], "query_target_user_indices", split=split
+        ).shape == (0,)
+
+
+@pytest.mark.parametrize("invalid_index", [0, 3])
+def test_validator_rejects_target_indices_outside_shared_user_table(tmp_path, invalid_index):
+    _, paths = _hydrated_inputs(tmp_path)
+    build_loader_index(**paths)
+    metadata = load_loader_index_metadata(paths["output_path"])
+    entry = metadata["splits"]["train"]["arrays"]["query_target_user_indices"]
+    target_indices = np.load(paths["output_path"] / entry["path"], mmap_mode="r+")
+    target_indices[0] = invalid_index
+    target_indices.flush()
+    del target_indices
+
+    with pytest.raises(ValueError, match="invalid target-user index"):
+        validate_loader_index(paths["output_path"])
+
+
+def test_validator_rejects_incorrect_target_coverage_metadata(tmp_path):
+    _, paths = _hydrated_inputs(tmp_path)
+    build_loader_index(**paths)
+    format_path = paths["output_path"] / "format.json"
+    metadata = json.loads(format_path.read_text())
+    metadata["splits"]["train"]["target_user_coverage"]["known_query_count"] = 1
+    format_path.write_text(json.dumps(metadata))
+
+    with pytest.raises(ValueError, match="target-user coverage does not match"):
+        validate_loader_index(paths["output_path"])
+
+
+@pytest.mark.parametrize(("dtype", "length"), [("<f4", 2), ("<u4", 1)])
+def test_validator_rejects_target_array_dtype_or_shape(tmp_path, dtype, length):
+    _, paths = _hydrated_inputs(tmp_path)
+    build_loader_index(**paths)
+    format_path = paths["output_path"] / "format.json"
+    metadata = json.loads(format_path.read_text())
+    entry = metadata["splits"]["train"]["arrays"]["query_target_user_indices"]
+    target_path = paths["output_path"] / entry["path"]
+    np.save(target_path, np.ones(length, dtype=dtype))
+    entry["file_size_bytes"] = target_path.stat().st_size
+    format_path.write_text(json.dumps(metadata))
+
+    with pytest.raises(ValueError, match="array shape or dtype is invalid"):
+        validate_loader_index(paths["output_path"])
+
+
 def test_builder_rejects_post_rows_outside_embedding_index_order(tmp_path):
     _, paths = _hydrated_inputs(tmp_path)
     posts_path = paths["posts_path"] / "part-00000.parquet"
@@ -461,29 +536,36 @@ def test_metadata_rejects_missing_and_unsupported_index(tmp_path):
         load_loader_index_metadata(tmp_path)
 
 
-def test_reader_and_validator_accept_existing_v1_index(tmp_path):
+@pytest.mark.parametrize("version", [1, 2])
+def test_reader_and_validator_accept_existing_legacy_index(tmp_path, version):
     _, paths = _hydrated_inputs(tmp_path)
     build_loader_index(**paths)
     format_path = paths["output_path"] / "format.json"
     metadata = json.loads(format_path.read_text())
-    metadata["format_version"] = 1
-    for name in (
-        "post_liker_offsets",
-        "post_liker_user_indices",
-        "post_liker_created_at_us",
-    ):
-        array_path = paths["output_path"] / metadata["arrays"].pop(name)["path"]
-        array_path.unlink()
-    metadata.pop("post_liker_user_table_num_rows")
-    metadata.pop("post_liker_event_count")
-    metadata.pop("post_liker_post_count")
+    metadata["format_version"] = version
+    for split in metadata["splits"].values():
+        entry = split["arrays"].pop("query_target_user_indices")
+        (paths["output_path"] / entry["path"]).unlink()
+        split.pop("target_user_coverage")
+    if version == 1:
+        for name in (
+            "post_liker_offsets",
+            "post_liker_user_indices",
+            "post_liker_created_at_us",
+        ):
+            array_path = paths["output_path"] / metadata["arrays"].pop(name)["path"]
+            array_path.unlink()
+        metadata.pop("post_liker_user_table_num_rows")
+        metadata.pop("post_liker_event_count")
+        metadata.pop("post_liker_post_count")
     metadata["total_data_bytes"] = training_index._total_declared_bytes(metadata)
     format_path.write_text(json.dumps(metadata))
 
-    assert load_loader_index_metadata(paths["output_path"])["format_version"] == 1
+    assert load_loader_index_metadata(paths["output_path"])["format_version"] == version
     validation = validate_loader_index(paths["output_path"])
-    assert validation["format_version"] == 1
-    assert validation["post_liker_event_count"] == 0
+    assert validation["format_version"] == version
+    assert validation["post_liker_event_count"] == (0 if version == 1 else 3)
+    assert validation["target_user_coverage_by_split"] == {}
     (tmp_path / "format.json").write_text(json.dumps({"format_version": 999}))
     with pytest.raises(ValueError, match="Unsupported.*Regenerate Stage 7"):
         load_loader_index_metadata(tmp_path)

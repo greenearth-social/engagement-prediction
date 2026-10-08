@@ -893,6 +893,49 @@ def test_bst_ranker_training_defaults():
     assert merged.bst_post_liker_pooling_tau_hours == 168.0
     assert merged.bst_max_post_liker_replay_events_per_post == 128
     assert merged.bst_post_liker_user_unknown_dropout_rate == 0.20
+    assert merged.bst_use_target_user_feature is False
+    assert merged.bst_target_user_projection_dim == 32
+    assert merged.bst_target_user_unknown_dropout_rate == 0.20
+    cli._validate_bst_config(merged)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_target_user_cli_overrides_config_independently_of_liker_feature(tmp_path, enabled):
+    config_path = tmp_path / "target.yml"
+    config_path.write_text(
+        f"bst_use_target_user_feature: {str(not enabled).lower()}\n"
+        "bst_use_post_liker_feature: false\n"
+        "bst_target_user_projection_dim: 48\n"
+        "bst_target_user_unknown_dropout_rate: 0.4\n"
+    )
+    flag = "--bst-use-target-user-feature" if enabled else "--no-bst-use-target-user-feature"
+    merged = cli._merge_args_with_config(cli.build_parser().parse_args([
+        "--config", str(config_path), flag, "--bst-target-user-projection-dim", "16",
+    ]))
+    assert merged.bst_use_target_user_feature is enabled
+    assert merged.bst_use_post_liker_feature is False
+    assert merged.bst_target_user_projection_dim == 16
+    assert merged.bst_target_user_unknown_dropout_rate == 0.4
+    cli._validate_bst_config(merged)
+
+
+@pytest.mark.parametrize("dropout", ["-0.1", "1.1"])
+def test_target_user_cli_rejects_invalid_dropout(dropout):
+    merged = cli._merge_args_with_config(cli.build_parser().parse_args([
+        "--bst-target-user-unknown-dropout-rate", dropout,
+    ]))
+    with pytest.raises(ValueError, match="bst-target-user-unknown-dropout-rate"):
+        cli._validate_bst_config(merged)
+
+
+def test_target_user_cli_requires_nonlinear_prediction_head():
+    merged = cli._merge_args_with_config(cli.build_parser().parse_args([
+        "--bst-use-target-user-feature",
+    ]))
+    merged.prediction_hidden_dims = []
+    with pytest.raises(ValueError, match="nonlinear prediction head"):
+        cli._validate_bst_config(merged)
+    merged.bst_use_target_user_feature = False
     cli._validate_bst_config(merged)
 
 
@@ -918,6 +961,7 @@ def test_bst_ranker_requires_one_transformer_layer():
         ("--bst-popularity-projection-dim", "bst-popularity-projection-dim"),
         ("--bst-post-liker-user-embedding-dim", "bst-post-liker-user-embedding-dim"),
         ("--bst-post-liker-projection-dim", "bst-post-liker-projection-dim"),
+        ("--bst-target-user-projection-dim", "bst-target-user-projection-dim"),
         ("--bst-post-liker-pooling-tau-hours", "bst-post-liker-pooling-tau-hours"),
         ("--bst-max-post-liker-replay-events-per-post", "bst-max-post-liker-replay-events-per-post"),
     ],

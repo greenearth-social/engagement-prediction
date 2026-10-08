@@ -283,6 +283,7 @@ def test_stage8_trains_native_two_tower_and_publishes_serving_artifacts(
         max_history_len=2,
         additional_batch_negatives=None,
         use_post_liker_feature=False,
+        use_target_user_feature=False,
         max_post_liker_replay_events_per_post=None,
         seed=7,
         logger=None,

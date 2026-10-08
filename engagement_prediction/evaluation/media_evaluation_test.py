@@ -16,7 +16,7 @@ from engagement_prediction.data.datasets import (
     create_hydrated_data_loader,
 )
 from engagement_prediction.data.datasets_test import _bundle, _write_post_liker_arrays
-from engagement_prediction.data.training_index import build_loader_index
+from engagement_prediction.data.training_index import FORMAT_VERSION, build_loader_index
 from engagement_prediction.evaluation.artifacts import Stage7Artifact
 from engagement_prediction.evaluation.media_artifacts import (
     MediaModelArtifact,
@@ -194,23 +194,32 @@ def _native_validation_artifact(tmp_path: Path) -> Stage7Artifact:
         0: [(2, datetime(2026, 1, 1, 10, tzinfo=timezone.utc))],
         1: [(3, datetime(2026, 1, 1, 11, tzinfo=timezone.utc))],
     }, user_table_num_rows=4)
+    # The event-fixture helper emulates v2; retain this freshly built v3 query
+    # index so target-user lookup is also exercised in the native comparison.
+    metadata_path = bundle / "loader_index" / "format.json"
+    index_metadata = json.loads(metadata_path.read_text())
+    index_metadata["format_version"] = FORMAT_VERSION
+    metadata_path.write_text(json.dumps(index_metadata))
     return Stage7Artifact(
         root=tmp_path, bundle_path=bundle, manifest={}, summary={},
         loader_index_validation={
-            "format_version": 2, "embedding_count": 5,
+            "format_version": FORMAT_VERSION, "embedding_count": 5,
             "splits": {split: {"query_count": 1} for split in ("val", "val_unseen_users")},
         },
         embedding_model="fixture-model", embedding_dim=2,
     )
 
 
-def _native_model(tmp_path: Path, *, use_post_liker_feature: bool) -> MediaModelArtifact:
+def _native_model(tmp_path: Path, *, use_post_liker_feature: bool, use_target_user_feature: bool = False) -> MediaModelArtifact:
     name = "liker" if use_post_liker_feature else "baseline"
+    if use_target_user_feature:
+        name += "-target"
     model_config = _bst_config(max_history_len=1 if use_post_liker_feature else 3,
                                author_table_num_rows=7)
     model_config["constructor_args"].update({
         "use_post_liker_feature": use_post_liker_feature,
-        "post_liker_user_table_num_rows": 4 if use_post_liker_feature else 2,
+        "use_target_user_feature": use_target_user_feature,
+        "post_liker_user_table_num_rows": 4 if (use_post_liker_feature or use_target_user_feature) else 2,
         "use_popularity_feature": True,
         "popularity_log_mean": 1.0,
         "popularity_log_std": 2.0,
@@ -239,11 +248,12 @@ def _run(dataset, models, metadata):
 
 
 @pytest.mark.parametrize("include_liker", [False, True])
-def test_native_evaluation_preserves_settings_and_matches_canonical(tmp_path, include_liker):
+@pytest.mark.parametrize("use_target_user_feature", [False, True])
+def test_native_evaluation_preserves_settings_and_matches_canonical(tmp_path, include_liker, use_target_user_feature):
     dataset = _native_validation_artifact(tmp_path)
-    models = [_native_model(tmp_path, use_post_liker_feature=False)]
+    models = [_native_model(tmp_path, use_post_liker_feature=False, use_target_user_feature=use_target_user_feature)]
     if include_liker:
-        models.append(_native_model(tmp_path, use_post_liker_feature=True))
+        models.append(_native_model(tmp_path, use_post_liker_feature=True, use_target_user_feature=use_target_user_feature))
     metadata = _metadata(["p1", "p2", "n1"], [True] * 3, [False] * 3, ["known"] * 3)
     result = _run(dataset, models, metadata)
     assert len(result["metrics"]) == len(models) * 2 * 3 * 2
@@ -252,7 +262,9 @@ def test_native_evaluation_preserves_settings_and_matches_canonical(tmp_path, in
     for artifact, model_result in zip(models, result["model_results"]):
         assert model_result["best_epoch"] == 2
         assert model_result["max_history_len"] == artifact.model_config["max_history_len"]
-        assert model_result["use_post_liker_feature"] is (artifact.name == "liker")
+        liker_enabled = artifact.model_config["constructor_args"]["use_post_liker_feature"]
+        assert model_result["use_post_liker_feature"] is liker_enabled
+        assert model_result["use_target_user_feature"] is use_target_user_feature
         eager_model, _ = load_bst_checkpoint_model(
             checkpoint_path=artifact.checkpoint_path,
             expected_model_config=artifact.model_config,
@@ -260,8 +272,9 @@ def test_native_evaluation_preserves_settings_and_matches_canonical(tmp_path, in
         )
         split_dataset = HydratedBucketedEngagementDataset(
             dataset.bundle_path, split="val", max_history_len=artifact.model_config["max_history_len"],
-            additional_batch_negatives=None, use_post_liker_feature=artifact.name == "liker",
-            max_post_liker_replay_events_per_post=2 if artifact.name == "liker" else None,
+            additional_batch_negatives=None, use_post_liker_feature=liker_enabled,
+            use_target_user_feature=use_target_user_feature,
+            max_post_liker_replay_events_per_post=2 if liker_enabled else None,
             seed=7, logger=None,
         )
         try:

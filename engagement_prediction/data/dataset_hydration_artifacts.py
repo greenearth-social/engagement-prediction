@@ -1151,6 +1151,8 @@ def _liker_support_partition_paths(path: Path, partition_id: int) -> list[Path]:
 def build_post_liker_user_vocabulary(
     *,
     feature_events_path: Path,
+    queries_lf: pl.LazyFrame,
+    counted_positives_path: Path,
     support_routes_path: Path,
     support_shards_path: Path,
     vocabulary_path: Path,
@@ -1159,7 +1161,7 @@ def build_post_liker_user_vocabulary(
     partition_count: int,
     logger: logging.Logger,
 ) -> dict[str, Any]:
-    """Build a bounded vocabulary from exact events visible to train uses."""
+    """Reserve training-target rows, then fill capacity with supported likers."""
 
     if min_training_event_count < 1:
         raise ValueError("min_post_liker_user_training_event_count must be at least 1")
@@ -1174,10 +1176,29 @@ def build_post_liker_user_vocabulary(
         ).lazy()
     )
     training_events_lf = events_lf.filter(pl.col("is_training_visible")).select(
-        "liker_did"
+        "liker_did",
+        pl.lit(1, dtype=pl.UInt64).alias("training_event_count"),
+        pl.lit(0, dtype=pl.UInt64).alias("training_target_query_count"),
+    )
+    # Query publication drops only queries without a hydrated positive. Use
+    # that same boundary here so discarded and evaluation-only targets cannot
+    # acquire vocabulary rows from their target role.
+    surviving_keys_lf = scan_parquet_artifact(counted_positives_path).select(
+        "did", "query_hour"
+    ).unique()
+    training_targets_lf = (
+        queries_lf.filter(pl.col("split") == "train")
+        .join(surviving_keys_lf, on=["did", "query_hour"], how="semi")
+        .select("did", "query_hour")
+        .unique()
+        .select(
+            pl.col("did").alias("liker_did"),
+            pl.lit(0, dtype=pl.UInt64).alias("training_event_count"),
+            pl.lit(1, dtype=pl.UInt64).alias("training_target_query_count"),
+        )
     )
     sink_partitioned_parquet(
-        training_events_lf.with_columns(
+        pl.concat([training_events_lf, training_targets_lf]).with_columns(
             post_liker_users.support_partition_expr(partition_count)
         ),
         output_path=support_routes_path,
@@ -1188,19 +1209,28 @@ def build_post_liker_user_vocabulary(
     pre_threshold_user_count = 0
     threshold_eligible_user_count = 0
     training_event_count = 0
+    training_target_user_count = 0
+    training_target_query_count = 0
     for partition_id in range(partition_count):
         rows_df = read_parquet_parts(
             _liker_support_partition_paths(support_routes_path, partition_id),
-            empty=pl.DataFrame(schema={"liker_did": pl.String}),
+            empty=pl.DataFrame(schema={
+                "liker_did": pl.String,
+                "training_event_count": pl.UInt64,
+                "training_target_query_count": pl.UInt64,
+            }),
         )
         support_df = (
             rows_df.group_by("liker_did")
-            .len(name="training_event_count")
-            .with_columns(pl.col("training_event_count").cast(pl.UInt64))
+            .agg(
+                pl.col("training_event_count").sum(),
+                pl.col("training_target_query_count").sum(),
+            )
             .sort("liker_did")
         )
         eligible_df = support_df.filter(
-            pl.col("training_event_count") >= min_training_event_count
+            (pl.col("training_event_count") >= min_training_event_count)
+            | (pl.col("training_target_query_count") > 0)
         )
         write_parquet_part_if_not_empty(
             eligible_df,
@@ -1209,12 +1239,26 @@ def build_post_liker_user_vocabulary(
         pre_threshold_user_count += support_df.height
         threshold_eligible_user_count += eligible_df.height
         training_event_count += int(support_df.get_column("training_event_count").sum() or 0)
+        training_target_user_count += support_df.filter(
+            pl.col("training_target_query_count") > 0
+        ).height
+        training_target_query_count += int(
+            support_df.get_column("training_target_query_count").sum() or 0
+        )
         logger.info(
             "Aggregated post-liker user support partition %s/%s: users=%s eligible=%s",
             partition_id + 1,
             partition_count,
             f"{support_df.height:,}",
             f"{eligible_df.height:,}",
+        )
+
+    if training_target_user_count > max_vocabulary_size:
+        raise ValueError(
+            f"Shared user vocabulary requires {training_target_user_count:,} "
+            "surviving training-target rows, exceeding "
+            f"max_post_liker_user_vocabulary_size={max_vocabulary_size:,}; "
+            "increase the vocabulary cap"
         )
 
     vocabulary_path.mkdir(parents=True, exist_ok=False)
@@ -1225,8 +1269,12 @@ def build_post_liker_user_vocabulary(
         (
             pl.scan_parquet(support_parts)
             .sort(
-                ["training_event_count", "liker_did"],
-                descending=[True, False],
+                [
+                    pl.col("training_target_query_count") > 0,
+                    "training_event_count",
+                    "liker_did",
+                ],
+                descending=[True, True, False],
             )
             .head(max_vocabulary_size)
             .sink_parquet(
@@ -1267,6 +1315,11 @@ def build_post_liker_user_vocabulary(
         "known_training_event_count": validation["training_event_count"],
         "unk_training_event_count": (
             training_event_count - validation["training_event_count"]
+        ),
+        "all_training_target_query_count": training_target_query_count,
+        "known_training_target_query_count": validation["training_target_query_count"],
+        "unk_training_target_query_count": (
+            training_target_query_count - validation["training_target_query_count"]
         ),
     }
 

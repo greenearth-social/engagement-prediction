@@ -35,8 +35,8 @@ from engagement_prediction.data.parquet import (
 )
 
 
-FORMAT_VERSION = 2
-SUPPORTED_FORMAT_VERSIONS = (1, 2)
+FORMAT_VERSION = 3
+SUPPORTED_FORMAT_VERSIONS = (1, 2, 3)
 SPLITS = (
     "train",
     "val",
@@ -63,7 +63,7 @@ V1_GLOBAL_ARRAY_DTYPES = {
     "post_created_at_us": TIMESTAMP_DTYPE,
     "post_author_idx": INDEX_DTYPE,
 }
-SPLIT_ARRAY_DTYPES = {
+LEGACY_SPLIT_ARRAY_DTYPES = {
     "query_hours_us": TIMESTAMP_DTYPE,
     "history_offsets": OFFSET_DTYPE,
     "history_emb_indices": INDEX_DTYPE,
@@ -77,6 +77,10 @@ SPLIT_ARRAY_DTYPES = {
     "negative_offsets": OFFSET_DTYPE,
     "negative_emb_indices": INDEX_DTYPE,
     "negative_prior_like_counts": COUNT_DTYPE,
+}
+SPLIT_ARRAY_DTYPES = {
+    **LEGACY_SPLIT_ARRAY_DTYPES,
+    "query_target_user_indices": INDEX_DTYPE,
 }
 
 
@@ -641,30 +645,42 @@ def _write_query_core(
     split_dir: Path,
     query_path: Path,
     query_count: int,
-) -> tuple[dict[str, Any], dict[str, Any], np.ndarray, np.ndarray]:
+) -> tuple[dict[str, Any], dict[str, Any], np.ndarray, np.ndarray, dict[str, int]]:
     """Write canonical query hours/DIDs and derive contiguous hour ranges."""
 
     hours_path = split_dir / "query_hours_us.npy"
+    target_users_path = split_dir / "query_target_user_indices.npy"
     dids_path = split_dir / "query_dids.arrow"
     hours = _allocate_array(hours_path, TIMESTAMP_DTYPE, query_count)
+    target_users = _allocate_array(target_users_path, INDEX_DTYPE, query_count)
     position = 0
+    known_query_count = 0
     with _Utf8IpcWriter(dids_path, "did") as did_writer:
-        for batch in _iter_parquet_batches(query_path, columns=["did", "query_hour"]):
+        for batch in _iter_parquet_batches(
+            query_path, columns=["did", "query_hour", "target_user_idx"]
+        ):
             size = batch.num_rows
             hours[position:position + size] = _timestamp_values(batch.column("query_hour"))
+            target_indices = _integer_values(batch.column("target_user_idx"), INDEX_DTYPE)
+            target_users[position:position + size] = target_indices
+            known_query_count += int(np.count_nonzero(target_indices > 1))
             did_writer.write(batch.column("did"))
             position += size
         did_offsets = did_writer.batch_offsets
     hours.flush()
+    target_users.flush()
     if position != query_count:
         raise ValueError(f"Query index for {split_dir.name!r} has an unexpected row count")
     hour_values, hour_counts = np.unique(np.asarray(hours), return_counts=True)
     query_offsets = np.empty(hour_values.size + 1, dtype=OFFSET_DTYPE)
     query_offsets[0] = 0
     np.cumsum(hour_counts, dtype=OFFSET_DTYPE, out=query_offsets[1:])
-    del hours
+    del hours, target_users
     arrays = {
         "query_hours_us": _array_metadata(root, hours_path, TIMESTAMP_DTYPE, query_count),
+        "query_target_user_indices": _array_metadata(
+            root, target_users_path, INDEX_DTYPE, query_count
+        ),
     }
     arrow_tables = {
         "query_dids": _arrow_metadata(
@@ -675,7 +691,11 @@ def _write_query_core(
             batch_offsets=did_offsets,
         )
     }
-    return arrays, arrow_tables, hour_values.astype(TIMESTAMP_DTYPE), query_offsets
+    target_user_coverage = {
+        "known_query_count": known_query_count,
+        "unknown_query_count": query_count - known_query_count,
+    }
+    return arrays, arrow_tables, hour_values.astype(TIMESTAMP_DTYPE), query_offsets, target_user_coverage
 
 
 def _route_paths(path: Path, partition_id: int) -> list[Path]:
@@ -1083,6 +1103,7 @@ def _prepare_all_split_relations(
             "did",
             "query_hour",
             "positive_count",
+            "target_user_idx",
             "split",
             "_source_partition",
         ).with_columns(pl.col("split").alias("_split_partition")),
@@ -1096,6 +1117,7 @@ def _prepare_all_split_relations(
         "did": pl.String,
         "query_hour": pl.Datetime("us", "UTC"),
         "positive_count": pl.UInt32,
+        "target_user_idx": pl.UInt32,
         "split": pl.String,
         "_source_partition": pl.UInt32,
     }
@@ -1110,7 +1132,7 @@ def _prepare_all_split_relations(
         )
         query_map = (
             split_queries_lf.select(
-                "did", "query_hour", "positive_count", "_source_partition"
+                "did", "query_hour", "positive_count", "target_user_idx", "_source_partition"
             )
             .sort("query_hour", "did")
             .with_row_index("_query_idx")
@@ -1123,6 +1145,7 @@ def _prepare_all_split_relations(
                 "did",
                 "query_hour",
                 "positive_count",
+                "target_user_idx",
                 "_source_partition",
             ],
         )
@@ -1195,7 +1218,7 @@ def _build_split(
     split_dir.mkdir(parents=True, exist_ok=False)
     query_count = _parquet_row_count(query_path)
     negative_count = _parquet_row_count(negative_path)
-    arrays, arrow_tables, hour_values, query_offsets = _write_query_core(
+    arrays, arrow_tables, hour_values, query_offsets, target_user_coverage = _write_query_core(
         root=root,
         split_dir=split_dir,
         query_path=query_path,
@@ -1233,6 +1256,7 @@ def _build_split(
         },
         "arrays": arrays,
         "arrow_tables": arrow_tables,
+        "target_user_coverage": target_user_coverage,
     }
 
 
@@ -1367,6 +1391,7 @@ def build_loader_index(
             pl.col("liker_idx").min().alias("min_liker_idx"),
             pl.col("liker_idx").max().alias("max_liker_idx"),
             pl.col("liker_idx").n_unique().alias("unique_liker_idx_count"),
+            pl.col("liker_did").n_unique().alias("unique_liker_did_count"),
         )
         .collect(engine="streaming")
         .row(0, named=True)
@@ -1377,9 +1402,21 @@ def build_loader_index(
         or int(post_liker_user_stats["max_liker_idx"]) != post_liker_user_count + 1
         or int(post_liker_user_stats["unique_liker_idx_count"])
         != post_liker_user_count
+        or int(post_liker_user_stats["unique_liker_did_count"])
+        != post_liker_user_count
     ):
         raise ValueError("Stage 7 post-liker user indices must be unique and dense from 2")
     post_liker_user_table_num_rows = post_liker_user_count + 2
+    # A query's target uses the same row as that DID's liker events. Join before
+    # canonical sorting so the numeric row remains aligned with every feature.
+    queries_with_source_lf = queries_with_source_lf.join(
+        scan_parquet_artifact(Path(post_liker_users_path)).select(
+            pl.col("liker_did").alias("did"),
+            pl.col("liker_idx").alias("target_user_idx"),
+        ),
+        on="did",
+        how="left",
+    ).with_columns(pl.col("target_user_idx").fill_null(1).cast(pl.UInt32))
     indexed_event_parts = sorted(Path(indexed_post_liker_events_path).glob("*.parquet"))
     liker_arrays, post_liker_event_count, post_liker_post_count = (
         _write_global_post_liker_index(
@@ -1448,6 +1485,7 @@ def build_loader_index(
         "splits": {
             split: dict(metadata["splits"][split]["counts"]) for split in SPLITS
         },
+        "target_user_coverage_by_split": validation["target_user_coverage_by_split"],
         "validated_data_bytes": validation["total_data_bytes"],
         "build_time_seconds": time.time() - started_at,
     }
@@ -1653,9 +1691,13 @@ def validate_loader_index(index_path: Path) -> dict[str, Any]:
         embedding_count,
     )
     split_counts: dict[str, dict[str, int]] = {}
+    target_user_coverage_by_split: dict[str, dict[str, int]] = {}
+    expected_split_dtypes = (
+        SPLIT_ARRAY_DTYPES if format_version >= 3 else LEGACY_SPLIT_ARRAY_DTYPES
+    )
     for split in SPLITS:
         split_meta = metadata["splits"][split]
-        if set(split_meta.get("arrays", {})) != set(SPLIT_ARRAY_DTYPES):
+        if set(split_meta.get("arrays", {})) != set(expected_split_dtypes):
             raise ValueError(f"Split {split!r} has unexpected numeric arrays")
         if set(split_meta.get("arrow_tables", {})) != {"query_dids"}:
             raise ValueError(f"Split {split!r} has unexpected Arrow tables")
@@ -1684,11 +1726,13 @@ def validate_loader_index(index_path: Path) -> dict[str, Any]:
             "negative_emb_indices": counts["negative_count"],
             "negative_prior_like_counts": counts["negative_count"],
         }
+        if format_version >= 3:
+            lengths["query_target_user_indices"] = counts["query_count"]
         arrays = {
             name: _validate_array(
                 root=index_path,
                 entry=split_meta["arrays"][name],
-                expected_dtype=SPLIT_ARRAY_DTYPES[name],
+                expected_dtype=expected_split_dtypes[name],
                 expected_length=length,
             )
             for name, length in lengths.items()
@@ -1710,6 +1754,21 @@ def validate_loader_index(index_path: Path) -> dict[str, Any]:
         ):
             raise ValueError("Every indexed query must have at least one positive")
         query_hours = arrays["query_hours_us"]
+        if format_version >= 3:
+            target_indices = arrays["query_target_user_indices"]
+            if target_indices.size and (
+                int(np.min(target_indices)) < 1
+                or int(np.max(target_indices)) >= post_liker_user_table_num_rows
+            ):
+                raise ValueError(f"Split {split!r} has an invalid target-user index")
+            known_query_count = int(np.count_nonzero(target_indices > 1))
+            coverage = {
+                "known_query_count": known_query_count,
+                "unknown_query_count": counts["query_count"] - known_query_count,
+            }
+            if split_meta.get("target_user_coverage") != coverage:
+                raise ValueError(f"Split {split!r} target-user coverage does not match its indices")
+            target_user_coverage_by_split[split] = coverage
         hour_values = arrays["hour_values_us"]
         if query_hours.size and np.any(query_hours[1:] < query_hours[:-1]):
             raise ValueError(f"Split {split!r} query hours are not sorted")
@@ -1755,4 +1814,5 @@ def validate_loader_index(index_path: Path) -> dict[str, Any]:
         "post_liker_event_count": post_liker_event_count,
         "post_liker_post_count": post_liker_post_count,
         "splits": split_counts,
+        "target_user_coverage_by_split": target_user_coverage_by_split,
     }

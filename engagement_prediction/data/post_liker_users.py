@@ -1,9 +1,9 @@
-"""Training-only liker-user vocabulary and compact event schemas.
+"""Shared training-user vocabulary and compact liker-event schemas.
 
 Stage 5 preserves raw liker DIDs because it is model-independent. Stage 7
-turns only the events visible to surviving training features into a bounded
-embedding vocabulary. Events from every other valid user remain useful: they
-map to the shared UNK row rather than disappearing from the pooled history.
+reserves rows for surviving training targets, then uses the remaining capacity
+for likers visible to training features. Other valid users map to the shared
+UNK row rather than disappearing from the pooled history.
 """
 
 from __future__ import annotations
@@ -18,11 +18,16 @@ POST_LIKER_USER_VOCABULARY_COLUMNS = [
     "liker_did",
     "liker_idx",
     "training_event_count",
+    "training_target_query_count",
 ]
-POST_LIKER_USER_VOCABULARY_SCHEMA = {
+LEGACY_POST_LIKER_USER_VOCABULARY_SCHEMA = {
     "liker_did": pl.String,
     "liker_idx": pl.UInt32,
     "training_event_count": pl.UInt64,
+}
+POST_LIKER_USER_VOCABULARY_SCHEMA = {
+    **LEGACY_POST_LIKER_USER_VOCABULARY_SCHEMA,
+    "training_target_query_count": pl.UInt64,
 }
 
 POST_LIKER_USE_WINDOW_COLUMNS = [
@@ -95,6 +100,7 @@ def add_liker_indices(selected_support_lf: pl.LazyFrame) -> pl.LazyFrame:
         .with_columns(
             pl.col("liker_idx").cast(pl.UInt32),
             pl.col("training_event_count").cast(pl.UInt64),
+            pl.col("training_target_query_count").cast(pl.UInt64),
         )
         .select(POST_LIKER_USER_VOCABULARY_COLUMNS)
     )
@@ -113,7 +119,11 @@ def validate_post_liker_user_vocabulary(
     if max_vocabulary_size < 0:
         raise ValueError("max_post_liker_user_vocabulary_size may not be negative")
     schema = vocabulary_lf.collect_schema()
-    if schema != pl.Schema(POST_LIKER_USER_VOCABULARY_SCHEMA):
+    if schema == pl.Schema(LEGACY_POST_LIKER_USER_VOCABULARY_SCHEMA):
+        vocabulary_lf = vocabulary_lf.with_columns(
+            pl.lit(0, dtype=pl.UInt64).alias("training_target_query_count")
+        )
+    elif schema != pl.Schema(POST_LIKER_USER_VOCABULARY_SCHEMA):
         raise ValueError(f"Unexpected post-liker user vocabulary schema: {schema}")
     checks = vocabulary_lf.select(
         pl.len().alias("user_count"),
@@ -122,12 +132,21 @@ def validate_post_liker_user_vocabulary(
         pl.col("liker_idx").n_unique().alias("unique_index_count"),
         pl.col("liker_idx").min().alias("min_liker_idx"),
         pl.col("liker_idx").max().alias("max_liker_idx"),
-        pl.col("training_event_count").min().alias("min_training_event_count"),
         pl.col("training_event_count").sum().alias("training_event_count"),
+        pl.col("training_target_query_count").sum().alias("training_target_query_count"),
+        (pl.col("training_target_query_count") > 0).sum().alias("training_target_user_count"),
+        (
+            (pl.col("training_event_count") < min_training_event_count)
+            & (pl.col("training_target_query_count") == 0)
+        ).sum().alias("below_threshold_user_count"),
+        pl.col("training_event_count").null_count().alias("null_event_support_count"),
+        pl.col("training_target_query_count").null_count().alias("null_target_support_count"),
     ).collect(engine="streaming").row(0, named=True)
     user_count = int(checks["user_count"])
     if checks["null_user_count"]:
         raise ValueError("Post-liker user vocabulary contains a null DID")
+    if checks["null_event_support_count"] or checks["null_target_support_count"]:
+        raise ValueError("Post-liker user vocabulary contains null training support")
     if int(checks["unique_user_count"]) != user_count:
         raise ValueError("Post-liker user vocabulary contains duplicate DIDs")
     if int(checks["unique_index_count"]) != user_count:
@@ -137,7 +156,7 @@ def validate_post_liker_user_vocabulary(
     if user_count:
         if int(checks["min_liker_idx"]) != 2 or int(checks["max_liker_idx"]) != user_count + 1:
             raise ValueError("Post-liker user indices are not dense from 2")
-        if int(checks["min_training_event_count"]) < min_training_event_count:
+        if checks["below_threshold_user_count"]:
             raise ValueError("Post-liker user vocabulary contains a user below threshold")
     invalid_order_count = (
         vocabulary_lf.select("liker_did", "liker_idx")
@@ -154,4 +173,6 @@ def validate_post_liker_user_vocabulary(
         "user_count": user_count,
         "user_table_num_rows": user_count + 2,
         "training_event_count": int(checks["training_event_count"] or 0),
+        "training_target_query_count": int(checks["training_target_query_count"] or 0),
+        "training_target_user_count": int(checks["training_target_user_count"] or 0),
     }

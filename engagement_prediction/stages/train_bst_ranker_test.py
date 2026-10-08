@@ -194,9 +194,10 @@ def _stage7_fixture(tmp_path: Path) -> tuple[Path, Path]:
         "post_liker_users",
         pl.DataFrame(
             {
-                "liker_did": ["liker-1"],
-                "liker_idx": [2],
-                "training_event_count": [2],
+                "liker_did": ["liker-1", "u1", "u2"],
+                "liker_idx": [2, 3, 4],
+                "training_event_count": [2, 0, 0],
+                "training_target_query_count": [0, 1, 1],
             },
             schema=post_liker_users.POST_LIKER_USER_VOCABULARY_SCHEMA,
         ),
@@ -232,6 +233,7 @@ def _args(
     save_model: bool,
     plots: bool,
     post_liker_feature: bool = False,
+    target_user_feature: bool = False,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         run_tag=None,
@@ -249,6 +251,9 @@ def _args(
         history_length_bucket_boundaries=[0, 1, 2],
         bst_use_popularity_feature=True,
         bst_use_post_liker_feature=post_liker_feature,
+        bst_use_target_user_feature=target_user_feature,
+        bst_target_user_projection_dim=3,
+        bst_target_user_unknown_dropout_rate=0.0,
         bst_post_liker_user_embedding_dim=3,
         bst_post_liker_projection_dim=2,
         bst_post_liker_pooling_tau_hours=24.0,
@@ -441,6 +446,7 @@ def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
         max_history_len=2,
         bst_additional_batch_negatives=2,
         use_post_liker_feature=False,
+        use_target_user_feature=False,
         max_post_liker_replay_events_per_post=None,
         seed=7,
         logger=None,
@@ -607,9 +613,13 @@ def test_stage8_keeps_local_manifest_when_manifest_upload_fails(tmp_path, monkey
     ).read_text()
 
 
+@pytest.mark.parametrize("target_user_feature", [False, True])
+@pytest.mark.parametrize("loss_type", ["listwise", "bce"])
 def test_stage8_post_liker_feature_exports_reloadable_serving_companions(
     tmp_path,
     monkeypatch,
+    target_user_feature,
+    loss_type,
 ):
     stage7_dir, bundle = _stage7_fixture(tmp_path)
     monkeypatch.setattr(
@@ -619,14 +629,14 @@ def test_stage8_post_liker_feature_exports_reloadable_serving_companions(
     )
     tracker = _RecordingTracker(task_id="")
 
-    result = train_bst_ranker.run(
-        _context(tmp_path, tracker),
-        _args(
-            save_model=True,
-            plots=False,
-            post_liker_feature=True,
-        ),
+    args = _args(
+        save_model=True,
+        plots=False,
+        post_liker_feature=True,
+        target_user_feature=target_user_feature,
     )
+    args.loss_type = loss_type
+    result = train_bst_ranker.run(_context(tmp_path, tracker), args)
 
     output_dir = Path(result["output_dir"])
     user_map_path = output_dir / "ranker_liker_user_idx.parquet"
@@ -637,7 +647,7 @@ def test_stage8_post_liker_feature_exports_reloadable_serving_companions(
     assert state_path.is_file()
     assert (output_dir / "post_liker_users").is_dir()
     assert result["artifacts"]["serving_manifest_path"] is None
-    assert np.load(table_path).shape == (3, 3)
+    assert np.load(table_path).shape == (5, 3)
     state = json.loads(state_path.read_text())
     assert state["ranker_contract_version"] == 2
     assert state["post_liker_feature_enabled"] is True
@@ -649,6 +659,7 @@ def test_stage8_post_liker_feature_exports_reloadable_serving_companions(
         max_history_len=2,
         bst_additional_batch_negatives=2,
         use_post_liker_feature=True,
+        use_target_user_feature=target_user_feature,
         max_post_liker_replay_events_per_post=128,
         seed=7,
         logger=None,
@@ -672,9 +683,72 @@ def test_stage8_post_liker_feature_exports_reloadable_serving_companions(
             batch["post_liker_event_offsets"],
             batch["history_post_liker_rows"],
             batch["candidate_post_liker_rows"],
+            batch.get("target_user_indices"),
         )
     assert scores.shape == batch["label_matrix"].shape
     assert torch.isfinite(scores).all()
+
+
+@pytest.mark.parametrize("loss_type", ["listwise", "bce"])
+def test_stage8_target_only_trains_and_publishes_shared_map(tmp_path, monkeypatch, loss_type):
+    stage7_dir, bundle = _stage7_fixture(tmp_path)
+    monkeypatch.setattr(
+        train_bst_ranker,
+        "resolve_recorded_stage_lineage",
+        lambda *args, **kwargs: {"07_dataset_hydration": stage7_dir},
+    )
+    tracker = _RecordingTracker(task_id="target-task")
+    args = _args(save_model=True, plots=False, target_user_feature=True)
+    args.loss_type = loss_type
+    result = train_bst_ranker.run(_context(tmp_path, tracker), args)
+    output_dir = Path(result["output_dir"])
+    model_config = json.loads((output_dir / "model_config.json").read_text())
+    training_config = json.loads((output_dir / "training_config.json").read_text())
+    results = json.loads((output_dir / "training_results.json").read_text())
+    constructor = model_config["constructor_args"]
+    assert constructor["use_target_user_feature"] is True
+    assert constructor["use_post_liker_feature"] is False
+    assert constructor["post_liker_user_table_num_rows"] == 5
+    assert training_config["bst_use_target_user_feature"] is True
+    assert results["target_user_feature"]["coverage_by_split"] == {
+        "train": {"known_query_count": 2, "unknown_query_count": 0},
+        "val": {"known_query_count": 0, "unknown_query_count": 1},
+        "val_unseen_users": {"known_query_count": 0, "unknown_query_count": 1},
+    }
+    assert pl.read_parquet(output_dir / "ranker_liker_user_idx.parquet")["liker_did"].to_list() == ["liker-1", "u1", "u2"]
+    assert not (output_dir / "ranker_liker_user_embeddings.npy").exists()
+    assert not (output_dir / "post_liker_state_config.json").exists()
+    manifest = json.loads(Path(result["artifacts"]["serving_manifest_path"]).read_text())
+    assert manifest["ranker_contract_version"] == 3
+    assert manifest["target_user_feature_enabled"] is True
+    assert manifest["post_liker_feature_enabled"] is False
+    assert manifest["target_user_indices_input_name"] == "target_user_indices"
+    dataset = HydratedBucketedEngagementDataset(
+        bundle,
+        split="train",
+        max_history_len=2,
+        bst_additional_batch_negatives=2,
+        use_post_liker_feature=False,
+        use_target_user_feature=True,
+        max_post_liker_replay_events_per_post=None,
+        seed=7,
+        logger=None,
+    )
+    batch = dataset.collate_tensor_batch([dataset[0], dataset[1]])
+    assert batch["target_user_indices"].tolist() == [3, 4]
+    assert "post_liker_event_user_indices" not in batch
+    scripted_model = torch.jit.load(str(output_dir / "checkpoints" / "ranker.pt")).eval()
+    with torch.inference_mode():
+        scores = scripted_model.score_candidate_matrix(
+            batch["history_embeddings"], batch["history_mask"],
+            batch["history_time_deltas_hours"], batch["candidate_post_embeddings"],
+            batch["history_author_indices"], batch["candidate_post_author_idx"],
+            batch["history_prior_cumulative_likes"], batch["candidate_prior_cumulative_likes"],
+            None, None, batch["target_user_indices"],
+        )
+    assert scores.shape == batch["label_matrix"].shape
+    assert torch.isfinite(scores).all()
+    dataset.close()
 
 
 def test_stage8_requires_every_training_split(tmp_path, monkeypatch):

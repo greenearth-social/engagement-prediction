@@ -43,6 +43,10 @@ _BST_EXTENDED_SCORE_ARGUMENT_NAMES = (
     "history_post_liker_vectors",
     "candidate_post_liker_vectors",
 )
+_BST_TARGET_USER_SCORE_ARGUMENT_NAMES = (
+    *_BST_EXTENDED_SCORE_ARGUMENT_NAMES,
+    "target_user_indices",
+)
 
 
 @dataclass(frozen=True)
@@ -443,6 +447,14 @@ def _resolve_canonical_model_artifact(
     # Filenames and callable signatures are deployment contracts, not merely
     # conventions: the inference service consumes these exact artifacts.
     if model_type == BST_MODEL_TYPE:
+        use_target_user_feature = constructor.get("use_target_user_feature", False)
+        if not isinstance(use_target_user_feature, bool):
+            raise ValueError("Canonical BST use_target_user_feature must be a boolean")
+        if use_target_user_feature:
+            raise ValueError(
+                "The model-comparison tool does not yet support BST models with "
+                "target-user features; use the BST media comparison tool"
+            )
         use_post_liker_feature = constructor.get("use_post_liker_feature", False)
         if not isinstance(use_post_liker_feature, bool):
             raise ValueError(
@@ -521,6 +533,7 @@ def _resolve_canonical_model_artifact(
             expected_argument_signatures=(
                 _BST_SCORE_ARGUMENT_NAMES,
                 _BST_EXTENDED_SCORE_ARGUMENT_NAMES,
+                _BST_TARGET_USER_SCORE_ARGUMENT_NAMES,
             ),
         )
     for key, (method_name, arguments) in script_methods.items():

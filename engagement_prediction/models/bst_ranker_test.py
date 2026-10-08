@@ -22,6 +22,9 @@ def _make_model(
     popularity_projection_dim: int | None = None,
     use_post_liker_feature: bool = False,
     post_liker_user_unknown_dropout_rate: float = 0.0,
+    use_target_user_feature: bool = False,
+    target_user_projection_dim: int = 4,
+    target_user_unknown_dropout_rate: float = 0.0,
 ) -> BSTRanker:
     torch.manual_seed(123)
     return BSTRanker(
@@ -50,6 +53,9 @@ def _make_model(
         post_liker_projection_dim=2,
         post_liker_pooling_tau_hours=24.0,
         post_liker_user_unknown_dropout_rate=post_liker_user_unknown_dropout_rate,
+        use_target_user_feature=use_target_user_feature,
+        target_user_projection_dim=target_user_projection_dim,
+        target_user_unknown_dropout_rate=target_user_unknown_dropout_rate,
     )
 
 
@@ -139,6 +145,11 @@ def _expected_matrix_scores(model: BSTRanker, batch: dict[str, torch.Tensor]) ->
     if "history_prior_cumulative_likes" in batch:
         kwargs["history_prior_cumulative_likes"] = batch["history_prior_cumulative_likes"].repeat_interleave(num_candidates, dim=0)
         kwargs["candidate_prior_cumulative_likes"] = batch["candidate_prior_cumulative_likes"].repeat(num_users)
+    if "history_post_liker_vectors" in batch:
+        kwargs["history_post_liker_vectors"] = batch["history_post_liker_vectors"].repeat_interleave(num_candidates, dim=0)
+        kwargs["candidate_post_liker_vectors"] = batch["candidate_post_liker_vectors"].repeat(num_users, 1)
+    if "target_user_indices" in batch:
+        kwargs["target_user_indices"] = batch["target_user_indices"].repeat_interleave(num_candidates)
     return model(**kwargs).reshape(num_users, num_candidates)
 
 
@@ -158,6 +169,186 @@ def _empty_history_batch() -> dict[str, torch.Tensor]:
         "history_time_deltas_hours": torch.empty((num_users, 0), dtype=torch.float32),
         "history_author_indices": torch.empty((num_users, 0), dtype=torch.long),
     }
+
+
+@pytest.mark.parametrize("use_post_liker_feature", [False, True])
+@pytest.mark.parametrize("use_target_user_feature", [False, True])
+@pytest.mark.parametrize("norm_first", [False, True])
+@pytest.mark.parametrize("batch_factory", [_batch, _mixed_zero_history_batch, _empty_history_batch])
+def test_target_user_feature_matrix_matches_pairs(
+    use_post_liker_feature, use_target_user_feature, norm_first, batch_factory
+):
+    model = _make_model(
+        use_post_liker_feature=use_post_liker_feature,
+        use_target_user_feature=use_target_user_feature,
+        norm_first=norm_first,
+    ).eval()
+    batch = batch_factory()
+    if use_post_liker_feature:
+        batch["history_post_liker_vectors"] = torch.randn(2, batch["history_mask"].size(1), 3)
+        batch["candidate_post_liker_vectors"] = torch.randn(2, 3)
+    if use_target_user_feature:
+        batch["target_user_indices"] = torch.tensor([2, 1])
+
+    with torch.inference_mode():
+        expected = _expected_matrix_scores(model, batch)
+        actual = model.score_candidate_matrix_one_layer(**batch)
+
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+    assert torch.isfinite(actual).all()
+
+
+@pytest.mark.parametrize("use_post_liker_feature", [False, True])
+@pytest.mark.parametrize("use_target_user_feature", [False, True])
+def test_target_user_feature_saved_script_matches_all_scoring_paths(
+    tmp_path, use_post_liker_feature, use_target_user_feature
+):
+    model = _make_model(
+        use_post_liker_feature=use_post_liker_feature,
+        use_target_user_feature=use_target_user_feature,
+    ).eval()
+    batch = _batch()
+    if use_target_user_feature:
+        batch["target_user_indices"] = torch.tensor([4, 1])
+    event_batch = {**batch, "history_prior_cumulative_likes": None, "candidate_prior_cumulative_likes": None, **_packed_post_liker_batch()}
+    if use_post_liker_feature:
+        events = _packed_post_liker_batch()
+        pooled = model.post_liker_user_pooler(
+            events["post_liker_event_user_indices"],
+            events["post_liker_event_age_from_latest_hours"],
+            events["post_liker_event_offsets"],
+        )
+        batch["history_post_liker_vectors"] = pooled[events["history_post_liker_rows"]]
+        batch["candidate_post_liker_vectors"] = pooled[events["candidate_post_liker_rows"]]
+    output_path = tmp_path / "ranker.pt"
+    torch.jit.script(model).save(str(output_path))
+    loaded = torch.jit.load(str(output_path)).eval()
+
+    with torch.inference_mode():
+        expected = model.score_candidate_matrix(**batch)
+        torch.testing.assert_close(loaded(**batch), model(**batch))
+        torch.testing.assert_close(loaded.score_candidate_matrix(**batch), expected)
+        if use_post_liker_feature:
+            torch.testing.assert_close(model.score_candidate_matrix_from_post_liker_events(**event_batch), expected)
+            torch.testing.assert_close(loaded.score_candidate_matrix_from_post_liker_events(**event_batch), expected)
+
+
+def test_target_and_liker_roles_update_the_same_embedding_parameter():
+    model = _make_model(use_post_liker_feature=True, use_target_user_feature=True)
+    batch = {
+        **_batch(),
+        "history_prior_cumulative_likes": None,
+        "candidate_prior_cumulative_likes": None,
+        **_packed_post_liker_batch(),
+        "target_user_indices": torch.tensor([4, 5]),
+    }
+
+    model.score_candidate_matrix_from_post_liker_events(**batch).sum().backward()
+
+    table = model.post_liker_user_pooler.user_embedding.weight
+    assert table.grad is not None
+    # Rows 2/3 occur only as likers; rows 4/5 occur only as targets.
+    assert torch.all(table.grad[2:6].abs().sum(dim=1) > 0)
+    assert torch.count_nonzero(table.grad[0]) == 0
+    table_names = [name for name, parameter in model.named_parameters() if parameter is table]
+    assert table_names == ["post_liker_user_pooler.user_embedding.weight"]
+
+
+def test_target_dropout_is_query_consistent_and_disabled_in_eval(monkeypatch):
+    model = _make_model(use_target_user_feature=True, target_user_unknown_dropout_rate=0.5)
+    batch = {**_batch(), "target_user_indices": torch.tensor([2, 3])}
+    draws = []
+
+    def deterministic_rand(shape, *, device):
+        draws.append(shape)
+        return torch.tensor([0.1, 0.9], device=device)
+
+    monkeypatch.setattr(torch, "rand", deterministic_rand)
+    scores = model.score_candidate_matrix(**batch)
+    model.eval()
+    dropped_batch = {**batch, "target_user_indices": torch.tensor([1, 3])}
+    expected = model.score_candidate_matrix(**dropped_batch)
+    eval_scores = model.score_candidate_matrix(**batch)
+
+    assert draws == [torch.Size([2])]
+    torch.testing.assert_close(scores, expected)
+    assert not torch.allclose(scores[0], eval_scores[0])
+    torch.testing.assert_close(scores[1], eval_scores[1])
+
+
+def test_target_dropout_preserves_pad_and_unknown_and_is_independent_of_liker_dropout():
+    model = _make_model(
+        use_post_liker_feature=True,
+        post_liker_user_unknown_dropout_rate=0.0,
+        use_target_user_feature=True,
+        target_user_unknown_dropout_rate=1.0,
+    )
+    states = torch.zeros(3, 2, model.transformer_input_dim)
+    fused = model._append_target_user_feature(states, torch.tensor([0, 1, 2]))
+    expected = model.target_user_projection(model.post_liker_user_pooler.lookup(torch.tensor([0, 1, 1])))
+    torch.testing.assert_close(fused[:, :, model.transformer_input_dim:], expected[:, None, :].expand(-1, 2, -1))
+    pooled = model.post_liker_user_pooler(torch.tensor([2]), torch.tensor([0.0]), torch.tensor([0, 1]))
+    torch.testing.assert_close(pooled, model.post_liker_user_pooler.lookup(torch.tensor([2])))
+
+
+def test_target_feature_can_reverse_candidate_ranking():
+    model = _make_model(use_target_user_feature=True, prediction_hidden_dims=(2,)).eval()
+    with torch.no_grad():
+        projection = model.target_user_projection[0]
+        projection.weight.zero_()
+        projection.bias.zero_()
+        projection.weight[0, 0] = 1.0
+        model.post_liker_user_pooler.user_embedding.weight[2].copy_(torch.tensor([1.0, 0.0, 0.0]))
+        model.post_liker_user_pooler.user_embedding.weight[3].copy_(torch.tensor([-1.0, 0.0, 0.0]))
+        hidden = model.prediction_head.network[0]
+        hidden.weight.zero_()
+        hidden.bias.zero_()
+        hidden.weight[0, 0] = 1.0
+        hidden.weight[0, model.transformer_input_dim] = 1.0
+        hidden.weight[1].copy_(-hidden.weight[0])
+        model.prediction_head.network[-1].weight.fill_(1.0)
+        model.prediction_head.network[-1].bias.zero_()
+    # The same two contextualized candidates receive opposite rankings solely
+    # from target identity, demonstrating the nonlinear head's interaction.
+    states = torch.zeros(2, 2, model.transformer_input_dim)
+    states[:, :, 0] = torch.tensor([-1.0, 1.0])
+    fused = model._append_target_user_feature(states, torch.tensor([2, 3]))
+    scores = model.prediction_head(fused)
+
+    assert scores.argmax(dim=1).tolist() == [1, 0]
+
+
+@pytest.mark.parametrize("method_name", ["forward", "score_candidate_matrix", "score_candidate_matrix_one_layer"])
+def test_target_feature_requires_aligned_indices(method_name):
+    model = _make_model(use_target_user_feature=True)
+    method = getattr(model, method_name)
+    with pytest.raises(RuntimeError, match="target_user_indices is required"):
+        method(**_batch())
+    with pytest.raises(RuntimeError, match="target_user_indices must have shape"):
+        method(**_batch(), target_user_indices=torch.tensor([[2, 3]]))
+    with pytest.raises(RuntimeError, match="target_user_indices must have shape"):
+        method(**_batch(), target_user_indices=torch.tensor([2]))
+
+
+@pytest.mark.parametrize("kwargs,match", [
+    ({"prediction_hidden_dims": ()}, "nonlinear prediction head"),
+    ({"target_user_projection_dim": 0}, "projection dimension"),
+    ({"target_user_unknown_dropout_rate": -0.1}, "dropout rate"),
+    ({"target_user_unknown_dropout_rate": 1.1}, "dropout rate"),
+])
+def test_target_feature_validates_configuration(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        _make_model(use_target_user_feature=True, **kwargs)
+
+
+def test_disabled_target_feature_has_no_parameters_and_ignores_indices():
+    model = _make_model().eval()
+    assert not any(name.startswith("target_user_") for name in model.state_dict())
+    assert model.prediction_input_dim == model.transformer_input_dim
+    torch.testing.assert_close(
+        model.score_candidate_matrix(**_batch(), target_user_indices=torch.tensor([2, 3])),
+        model.score_candidate_matrix(**_batch()),
+    )
 
 
 def test_bst_ranker_forward_transformer_shape_and_builtin_transformer_encoder():
@@ -315,6 +506,9 @@ def test_bst_ranker_rejects_attention_head_mismatch():
             post_liker_projection_dim=2,
             post_liker_pooling_tau_hours=24.0,
             post_liker_user_unknown_dropout_rate=0.0,
+            use_target_user_feature=False,
+            target_user_projection_dim=4,
+            target_user_unknown_dropout_rate=0.0,
         )
 
 
@@ -552,6 +746,9 @@ def test_bst_ranker_can_script_differently_shaped_models_in_one_process():
         post_liker_projection_dim=2,
         post_liker_pooling_tau_hours=24.0,
         post_liker_user_unknown_dropout_rate=0.0,
+        use_target_user_feature=False,
+        target_user_projection_dim=4,
+        target_user_unknown_dropout_rate=0.0,
     ).eval()
 
     first_scripted = torch.jit.script(first_model)

@@ -166,6 +166,7 @@ def run_model_comparison(
                             max_history_len=history_lengths[model.name],
                             additional_batch_negatives=None,
                             use_post_liker_feature=False,
+                            use_target_user_feature=False,
                             max_post_liker_replay_events_per_post=None,
                             seed=settings.random_seed,
                             logger=logger,

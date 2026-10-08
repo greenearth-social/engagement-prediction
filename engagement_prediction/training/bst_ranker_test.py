@@ -22,7 +22,7 @@ from engagement_prediction.models.bst_ranker import BSTRanker
 from engagement_prediction.training import bst_ranker as bst_training
 
 
-def _model(*, use_popularity_feature: bool) -> BSTRanker:
+def _model(*, use_popularity_feature: bool, use_target_user_feature: bool = False, use_post_liker_feature: bool = False) -> BSTRanker:
     torch.manual_seed(4)
     return BSTRanker(
         post_embedding_dim=2,
@@ -44,12 +44,15 @@ def _model(*, use_popularity_feature: bool) -> BSTRanker:
         popularity_projection_dim=2 if use_popularity_feature else 0,
         popularity_log_mean=1.0,
         popularity_log_std=2.0,
-        use_post_liker_feature=False,
-        post_liker_user_table_num_rows=2,
+        use_post_liker_feature=use_post_liker_feature,
+        post_liker_user_table_num_rows=6,
         post_liker_user_embedding_dim=3,
         post_liker_projection_dim=2,
         post_liker_pooling_tau_hours=24.0,
         post_liker_user_unknown_dropout_rate=0.0,
+        use_target_user_feature=use_target_user_feature,
+        target_user_projection_dim=4,
+        target_user_unknown_dropout_rate=0.0,
     )
 
 
@@ -195,12 +198,21 @@ def _native_bundle(tmp_path):
     _write_dataset(
         bundle,
         "post_liker_users",
-        pl.DataFrame(schema=post_liker_users.POST_LIKER_USER_VOCABULARY_SCHEMA),
+        pl.DataFrame({
+            "liker_did": ["l1", "l2", "u1", "u2"],
+            "liker_idx": [2, 3, 4, 5],
+            "training_event_count": [1, 1, 0, 0],
+            "training_target_query_count": [0, 0, 1, 1],
+        }, schema=post_liker_users.POST_LIKER_USER_VOCABULARY_SCHEMA),
     )
     _write_dataset(
         bundle,
         "indexed_post_liker_events",
-        pl.DataFrame(schema=post_liker_users.INDEXED_POST_LIKER_EVENT_SCHEMA),
+        pl.DataFrame({
+            "emb_idx": [0, 1],
+            "liker_idx": [2, 3],
+            "like_created_at": [created, created],
+        }, schema=post_liker_users.INDEXED_POST_LIKER_EVENT_SCHEMA),
     )
     training_index.build_loader_index(
         posts_path=bundle / "posts",
@@ -306,14 +318,17 @@ def test_bst_loss_modes_preserve_scores_labels_and_ndcg():
 
 
 @pytest.mark.parametrize("loss_type", ["listwise", "bce"])
-def test_native_stage7_batch_runs_one_optimizer_step(tmp_path, loss_type):
+@pytest.mark.parametrize("use_target_user_feature", [False, True])
+@pytest.mark.parametrize("use_post_liker_feature", [False, True])
+def test_native_stage7_batch_runs_one_optimizer_step(tmp_path, loss_type, use_target_user_feature, use_post_liker_feature):
     dataset = HydratedBucketedEngagementDataset(
         _native_bundle(tmp_path),
         split="train",
         max_history_len=2,
         bst_additional_batch_negatives=None,
-        use_post_liker_feature=False,
-        max_post_liker_replay_events_per_post=None,
+        use_post_liker_feature=use_post_liker_feature,
+        use_target_user_feature=use_target_user_feature,
+        max_post_liker_replay_events_per_post=8 if use_post_liker_feature else None,
         seed=7,
         logger=None,
     )
@@ -329,7 +344,11 @@ def test_native_stage7_batch_runs_one_optimizer_step(tmp_path, loss_type):
         seed=7,
         resample_candidates_each_epoch=False,
     )
-    model = _model(use_popularity_feature=True)
+    model = _model(
+        use_popularity_feature=True,
+        use_target_user_feature=use_target_user_feature,
+        use_post_liker_feature=use_post_liker_feature,
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
     batch = next(iter(loader))
 
@@ -366,6 +385,57 @@ def test_native_stage7_batch_runs_one_optimizer_step(tmp_path, loss_type):
         for parameter in model.parameters()
         if parameter.grad is not None
     )
+    if use_target_user_feature:
+        assert batch["target_user_indices"].tolist() == [4, 5]
+        table_grad = model.post_liker_user_pooler.user_embedding.weight.grad
+        assert table_grad is not None
+        assert torch.all(table_grad[4:6].abs().sum(dim=1) > 0)
+
+
+def test_training_primitive_requires_target_user_indices_when_enabled():
+    model = _model(use_popularity_feature=False, use_target_user_feature=True)
+    with pytest.raises(RuntimeError, match="target_user_indices.*rebuild Stage 7"):
+        bst_training.compute_bst_listwise_loss_and_scores(model, _batch(), "cpu", loss_type="listwise")
+
+
+@pytest.mark.parametrize("loss_type", ["listwise", "bce"])
+def test_target_user_training_checkpoint_reload_preserves_scores(tmp_path, loss_type):
+    model = _model(use_popularity_feature=False, use_target_user_feature=True)
+    batch = {**_batch(), "target_user_indices": torch.tensor([4, 5])}
+    loader = DataLoader(_SingleBatchDataset(batch), batch_size=None)
+    results = bst_training.train_bst_ranker_model(
+        model=model,
+        train_loader=loader,
+        val_loader=loader,
+        val_unseen_loader=loader,
+        device="cpu",
+        loss_type=loss_type,
+        epochs=1,
+        learning_rate=1.0e-3,
+        weight_decay=0.0,
+        patience=2,
+        early_stopping_min_delta=0.0,
+        checkpoints_dir=tmp_path,
+        disable_progress=True,
+        lr_scheduler_factor=0.5,
+        lr_scheduler_patience=1,
+        gradient_clip_max_norm=1.0,
+        metrics_top_ks=[1, 2],
+        bst_max_train_batches_per_epoch=None,
+        checkpoint_metadata={"use_target_user_feature": True},
+        best_checkpoint_callback=None,
+        experiment_tracker=None,
+        logger=logging.getLogger(__name__),
+    )
+    checkpoint = torch.load(tmp_path / "bst_ranker_best.pth", weights_only=False)
+    reloaded = _model(use_popularity_feature=False, use_target_user_feature=True)
+    reloaded.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    model.eval()
+    reloaded.eval()
+    assert results["epochs_completed"] == 1
+    expected = bst_training.compute_bst_listwise_loss_and_scores(model, batch, "cpu", loss_type=loss_type)
+    actual = bst_training.compute_bst_listwise_loss_and_scores(reloaded, batch, "cpu", loss_type=loss_type)
+    torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.parametrize("history_boundaries", [None, [0, 1, 4]])
