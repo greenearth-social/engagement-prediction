@@ -86,7 +86,7 @@ DEFAULTS: Dict[str, Any] = {
     "dataset_hydration_worker_count": 8,
     "min_author_training_feature_count": 50,
     "min_post_liker_user_training_event_count": 2,
-    "max_post_liker_user_vocabulary_size": 10_000_000,
+    "max_post_liker_user_vocabulary_size": 10_000_000, # in practice this is around 2MM
     # Stage 8: Model architecture
     "model_type": "bst-ranker",
     "loss_type": "listwise",
