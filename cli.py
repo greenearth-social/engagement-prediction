@@ -17,7 +17,7 @@ import argparse
 import os
 import sys
 import subprocess
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 import json
@@ -49,6 +49,8 @@ CLI_FILE_DIR = Path(__file__).parent
 TRAIN_PLACEHOLDER = 'train_placeholder'
 STAGE_ORDER = ['source_metadata', 'query_selection', 'user_history', 'post_selection', 'negative_selection', 'post_liker_history', 'author_statistics', 'dataset_hydration', TRAIN_PLACEHOLDER]
 
+DATE_FIELDS = ("posts_start", "posts_end", "train_start", "val_start", "holdout_start", "holdout_end")
+
 # Central default map for all run-all parameters
 DEFAULTS: Dict[str, Any] = {
     "output_dir": None,
@@ -56,8 +58,9 @@ DEFAULTS: Dict[str, Any] = {
     "embedding_model": "all_MiniLM_L12_v2",
     # Stage 00: Canonical source metadata
     "gcs_bucket": 'greenearth-471522-ingex-extract-prod',
-    "posts_start": None,
+    # A missing end resolves to today's UTC midnight when preparing source data.
     "posts_end": None,
+    "posts_start_days_before_end": 37,
     "source_metadata_partition_count": 16,
     "data_partition_worker_count": 4,
     # Stage 1: Query selection
@@ -66,10 +69,9 @@ DEFAULTS: Dict[str, Any] = {
     "max_train_query_hours": None,
     "max_eval_query_hours_per_split": None,
     "max_positives_per_user_hour": 32,
-    "train_start": None,
-    "val_start": None,
-    "holdout_start": None,
-    "holdout_end": None,
+    "train_start_days_after_posts_start": 7,
+    "val_start_days_before_end": 8,
+    "holdout_start_days_before_end": 3,
     # Stage 2: User history
     "max_history_posts_per_query": 64,
     "user_history_partition_count": 16,
@@ -165,6 +167,7 @@ DEFAULTS: Dict[str, Any] = {
     # Execution behavior
     # Default is foreground execution (recommended for ClearML remote execution).
     "background": False,
+    "dry_run": False,
     "_initial_log": None,
     # Optional checks for unattended full-data runs.
     "data_checks": False,
@@ -263,6 +266,9 @@ def _merge_args_with_config(raw_args: argparse.Namespace) -> argparse.Namespace:
             raise ValueError(f"Unknown config keys: {', '.join(sorted(unknown_keys))}")
         merged.update(config_data)
     merged.update({k: v for k, v in args_dict.items() if k not in ("command", "func")})
+    # Keep an unquoted YAML anchor serializable for ClearML/background configs.
+    if isinstance(merged["posts_end"], date):
+        merged["posts_end"] = merged["posts_end"].isoformat()
     if merged["model_type"] not in {"bst-ranker", "two-tower"}:
         raise ValueError(
             f"Unknown model_type: {merged['model_type']!r}. "
@@ -282,6 +288,85 @@ def _merge_args_with_config(raw_args: argparse.Namespace) -> argparse.Namespace:
     setattr(final_ns, "command", command)
     setattr(final_ns, "func", func)
     return final_ns
+
+
+def _date_fields_for_run(args: argparse.Namespace) -> Tuple[str, ...]:
+    """Only stages that build source/query data need new date boundaries."""
+    train_key = _get_train_key(args.model_type)
+    stages = _get_stage_order_for_model_type(train_key)
+    start, stop, _ = _get_stage_folder_and_start_stop_indices(
+        stages, args.start_from, args.stop_after, train_key
+    )
+    selected = stages[start:stop + 1]
+    if "query_selection" in selected:
+        return DATE_FIELDS
+    if "source_metadata" in selected or "post_selection" in selected:
+        return DATE_FIELDS[:2]
+    return ()
+
+
+def _freeze_posts_end(args: argparse.Namespace) -> argparse.Namespace:
+    args = copy.copy(args)
+    if _date_fields_for_run(args) and args.posts_end is None:
+        args.posts_end = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).isoformat()
+    return args
+
+
+def _resolve_date_args(args: argparse.Namespace) -> argparse.Namespace:
+    """Calculate downstream timestamps from the anchor and relative offsets."""
+    from engagement_prediction.data import timestamps
+
+    args = _freeze_posts_end(args)
+    # These are outputs, never inputs, including when cloning older ClearML tasks.
+    for name in DATE_FIELDS:
+        if name != "posts_end":
+            setattr(args, name, None)
+    fields = _date_fields_for_run(args)
+    if not fields:
+        # Training and other artifact-only stages use their recorded data window.
+        return args
+
+    offset_names = ["posts_start_days_before_end"]
+    if "train_start" in fields:
+        offset_names += [
+            "train_start_days_after_posts_start", "val_start_days_before_end",
+            "holdout_start_days_before_end",
+        ]
+    for name in offset_names:
+        value = getattr(args, name)
+        if name == "holdout_start_days_before_end" and value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+
+    posts_end = timestamps.parse_utc_datetime(args.posts_end, field_name="posts_end")
+    if not posts_end:
+        raise ValueError("posts_end must be a valid ISO 8601 UTC datetime string")
+    posts_start = posts_end - timedelta(days=args.posts_start_days_before_end)
+    dates: Dict[str, datetime | None] = {"posts_start": posts_start, "posts_end": posts_end}
+    timestamps.validate_half_open_utc_window(
+        start=posts_start, end=posts_end,
+        start_field_name="posts_start", end_field_name="posts_end",
+    )
+    if "train_start" in fields:
+        train_start = posts_start + timedelta(days=args.train_start_days_after_posts_start)
+        val_start = posts_end - timedelta(days=args.val_start_days_before_end)
+        holdout_start = None
+        if args.holdout_start_days_before_end is not None:
+            holdout_start = posts_end - timedelta(days=args.holdout_start_days_before_end)
+        holdout_end = posts_end if holdout_start is not None else None
+        dates.update(train_start=train_start, val_start=val_start,
+                     holdout_start=holdout_start, holdout_end=holdout_end)
+        if not posts_start <= train_start < val_start < posts_end:
+            raise ValueError("Require posts_start <= train_start < val_start < posts_end")
+        if holdout_start is not None and not val_start < holdout_start < posts_end:
+            raise ValueError("Require val_start < holdout_start < posts_end")
+
+    for name, value in dates.items():
+        setattr(args, name, value.isoformat() if value is not None else None)
+    return args
 
 
 def _validate_checks_config(args: argparse.Namespace) -> None:
@@ -424,6 +509,16 @@ def cmd_run_all(args: argparse.Namespace) -> int:
 
     Creates a run directory up front and backgrounds itself with nohup if --background.
     """
+    # Freeze the anchor before a background handoff; calculate the other dates
+    # after ClearML has had a chance to override the configured offsets.
+    args = _freeze_posts_end(args)
+    if args.dry_run:
+        resolved = _resolve_date_args(args)
+        preview = {key: getattr(resolved, key) for key in DEFAULTS}
+        preview.update({key: getattr(resolved, key) for key in _date_fields_for_run(resolved)})
+        print(json.dumps(preview, indent=2, sort_keys=True))
+        return 0
+
     train_key = _get_train_key(args.model_type)
     stage_order = _get_stage_order_for_model_type(train_key)
     start_idx, stop_idx, _ = _get_stage_folder_and_start_stop_indices(
@@ -437,6 +532,7 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     run_timestamp = (os.environ.get("ENGAGEMENT_RUN_TIMESTAMP") or "").strip() or generate_run_timestamp()
 
     if bool(args.background):
+        _resolve_date_args(args)  # Validate before creating files or spawning a child.
         output_root = _resolve_run_dir(args, run_timestamp=run_timestamp)
         output_root.mkdir(parents=True, exist_ok=True)
         run_dir = _resolve_pipeline_run_dir(args, output_root=output_root, run_timestamp=run_timestamp)
@@ -513,6 +609,17 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     # ClearML remote execution can override parameters on the server/UI.
     # Connect args and rehydrate a Namespace so downstream code sees the updated values.
     args = tracker.connect_args(args, "Args")
+    try:
+        args = _resolve_date_args(args)
+    except ValueError as exc:
+        try:
+            tracker.mark_failed(str(exc))
+        finally:
+            tracker.close()
+        raise
+    date_fields = _date_fields_for_run(args)
+    if date_fields:
+        tracker.log_params(params={key: getattr(args, key) for key in date_fields}, name="ResolvedDates")
 
     output_root = _resolve_run_dir(args, run_timestamp=run_timestamp)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -538,7 +645,9 @@ def cmd_run_all(args: argparse.Namespace) -> int:
         (run_dir / name).mkdir(parents=True, exist_ok=True)
 
     run_resolved_config_path = run_dir / "run-all.resolved-config.json"
-    args_dict = {k: v for k, v in vars(args).items() if k != "func" and not callable(v)}
+    # Only save accepted inputs here so --config can replay the frozen window.
+    # Calculated dates are recorded in ClearML and individual stage configs.
+    args_dict = {key: getattr(args, key) for key in DEFAULTS}
     run_resolved_config_path.write_text(json.dumps(args_dict, indent=2, sort_keys=True) + "\n")
 
     lineage_path = run_dir / LINEAGE_FILENAME
@@ -906,6 +1015,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Engagement Prediction Pipeline CLI",
         argument_default=argparse.SUPPRESS,
+        allow_abbrev=False,
     )
     # Backwards compatible vestige: `run-all` used to be a subcommand; now it's implicit.
     parser.add_argument(
@@ -925,10 +1035,10 @@ def build_parser() -> argparse.ArgumentParser:
     # Data-source options
     _add_arg_with_default(p_all, "--gcs-bucket", type=str, default=argparse.SUPPRESS,
                           help_text="GCS bucket name for ingex data")
-    _add_arg_with_default(p_all, "--posts-start", type=str, default=argparse.SUPPRESS,
-                          help_text="UTC start of the common Ingex posts, replies, and likes window (inclusive)")
     _add_arg_with_default(p_all, "--posts-end", type=str, default=argparse.SUPPRESS,
-                          help_text="UTC end of the common Ingex posts, replies, and likes window (exclusive)")
+                          help_text="UTC source-window end (exclusive); defaults to today's UTC midnight")
+    _add_arg_with_default(p_all, "--posts-start-days-before-end", type=int, default=argparse.SUPPRESS,
+                          help_text="Source-window length in days before posts-end")
     _add_arg_with_default(p_all, "--source-metadata-partition-count", type=int,
                           default=argparse.SUPPRESS,
                           help_text="Stable URI-hash partition count owned by the Stage 00 metadata index")
@@ -997,14 +1107,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--max-post-liker-user-vocabulary-size", type=int,
                           default=argparse.SUPPRESS,
                           help_text="Maximum number of dedicated liker-user indices retained by Stage 7")
-    _add_arg_with_default(p_all, "--train-start", type=str, default=argparse.SUPPRESS,
-                          help_text="UTC start of target eligibility and the training split")
-    _add_arg_with_default(p_all, "--val-start", type=str, default=argparse.SUPPRESS,
-                          help_text="ISO date string for start of validation dataset window. Must be >= train-start")
-    _add_arg_with_default(p_all, "--holdout-start", type=str, default=argparse.SUPPRESS,
-                          help_text="ISO date string for start of seen-users holdout window. Non-holdout users' rows at/after this date become holdout_seen_users. Must be after val-start.")
-    _add_arg_with_default(p_all, "--holdout-end", type=str, default=argparse.SUPPRESS,
-                          help_text="ISO date string for end of holdout window. Applies to both holdout_seen_users and holdout_unseen_users. Rows at/after this date get split=None. Default: no upper bound.")
+    _add_arg_with_default(p_all, "--train-start-days-after-posts-start", type=int, default=argparse.SUPPRESS,
+                          help_text="History warm-up days between posts-start and train-start")
+    _add_arg_with_default(p_all, "--val-start-days-before-end", type=int, default=argparse.SUPPRESS,
+                          help_text="Days before posts-end at which validation starts")
+    _add_arg_with_default(p_all, "--holdout-start-days-before-end", type=int, default=argparse.SUPPRESS,
+                          help_text="Days before posts-end at which holdout starts; YAML null disables holdout")
     # Stage 8 model selection
     _add_arg_with_default(p_all, "--model-type", type=str, choices=["two-tower", "bst-ranker"],
                           default=argparse.SUPPRESS, help_text="Model architecture: two-tower or bst-ranker")
@@ -1157,6 +1265,8 @@ def build_parser() -> argparse.ArgumentParser:
     # Execution behavior
     _add_arg_with_default(p_all, "--background", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help_text="Run in background with nohup (default: foreground)")
+    _add_arg_with_default(p_all, "--dry-run", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
+                          help_text="Print resolved config without creating outputs, starting ClearML, or running stages")
     p_all.add_argument("--_initial-log", type=str, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     # Unattended-run checks (threshold defaults remain in DEFAULTS).
     _add_arg_with_default(p_all, "--data-checks", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
@@ -1191,9 +1301,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
-    raw_args = parser.parse_args()
+    raw_args = parser.parse_args(argv)
     merged_args = _merge_args_with_config(raw_args)
     return merged_args.func(merged_args)
 
