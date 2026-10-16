@@ -59,6 +59,54 @@ def test_history_length_bucket_defaults_are_copied():
     assert args.history_length_bucket_boundaries is not cli.DEFAULTS["history_length_bucket_boundaries"]
 
 
+def test_health_checks_config_and_cli_overrides(tmp_path):
+    config_path = tmp_path / "checks.yml"
+    config_path.write_text("data_checks: true\ndisk_checks: true\nraw_data_fail_min_ratio: 0.2\nmin_free_output_gib: 200\n")
+    parser = cli.build_parser()
+    args = cli._merge_args_with_config(parser.parse_args([
+        "--config", str(config_path), "--no-disk-checks", "--raw-data-fail-min-ratio", "0.1",
+    ]))
+
+    assert args.data_checks is True
+    assert args.disk_checks is False
+    assert args.raw_data_fail_min_ratio == 0.1
+    assert args.min_free_output_gib == 200
+    assert args.raw_data_warn_min_ratio == cli.DEFAULTS["raw_data_warn_min_ratio"]
+
+
+def test_automation_config_enables_checks_and_keeps_full_foreground_run():
+    args = cli._merge_args_with_config(cli.build_parser().parse_args([
+        "--config", str(Path(cli.__file__).parent / "config.automation.yml"),
+    ]))
+
+    assert args.data_checks and args.disk_checks
+    assert args.background is False
+    assert args.start_from is None
+    assert args.stop_after is None
+    assert args.output_dir == "/mnt/data/dave/outputs/automated-ranker"
+
+
+@pytest.mark.parametrize("overrides", [
+    {"data_checks": "false"},
+    {"raw_data_min_complete_days": 0},
+    {"raw_data_min_complete_days": 1.5},
+    {"raw_data_fail_min_ratio": 0},
+    {"raw_data_fail_min_ratio": 0.8},
+    {"raw_data_warn_min_ratio": 1.1},
+    {"raw_data_warn_max_ratio": 0.9},
+    {"raw_data_warn_invalid_timestamp_fraction": -0.1},
+    {"raw_data_warn_invalid_timestamp_fraction": 1.1},
+    {"min_free_output_gib": float("nan")},
+    {"min_free_output_gib": float("inf")},
+    {"min_free_output_gib": -1},
+])
+def test_invalid_health_check_config_is_rejected(tmp_path, overrides):
+    config_path = tmp_path / "checks.json"
+    config_path.write_text(json.dumps(overrides))
+    with pytest.raises(ValueError):
+        cli._merge_args_with_config(cli.build_parser().parse_args(["--config", str(config_path)]))
+
+
 @pytest.mark.parametrize("command", [[], ["run-all"]])
 def test_history_length_bucket_cli_overrides_config(tmp_path, command):
     config_path = tmp_path / "history_lengths.json"
@@ -700,6 +748,102 @@ def test_native_two_tower_sequential_run_executes_stages_zero_through_eight(
         "dataset_hydration",
         "train_two_tower",
     ]
+
+
+@pytest.mark.parametrize("fail_before_stage", [None, "source_metadata", "dataset_hydration"])
+def test_disk_checks_stop_pipeline_at_boundaries_and_preserve_report(tmp_path, monkeypatch, fail_before_stage):
+    from engagement_prediction.experiment_tracking import NoOpExperimentTracker
+
+    class Tracker(NoOpExperimentTracker):
+        closed = False
+        failed = False
+
+        def mark_failed(self, reason):
+            assert not self.closed
+            self.failed = True
+
+        def close(self):
+            self.closed = True
+
+    args = cli._merge_args_with_config(cli.build_parser().parse_args(["--disk-checks"]))
+    args.output_dir = str(tmp_path)
+    tracker = Tracker()
+    context = cli.Context(
+        run_dir=tmp_path / "runs" / "run",
+        artifacts_dir=tmp_path / "artifacts",
+        tracker=tracker,
+    )
+    stage_order = cli._get_stage_order_for_model_type("train_bst_ranker")
+    executed, checked_stages = [], []
+
+    def check_space(**kwargs):
+        stage = stage_order[len(executed)]
+        checked_stages.append(stage)
+        assert kwargs == {"output_dir": tmp_path, "min_output_free_gib": 150}
+        status = "fail" if stage == fail_before_stage else "pass"
+        return {"status": status, "checks": [{"status": status, "message": f"disk before {stage}"}]}
+
+    monkeypatch.setattr(cli.disk_checks, "check_disk_space", check_space)
+    monkeypatch.setattr(cli, "pin_lineage_aligned_inputs", lambda *args: None)
+    monkeypatch.setattr(cli.reg, "run_stage", lambda stage, *args: executed.append(stage))
+
+    if fail_before_stage is None:
+        assert cli.cmd__run_all_exec(args, context) == 0
+        assert executed == stage_order
+        assert checked_stages == ["source_metadata", "dataset_hydration"]
+    else:
+        with pytest.raises(ValueError, match=f"disk before {fail_before_stage}"):
+            cli.cmd__run_all_exec(args, context)
+        assert executed == stage_order[:stage_order.index(fail_before_stage)]
+        report = json.loads((context.run_dir / f"disk_checks_{fail_before_stage}.json").read_text())
+        assert report["status"] == "fail"
+        assert report["stage"] == fail_before_stage
+    assert tracker.closed
+    assert tracker.failed == (fail_before_stage is not None)
+
+
+@pytest.mark.parametrize(
+    ("model_type", "start_from", "train_stage"),
+    [
+        ("bst-ranker", "train", "train_bst_ranker"),
+        ("bst-ranker", "train_bst_ranker", "train_bst_ranker"),
+        ("two-tower", "train", "train_two_tower"),
+        ("two-tower", "train_two_tower", "train_two_tower"),
+    ],
+)
+def test_disk_checks_skip_runs_starting_at_train(
+    tmp_path, monkeypatch, model_type, start_from, train_stage
+):
+    args = cli._merge_args_with_config(cli.build_parser().parse_args([
+        "--disk-checks", "--model-type", model_type, "--start-from", start_from,
+    ]))
+    args.output_dir = str(tmp_path)
+    context = cli.Context(
+        run_dir=tmp_path / "runs" / "run",
+        artifacts_dir=tmp_path / "artifacts",
+    )
+    executed = []
+    monkeypatch.setattr(
+        cli.disk_checks,
+        "check_disk_space",
+        lambda **kwargs: pytest.fail("Training-only runs must not check disk space"),
+    )
+    monkeypatch.setattr(cli, "pin_lineage_aligned_inputs", lambda *args: None)
+    monkeypatch.setattr(cli.reg, "run_stage", lambda stage, *args: executed.append(stage))
+
+    assert cli.cmd__run_all_exec(args, context) == 0
+    assert executed == [train_stage]
+
+
+def test_runtime_revalidates_check_thresholds_after_remote_overrides(tmp_path, monkeypatch):
+    args = cli._merge_args_with_config(cli.build_parser().parse_args([]))
+    args.output_dir = str(tmp_path)
+    args.raw_data_fail_min_ratio = float("nan")
+    context = cli.Context(run_dir=tmp_path / "run", artifacts_dir=tmp_path / "artifacts")
+    monkeypatch.setattr(cli.reg, "run_stage", lambda *args: pytest.fail("Stage must not run"))
+
+    with pytest.raises(ValueError, match="raw_data_fail_min_ratio"):
+        cli.cmd__run_all_exec(args, context)
 
 
 def test_two_tower_uses_fixed_encoder_and_output_dimension_default():

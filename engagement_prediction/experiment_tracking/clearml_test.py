@@ -86,6 +86,20 @@ def test_log_params_updates_clearml_parameters_with_section_prefix():
     }
 
 
+def test_mark_failed_uses_explicit_status_and_checked_request():
+    calls = []
+    tracker = ClearMLExperimentTracker.__new__(ClearMLExperimentTracker)
+    tracker._task = SimpleNamespace(mark_failed=lambda **kwargs: calls.append(kwargs))
+
+    tracker.mark_failed("likes missing on 2026-01-02")
+
+    assert calls == [{
+        "ignore_errors": False,
+        "status_reason": "Pipeline checks failed",
+        "status_message": "likes missing on 2026-01-02",
+    }]
+
+
 def test_log_histogram_reports_grouped_categorical_values():
     tracker = ClearMLExperimentTracker.__new__(ClearMLExperimentTracker)
     tracker._logger = _FakeLogger()

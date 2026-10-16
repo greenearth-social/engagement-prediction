@@ -22,8 +22,11 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 import json
 import copy
+import math
 
 from engagement_prediction.pipeline import registry as reg
+from engagement_prediction.pipeline import checks, disk_checks
+from engagement_prediction.pipeline.logging import get_stage_logger
 from engagement_prediction.pipeline.dependencies import (
     pin_lineage_aligned_inputs,
     validate_explicit_prior_pin_consistency,
@@ -163,6 +166,15 @@ DEFAULTS: Dict[str, Any] = {
     # Default is foreground execution (recommended for ClearML remote execution).
     "background": False,
     "_initial_log": None,
+    # Optional checks for unattended full-data runs.
+    "data_checks": False,
+    "raw_data_min_complete_days": 7,
+    "raw_data_fail_min_ratio": 0.25,
+    "raw_data_warn_min_ratio": 0.5,
+    "raw_data_warn_max_ratio": 3.0,
+    "raw_data_warn_invalid_timestamp_fraction": 0.01,
+    "disk_checks": False,
+    "min_free_output_gib": 150.0,
     # Experiment tracking
     "experiment_tracker": "clearml",
     "experiment_project": "Engagement Prediction",
@@ -265,10 +277,37 @@ def _merge_args_with_config(raw_args: argparse.Namespace) -> argparse.Namespace:
         merged["history_length_bucket_boundaries"]
     )
     final_ns = argparse.Namespace(**merged)
+    _validate_checks_config(final_ns)
     # Preserve argparse-injected metadata
     setattr(final_ns, "command", command)
     setattr(final_ns, "func", func)
     return final_ns
+
+
+def _validate_checks_config(args: argparse.Namespace) -> None:
+    """Reject invalid check policies before data preparation starts."""
+
+    for name in ("data_checks", "disk_checks"):
+        if not isinstance(getattr(args, name), bool):
+            raise ValueError(f"{name} must be a boolean")
+    days = args.raw_data_min_complete_days
+    if isinstance(days, bool) or not isinstance(days, int) or days < 1:
+        raise ValueError("raw_data_min_complete_days must be a positive integer")
+    for name in (
+        "raw_data_fail_min_ratio", "raw_data_warn_min_ratio", "raw_data_warn_max_ratio",
+        "raw_data_warn_invalid_timestamp_fraction", "min_free_output_gib",
+    ):
+        value = getattr(args, name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError(f"{name} must be a finite number")
+    if not 0 < args.raw_data_fail_min_ratio <= args.raw_data_warn_min_ratio <= 1:
+        raise ValueError("Require 0 < raw_data_fail_min_ratio <= raw_data_warn_min_ratio <= 1")
+    if args.raw_data_warn_max_ratio < 1:
+        raise ValueError("raw_data_warn_max_ratio must be at least 1")
+    if not 0 <= args.raw_data_warn_invalid_timestamp_fraction <= 1:
+        raise ValueError("raw_data_warn_invalid_timestamp_fraction must be between 0 and 1")
+    if args.min_free_output_gib < 0:
+        raise ValueError("min_free_output_gib must be non-negative")
 
 
 def _build_effective_config_for_background_run(
@@ -817,9 +856,24 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
 
     # Execute selected subset
     try:
+        # Revalidate after ClearML has applied any remote parameter overrides.
+        _validate_checks_config(args)
         for idx, key in enumerate(stage_order):
             if idx < start_idx or idx > stop_idx:
                 continue
+            # Training reuses prepared artifacts and needs no preparation headroom.
+            if args.disk_checks and key != train_key and (idx == start_idx or key == "dataset_hydration"):
+                report = disk_checks.check_disk_space(
+                    output_dir=output_root,
+                    min_output_free_gib=args.min_free_output_gib,
+                )
+                report["stage"] = key
+                checks.report_checks(
+                    report,
+                    path=run_dir / f"disk_checks_{key}.json",
+                    tracker=ctx.tracker,
+                    logger=get_stage_logger("PIPELINE_CHECKS", run_dir / "checks.log"),
+                )
             # Before running, offer prior selection for this stage's dependency (if any)
             if idx > 0:
                 prev_key = stage_order[idx - 1]
@@ -1104,6 +1158,23 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--background", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                           help_text="Run in background with nohup (default: foreground)")
     p_all.add_argument("--_initial-log", type=str, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    # Unattended-run checks (threshold defaults remain in DEFAULTS).
+    _add_arg_with_default(p_all, "--data-checks", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
+                          help_text="Check raw source volumes before continuing data preparation")
+    _add_arg_with_default(p_all, "--raw-data-min-complete-days", type=int, default=argparse.SUPPRESS,
+                          help_text="Minimum complete UTC days needed for median-relative volume checks")
+    _add_arg_with_default(p_all, "--raw-data-fail-min-ratio", type=float, default=argparse.SUPPRESS,
+                          help_text="Fail when a daily raw count is below this fraction of its source median")
+    _add_arg_with_default(p_all, "--raw-data-warn-min-ratio", type=float, default=argparse.SUPPRESS,
+                          help_text="Warn when a daily raw count is below this fraction of its source median")
+    _add_arg_with_default(p_all, "--raw-data-warn-max-ratio", type=float, default=argparse.SUPPRESS,
+                          help_text="Warn when a daily raw count exceeds this multiple of its source median")
+    _add_arg_with_default(p_all, "--raw-data-warn-invalid-timestamp-fraction", type=float, default=argparse.SUPPRESS,
+                          help_text="Warn when invalid timestamps exceed this fraction of scanned raw rows")
+    _add_arg_with_default(p_all, "--disk-checks", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
+                          help_text="Check output disk space before data preparation and hydration")
+    _add_arg_with_default(p_all, "--min-free-output-gib", type=float, default=argparse.SUPPRESS,
+                          help_text="Output filesystem free GiB required before data preparation and hydration")
     # Experiment tracking
     _add_arg_with_default(p_all, "--experiment-tracker", type=str, choices=["none", "clearml"], default=argparse.SUPPRESS,
                           help_text="Type of experiment tracker to use")

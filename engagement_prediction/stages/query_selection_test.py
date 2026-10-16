@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import polars as pl
 import pytest
 
+from cli import DEFAULTS
 from engagement_prediction.data import ingex, source_metadata
 from engagement_prediction.experiment_tracking import NoOpExperimentTracker
 from engagement_prediction.pipeline.core import Context
@@ -41,6 +42,10 @@ def _config(**overrides):
     }
     values.update(overrides)
     return stage.QuerySelectionConfig(**values)
+
+
+def _run_args(**overrides):
+    return SimpleNamespace(**(DEFAULTS | overrides))
 
 
 def _write_source_metadata(tmp_path, posts_path, *, partition_count=4):
@@ -767,7 +772,7 @@ def test_registry_run_writes_query_artifacts_and_manifest(tmp_path, monkeypatch)
         raise AssertionError(f"Unexpected source lookup: {kwargs['blob_prefix']}")
 
     monkeypatch.setattr(stage.ingex, "list_ingex_parquet_files", list_sources)
-    args = SimpleNamespace(
+    args = _run_args(
         gcs_bucket="unused",
         posts_start="2026-01-01T00:00:00Z",
         posts_end="2026-01-10T00:00:00Z",
@@ -874,7 +879,7 @@ def test_partition_failure_does_not_publish_final_artifacts_or_manifest(tmp_path
         "filter_positive_partitions",
         fail_partition,
     )
-    args = SimpleNamespace(
+    args = _run_args(
         gcs_bucket="unused",
         posts_start="2026-01-01T00:00:00Z",
         posts_end="2026-01-10T00:00:00Z",
@@ -953,7 +958,7 @@ def raw_likes_run(tmp_path, monkeypatch):
         ]
 
     monkeypatch.setattr(stage.ingex, "list_ingex_parquet_files", list_sources)
-    args = SimpleNamespace(
+    args = _run_args(
         **_config(train_start=datetime(2026, 1, 2, tzinfo=UTC)).__dict__,
         gcs_bucket="unused",
         no_plots=True,
@@ -1062,3 +1067,44 @@ def test_missing_likes_sources_still_fail_before_reporting(raw_likes_run, monkey
         registry.run_stage("query_selection", context, args)
 
     assert tracker.histograms == []
+
+
+def test_data_checks_stop_selection_and_keep_failure_report(raw_likes_run, monkeypatch):
+    context, args, tracker, _ = raw_likes_run
+    args.data_checks = True
+
+    def unexpected_preparation(*args):
+        pytest.fail("Failed data checks must prevent query selection")
+
+    monkeypatch.setattr(stage, "_prepare_likes", unexpected_preparation)
+    with pytest.raises(ValueError, match="Pipeline checks failed"):
+        registry.run_stage("query_selection", context, args)
+
+    report = json.loads((context.run_dir / "raw_data_checks_query_selection.json").read_text())
+    assert report["status"] == "fail"
+    assert report["raw_source_diagnostics"]["likes"]["counts"] == [1, 5, 0, 0, 0, 0, 0, 0, 1]
+    assert len(tracker.histograms) == 1
+    output_dir = next(context.artifacts_dir.joinpath("01_query_selection").iterdir())
+    assert not (output_dir / "manifest.json").exists()
+    assert not list(output_dir.glob("_candidate_query_counts*"))
+
+
+def test_data_check_warnings_allow_query_selection_to_complete(raw_likes_run):
+    context, args, _, like_paths = raw_likes_run
+    args.data_checks = True
+    # Fill missing days while preserving the spike and malformed timestamps.
+    missing_days = pl.DataFrame({
+        "did": ["did:one"] * 6,
+        "subject_uri": ["at://post/one"] * 6,
+        "record_created_at": [f"2026-01-{day:02d}T01:05:00Z" for day in range(3, 9)],
+    })
+    pl.concat([pl.read_parquet(like_paths[0]), missing_days]).write_parquet(like_paths[0])
+
+    result = registry.run_stage("query_selection", context, args)
+
+    report = json.loads((context.run_dir / "raw_data_checks_query_selection.json").read_text())
+    assert report["status"] == "warn"
+    assert {check["check"] for check in report["checks"] if check["status"] == "warn"} == {
+        "daily_volume", "invalid_timestamps",
+    }
+    assert (Path(result["output_dir"]) / "manifest.json").is_file()

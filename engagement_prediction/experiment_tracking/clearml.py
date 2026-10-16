@@ -273,5 +273,14 @@ class ClearMLExperimentTracker:
             report_interactive=False,  # Static image is more reliable
         )
 
+    def mark_failed(self, reason: str) -> None:
+        # Mark before close: ClearML's normal close path would mark the
+        # task as "completed", so we mark it as failed on a real failure
+        self._task.mark_failed(
+            ignore_errors=False,
+            status_reason="Pipeline checks failed",
+            status_message=reason,
+        )
+
     def close(self) -> None:
         self._task.close()

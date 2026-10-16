@@ -1,0 +1,5 @@
+# Full foreground runs with health checks. Supply the source/split dates via
+# CLI flags; all other pipeline and check defaults come from cli.py.
+output_dir: "/mnt/data/dave/outputs/automated-ranker"
+data_checks: true
+disk_checks: true

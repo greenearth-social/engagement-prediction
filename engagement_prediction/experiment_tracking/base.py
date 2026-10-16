@@ -61,6 +61,9 @@ class ExperimentTracker(ModelPublicationTracker, Protocol):
     ) -> None:
         ...
 
+    def mark_failed(self, reason: str) -> None:
+        ...
+
     def close(self) -> None:
         ...
 
@@ -112,6 +115,9 @@ class NoOpExperimentTracker:
         figure: Any,
         iteration: int = 0,
     ) -> None:
+        return None
+
+    def mark_failed(self, reason: str) -> None:
         return None
 
     def close(self) -> None:
