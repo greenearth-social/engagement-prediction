@@ -187,7 +187,7 @@ Only dates consumed by the selected stages are resolved: source-only runs need n
 
 For real runs, ClearML overrides are applied before final date resolution. ClearML's `Args` records configured inputs, and `ResolvedDates` records the dates used by selected stages. `run-all.resolved-config.json` saves the fixed anchor and offsets and can be reused with `--config` to calculate the same dates. Calculated timestamps are also saved in each stage's resolved config. Background execution passes its fixed end date to the child so the window cannot shift at midnight.
 
-ClearML tracking and GCS model uploads use the existing pipeline. Model review and deployment remain manual. Scheduling with a systemd service/timer is a separate step; no schedule is installed by the CLI. Use the dedicated automation config and foreground execution for scheduled runs; `config.yml` is never loaded implicitly.
+ClearML tracking and GCS model uploads use the existing pipeline. Model review and deployment remain manual. The [systemd setup](ops/systemd/README.md) provides a weekly timer and a service that updates a dedicated checkout to remote `main`, syncs its Pipenv environment, and runs this CLI in the foreground. Installation and timer activation are explicit steps; `config.yml` is never loaded implicitly.
 
 ### Data and Disk Checks
 
