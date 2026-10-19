@@ -21,12 +21,14 @@ from typing import Any, Dict
 
 from engagement_prediction.data import (
     ingex,
+    raw_source_checks,
     raw_source_diagnostics,
     source_metadata,
     source_metadata_artifacts,
     timestamps,
 )
 from engagement_prediction.pipeline.artifacts import PartialArtifactBundle
+from engagement_prediction.pipeline.checks import report_checks
 from engagement_prediction.pipeline.core import Context
 from engagement_prediction.pipeline.logging import get_stage_logger
 
@@ -75,6 +77,14 @@ def build_config(args: argparse.Namespace) -> SourceMetadataConfig:
 
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     """Build and atomically publish the exact-window canonical metadata index."""
+
+    # --- hyperparams ---
+    data_checks = bool(args.data_checks)
+    min_complete_days = int(args.raw_data_min_complete_days)
+    fail_min_ratio = float(args.raw_data_fail_min_ratio)
+    warn_min_ratio = float(args.raw_data_warn_min_ratio)
+    warn_max_ratio = float(args.raw_data_warn_max_ratio)
+    warn_invalid_timestamp_fraction = float(args.raw_data_warn_invalid_timestamp_fraction)
 
     out_dir = context.new_stage_dir("00_source_metadata")
     logger = get_stage_logger("00_SOURCE_METADATA", log_file=out_dir / "stage.log")
@@ -195,6 +205,20 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         mode="group",
         iteration=0,
     )
+    if data_checks:
+        report_checks(
+            raw_source_checks.evaluate_raw_sources(
+                daily_counts,
+                min_complete_days=min_complete_days,
+                fail_min_ratio=fail_min_ratio,
+                warn_min_ratio=warn_min_ratio,
+                warn_max_ratio=warn_max_ratio,
+                warn_invalid_timestamp_fraction=warn_invalid_timestamp_fraction,
+            ),
+            path=context.run_dir / "raw_data_checks_source_metadata.json",
+            tracker=context.tracker,
+            logger=logger,
+        )
     # Each partition now contains every source row needed to choose one
     # canonical record for its URIs. If a URI exists in both sources, its root
     # row wins and the reply row is counted as an overlap.

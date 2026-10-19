@@ -10,6 +10,7 @@ outputs
 
 # Ops subdirectories (analysis scratch work)
 ops/*/
+!ops/systemd/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -52,6 +53,7 @@ Thumbs.db
 
 # Config
 config*.yml
+!config.automation.yml
 !legacy/config-old.yml
 
 # Pytest

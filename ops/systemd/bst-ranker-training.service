@@ -1,0 +1,24 @@
+[Unit]
+Description=Train the BST ranker from the latest main revision
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/mnt/data
+
+[Service]
+Type=oneshot
+User=david.freifeld
+WorkingDirectory=/home/david.freifeld/greenearth-social/engagement-prediction-training
+Environment=HOME=/home/david.freifeld
+Environment=PATH=/home/david.freifeld/.local/bin:/opt/miniconda3/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PIPENV_PIPFILE=/home/david.freifeld/greenearth-social/engagement-prediction-training/Pipfile
+Environment=PIPENV_VENV_IN_PROJECT=1
+Environment=PIPENV_IGNORE_VIRTUALENVS=1
+Environment=GIT_TERMINAL_PROMPT=0
+Environment="GIT_SSH_COMMAND=/usr/bin/ssh -o BatchMode=yes -o IdentitiesOnly=yes -i /home/david.freifeld/.ssh/id_ed25519_bst_training"
+ExecStartPre=/usr/local/libexec/bst-ranker-training-prepare
+ExecStartPre=/home/david.freifeld/.local/bin/pipenv sync --dev
+ExecStart=/home/david.freifeld/.local/bin/pipenv run python -u cli.py --config config.automation.local.yml --no-background
+TimeoutStartSec=infinity
+Restart=no
+StandardOutput=journal
+StandardError=journal

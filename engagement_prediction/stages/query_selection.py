@@ -17,10 +17,12 @@ from engagement_prediction.data import (
     ingex,
     likes,
     query_selection_artifacts,
+    raw_source_checks,
     raw_source_diagnostics,
     source_metadata_artifacts,
     timestamps,
 )
+from engagement_prediction.pipeline.checks import report_checks
 from engagement_prediction.pipeline.core import Context
 from engagement_prediction.pipeline.lineage import resolve_recorded_stage_lineage
 from engagement_prediction.pipeline.logging import get_stage_logger
@@ -653,6 +655,14 @@ def _validate_post_window(
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     """Run Stage 1 and publish query, positive, and source-snapshot artifacts."""
 
+    # --- hyperparams ---
+    data_checks = bool(args.data_checks)
+    min_complete_days = int(args.raw_data_min_complete_days)
+    fail_min_ratio = float(args.raw_data_fail_min_ratio)
+    warn_min_ratio = float(args.raw_data_warn_min_ratio)
+    warn_max_ratio = float(args.raw_data_warn_max_ratio)
+    warn_invalid_timestamp_fraction = float(args.raw_data_warn_invalid_timestamp_fraction)
+
     out_dir = context.new_stage_dir("01_query_selection")
     logger = get_stage_logger("01_QUERY_SELECTION", log_file=out_dir / "stage.log")
     started_at = time.time()
@@ -738,6 +748,20 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         xaxis="Creation date (UTC)",
         yaxis="Raw rows",
     )
+    if data_checks:
+        report_checks(
+            raw_source_checks.evaluate_raw_sources(
+                {"likes": like_diagnostics},
+                min_complete_days=min_complete_days,
+                fail_min_ratio=fail_min_ratio,
+                warn_min_ratio=warn_min_ratio,
+                warn_max_ratio=warn_max_ratio,
+                warn_invalid_timestamp_fraction=warn_invalid_timestamp_fraction,
+            ),
+            path=context.run_dir / "raw_data_checks_query_selection.json",
+            tracker=context.tracker,
+            logger=logger,
+        )
 
     # Materializing the narrow counts prevents later ranking and capping plans
     # from repeatedly executing the all-like user-hour aggregation.

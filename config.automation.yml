@@ -1,0 +1,10 @@
+# Use with cli.py for full foreground runs with checks.
+# Pipeline and relative-date defaults come from cli.py. Uncomment to override:
+# posts_end: null  # Today's UTC midnight; set an ISO date for a fixed window.
+# posts_start_days_before_end: 37
+# train_start_days_after_posts_start: 7
+# val_start_days_before_end: 8
+# holdout_start_days_before_end: 3
+output_dir: "/mnt/data/dave/outputs/automated-ranker"
+data_checks: true
+disk_checks: true

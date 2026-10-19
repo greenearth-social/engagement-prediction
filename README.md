@@ -151,6 +151,68 @@ Both charts count raw rows by `record_created_at`, normalized to UTC, within `[p
 
 Each stage's `summary.json` stores daily counts, source-window boundaries, and exclusion counters under `raw_source_diagnostics`, with `root_posts` and `replies` entries for Stage 00 and a `likes` entry for Stage 1. Charts are generated whenever their ingestion stage executes; reusing prior artifacts does not replay them. `--no-plots` disables training plots only, so ingestion charts remain enabled. With `--experiment-tracker none`, the local summary counts are still saved.
 
+### Relative Dates and Automated Training
+
+`cli.py` can derive data windows from configurable day offsets. `config.automation.yml` enables checks and uses the ordinary full, foreground BST defaults. Preview the resolved configuration without creating artifacts, starting ClearML, or running stages:
+
+```bash
+pipenv run python cli.py --config config.automation.yml --dry-run
+pipenv run python cli.py --config config.automation.yml --posts-end 2026-10-16 --dry-run
+```
+
+Remove `--dry-run` to execute. An omitted or null `posts_end` resolves once to today's UTC midnight; `--posts-end YYYY-MM-DD` fixes the anchor for a historical window. End dates are exclusive, so the default includes data through yesterday. `--dry-run` also takes precedence over `--background`.
+
+All defaults live in `cli.py`'s `DEFAULTS`. Override these top-level config keys or use the corresponding CLI flags:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `posts_start_days_before_end` | 37 | `posts_start` is this many days before `posts_end` |
+| `train_start_days_after_posts_start` | 7 | `train_start` is this many days after `posts_start` |
+| `val_start_days_before_end` | 8 | `val_start` is this many days before `posts_end` |
+| `holdout_start_days_before_end` | 3 | `holdout_start` is this many days before `posts_end` |
+
+The defaults give 37 source days containing 7 history warm-up days, 22 training days, 5 validation days and 3 holdout days. For `--posts-end 2026-10-16`, the source window is `[2026-09-09, 2026-10-16)`, training starts September 16, validation starts October 8 and holdout starts October 13. `holdout_end` equals `posts_end` when holdout is enabled.
+
+`posts_end` is the only absolute-date input. The CLI calculates `posts_start`, `train_start`, `val_start`, `holdout_start` and `holdout_end` and passes these timestamps to the pipeline. Those five names are no longer accepted as CLI flags or config keys. For example:
+
+```yaml
+posts_end: "2026-10-16"
+posts_start_days_before_end: 45
+epochs: 100
+```
+
+Set `holdout_start_days_before_end: null` to disable holdout. Offsets must be non-negative integers, and resolved source/split windows must be correctly ordered. Date-only anchors mean UTC midnight; hour-aligned timestamp anchors are also supported.
+
+Only dates consumed by the selected stages are resolved: source-only runs need no split dates, and train-only runs use their prepared dataset and recorded lineage. Relative dates do not change an existing dataset. Partial runs and prior artifact selection remain available through the ordinary CLI options.
+
+For real runs, ClearML overrides are applied before final date resolution. ClearML's `Args` records configured inputs, and `ResolvedDates` records the dates used by selected stages. `run-all.resolved-config.json` saves the fixed anchor and offsets and can be reused with `--config` to calculate the same dates. Calculated timestamps are also saved in each stage's resolved config. Background execution passes its fixed end date to the child so the window cannot shift at midnight.
+
+ClearML tracking and GCS model uploads use the existing pipeline. Model review and deployment remain manual. The [systemd setup](ops/systemd/README.md) provides a weekly timer and a service that updates a dedicated checkout to remote `main`, syncs its Pipenv environment, and runs this CLI in the foreground. Installation and timer activation are explicit steps; `config.yml` is never loaded implicitly.
+
+### Data and Disk Checks
+
+`config.automation.yml` enables checks and writes to `/mnt/data/dave/outputs/automated-ranker`. To enable either check on another run, pass `--data-checks` or `--disk-checks`; both are disabled by default for small exploratory runs.
+
+Raw-data checks reuse the existing counts after the Stage 00 and Stage 1 histograms, before further preparation. Each source (root posts, replies, likes) is evaluated independently:
+
+| Condition | Default action |
+| --- | --- |
+| No rows in the source window, or any complete UTC day with zero rows | Fail |
+| Daily count below 25% of its source's median | Fail |
+| Daily count below 50% of its source's median | Warn |
+| Daily count above 3 times its source's median | Warn |
+| Invalid timestamps exceed 1% of all scanned source rows | Warn |
+
+The median uses all complete days in the source window, including history warm-up. Partial boundary days are excluded from daily checks and the median. Relative-volume checks require at least seven complete days; empty-source and missing-day checks still apply to shorter windows. Counts include duplicate rows and invalid IDs. Before/after-window rows remain informational. A uniformly low entire window can pass these relative checks; these are initial operational thresholds, not a guarantee of complete ingestion.
+
+Override `raw_data_min_complete_days`, `raw_data_fail_min_ratio`, `raw_data_warn_min_ratio`, `raw_data_warn_max_ratio`, or `raw_data_warn_invalid_timestamp_fraction` in YAML/JSON or with their corresponding CLI flags. Defaults remain in `cli.py`.
+
+Disk checks require `min_free_output_gib` (150 GiB) on the actual output filesystem before the first selected data-preparation stage and before Stage 7 hydration. Runs starting at `train` (or the model's explicit training stage) automatically skip disk checks, even with `disk_checks: true`. This check does not reserve space or monitor usage within a stage. The threshold is provisional; measure peak usage for the intended dataset size before relying on unattended runs.
+
+Reports are written to the pipeline run directory as `raw_data_checks_source_metadata.json`, `raw_data_checks_query_selection.json`, and `disk_checks_<stage>.json`, and attached to ClearML when enabled. Reports include observed values, thresholds, and severity. Failures save their report and mark the ClearML task failed before raising, preventing downstream stages from running; warnings allow the run to continue. If ClearML reporting fails, the local report remains available and the check still fails. Raw-data checks only execute when their ingestion stages run, so reusing artifacts does not recheck their counts.
+
+Cleanup remains manual. Failed partial artifacts are retained for diagnosis. Large files live in `artifacts/`; deleting symlink views under `runs/` alone does not reclaim them.
+
 ### Stage 00: Source Metadata
 
 Stage 00 owns the exact `bsky_posts` and `bsky_replies` snapshots for the common half-open `[posts_start, posts_end)` source window. It normalizes narrow metadata, deduplicates each source by URI using latest creation time and ascending-author tie-breaking, applies root precedence to cross-source collisions, and publishes stable URI-hash partitions.
@@ -159,8 +221,8 @@ Common config:
 
 ```yaml
 gcs_bucket: "greenearth-471522-ingex-extract-prod"
-posts_start: "2026-06-20T00:00:00Z"
 posts_end: "2026-06-24T00:00:00Z"
+posts_start_days_before_end: 4
 source_metadata_partition_count: 16
 data_partition_worker_count: 4
 ```
@@ -177,12 +239,11 @@ Common config keys:
 
 ```yaml
 gcs_bucket: "greenearth-471522-ingex-extract-prod"
-posts_start: "2026-06-20T00:00:00Z"
 posts_end: "2026-06-24T00:00:00Z"
-train_start: "2026-06-21T00:00:00Z"
-val_start: "2026-06-22T00:00:00Z"
-holdout_start: "2026-06-23T00:00:00Z"
-holdout_end: null
+posts_start_days_before_end: 4
+train_start_days_after_posts_start: 1
+val_start_days_before_end: 2
+holdout_start_days_before_end: 1
 unseen_user_fraction: 0.10
 max_hours_per_user_per_split: 16
 max_train_query_hours: null

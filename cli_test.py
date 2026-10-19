@@ -59,6 +59,54 @@ def test_history_length_bucket_defaults_are_copied():
     assert args.history_length_bucket_boundaries is not cli.DEFAULTS["history_length_bucket_boundaries"]
 
 
+def test_health_checks_config_and_cli_overrides(tmp_path):
+    config_path = tmp_path / "checks.yml"
+    config_path.write_text("data_checks: true\ndisk_checks: true\nraw_data_fail_min_ratio: 0.2\nmin_free_output_gib: 200\n")
+    parser = cli.build_parser()
+    args = cli._merge_args_with_config(parser.parse_args([
+        "--config", str(config_path), "--no-disk-checks", "--raw-data-fail-min-ratio", "0.1",
+    ]))
+
+    assert args.data_checks is True
+    assert args.disk_checks is False
+    assert args.raw_data_fail_min_ratio == 0.1
+    assert args.min_free_output_gib == 200
+    assert args.raw_data_warn_min_ratio == cli.DEFAULTS["raw_data_warn_min_ratio"]
+
+
+def test_automation_config_enables_checks_and_keeps_full_foreground_run():
+    args = cli._merge_args_with_config(cli.build_parser().parse_args([
+        "--config", str(Path(cli.__file__).parent / "config.automation.yml"),
+    ]))
+
+    assert args.data_checks and args.disk_checks
+    assert args.background is False
+    assert args.start_from is None
+    assert args.stop_after is None
+    assert args.output_dir == "/mnt/data/dave/outputs/automated-ranker"
+
+
+@pytest.mark.parametrize("overrides", [
+    {"data_checks": "false"},
+    {"raw_data_min_complete_days": 0},
+    {"raw_data_min_complete_days": 1.5},
+    {"raw_data_fail_min_ratio": 0},
+    {"raw_data_fail_min_ratio": 0.8},
+    {"raw_data_warn_min_ratio": 1.1},
+    {"raw_data_warn_max_ratio": 0.9},
+    {"raw_data_warn_invalid_timestamp_fraction": -0.1},
+    {"raw_data_warn_invalid_timestamp_fraction": 1.1},
+    {"min_free_output_gib": float("nan")},
+    {"min_free_output_gib": float("inf")},
+    {"min_free_output_gib": -1},
+])
+def test_invalid_health_check_config_is_rejected(tmp_path, overrides):
+    config_path = tmp_path / "checks.json"
+    config_path.write_text(json.dumps(overrides))
+    with pytest.raises(ValueError):
+        cli._merge_args_with_config(cli.build_parser().parse_args(["--config", str(config_path)]))
+
+
 @pytest.mark.parametrize("command", [[], ["run-all"]])
 def test_history_length_bucket_cli_overrides_config(tmp_path, command):
     config_path = tmp_path / "history_lengths.json"
@@ -445,14 +493,17 @@ def test_new_pipeline_runs_query_selection_through_user_history(tmp_path, monkey
     )
     args = cli._merge_args_with_config(cli.build_parser().parse_args([
         "--stop-after", "user_history",
-        "--posts-start", "2026-01-01T00:00:00Z",
         "--posts-end", "2026-01-02T00:00:00Z",
-        "--train-start", "2026-01-01T10:00:00Z",
-        "--val-start", "2026-01-01T20:00:00Z",
         "--unseen-user-fraction", "0",
         "--user-history-partition-count", "2",
         "--source-metadata-partition-count", "2",
     ]))
+    # Exercise downstream hourly windows directly, without the CLI date resolver.
+    args.posts_start = "2026-01-01T00:00:00Z"
+    args.train_start = "2026-01-01T10:00:00Z"
+    args.val_start = "2026-01-01T20:00:00Z"
+    args.holdout_start = None
+    args.holdout_end = None
     output_root = Path(tmp_path) / "output"
     output_root.mkdir()
     args.output_dir = str(output_root)
@@ -519,10 +570,7 @@ def test_new_pipeline_runs_query_selection_through_dataset_hydration(tmp_path, m
     )
     args = cli._merge_args_with_config(cli.build_parser().parse_args([
         "--stop-after", "dataset_hydration",
-        "--posts-start", "2026-01-01T00:00:00Z",
         "--posts-end", "2026-01-02T00:00:00Z",
-        "--train-start", "2026-01-01T10:00:00Z",
-        "--val-start", "2026-01-01T20:00:00Z",
         "--unseen-user-fraction", "0",
         "--user-history-partition-count", "2",
         "--source-metadata-partition-count", "2",
@@ -534,6 +582,12 @@ def test_new_pipeline_runs_query_selection_through_dataset_hydration(tmp_path, m
         "--author-statistics-partition-count", "2",
         "--min-author-training-feature-count", "1",
     ]))
+    # Exercise downstream hourly windows directly, without the CLI date resolver.
+    args.posts_start = "2026-01-01T00:00:00Z"
+    args.train_start = "2026-01-01T10:00:00Z"
+    args.val_start = "2026-01-01T20:00:00Z"
+    args.holdout_start = None
+    args.holdout_end = None
     output_root = Path(tmp_path) / "output"
     output_root.mkdir()
     args.output_dir = str(output_root)
@@ -700,6 +754,102 @@ def test_native_two_tower_sequential_run_executes_stages_zero_through_eight(
         "dataset_hydration",
         "train_two_tower",
     ]
+
+
+@pytest.mark.parametrize("fail_before_stage", [None, "source_metadata", "dataset_hydration"])
+def test_disk_checks_stop_pipeline_at_boundaries_and_preserve_report(tmp_path, monkeypatch, fail_before_stage):
+    from engagement_prediction.experiment_tracking import NoOpExperimentTracker
+
+    class Tracker(NoOpExperimentTracker):
+        closed = False
+        failed = False
+
+        def mark_failed(self, reason):
+            assert not self.closed
+            self.failed = True
+
+        def close(self):
+            self.closed = True
+
+    args = cli._merge_args_with_config(cli.build_parser().parse_args(["--disk-checks"]))
+    args.output_dir = str(tmp_path)
+    tracker = Tracker()
+    context = cli.Context(
+        run_dir=tmp_path / "runs" / "run",
+        artifacts_dir=tmp_path / "artifacts",
+        tracker=tracker,
+    )
+    stage_order = cli._get_stage_order_for_model_type("train_bst_ranker")
+    executed, checked_stages = [], []
+
+    def check_space(**kwargs):
+        stage = stage_order[len(executed)]
+        checked_stages.append(stage)
+        assert kwargs == {"output_dir": tmp_path, "min_output_free_gib": 150}
+        status = "fail" if stage == fail_before_stage else "pass"
+        return {"status": status, "checks": [{"status": status, "message": f"disk before {stage}"}]}
+
+    monkeypatch.setattr(cli.disk_checks, "check_disk_space", check_space)
+    monkeypatch.setattr(cli, "pin_lineage_aligned_inputs", lambda *args: None)
+    monkeypatch.setattr(cli.reg, "run_stage", lambda stage, *args: executed.append(stage))
+
+    if fail_before_stage is None:
+        assert cli.cmd__run_all_exec(args, context) == 0
+        assert executed == stage_order
+        assert checked_stages == ["source_metadata", "dataset_hydration"]
+    else:
+        with pytest.raises(ValueError, match=f"disk before {fail_before_stage}"):
+            cli.cmd__run_all_exec(args, context)
+        assert executed == stage_order[:stage_order.index(fail_before_stage)]
+        report = json.loads((context.run_dir / f"disk_checks_{fail_before_stage}.json").read_text())
+        assert report["status"] == "fail"
+        assert report["stage"] == fail_before_stage
+    assert tracker.closed
+    assert tracker.failed == (fail_before_stage is not None)
+
+
+@pytest.mark.parametrize(
+    ("model_type", "start_from", "train_stage"),
+    [
+        ("bst-ranker", "train", "train_bst_ranker"),
+        ("bst-ranker", "train_bst_ranker", "train_bst_ranker"),
+        ("two-tower", "train", "train_two_tower"),
+        ("two-tower", "train_two_tower", "train_two_tower"),
+    ],
+)
+def test_disk_checks_skip_runs_starting_at_train(
+    tmp_path, monkeypatch, model_type, start_from, train_stage
+):
+    args = cli._merge_args_with_config(cli.build_parser().parse_args([
+        "--disk-checks", "--model-type", model_type, "--start-from", start_from,
+    ]))
+    args.output_dir = str(tmp_path)
+    context = cli.Context(
+        run_dir=tmp_path / "runs" / "run",
+        artifacts_dir=tmp_path / "artifacts",
+    )
+    executed = []
+    monkeypatch.setattr(
+        cli.disk_checks,
+        "check_disk_space",
+        lambda **kwargs: pytest.fail("Training-only runs must not check disk space"),
+    )
+    monkeypatch.setattr(cli, "pin_lineage_aligned_inputs", lambda *args: None)
+    monkeypatch.setattr(cli.reg, "run_stage", lambda stage, *args: executed.append(stage))
+
+    assert cli.cmd__run_all_exec(args, context) == 0
+    assert executed == [train_stage]
+
+
+def test_runtime_revalidates_check_thresholds_after_remote_overrides(tmp_path, monkeypatch):
+    args = cli._merge_args_with_config(cli.build_parser().parse_args([]))
+    args.output_dir = str(tmp_path)
+    args.raw_data_fail_min_ratio = float("nan")
+    context = cli.Context(run_dir=tmp_path / "run", artifacts_dir=tmp_path / "artifacts")
+    monkeypatch.setattr(cli.reg, "run_stage", lambda *args: pytest.fail("Stage must not run"))
+
+    with pytest.raises(ValueError, match="raw_data_fail_min_ratio"):
+        cli.cmd__run_all_exec(args, context)
 
 
 def test_two_tower_uses_fixed_encoder_and_output_dimension_default():
@@ -1125,3 +1275,268 @@ def test_removed_legacy_training_pin_is_rejected():
 def test_removed_skip_embeddings_setting_is_rejected():
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(["--skip-embeddings"])
+
+
+_DATE_FIELDS = (
+    "posts_start", "posts_end", "train_start", "val_start", "holdout_start", "holdout_end",
+)
+
+
+def _date_args(argv, values=None):
+    raw = cli.build_parser().parse_args(argv)
+    if values is not None:
+        raw = cli.argparse.Namespace(**{**values, **vars(raw)})
+    return cli._merge_args_with_config(raw)
+
+
+def _assert_resolved_days(args, expected):
+    for name, day in zip(_DATE_FIELDS, expected, strict=True):
+        actual = getattr(args, name)
+        if day is None:
+            assert actual is None
+        else:
+            assert isinstance(actual, str)
+            assert datetime.fromisoformat(actual) == datetime.fromisoformat(day + "T00:00:00+00:00")
+
+
+@pytest.mark.parametrize("anchor, expected", [
+    ("2026-10-16", ("2026-09-09", "2026-10-16", "2026-09-16", "2026-10-08", "2026-10-13", "2026-10-16")),
+    ("2024-03-01", ("2024-01-24", "2024-03-01", "2024-01-31", "2024-02-22", "2024-02-27", "2024-03-01")),
+    ("2026-01-05", ("2025-11-29", "2026-01-05", "2025-12-06", "2025-12-28", "2026-01-02", "2026-01-05")),
+])
+def test_relative_dates_default_windows_cross_calendar_boundaries(anchor, expected):
+    raw = _date_args(["--posts-end", anchor])
+
+    resolved = cli._resolve_date_args(raw)
+
+    _assert_resolved_days(resolved, expected)
+    assert not hasattr(raw, "posts_start")
+    assert raw.posts_end == anchor
+
+
+def test_relative_dates_config_and_cli_offsets_follow_normal_precedence(tmp_path):
+    config_path = tmp_path / "relative.yml"
+    config_path.write_text(
+        "posts_end: 2026-10-14\nposts_start_days_before_end: 42\n"
+        "train_start_days_after_posts_start: 10\nval_start_days_before_end: 9\n"
+        "holdout_start_days_before_end: 5\nepochs: 2\n"
+    )
+    raw = _date_args(["--config", str(config_path), "--holdout-start-days-before-end", "4"])
+
+    resolved = cli._resolve_date_args(raw)
+
+    _assert_resolved_days(resolved, (
+        "2026-09-02", "2026-10-14", "2026-09-12", "2026-10-05", "2026-10-10", "2026-10-14",
+    ))
+    assert resolved.epochs == 2
+    assert resolved.learning_rate == cli.DEFAULTS["learning_rate"]
+    # YAML dates must already be serializable when a background parent saves its inputs.
+    assert isinstance(raw.posts_end, str)
+    json.dumps({key: getattr(raw, key) for key in cli.DEFAULTS})
+
+
+@pytest.mark.parametrize("name", [name for name in _DATE_FIELDS if name != "posts_end"])
+@pytest.mark.parametrize("value", ["2026-10-01", "7"])
+def test_explicit_derived_date_cli_flags_are_rejected(name, value):
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["--" + name.replace("_", "-"), value])
+
+    assert name not in cli.DEFAULTS
+
+
+@pytest.mark.parametrize("name", [name for name in _DATE_FIELDS if name != "posts_end"])
+def test_explicit_derived_date_config_keys_are_rejected(tmp_path, name):
+    config_path = tmp_path / "absolute.yml"
+    config_path.write_text(f"{name}: 2026-10-01\n")
+
+    with pytest.raises(ValueError, match=name):
+        _date_args(["--config", str(config_path)])
+
+
+def test_relative_dates_nullable_holdout_offset_disables_holdout():
+    resolved = cli._resolve_date_args(_date_args(["--posts-end", "2026-10-16"], {
+        "holdout_start_days_before_end": None,
+        "train_start_days_after_posts_start": 0,
+    }))
+
+    assert resolved.holdout_start is None and resolved.holdout_end is None
+    assert resolved.train_start == resolved.posts_start
+
+
+@pytest.mark.parametrize("config", [
+    {"posts_start_days_before_end": -1},
+    {"posts_start_days_before_end": 37.5},
+    {"train_start_days_after_posts_start": True},
+    {"val_start_days_before_end": "8"},
+    {"holdout_start_days_before_end": -1},
+    {"posts_start_days_before_end": 0},
+    {"train_start_days_after_posts_start": 30},
+    {"val_start_days_before_end": 3},
+    {"val_start_days_before_end": 40},
+    {"holdout_start_days_before_end": 0},
+    {"posts_end": "2026-10-16T00:30:00Z"},
+])
+def test_relative_dates_reject_invalid_offsets_and_windows(config):
+    raw = _date_args([], {"posts_end": "2026-10-16", **config})
+
+    with pytest.raises(ValueError):
+        cli._resolve_date_args(raw)
+
+
+def test_relative_dates_source_only_run_does_not_require_split_window():
+    raw = _date_args([
+        "--stop-after", "source_metadata", "--posts-start-days-before-end", "1",
+        "--posts-end", "2026-01-02", "--val-start-days-before-end", "-1",
+    ])
+
+    resolved = cli._resolve_date_args(raw)
+
+    assert set(cli._date_fields_for_run(raw)) == {"posts_start", "posts_end"}
+    assert datetime.fromisoformat(resolved.posts_start).day == 1
+    assert resolved.train_start is None and resolved.holdout_start is None
+
+
+@pytest.mark.parametrize("stage", ["train", "train_bst_ranker", "dataset_hydration"])
+def test_relative_dates_prepared_artifact_runs_do_not_resolve_unused_dates(stage):
+    raw = _date_args(["--start-from", stage], {
+        "val_start_days_before_end": -1,
+    })
+    raw.posts_start = "stale remote value"
+
+    resolved = cli._resolve_date_args(cli._freeze_posts_end(raw))
+
+    assert not cli._date_fields_for_run(raw)
+    assert resolved.posts_end is None and resolved.train_start is None
+    assert resolved.posts_start is None
+
+
+def test_relative_dates_freeze_current_utc_day_once(monkeypatch):
+    calls = []
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            calls.append(tz)
+            return cls(2026, 10, 16, 23, 59, 59, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(cli, "datetime", FrozenDatetime)
+    raw = _date_args([])
+    frozen = cli._freeze_posts_end(raw)
+    resolved = cli._resolve_date_args(cli._freeze_posts_end(frozen))
+
+    assert calls == [timezone.utc]
+    assert raw.posts_end is None
+    assert datetime.fromisoformat(resolved.posts_end) == datetime(2026, 10, 16, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("background", [False, True])
+def test_relative_dates_dry_run_has_no_tracker_output_or_background_process(tmp_path, monkeypatch, capsys, background):
+    output_dir = tmp_path / "outputs"
+    monkeypatch.setattr(cli, "build_experiment_tracker", lambda *a, **k: pytest.fail("dry-run created tracker"))
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: pytest.fail("dry-run started child"))
+    monkeypatch.setattr(cli, "cmd__run_all_exec", lambda *a, **k: pytest.fail("dry-run ran pipeline"))
+    argv = ["--dry-run", "--posts-end", "2026-10-16", "--output-dir", str(output_dir)]
+    if background:
+        argv.append("--background")
+
+    assert cli.main(argv) == 0
+
+    printed = json.loads(capsys.readouterr().out)
+    assert set(printed) == set(cli.DEFAULTS) | set(_DATE_FIELDS)
+    assert datetime.fromisoformat(printed["posts_start"]).date().isoformat() == "2026-09-09"
+    assert printed["background"] is background
+    assert not output_dir.exists()
+
+
+def test_relative_dates_background_config_pins_anchor_but_keeps_starts_unresolved(tmp_path, monkeypatch):
+    monkeypatch.delenv("ENGAGEMENT_PIPELINE_RUN_ID", raising=False)
+    monkeypatch.setenv("ENGAGEMENT_RUN_TIMESTAMP", "20261016_000001")
+    children = []
+
+    def launch_child(command, **kwargs):
+        children.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="12345\n", stderr="")
+
+    monkeypatch.setattr(cli.subprocess, "run", launch_child)
+    monkeypatch.setattr(cli, "build_experiment_tracker", lambda *a, **k: pytest.fail("parent created tracker"))
+    args = _date_args(["--background", "--posts-end", "2026-10-16", "--output-dir", str(tmp_path)])
+
+    assert cli.cmd_run_all(args) == 0
+
+    assert len(children) == 1
+    paths = list((tmp_path / "runs").glob("*/run-all.resolved-config.json"))
+    paths = [path for path in paths if not path.parent.is_symlink()]
+    assert len(paths) == 1
+    child_config = json.loads(paths[0].read_text())
+    assert child_config["background"] is False
+    assert datetime.fromisoformat(child_config["posts_end"]).date().isoformat() == "2026-10-16"
+    assert not (set(child_config) & (set(_DATE_FIELDS) - {"posts_end"}))
+    child_args = _date_args(["--config", str(paths[0])])
+    resolved = cli._resolve_date_args(cli._freeze_posts_end(child_args))
+    assert datetime.fromisoformat(resolved.posts_start).date().isoformat() == "2026-09-09"
+
+
+def test_relative_dates_remote_overrides_resolve_before_stages_and_save_reloadable_config(tmp_path, monkeypatch):
+    from engagement_prediction.experiment_tracking.base import NoOpExperimentTracker
+
+    monkeypatch.delenv("ENGAGEMENT_PIPELINE_RUN_ID", raising=False)
+    received = {}
+    logged = {}
+
+    class RemoteTracker(NoOpExperimentTracker):
+        def connect_args(self, args, name=None):
+            assert not hasattr(args, "posts_start") and not hasattr(args, "train_start")
+            args.posts_end = "2026-10-14"
+            args.posts_start_days_before_end = 42
+            # Older remote tasks can contain absolute values; offsets must win.
+            for key in _DATE_FIELDS:
+                if key != "posts_end":
+                    setattr(args, key, "2020-01-01")
+            return args
+
+        def log_params(self, params, name=None):
+            logged[name] = params
+
+    monkeypatch.setattr(cli, "build_experiment_tracker", lambda *a, **k: RemoteTracker())
+
+    def execute(args, ctx):
+        received["args"] = args
+        received["run_dir"] = ctx.run_dir
+        return 7
+
+    monkeypatch.setattr(cli, "cmd__run_all_exec", execute)
+
+    assert cli.main(["--posts-end", "2026-10-16", "--output-dir", str(tmp_path)]) == 7
+
+    expected = ("2026-09-02", "2026-10-14", "2026-09-09", "2026-10-06", "2026-10-11", "2026-10-14")
+    _assert_resolved_days(received["args"], expected)
+    assert logged["ResolvedDates"] == {name: getattr(received["args"], name) for name in _DATE_FIELDS}
+    saved = received["run_dir"] / "run-all.resolved-config.json"
+    assert set(json.loads(saved.read_text())) == set(cli.DEFAULTS)
+    _assert_resolved_days(cli._resolve_date_args(_date_args(["--config", str(saved)])), expected)
+
+
+def test_relative_dates_invalid_remote_override_marks_task_failed_and_closes(tmp_path, monkeypatch):
+    from engagement_prediction.experiment_tracking.base import NoOpExperimentTracker
+
+    events = []
+
+    class InvalidRemoteTracker(NoOpExperimentTracker):
+        def connect_args(self, args, name=None):
+            args.val_start_days_before_end = 40
+            return args
+
+        def mark_failed(self, reason):
+            events.append("failed")
+
+        def close(self):
+            events.append("closed")
+
+    monkeypatch.setattr(cli, "build_experiment_tracker", lambda *a, **k: InvalidRemoteTracker())
+    monkeypatch.setattr(cli, "cmd__run_all_exec", lambda *a, **k: pytest.fail("invalid dates ran pipeline"))
+
+    with pytest.raises(ValueError):
+        cli.main(["--posts-end", "2026-10-16", "--output-dir", str(tmp_path / "outputs")])
+
+    assert events == ["failed", "closed"]
+    assert not (tmp_path / "outputs").exists()

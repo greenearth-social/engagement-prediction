@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly BST ranker training
+
+[Timer]
+OnCalendar=Sun *-*-* 06:00:00 UTC
+Persistent=true
+Unit=bst-ranker-training.service
+
+[Install]
+WantedBy=timers.target

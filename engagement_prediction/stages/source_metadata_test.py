@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import polars as pl
 import pytest
 
+from cli import DEFAULTS
 from engagement_prediction.data import source_metadata
 from engagement_prediction.data.parquet import scan_parquet_artifact
 from engagement_prediction.experiment_tracking import NoOpExperimentTracker
@@ -56,15 +57,16 @@ def _sources(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def _args(partition_count: int, worker_count: int = 1) -> SimpleNamespace:
-    return SimpleNamespace(
-        gcs_bucket="bucket",
-        posts_start="2026-01-01T00:00:00Z",
-        posts_end="2026-01-02T00:00:00Z",
-        source_metadata_partition_count=partition_count,
-        data_partition_worker_count=worker_count,
-        no_plots=True,
-        _argv=["--stop-after", "source_metadata"],
-    )
+    return SimpleNamespace(**{
+        **DEFAULTS,
+        "gcs_bucket": "bucket",
+        "posts_start": "2026-01-01T00:00:00Z",
+        "posts_end": "2026-01-02T00:00:00Z",
+        "source_metadata_partition_count": partition_count,
+        "data_partition_worker_count": worker_count,
+        "no_plots": True,
+        "_argv": ["--stop-after", "source_metadata"],
+    })
 
 
 def _context(tmp_path: Path, suffix: str) -> Context:
@@ -329,3 +331,45 @@ def test_config_validation():
         stage.build_config(_args(0))
     with pytest.raises(ValueError, match="data_partition_worker_count"):
         stage.build_config(_args(1, 0))
+
+
+@pytest.mark.parametrize("missing_day", [False, True])
+def test_data_checks_report_all_sources_before_deduplication(tmp_path, monkeypatch, missing_day):
+    posts, replies = _sources(tmp_path)
+    monkeypatch.setattr(
+        stage.ingex,
+        "list_ingex_parquet_files",
+        lambda **kwargs: (
+            [str(posts if kwargs["blob_prefix"] == "bsky_posts" else replies)],
+            [datetime(2026, 1, 1, tzinfo=UTC)],
+        ),
+    )
+    args = _args(2)
+    args.data_checks = True
+    if missing_day:
+        args.posts_end = "2026-01-04T00:00:00Z"
+    context = _context(tmp_path, "checks")
+    tracker = _RecordingTracker()
+    context.tracker = tracker
+    report_path = context.run_dir / "raw_data_checks_source_metadata.json"
+
+    def check_before_deduplication(**kwargs):
+        assert not missing_day, "Failed data checks must prevent deduplication"
+        assert len(tracker.histogram_calls) == 1
+        assert json.loads(report_path.read_text())["status"] == "pass"
+        raise RuntimeError("deduplication reached")
+
+    monkeypatch.setattr(stage.source_metadata_artifacts, "process_uri_partitions", check_before_deduplication)
+    _reset_logger()
+    expected_error = ValueError if missing_day else RuntimeError
+    expected_message = "Pipeline checks failed" if missing_day else "deduplication reached"
+    with pytest.raises(expected_error, match=expected_message):
+        registry.run_stage("source_metadata", context, args)
+
+    report = json.loads(report_path.read_text())
+    assert report["status"] == ("fail" if missing_day else "pass")
+    assert set(report["sources"]) == {"root_posts", "replies"}
+    assert len(tracker.histogram_calls) == 1
+    output_dir = next((tmp_path / "artifacts" / "00_source_metadata").iterdir())
+    assert not (output_dir / "manifest.json").exists()
+    assert not (output_dir / "summary.json").exists()
