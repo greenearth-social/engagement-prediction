@@ -31,6 +31,7 @@ class ComparisonSettings:
 
     splits: tuple[str, ...]
     batch_size: int
+    additional_batch_negatives: int | None
     metrics_top_ks: tuple[int, ...]
     bst_candidate_chunk_size: int
     device: str
@@ -70,6 +71,11 @@ def _validate_settings(
         raise ValueError(f"Unknown Stage 7 splits: {', '.join(unknown_splits)}")
     if settings.batch_size <= 0:
         raise ValueError("Comparison batch size must be positive")
+    negative_cap = settings.additional_batch_negatives
+    if negative_cap is not None and (
+        isinstance(negative_cap, bool) or not isinstance(negative_cap, int) or negative_cap <= 0
+    ):
+        raise ValueError("Comparison additional_batch_negatives must be a positive integer or None")
     if not settings.metrics_top_ks or any(k <= 0 for k in settings.metrics_top_ks):
         raise ValueError("Comparison metric K values must be positive")
     if len(set(settings.metrics_top_ks)) != len(settings.metrics_top_ks):
@@ -78,7 +84,7 @@ def _validate_settings(
         raise ValueError("BST candidate chunk size must be positive")
     if settings.num_dataloader_workers < 0:
         raise ValueError("DataLoader worker count must be nonnegative")
-    if settings.dataloader_prefetch_factor <= 0:
+    if settings.num_dataloader_workers > 0 and settings.dataloader_prefetch_factor <= 0:
         raise ValueError("DataLoader prefetch factor must be positive")
     if settings.max_classification_metric_pairs <= 0:
         raise ValueError("Classification metric sample size must be positive")
@@ -164,7 +170,7 @@ def run_model_comparison(
                             dataset.bundle_path,
                             split=split,
                             max_history_len=history_lengths[model.name],
-                            additional_batch_negatives=None,
+                            additional_batch_negatives=settings.additional_batch_negatives,
                             use_post_liker_feature=False,
                             max_post_liker_replay_events_per_post=None,
                             seed=settings.random_seed,

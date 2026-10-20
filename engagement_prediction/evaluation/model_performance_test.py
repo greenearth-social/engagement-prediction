@@ -491,7 +491,8 @@ def test_model_resolution_rejects_legacy_bst_with_extra_script_argument(tmp_path
         resolve_model_artifact("experimental", model_path)
 
 
-def test_mixed_legacy_bst_and_canonical_two_tower_compare_on_stage7(tmp_path):
+@pytest.mark.parametrize("prefetch_factor", [0, 1])
+def test_mixed_legacy_bst_and_canonical_two_tower_compare_on_stage7(tmp_path, prefetch_factor):
     stage7_path, _ = _write_stage7_artifact(tmp_path)
     dataset = resolve_stage7_artifact(stage7_path)
     author_dids = [f"author{index}" for index in range(dataset.embedding_count)]
@@ -529,12 +530,13 @@ def test_mixed_legacy_bst_and_canonical_two_tower_compare_on_stage7(tmp_path):
         settings=ComparisonSettings(
             splits=("train",),
             batch_size=1,
+            additional_batch_negatives=None,
             metrics_top_ks=(2,),
             bst_candidate_chunk_size=2,
             device="cpu",
             num_dataloader_workers=0,
             dataloader_pin_memory=False,
-            dataloader_prefetch_factor=1,
+            dataloader_prefetch_factor=prefetch_factor,
             random_seed=7,
             max_classification_metric_pairs=10,
             max_history_len=None,
@@ -988,10 +990,14 @@ def test_metrics_and_model_b_minus_a_delta_csvs(tmp_path):
 
 
 @pytest.mark.parametrize("num_workers", [0, 2])
+@pytest.mark.parametrize("negative_cap", [None, 1])
+@pytest.mark.parametrize("seed", [7, 8])
 def test_comparison_keeps_shared_batches_and_override_alive(
     tmp_path,
     monkeypatch,
     num_workers,
+    negative_cap,
+    seed,
 ):
     stage7_path, _ = _write_stage7_artifact(tmp_path)
     dataset = resolve_stage7_artifact(stage7_path)
@@ -1013,12 +1019,12 @@ def test_comparison_keeps_shared_batches_and_override_alive(
                 tmp_path / "tt",
                 model_type="two-tower",
                 max_history_len=3,
-                author_dids=authors,
+                author_dids=authors[1:],
                 stage7_dir=stage7_path,
             ),
         ),
     )
-    observed: list[list[tuple[torch.Tensor, torch.Tensor]]] = []
+    observed: list[dict] = []
 
     class _NoopScorer:
         def close(self):
@@ -1030,20 +1036,25 @@ def test_comparison_keeps_shared_batches_and_override_alive(
     )
 
     def capture(_scorer, loader, *_args, **_kwargs):
+        # Sampler row IDs identify the exact query sequence even though the
+        # comparison's tensor-only batches intentionally omit string metadata.
+        queries = list(loader.batch_sampler)
         batches = []
         for batch in loader:
             batches.append((
                 batch["candidate_post_embeddings"].clone(),
                 batch["label_matrix"].clone(),
+                batch["candidate_post_author_idx"].clone(),
+                batch["history_mask"].clone(),
             ))
-        observed.append(batches)
+        observed.append({"queries": queries, "batches": batches})
         return {
             "metrics": {
                 "rank_metric_user_count": sum(
-                    batch_labels.size(0) for _, batch_labels in batches
+                    batch[1].size(0) for batch in batches
                 ),
                 "classification_metric_pair_count": sum(
-                    batch_labels.numel() for _, batch_labels in batches
+                    batch[1].numel() for batch in batches
                 ),
                 "classification_metric_sampled_pair_count": 1,
                 "ndcg@30": 0.5,
@@ -1062,13 +1073,14 @@ def test_comparison_keeps_shared_batches_and_override_alive(
         settings=ComparisonSettings(
             splits=("train", "holdout_seen_users"),
             batch_size=1,
+            additional_batch_negatives=negative_cap,
             metrics_top_ks=(30,),
             bst_candidate_chunk_size=2,
             device="cpu",
             num_dataloader_workers=num_workers,
             dataloader_pin_memory=False,
             dataloader_prefetch_factor=1,
-            random_seed=7,
+            random_seed=seed,
             max_classification_metric_pairs=10,
             max_history_len=None,
             disable_progress=True,
@@ -1080,14 +1092,41 @@ def test_comparison_keeps_shared_batches_and_override_alive(
     assert result.history_lengths == {"a": 2, "b": 3}
     assert result.skipped_splits == ("holdout_seen_users",)
     assert len(observed) == 2
-    assert len(observed[0]) == len(observed[1])
-    for first, second in zip(observed[0], observed[1]):
+    assert observed[0]["queries"] == observed[1]["queries"] == [[(0, 0)], [(1, 0)]]
+    first_batches = observed[0]["batches"]
+    second_batches = observed[1]["batches"]
+    assert len(first_batches) == len(second_batches)
+    for first, second in zip(first_batches, second_batches):
         torch.testing.assert_close(first[0], second[0])
         torch.testing.assert_close(first[1], second[1])
+        assert not torch.equal(first[2], second[2])
+        assert first[3].shape[1] == 2 and second[3].shape[1] == 3
+    assert first_batches[0][3].sum().item() == 2
+    assert second_batches[0][3].sum().item() == 3
+    if negative_cap is None:
+        assert first_batches[0][0][:, 0].tolist() == [1.0, 2.0, 5.0]
+        assert first_batches[1][0].size(0) == 3
+    else:
+        # Two stored negatives include p1, which is also this query's positive.
+        # Seed 7 picks p1, deduplicated from the slate; seed 8 picks n1.
+        expected = [1.0, 2.0] if seed == 7 else [1.0, 2.0, 5.0]
+        assert first_batches[0][0][:, 0].tolist() == expected
+        assert first_batches[1][0].size(0) == 2
+    assert result.mapping_coverage_by_model["b"]["model_unknown_post_count"] == 1
     assert not list(temporary_dir.iterdir())
 
 
-def test_comparison_fails_when_all_requested_splits_are_empty(tmp_path):
+@pytest.mark.parametrize("negative_cap, num_workers, prefetch_factor, error", [
+    (None, 0, 1, "All requested"),
+    (0, 0, 1, "additional_batch_negatives"),
+    (-1, 0, 1, "additional_batch_negatives"),
+    (True, 0, 1, "additional_batch_negatives"),
+    (1.5, 0, 1, "additional_batch_negatives"),
+    (None, 1, 0, "DataLoader prefetch factor"),
+])
+def test_comparison_rejects_invalid_settings_or_empty_splits(
+    tmp_path, negative_cap, num_workers, prefetch_factor, error,
+):
     stage7_path, _ = _write_stage7_artifact(tmp_path)
     dataset = resolve_stage7_artifact(stage7_path)
     dummy_model = SimpleNamespace(
@@ -1103,19 +1142,20 @@ def test_comparison_fails_when_all_requested_splits_are_empty(tmp_path):
         embedding_dim=dataset.embedding_dim,
     )
 
-    with pytest.raises(ValueError, match="All requested"):
+    with pytest.raises(ValueError, match=error):
         run_model_comparison(
             dataset=dataset,
             models=(dummy_model, other_model),
             settings=ComparisonSettings(
                 splits=("holdout_seen_users",),
                 batch_size=1,
+                additional_batch_negatives=negative_cap,
                 metrics_top_ks=(30,),
                 bst_candidate_chunk_size=2,
                 device="cpu",
-                num_dataloader_workers=0,
+                num_dataloader_workers=num_workers,
                 dataloader_pin_memory=False,
-                dataloader_prefetch_factor=1,
+                dataloader_prefetch_factor=prefetch_factor,
                 random_seed=7,
                 max_classification_metric_pairs=10,
                 max_history_len=None,

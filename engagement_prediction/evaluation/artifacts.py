@@ -123,7 +123,7 @@ class ModelArtifact:
         return {
             "name": self.name,
             "root": str(self.root),
-            "stage_run_id": self.manifest["stage_run_id"],
+            "stage_run_id": self.manifest.get("stage_run_id"),
             "artifact_format": self.artifact_format,
             "model_type": self.model_type,
             "embedding_model": self.embedding_model,

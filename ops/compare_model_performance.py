@@ -98,6 +98,8 @@ class ComparisonArgumentParser(argparse.ArgumentParser):
             )
         if parsed.batch_size <= 0:
             self.error("--batch-size must be positive")
+        if parsed.additional_batch_negatives is not None and parsed.additional_batch_negatives <= 0:
+            self.error("--additional-batch-negatives must be positive")
         if any(k <= 0 for k in parsed.metrics_top_ks):
             self.error("--metrics-top-ks values must be positive")
         if len(set(parsed.metrics_top_ks)) != len(parsed.metrics_top_ks):
@@ -166,6 +168,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_BATCH_SIZE,
         help=f"Evaluation batch size (default: {DEFAULT_BATCH_SIZE})",
+    )
+    parser.add_argument(
+        "--additional-batch-negatives",
+        type=int,
+        help="Shared sampled negative cap per batch (default: all stored negatives)",
     )
     parser.add_argument(
         "--metrics-top-ks",
@@ -356,6 +363,7 @@ def _run(args: argparse.Namespace) -> Path:
         settings = ComparisonSettings(
             splits=tuple(args.splits),
             batch_size=args.batch_size,
+            additional_batch_negatives=args.additional_batch_negatives,
             metrics_top_ks=tuple(args.metrics_top_ks),
             bst_candidate_chunk_size=args.bst_candidate_chunk_size,
             device=device,
@@ -447,6 +455,7 @@ def _run(args: argparse.Namespace) -> Path:
             f"splits: {', '.join(args.splits)}",
             f"metrics_top_ks: {', '.join(str(k) for k in args.metrics_top_ks)}",
             f"batch_size: {args.batch_size}",
+            f"additional_batch_negatives: {args.additional_batch_negatives}",
             (
                 "skipped_splits: "
                 + (", ".join(result.skipped_splits) if result.skipped_splits else "none")

@@ -77,7 +77,7 @@ DEFAULTS: Dict[str, Any] = {
     "unseen_user_fraction": 0.1,
     "max_hours_per_user_per_split": 16,
     "max_train_query_hours": 10_000_000,
-    "max_eval_query_hours_per_split": 500_000,
+    "max_eval_query_hours_per_split": 1_000_000,
     "max_positives_per_user_hour": 32,
     "train_start_days_after_posts_start": 7,
     "val_start_days_before_end": 8,
@@ -188,6 +188,13 @@ DEFAULTS: Dict[str, Any] = {
     "raw_data_warn_invalid_timestamp_fraction": 0.01,
     "disk_checks": False,
     "min_free_output_gib": 150.0,
+    # Optional offline holdout comparison against the deployed BST ranker.
+    "compare_to_production": False,
+    "production_gcp_project": "greenearth-471522",
+    "production_gcp_region": "us-east1",
+    "production_cloud_run_service": "engagement-prediction-inference-prod",
+    "production_comparison_candidate_chunk_size": 1024,
+    "production_comparison_max_classification_metric_pairs": 2_000_000,
     # Experiment tracking
     "experiment_tracker": "clearml",
     "experiment_project": "Engagement Prediction",
@@ -294,6 +301,7 @@ def _merge_args_with_config(raw_args: argparse.Namespace) -> argparse.Namespace:
     )
     final_ns = argparse.Namespace(**merged)
     _validate_checks_config(final_ns)
+    _validate_production_comparison_config(final_ns)
     # Preserve argparse-injected metadata
     setattr(final_ns, "command", command)
     setattr(final_ns, "func", func)
@@ -403,6 +411,107 @@ def _validate_checks_config(args: argparse.Namespace) -> None:
         raise ValueError("raw_data_warn_invalid_timestamp_fraction must be between 0 and 1")
     if args.min_free_output_gib < 0:
         raise ValueError("min_free_output_gib must be non-negative")
+
+
+def _validate_production_comparison_config(args: argparse.Namespace) -> None:
+    if not isinstance(args.compare_to_production, bool):
+        raise ValueError("compare_to_production must be a boolean")
+    if not args.compare_to_production:
+        return
+    if args.model_type != "bst-ranker":
+        raise ValueError("Production comparison supports BST rankers only")
+    if args.bst_use_post_liker_feature:
+        raise ValueError("Production comparison does not support post-liker features")
+    stages = _get_stage_order_for_model_type("train_bst_ranker")
+    start, stop, includes_train = _get_stage_folder_and_start_stop_indices(
+        stages, args.start_from, args.stop_after, "train_bst_ranker"
+    )
+    if not includes_train:
+        raise ValueError("Production comparison requires a run that includes training")
+    if "query_selection" in stages[start:stop + 1] and args.holdout_start_days_before_end is None:
+        raise ValueError("Production comparison requires holdout to be enabled")
+    for name in ("production_gcp_project", "production_gcp_region", "production_cloud_run_service"):
+        value = getattr(args, name)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} is required when compare_to_production is enabled")
+    for name in (
+        "production_comparison_candidate_chunk_size",
+        "production_comparison_max_classification_metric_pairs",
+    ):
+        value = getattr(args, name)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+
+
+def _prepare_production_comparison(args: argparse.Namespace, ctx: Context, logger):
+    from engagement_prediction.evaluation.production import snapshot_production_model
+
+    model, metadata = snapshot_production_model(
+        project=args.production_gcp_project, region=args.production_gcp_region,
+        service=args.production_cloud_run_service,
+        output_dir=Path(ctx.run_dir) / "production_comparison" / "production_snapshot",
+        logger=logger,
+    )
+    if model.embedding_model != args.embedding_model:
+        raise ValueError("Production and candidate must use the same content embedding model")
+    # Preserve enough source history for both models. Each scorer still trims to
+    # its own model limit; this does not change the candidate architecture.
+    args.max_history_posts_per_query = max(
+        args.max_history_posts_per_query, args.max_history_len, model.max_history_len,
+    )
+    resolved_path = Path(ctx.run_dir) / "run-all.resolved-config.json"
+    resolved_path.write_text(json.dumps(
+        {key: getattr(args, key) for key in DEFAULTS}, indent=2, sort_keys=True,
+    ) + "\n")
+    ctx.tracker.log_params(
+        {"max_history_posts_per_query": args.max_history_posts_per_query}, name="Args",
+    )
+    logger.info("Source history limit for comparison: %s; candidate model limit: %s; production model limit: %s",
+                args.max_history_posts_per_query, args.max_history_len, model.max_history_len)
+    return model, metadata
+
+
+def _validate_production_comparison_dataset(args: argparse.Namespace, ctx: Context, production_model) -> None:
+    from engagement_prediction.evaluation.artifacts import resolve_stage7_artifact
+    from engagement_prediction.evaluation.production_comparison import validate_holdout_dataset
+
+    dataset = resolve_stage7_artifact(ctx.prior_outputs["07_dataset_hydration"])
+    validate_holdout_dataset(dataset, max(args.max_history_len, production_model.max_history_len))
+    if (dataset.embedding_model, dataset.embedding_dim) != (
+        production_model.embedding_model, production_model.embedding_dim,
+    ):
+        raise ValueError("Holdout and production content embedding contracts disagree")
+
+
+def _run_production_comparison(*, candidate_dir, production_model, production_metadata, args, ctx, logger):
+    from engagement_prediction.evaluation.production_comparison import run_production_comparison
+
+    return run_production_comparison(
+        candidate_dir=Path(candidate_dir), production_model=production_model,
+        production_metadata=production_metadata, args=args,
+        output_dir=Path(ctx.run_dir) / "production_comparison", tracker=ctx.tracker, logger=logger,
+    )
+
+
+def _record_production_comparison_failure(ctx: Context, phase: str, error: Exception, logger) -> None:
+    reason = f"Production comparison failed during {phase}: {error}"
+    logger.error("%s", reason)
+    path = Path(ctx.run_dir) / "production_comparison" / "failure.json"
+    # Reporting errors must not hide the original failure or prevent marking the
+    # task failed before ClearML's normal close path attempts completion.
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "status": "failed", "phase": phase, "error": str(error),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }, indent=2, sort_keys=True) + "\n")
+        ctx.tracker.log_file_artifact("production_comparison_failure", path)
+    except Exception as reporting_error:
+        logger.warning("Could not save/upload comparison failure: %s", reporting_error)
+    try:
+        ctx.tracker.mark_failed(reason)
+    except Exception as tracking_error:
+        logger.warning("Could not mark tracker task failed: %s", tracking_error)
 
 
 def _build_effective_config_for_background_run(
@@ -973,10 +1082,20 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
         except Exception:
             pass
 
-    # Execute selected subset
+    # Execute selected subset. Keep comparison failures distinct from stage
+    # failures so their report describes the operation that actually failed.
+    comparison_phase = None
+    comparison_logger = None
     try:
         # Revalidate after ClearML has applied any remote parameter overrides.
         _validate_checks_config(args)
+        if args.compare_to_production:
+            comparison_logger = get_stage_logger("PRODUCTION_COMPARISON", run_dir / "production_comparison.log")
+            comparison_phase = "configuration"
+            _validate_production_comparison_config(args)
+            comparison_phase = "production snapshot"
+            production_model, production_metadata = _prepare_production_comparison(args, ctx, comparison_logger)
+            comparison_phase = None
         for idx, key in enumerate(stage_order):
             if idx < start_idx or idx > stop_idx:
                 continue
@@ -1013,7 +1132,23 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
             label = label_map.get(key, f"Stage {idx+1}: {key}…")
             print(f"\n[{idx+1}/{len(stage_order)}] ▶️  {label}")
             pin_lineage_aligned_inputs(ctx, key, stage_folder)
-            reg.run_stage(key, ctx, args)
+            if args.compare_to_production and key == train_key:
+                comparison_phase = "holdout validation"
+                _validate_production_comparison_dataset(args, ctx, production_model)
+                comparison_phase = None
+            result = reg.run_stage(key, ctx, args)
+            if args.compare_to_production and key == train_key:
+                # The registry has now finalized the candidate's manifest.
+                comparison_phase = "evaluation and reporting"
+                _run_production_comparison(
+                    candidate_dir=result["output_dir"], production_model=production_model,
+                    production_metadata=production_metadata, args=args, ctx=ctx, logger=comparison_logger,
+                )
+                comparison_phase = None
+    except Exception as exc:
+        if comparison_phase is not None:
+            _record_production_comparison_failure(ctx, comparison_phase, exc, comparison_logger)
+        raise
     finally:
         ctx.tracker.close()
 
@@ -1295,6 +1430,18 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Check output disk space before data preparation and hydration")
     _add_arg_with_default(p_all, "--min-free-output-gib", type=float, default=argparse.SUPPRESS,
                           help_text="Output filesystem free GiB required before data preparation and hydration")
+    _add_arg_with_default(p_all, "--compare-to-production", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
+                          help_text="Compare the trained BST ranker with production on the candidate holdout")
+    _add_arg_with_default(p_all, "--production-gcp-project", type=str, default=argparse.SUPPRESS,
+                          help_text="Google Cloud project containing the production inference service")
+    _add_arg_with_default(p_all, "--production-gcp-region", type=str, default=argparse.SUPPRESS,
+                          help_text="Cloud Run region of the production inference service")
+    _add_arg_with_default(p_all, "--production-cloud-run-service", type=str, default=argparse.SUPPRESS,
+                          help_text="Cloud Run service whose traffic-serving revision supplies the baseline")
+    _add_arg_with_default(p_all, "--production-comparison-candidate-chunk-size", type=int, default=argparse.SUPPRESS,
+                          help_text="Candidate chunk size for offline BST comparison scoring")
+    _add_arg_with_default(p_all, "--production-comparison-max-classification-metric-pairs", type=int, default=argparse.SUPPRESS,
+                          help_text="Maximum sampled query/post pairs for comparison classification metrics")
     # Experiment tracking
     _add_arg_with_default(p_all, "--experiment-tracker", type=str, choices=["none", "clearml"], default=argparse.SUPPRESS,
                           help_text="Type of experiment tracker to use")

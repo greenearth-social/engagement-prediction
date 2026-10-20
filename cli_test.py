@@ -80,6 +80,8 @@ def test_automation_config_enables_checks_and_keeps_full_foreground_run():
     ]))
 
     assert args.data_checks and args.disk_checks
+    assert args.compare_to_production
+    assert args.production_cloud_run_service == "engagement-prediction-inference-prod"
     assert args.background is False
     assert args.start_from is None
     assert args.stop_after is None
