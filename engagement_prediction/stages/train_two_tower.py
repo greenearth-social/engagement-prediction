@@ -205,7 +205,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     random_seed = int(args.random_seed)
     loss_type = args.loss_type
     max_history_len = int(args.max_history_len)
-    output_embedding_dim = int(args.output_embedding_dim)
+    output_embedding_dim = int(args.two_tower_output_embedding_dim)
     batch_size = int(args.batch_size)
     eval_batch_size = int(args.eval_batch_size)
     num_workers = int(args.num_dataloader_workers)
@@ -317,13 +317,13 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "author_embedding_dim": int(args.author_embedding_dim),
         "content_projection_dim": int(args.content_projection_dim),
         "author_projection_dim": int(args.author_projection_dim),
-        "user_hidden_dim": int(args.user_hidden_dim),
-        "post_hidden_dim": int(args.post_hidden_dim),
+        "user_hidden_dim": int(args.two_tower_user_hidden_dim),
+        "post_hidden_dim": int(args.two_tower_post_hidden_dim),
         "output_embedding_dim": output_embedding_dim,
         "max_history_len": max_history_len,
-        "dropout_rate": float(args.dropout_rate_two_tower),
+        "dropout_rate": float(args.two_tower_dropout_rate),
         "author_unknown_dropout_rate": float(args.author_unknown_dropout_rate),
-        "similarity_temperature": float(args.similarity_temperature),
+        "similarity_temperature": float(args.two_tower_similarity_temperature),
     }
     model_config = {
         "model_type": "two-tower",
@@ -356,7 +356,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "output_embedding_dim": output_embedding_dim,
         "epochs": int(args.epochs),
         "learning_rate": float(args.learning_rate),
-        "weight_decay": float(args.weight_decay_two_tower),
+        "weight_decay": float(args.two_tower_weight_decay),
         "patience": int(args.patience),
         "early_stopping_min_delta": float(args.early_stopping_min_delta),
         "lr_scheduler_factor": float(args.lr_scheduler_factor),
@@ -422,7 +422,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         loss_type=loss_type,
         epochs=int(args.epochs),
         learning_rate=float(args.learning_rate),
-        weight_decay=float(args.weight_decay_two_tower),
+        weight_decay=float(args.two_tower_weight_decay),
         patience=int(args.patience),
         early_stopping_min_delta=float(args.early_stopping_min_delta),
         checkpoints_dir=checkpoints_dir,

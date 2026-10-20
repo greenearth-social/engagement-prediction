@@ -271,7 +271,7 @@ def _args(
         author_unknown_dropout_rate=0.0,
         bst_norm_first=False,
         bst_time_delta_bucket_boundaries_hours=[1.0, 6.0, 24.0],
-        prediction_hidden_dims=[4],
+        bst_prediction_hidden_dims=[4],
         bst_popularity_projection_dim=2,
         epochs=1,
         learning_rate=1.0e-3,

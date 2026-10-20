@@ -32,7 +32,7 @@ def test_readme_describes_current_pipeline_and_new_ranker_surface():
     assert "compare-rankers" not in readme
     assert "--model-type bst-ranker" in readme
     assert "--model-type two-tower" in readme
-    assert "--output-embedding-dim" in readme
+    assert "--two-tower-output-embedding-dim" in readme
     assert "08_train_two_tower" in readme
     assert "hourly_candidates/" in readme
     assert "post_metadata/" in readme

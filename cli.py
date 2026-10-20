@@ -101,24 +101,24 @@ DEFAULTS: Dict[str, Any] = {
     "dataset_hydration_worker_count": 8,
     "min_author_training_feature_count": 50,
     "min_post_liker_user_training_event_count": 10,
-    "max_post_liker_user_vocabulary_size": 1_000_000,
+    "max_post_liker_user_vocabulary_size": 10_000_000, # in practice this is around 2MM
     # Stage 8: Model architecture
     "model_type": "bst-ranker",
     "loss_type": "listwise",
-    "output_embedding_dim": 128,
-    "user_hidden_dim": 256,
-    "post_hidden_dim": 256,
-    "max_history_len": 64,
-    "similarity_temperature": 0.1,
+    "two_tower_output_embedding_dim": 128,
+    "two_tower_user_hidden_dim": 256,
+    "two_tower_post_hidden_dim": 256,
+    "max_history_len": 32,
+    "two_tower_similarity_temperature": 0.1,
     "author_embedding_dim": 16,
     "author_unknown_dropout_rate": 0.25,
     "epochs": 300,
     "batch_size": 64,
     "learning_rate": 0.0001,
-    "weight_decay_two_tower": 0.05,
+    "two_tower_weight_decay": 0.05,
     "content_projection_dim": 192,
     "author_projection_dim": 48,
-    "prediction_hidden_dims": [64, 32, 16],
+    "bst_prediction_hidden_dims": [64, 32, 16],
     "bst_additional_batch_negatives": 64,
     "bst_model_dim": 256,
     "bst_time_embedding_dim": 16,
@@ -138,7 +138,7 @@ DEFAULTS: Dict[str, Any] = {
     "bst_post_liker_pooling_tau_hours": 168.0,
     "bst_max_post_liker_replay_events_per_post": 128,
     "bst_post_liker_user_unknown_dropout_rate": 0.4,
-    "dropout_rate_two_tower": 0.3,
+    "two_tower_dropout_rate": 0.3,
     "device": "cuda",
     "patience": 10,
     "early_stopping_min_delta": 0.0025,
@@ -705,17 +705,17 @@ def _get_train_key(model_type: str) -> str:
 
 
 def _validate_bst_config(args: argparse.Namespace) -> None:
-    if args.prediction_hidden_dims is None:
-        raise ValueError("--prediction-hidden-dims is required when --model-type is 'bst-ranker'.")
+    if args.bst_prediction_hidden_dims is None:
+        raise ValueError("--bst-prediction-hidden-dims is required when --model-type is 'bst-ranker'.")
 
-    if isinstance(args.prediction_hidden_dims, (str, bytes)):
-        raise ValueError("--prediction-hidden-dims must be a list of integers.")
+    if isinstance(args.bst_prediction_hidden_dims, (str, bytes)):
+        raise ValueError("--bst-prediction-hidden-dims must be a list of integers.")
     try:
-        prediction_hidden_dims = tuple(int(v) for v in args.prediction_hidden_dims)
+        bst_prediction_hidden_dims = tuple(int(v) for v in args.bst_prediction_hidden_dims)
     except (TypeError, ValueError) as exc:
-        raise ValueError("--prediction-hidden-dims must be a list of integers.") from exc
-    if any(dim <= 0 for dim in prediction_hidden_dims):
-        raise ValueError("--prediction-hidden-dims values must be positive integers.")
+        raise ValueError("--bst-prediction-hidden-dims must be a list of integers.") from exc
+    if any(dim <= 0 for dim in bst_prediction_hidden_dims):
+        raise ValueError("--bst-prediction-hidden-dims values must be positive integers.")
 
     model_dim = int(args.bst_model_dim)
     content_projection_dim = int(args.content_projection_dim)
@@ -791,9 +791,9 @@ def _validate_two_tower_config(args: argparse.Namespace) -> None:
     """Validate the fixed canonical cross-attention two-tower contract."""
 
     positive_dimensions = {
-        "--output-embedding-dim": args.output_embedding_dim,
-        "--user-hidden-dim": args.user_hidden_dim,
-        "--post-hidden-dim": args.post_hidden_dim,
+        "--two-tower-output-embedding-dim": args.two_tower_output_embedding_dim,
+        "--two-tower-user-hidden-dim": args.two_tower_user_hidden_dim,
+        "--two-tower-post-hidden-dim": args.two_tower_post_hidden_dim,
         "--max-history-len": args.max_history_len,
         "--author-embedding-dim": args.author_embedding_dim,
         "--content-projection-dim": args.content_projection_dim,
@@ -804,10 +804,10 @@ def _validate_two_tower_config(args: argparse.Namespace) -> None:
     for flag, value in positive_dimensions.items():
         if int(value) <= 0:
             raise ValueError(f"{flag} must be positive for the two-tower model.")
-    if not 0.0 <= float(args.dropout_rate_two_tower) < 1.0:
-        raise ValueError("--dropout-rate-two-tower must be in [0, 1).")
-    if float(args.similarity_temperature) <= 0.0:
-        raise ValueError("--similarity-temperature must be positive.")
+    if not 0.0 <= float(args.two_tower_dropout_rate) < 1.0:
+        raise ValueError("--two-tower-dropout-rate must be in [0, 1).")
+    if float(args.two_tower_similarity_temperature) <= 0.0:
+        raise ValueError("--two-tower-similarity-temperature must be positive.")
     if not 0.0 <= float(args.author_unknown_dropout_rate) < 1.0:
         raise ValueError(
             "--author-unknown-dropout-rate must be in [0, 1) for the two-tower model."
@@ -1129,15 +1129,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--loss-type", type=str, choices=["listwise", "bce"],
                           default=argparse.SUPPRESS, help_text="Training loss for either model: listwise cross entropy or binary cross entropy")
     # Two-tower specific options
-    _add_arg_with_default(p_all, "--output-embedding-dim", type=int, default=argparse.SUPPRESS,
+    _add_arg_with_default(p_all, "--two-tower-output-embedding-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Canonical two-tower user/post output embedding dimension")
-    _add_arg_with_default(p_all, "--user-hidden-dim", type=int, default=argparse.SUPPRESS,
+    _add_arg_with_default(p_all, "--two-tower-user-hidden-dim", type=int, default=argparse.SUPPRESS,
                           help_text="User encoder hidden dimension")
-    _add_arg_with_default(p_all, "--post-hidden-dim", type=int, default=argparse.SUPPRESS,
+    _add_arg_with_default(p_all, "--two-tower-post-hidden-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Two-tower post encoder hidden dimension")
     _add_arg_with_default(p_all, "--max-history-len", type=int, default=argparse.SUPPRESS,
                           help_text="Max user history length")
-    _add_arg_with_default(p_all, "--similarity-temperature", type=float, default=argparse.SUPPRESS,
+    _add_arg_with_default(p_all, "--two-tower-similarity-temperature", type=float, default=argparse.SUPPRESS,
                           help_text="Temperature used to scale cosine-similarity logits in the two-tower model")
     _add_arg_with_default(p_all, "--author-embedding-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Embedding dimension for the trainable author embedding table")
@@ -1148,7 +1148,7 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Ranker content branch projection dimension")
     _add_arg_with_default(p_all, "--author-projection-dim", type=int, default=argparse.SUPPRESS,
                           help_text="Ranker author branch projection dimension")
-    _add_arg_with_default(p_all, "--prediction-hidden-dims", type=int, nargs="*", default=argparse.SUPPRESS,
+    _add_arg_with_default(p_all, "--bst-prediction-hidden-dims", type=int, nargs="*", default=argparse.SUPPRESS,
                           help_text="Ranker prediction-head hidden dimensions. Use no values for a direct linear head")
     _add_arg_with_default(p_all, "--bst-additional-batch-negatives", type=int, default=argparse.SUPPRESS,
                           help_text="Additional same-hour negative-pool posts to sample per BST training batch")
@@ -1204,9 +1204,9 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Training batch size")
     _add_arg_with_default(p_all, "--learning-rate", type=float, default=argparse.SUPPRESS,
                           help_text="Learning rate")
-    _add_arg_with_default(p_all, "--weight-decay-two-tower", type=float, default=argparse.SUPPRESS,
+    _add_arg_with_default(p_all, "--two-tower-weight-decay", type=float, default=argparse.SUPPRESS,
                           help_text="Weight decay for two tower model")
-    _add_arg_with_default(p_all, "--dropout-rate-two-tower", type=float, default=argparse.SUPPRESS,
+    _add_arg_with_default(p_all, "--two-tower-dropout-rate", type=float, default=argparse.SUPPRESS,
                           help_text="Dropout rate for two tower model")
     _add_arg_with_default(p_all, "--device", type=str, choices=["cpu", "cuda"], default=argparse.SUPPRESS,
                           help_text="Device for training")

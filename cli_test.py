@@ -333,10 +333,10 @@ def test_query_sampling_defaults():
 
     assert merged.unseen_user_fraction == 0.10
     assert merged.max_hours_per_user_per_split == 16
-    assert merged.max_train_query_hours is None
-    assert merged.max_eval_query_hours_per_split is None
+    assert merged.max_train_query_hours == 10_000_000
+    assert merged.max_eval_query_hours_per_split == 500_000
     assert merged.max_positives_per_user_hour == 32
-    assert merged.max_history_posts_per_query == 64
+    assert merged.max_history_posts_per_query == 32
     assert merged.user_history_partition_count == 16
     assert merged.random_candidate_sampling_fraction == 0.10
     assert merged.source_metadata_partition_count == 16
@@ -350,8 +350,8 @@ def test_query_sampling_defaults():
     assert merged.embedding_source_batch_size == 64
     assert merged.dataset_hydration_worker_count == 8
     assert merged.min_author_training_feature_count == 50
-    assert merged.min_post_liker_user_training_event_count == 2
-    assert merged.max_post_liker_user_vocabulary_size == 1_000_000
+    assert merged.min_post_liker_user_training_event_count == 10
+    assert merged.max_post_liker_user_vocabulary_size == 10_000_000
 
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(["--max-prior-likes", "64"])
@@ -857,16 +857,16 @@ def test_two_tower_uses_fixed_encoder_and_output_dimension_default():
     raw = parser.parse_args(["--model-type", "two-tower"])
     merged = cli._merge_args_with_config(raw)
 
-    assert merged.output_embedding_dim == 128
+    assert merged.two_tower_output_embedding_dim == 128
     cli._validate_two_tower_config(merged)
 
 
 @pytest.mark.parametrize(
     ("flag", "message"),
     [
-        ("--output-embedding-dim", "output-embedding-dim"),
-        ("--user-hidden-dim", "user-hidden-dim"),
-        ("--post-hidden-dim", "post-hidden-dim"),
+        ("--two-tower-output-embedding-dim", "two-tower-output-embedding-dim"),
+        ("--two-tower-user-hidden-dim", "two-tower-user-hidden-dim"),
+        ("--two-tower-post-hidden-dim", "two-tower-post-hidden-dim"),
         ("--max-history-len", "max-history-len"),
         ("--batch-size", "batch-size"),
         ("--eval-batch-size", "eval-batch-size"),
@@ -943,7 +943,7 @@ def test_bst_ranker_model_type_maps_train_alias():
         "--model-type", "bst-ranker",
         "--start-from", "train",
         "--stop-after", "train",
-        "--prediction-hidden-dims", "144", "72",
+        "--bst-prediction-hidden-dims", "144", "72",
     ])
     merged = cli._merge_args_with_config(raw)
 
@@ -969,7 +969,7 @@ def test_bst_ranker_explicit_train_stage_names_parse():
         "--model-type", "bst-ranker",
         "--start-from", "train_bst_ranker",
         "--stop-after", "train_bst_ranker",
-        "--prediction-hidden-dims", "144", "72",
+        "--bst-prediction-hidden-dims", "144", "72",
     ])
     merged = cli._merge_args_with_config(raw)
 
@@ -993,7 +993,7 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
             bst_dropout_rate: 0.2
             bst_norm_first: true
             bst_time_delta_bucket_boundaries_hours: [1, 2, 4]
-            prediction_hidden_dims: [128, 64]
+            bst_prediction_hidden_dims: [128, 64]
             bst_weight_decay: 0.02
             bst_additional_batch_negatives: 32
             batch_size: 16
@@ -1015,7 +1015,7 @@ def test_merge_args_with_config_accepts_bst_ranker_keys(tmp_path):
     assert merged.author_projection_dim == 24
     assert merged.bst_time_embedding_dim == 32
     assert merged.bst_num_attention_heads == 8
-    assert merged.prediction_hidden_dims == [128, 64]
+    assert merged.bst_prediction_hidden_dims == [128, 64]
     assert merged.bst_additional_batch_negatives == 32
     assert merged.batch_size == 16
     assert merged.bst_max_train_batches_per_epoch == 5
@@ -1037,12 +1037,12 @@ def test_bst_ranker_training_defaults():
     assert merged.bst_max_train_batches_per_epoch is None
     assert merged.bst_use_popularity_feature is True
     assert merged.bst_popularity_projection_dim == 8
-    assert merged.bst_use_post_liker_feature is True
+    assert merged.bst_use_post_liker_feature is False
     assert merged.bst_post_liker_user_embedding_dim == 16
     assert merged.bst_post_liker_projection_dim == 32
     assert merged.bst_post_liker_pooling_tau_hours == 168.0
     assert merged.bst_max_post_liker_replay_events_per_post == 128
-    assert merged.bst_post_liker_user_unknown_dropout_rate == 0.20
+    assert merged.bst_post_liker_user_unknown_dropout_rate == 0.4
     cli._validate_bst_config(merged)
 
 
@@ -1098,7 +1098,7 @@ def test_bst_ranker_rejects_negative_eval_batch_size():
 
 def test_bst_ranker_uses_stage7_author_indices_without_a_feature_flag():
     parser = cli.build_parser()
-    raw = parser.parse_args(["--model-type", "bst-ranker", "--prediction-hidden-dims", "144", "72"])
+    raw = parser.parse_args(["--model-type", "bst-ranker", "--bst-prediction-hidden-dims", "144", "72"])
     merged = cli._merge_args_with_config(raw)
 
     assert not hasattr(merged, "use_author_embedding_table")
@@ -1109,9 +1109,9 @@ def test_bst_ranker_requires_prediction_hidden_dims():
     parser = cli.build_parser()
     raw = parser.parse_args(["--model-type", "bst-ranker"])
     merged = cli._merge_args_with_config(raw)
-    merged.prediction_hidden_dims = None
+    merged.bst_prediction_hidden_dims = None
 
-    with pytest.raises(ValueError, match="prediction-hidden-dims"):
+    with pytest.raises(ValueError, match="bst-prediction-hidden-dims"):
         cli._validate_bst_config(merged)
 
 
@@ -1119,11 +1119,11 @@ def test_bst_ranker_accepts_explicit_empty_prediction_hidden_dims():
     parser = cli.build_parser()
     raw = parser.parse_args([
         "--model-type", "bst-ranker",
-        "--prediction-hidden-dims",
+        "--bst-prediction-hidden-dims",
     ])
     merged = cli._merge_args_with_config(raw)
 
-    assert merged.prediction_hidden_dims == []
+    assert merged.bst_prediction_hidden_dims == []
     cli._validate_bst_config(merged)
 
 
@@ -1138,7 +1138,7 @@ def test_bst_ranker_validates_projection_dims(arg_name, error_match):
     parser = cli.build_parser()
     raw = parser.parse_args([
         "--model-type", "bst-ranker",
-        "--prediction-hidden-dims", "144", "72",
+        "--bst-prediction-hidden-dims", "144", "72",
     ])
     merged = cli._merge_args_with_config(raw)
     setattr(merged, arg_name, 0)
@@ -1152,7 +1152,7 @@ def test_bst_ranker_validates_transformer_head_divisibility():
     raw = parser.parse_args([
         "--model-type", "bst-ranker",
         "--bst-time-embedding-dim", "15",
-        "--prediction-hidden-dims", "144", "72",
+        "--bst-prediction-hidden-dims", "144", "72",
     ])
     merged = cli._merge_args_with_config(raw)
 

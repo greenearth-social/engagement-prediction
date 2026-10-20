@@ -442,7 +442,7 @@ The BST ranker always fuses content embeddings, Stage 7 author indices, time-del
 
 ```bash
 pipenv run python cli.py --model-type bst-ranker \
-  --prediction-hidden-dims 64 32 16 \
+  --bst-prediction-hidden-dims 64 32 16 \
   --stop-after train_bst_ranker
 ```
 
@@ -487,13 +487,13 @@ The canonical two-tower model consumes the Stage 7 loader index directly. It use
 ```bash
 pipenv run python cli.py --config config.yml \
   --model-type two-tower \
-  --output-embedding-dim 128 \
+  --two-tower-output-embedding-dim 128 \
   --stop-after train_two_tower
 ```
 
 Training uses every Stage 4 hourly negative retained in Stage 7. It uses `batch_size` for training and final train metrics, `eval_batch_size` for both validation splits, and unseen-user validation NDCG for checkpoint selection. Random baselines piggyback on the first split passes and are reported in the same grouped ClearML histogram contract as BST training. The architecture is fixed to the canonical author-aware cross-attention encoder and learned post projection; both towers always L2-normalize their outputs.
 
-Useful options include `--output-embedding-dim` (default `128`), `--user-hidden-dim`, `--post-hidden-dim`, `--content-projection-dim`, `--author-projection-dim`, `--author-embedding-dim`, `--dropout-rate-two-tower`, and `--similarity-temperature`.
+Useful options include `--two-tower-output-embedding-dim` (default `128`), `--two-tower-user-hidden-dim`, `--two-tower-post-hidden-dim`, `--content-projection-dim`, `--author-projection-dim`, `--author-embedding-dim`, `--two-tower-dropout-rate`, and `--two-tower-similarity-temperature`.
 
 The `08_train_two_tower/<stage_run_id>/` artifact contains `checkpoints/two_tower_best.pth`, `checkpoints/engagement_user_tower.pt`, `checkpoints/engagement_post_tower.pt`, `two_tower_author_idx.parquet`, model/training/results JSON, an exact copy of `authors/`, and an optional training plot. Every new best refreshes both local TorchScript towers and verifies eager/script parity, output shapes, finiteness, unit norms, and combined scores. Canonical training always writes these artifacts.
 

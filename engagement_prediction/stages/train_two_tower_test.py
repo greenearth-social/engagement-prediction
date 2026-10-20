@@ -73,13 +73,13 @@ class _RecordingTracker:
         return True
 
 
-def _args(*, plots: bool = False, output_embedding_dim: int = 3):
+def _args(*, plots: bool = False, two_tower_output_embedding_dim: int = 3):
     return SimpleNamespace(
         run_tag=None,
         random_seed=7,
         loss_type=DEFAULTS["loss_type"],
         max_history_len=2,
-        output_embedding_dim=output_embedding_dim,
+        two_tower_output_embedding_dim=two_tower_output_embedding_dim,
         batch_size=2,
         eval_batch_size=3,
         num_dataloader_workers=0,
@@ -95,14 +95,14 @@ def _args(*, plots: bool = False, output_embedding_dim: int = 3):
         author_embedding_dim=3,
         content_projection_dim=4,
         author_projection_dim=2,
-        user_hidden_dim=4,
-        post_hidden_dim=5,
-        dropout_rate_two_tower=0.0,
+        two_tower_user_hidden_dim=4,
+        two_tower_post_hidden_dim=5,
+        two_tower_dropout_rate=0.0,
         author_unknown_dropout_rate=0.0,
-        similarity_temperature=0.5,
+        two_tower_similarity_temperature=0.5,
         epochs=1,
         learning_rate=1.0e-3,
-        weight_decay_two_tower=0.0,
+        two_tower_weight_decay=0.0,
         patience=2,
         early_stopping_min_delta=0.1,
         lr_scheduler_factor=0.5,
@@ -163,7 +163,7 @@ def test_stage8_trains_native_two_tower_and_publishes_serving_artifacts(
 
     monkeypatch.setattr(two_tower_training, "run_two_tower_listwise_epoch", record_epoch)
     monkeypatch.setattr(train_two_tower, "run_two_tower_listwise_epoch", record_epoch)
-    args = _args(plots=True, output_embedding_dim=3)
+    args = _args(plots=True, two_tower_output_embedding_dim=3)
     args.loss_type = loss_type
     result = train_two_tower.run(
         _context(tmp_path, tracker),

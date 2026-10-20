@@ -395,7 +395,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "time_delta_bucket_boundaries_hours": [
             float(value) for value in args.bst_time_delta_bucket_boundaries_hours
         ],
-        "prediction_hidden_dims": [int(value) for value in args.prediction_hidden_dims],
+        "prediction_hidden_dims": [int(value) for value in args.bst_prediction_hidden_dims],
         "use_popularity_feature": use_popularity_feature,
         "popularity_projection_dim": int(args.bst_popularity_projection_dim),
         "popularity_log_mean": popularity_stats.log_mean,
