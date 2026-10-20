@@ -2,7 +2,8 @@
 Description=Weekly BST ranker training
 
 [Timer]
-OnCalendar=Sun *-*-* 06:00:00 UTC
+OnCalendar=
+OnCalendar=Sat *-*-* 02:00:00 UTC
 Persistent=true
 Unit=bst-ranker-training.service
 
