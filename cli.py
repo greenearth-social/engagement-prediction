@@ -77,14 +77,14 @@ DEFAULTS: Dict[str, Any] = {
     "unseen_user_fraction": 0.1,
     "max_hours_per_user_per_split": 16,
     "max_train_query_hours": 10_000_000,
-    "max_eval_query_hours_per_split": 1_000_000,
+    "max_eval_query_hours_per_split": 500_000,
     "max_positives_per_user_hour": 32,
     "train_start_days_after_posts_start": 7,
     "val_start_days_before_end": 8,
     "holdout_start_days_before_end": 3,
     # Stage 2: User history
     "max_history_posts_per_query": 32,
-    "user_history_partition_count": 16,
+    "user_history_partition_count": 8,
     # Stage 3: Post selection
     "random_candidate_sampling_fraction": 0.1,
     # Stage 4: Popularity-aware negative selection

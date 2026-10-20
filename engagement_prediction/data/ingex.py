@@ -88,6 +88,7 @@ def scan_post_parquet_files(
         schema=schema,
         missing_columns="insert",
         include_file_paths=include_file_paths,
+        extra_columns="ignore",
     )
 
 
