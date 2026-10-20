@@ -143,7 +143,6 @@ DEFAULTS: Dict[str, Any] = {
     "bst_use_target_user_feature": False,
     "bst_target_user_projection_dim": 32,
     "bst_target_user_unknown_dropout_rate": 0.20,
-    "dropout_rate_two_tower": 0.3,
     "device": "cuda",
     "patience": 10,
     "early_stopping_min_delta": 0.0025,
