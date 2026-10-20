@@ -47,7 +47,17 @@ from engagement_prediction.pipeline.core import (
 CLI_FILE_DIR = Path(__file__).parent
 
 TRAIN_PLACEHOLDER = 'train_placeholder'
-STAGE_ORDER = ['source_metadata', 'query_selection', 'user_history', 'post_selection', 'negative_selection', 'post_liker_history', 'author_statistics', 'dataset_hydration', TRAIN_PLACEHOLDER]
+STAGE_ORDER = [
+    'source_metadata',
+    'query_selection',
+    'user_history',
+    'post_selection',
+    'negative_selection',
+    'post_liker_history',
+    'author_statistics',
+    'dataset_hydration',
+    TRAIN_PLACEHOLDER
+]
 
 DATE_FIELDS = ("posts_start", "posts_end", "train_start", "val_start", "holdout_start", "holdout_end")
 
@@ -66,14 +76,14 @@ DEFAULTS: Dict[str, Any] = {
     # Stage 1: Query selection
     "unseen_user_fraction": 0.1,
     "max_hours_per_user_per_split": 16,
-    "max_train_query_hours": 10000000,
-    "max_eval_query_hours_per_split": 500000,
+    "max_train_query_hours": 10_000_000,
+    "max_eval_query_hours_per_split": 500_000,
     "max_positives_per_user_hour": 32,
     "train_start_days_after_posts_start": 7,
     "val_start_days_before_end": 8,
     "holdout_start_days_before_end": 3,
     # Stage 2: User history
-    "max_history_posts_per_query": 64,
+    "max_history_posts_per_query": 32,
     "user_history_partition_count": 16,
     # Stage 3: Post selection
     "random_candidate_sampling_fraction": 0.1,
