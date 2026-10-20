@@ -278,7 +278,7 @@ class ClearMLExperimentTracker:
         # task as "completed", so we mark it as failed on a real failure
         self._task.mark_failed(
             ignore_errors=False,
-            status_reason="Pipeline checks failed",
+            status_reason="Pipeline failed",
             status_message=reason,
         )
 

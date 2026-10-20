@@ -153,7 +153,7 @@ Each stage's `summary.json` stores daily counts, source-window boundaries, and e
 
 ### Relative Dates and Automated Training
 
-`cli.py` can derive data windows from configurable day offsets. `config.automation.yml` enables checks and uses the ordinary full, foreground BST defaults. Preview the resolved configuration without creating artifacts, starting ClearML, or running stages:
+`cli.py` can derive data windows from configurable day offsets. `config.automation.yml` enables checks and production comparison and uses the ordinary full, foreground BST defaults. Preview the resolved configuration without creating artifacts, starting ClearML, or running stages:
 
 ```bash
 pipenv run python cli.py --config config.automation.yml --dry-run
@@ -181,13 +181,33 @@ posts_start_days_before_end: 45
 epochs: 100
 ```
 
-Set `holdout_start_days_before_end: null` to disable holdout. Offsets must be non-negative integers, and resolved source/split windows must be correctly ordered. Date-only anchors mean UTC midnight; hour-aligned timestamp anchors are also supported.
+Set `holdout_start_days_before_end: null` to disable holdout (requires production comparison to be disabled too). Offsets must be non-negative integers, and resolved source/split windows must be correctly ordered. Date-only anchors mean UTC midnight; hour-aligned timestamp anchors are also supported.
 
 Only dates consumed by the selected stages are resolved: source-only runs need no split dates, and train-only runs use their prepared dataset and recorded lineage. Relative dates do not change an existing dataset. Partial runs and prior artifact selection remain available through the ordinary CLI options.
 
 For real runs, ClearML overrides are applied before final date resolution. ClearML's `Args` records configured inputs, and `ResolvedDates` records the dates used by selected stages. `run-all.resolved-config.json` saves the fixed anchor and offsets and can be reused with `--config` to calculate the same dates. Calculated timestamps are also saved in each stage's resolved config. Background execution passes its fixed end date to the child so the window cannot shift at midnight.
 
 ClearML tracking and GCS model uploads use the existing pipeline. Model review and deployment remain manual. The [systemd setup](ops/systemd/README.md) provides a weekly timer and a service that updates a dedicated checkout to remote `main`, syncs its Pipenv environment, and runs this CLI in the foreground. Installation and timer activation are explicit steps; `config.yml` is never loaded implicitly.
+
+### Candidate versus Production
+
+Enable `compare_to_production` to evaluate the new BST model and the deployed model on the candidate's existing Stage 7 holdout dataset. The automation template enables it with this setting:
+
+```yaml
+compare_to_production: true
+```
+
+Ordinary CLI runs default to comparison disabled; `--no-compare-to-production` disables it for a configured run. Comparison requires a run that includes BST training, with post-liker features disabled for both models. Other architectures, split production traffic, incompatible content embeddings, and missing holdout data fail clearly. There is no deployment step or minimum improvement threshold: a worse candidate still produces a successful comparison for review.
+
+Before data preparation, the CLI reads the Cloud Run service's actual traffic allocation and snapshots the revision serving 100% of traffic. It reads that revision's model settings and downloads its ranker, author map, serving manifest, and model configuration. GCS object generations and file hashes are recorded. This requires `gcloud` on PATH, noninteractive Cloud Run read access, and application default credentials with read access to the model bucket. The current canonical BST publication layout is required. The baseline stays fixed throughout the run, even if production changes later.
+
+Both models are evaluated offline on the exact same `holdout_seen_users` and `holdout_unseen_users` queries, labels, and candidate slates. Evaluation reuses the candidate's saved batch size, negative-sampling cap, and random seed. Each model uses its own author vocabulary and history limit. The CLI raises `max_history_posts_per_query` before preparation if necessary to retain enough history for both models; it does not change the candidate's `max_history_len`. The effective extraction limit is saved in the resolved config and ClearML. Reusing a dataset with insufficient extracted history fails before training and requires rebuilding it. Both holdout splits must be nonempty.
+
+Results live under `<pipeline run directory>/production_comparison/`: `review.md`, `metrics.json`, `metrics.csv`, and `metric_deltas.csv`. They include scores and candidate-minus-production deltas, dates, sample counts, model identities, evaluation settings, and author-mapping coverage. The primary metric is the candidate's first configured NDCG cutoff (normally NDCG@30), shown separately for each holdout split. Reports upload through the run's existing ClearML/GCS tracking; primary scores also appear as ClearML scalars. A comparison or report-upload failure exits unsuccessfully and marks the task failed while retaining local files and any completed candidate model. `failure.json` records the failed operation.
+
+Seen/unseen cohort names refer to the candidate's training users. Production's training dates are not available from its serving configuration, so the report explicitly leaves temporal overlap unverified; consider this when comparing historical windows. These are offline ranking results, not an inference-service compatibility test.
+
+`--dry-run` performs no production lookup or download. It therefore does not validate cloud access or calculate any production-driven increase to the source history limit. Existing systemd installations must add the four settings above to their ignored `config.automation.local.yml`; updating the committed template does not alter that local copy.
 
 ### Data and Disk Checks
 
