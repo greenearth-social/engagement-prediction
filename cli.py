@@ -68,7 +68,7 @@ DEFAULTS: Dict[str, Any] = {
     "embedding_model": "all_MiniLM_L12_v2",
     # Stage 00: Canonical source metadata
     "gcs_bucket": 'greenearth-471522-ingex-extract-prod',
-    # A missing end resolves to today's UTC midnight when preparing source data.
+    # A missing end uses prior data's anchor when resuming, otherwise today's UTC midnight.
     "posts_end": None,
     "posts_start_days_before_end": 37,
     "source_metadata_partition_count": 16,
@@ -324,11 +324,53 @@ def _date_fields_for_run(args: argparse.Namespace) -> Tuple[str, ...]:
 
 
 def _freeze_posts_end(args: argparse.Namespace) -> argparse.Namespace:
+    """Freeze the anchor and, when inheriting it, the exact upstream inputs."""
     args = copy.copy(args)
-    if _date_fields_for_run(args) and args.posts_end is None:
+    if not _date_fields_for_run(args) or args.posts_end is not None:
+        return args
+
+    train_key = _get_train_key(args.model_type)
+    stages = _get_stage_order_for_model_type(train_key)
+    start, _, _ = _get_stage_folder_and_start_stop_indices(
+        stages, args.start_from, args.stop_after, train_key
+    )
+    if start == 0:
         args.posts_end = datetime.now(timezone.utc).replace(
             hour=0, minute=0, second=0, microsecond=0
         ).isoformat()
+        return args
+
+    # Resolve the same upstream chain the first stage will consume. Context
+    # construction and dependency resolution only read metadata; dry runs must
+    # not create output directories or an experiment-tracking task.
+    output_root = _resolve_run_dir(args, run_timestamp="")
+    ctx = Context(
+        run_dir=output_root, artifacts_dir=output_root / "artifacts",
+        runs_dir=output_root / "runs", run_timestamp="", use_latest=True,
+    )
+    _apply_prior_pins(args, ctx, output_root)
+    stage_folders = _get_stage_folder(stages)
+    previous = stages[start - 1]
+    if stage_folders[previous] not in ctx.prior_outputs:
+        _maybe_choose_prior(args, ctx, previous)
+    pin_lineage_aligned_inputs(ctx, stages[start], stage_folders)
+
+    source_dir = ctx.prior_outputs["00_source_metadata"]
+    summary_path = source_dir / "summary.json"
+    summary = json.loads(summary_path.read_text())
+    from engagement_prediction.data import timestamps
+
+    anchor = timestamps.parse_utc_datetime(
+        summary.get("posts_end") if isinstance(summary, dict) else None,
+        field_name=f"posts_end in {summary_path}",
+    )
+    if anchor is None:
+        raise ValueError(f"Cannot inherit posts_end: missing date in {summary_path}")
+    args.posts_end = anchor.isoformat()
+    # Freeze the actual artifact paths along with the anchor, including across
+    # a background handoff. Never reselect a newer chain using the older date.
+    for folder, path in ctx.prior_outputs.items():
+        setattr(args, f"prior_{folder}", str(path))
     return args
 
 
@@ -628,9 +670,6 @@ def cmd_run_all(args: argparse.Namespace) -> int:
 
     Creates a run directory up front and backgrounds itself with nohup if --background.
     """
-    # Freeze the anchor before a background handoff; calculate the other dates
-    # after ClearML has had a chance to override the configured offsets.
-    args = _freeze_posts_end(args)
     if args.dry_run:
         resolved = _resolve_date_args(args)
         preview = {key: getattr(resolved, key) for key in DEFAULTS}
@@ -651,6 +690,9 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     run_timestamp = (os.environ.get("ENGAGEMENT_RUN_TIMESTAMP") or "").strip() or generate_run_timestamp()
 
     if bool(args.background):
+        # Freeze both the anchor and any inherited input chain before handing
+        # off. Foreground runs resolve after ClearML applies its overrides.
+        args = _freeze_posts_end(args)
         _resolve_date_args(args)  # Validate before creating files or spawning a child.
         output_root = _resolve_run_dir(args, run_timestamp=run_timestamp)
         output_root.mkdir(parents=True, exist_ok=True)
@@ -730,7 +772,7 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     args = tracker.connect_args(args, "Args")
     try:
         args = _resolve_date_args(args)
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         try:
             tracker.mark_failed(str(exc))
         finally:
@@ -739,6 +781,10 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     date_fields = _date_fields_for_run(args)
     if date_fields:
         tracker.log_params(params={key: getattr(args, key) for key in date_fields}, name="ResolvedDates")
+        if args.start_from not in (None, "source_metadata") and args.prior_00_source_metadata is not None:
+            source = {"posts_end": args.posts_end, "source_metadata": args.prior_00_source_metadata}
+            tracker.log_params(params=source, name="ResolvedDateSource")
+            print(f"Resolved posts_end={args.posts_end}; Stage 0 input: {args.prior_00_source_metadata}")
 
     output_root = _resolve_run_dir(args, run_timestamp=run_timestamp)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -964,79 +1010,52 @@ def _get_stage_folder_and_start_stop_indices(
     return start_idx, stop_idx, includes_train
 
 
+def _apply_prior_pins(args: argparse.Namespace, ctx: Context, output_root: Path) -> None:
+    """Use the same explicit input selection for date inference and execution."""
+    for name in DEFAULTS:
+        if not name.startswith("prior_"):
+            continue
+        folder = name.removeprefix("prior_")
+        prior = _resolve_prior_spec(
+            getattr(args, name), output_root=output_root,
+            artifacts_dir=ctx.artifacts_dir, stage_folder=folder,
+        )
+        if prior is not None:
+            ctx.prior_outputs[folder] = prior
+    validate_explicit_prior_pin_consistency(ctx)
+
+
+def _maybe_choose_prior(args: argparse.Namespace, ctx: Context, stage_key: str) -> None:
+    """Choose a prior before inferring dates, or before artifact-only execution."""
+    if not args.pick_prior or args.background or args.dry_run:
+        return
+    folder = _get_stage_folder([stage_key])[stage_key]
+    base = Path(ctx.artifacts_dir) / folder
+    if not base.exists():
+        return
+    subdirs = [p for p in base.iterdir() if p.is_dir()]
+    if len(subdirs) <= 1:
+        return
+    subdirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    print(f"\nPick prior output for stage '{stage_key}' under {base}:")
+    for i, p in enumerate(subdirs):
+        print(f"  [{i}] {p.name}")
+    try:
+        choice = input("Enter index (blank for latest): ").strip()
+        if choice:
+            idx = int(choice)
+            if 0 <= idx < len(subdirs):
+                ctx.prior_outputs[folder] = subdirs[idx]
+    except Exception:
+        pass
+
+
 def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     """Execute the modular pipeline stages in the foreground sequentially."""
     run_dir = Path(ctx.run_dir).resolve()
-    artifacts_dir = Path(ctx.artifacts_dir).resolve()
     output_root = Path(args.output_dir).resolve()
+    _apply_prior_pins(args, ctx, output_root)
 
-    # Apply non-interactive prior pins (paths or stage_run_ids).
-    prior_00_source_metadata = _resolve_prior_spec(
-        args.prior_00_source_metadata,
-        output_root=output_root,
-        artifacts_dir=artifacts_dir,
-        stage_folder="00_source_metadata",
-    )
-    prior_01_query_selection = _resolve_prior_spec(
-        args.prior_01_query_selection,
-        output_root=output_root,
-        artifacts_dir=artifacts_dir,
-        stage_folder="01_query_selection",
-    )
-    prior_02_user_history = _resolve_prior_spec(
-        args.prior_02_user_history,
-        output_root=output_root,
-        artifacts_dir=artifacts_dir,
-        stage_folder="02_user_history",
-    )
-    prior_03_post_selection = _resolve_prior_spec(
-        args.prior_03_post_selection,
-        output_root=output_root,
-        artifacts_dir=artifacts_dir,
-        stage_folder="03_post_selection",
-    )
-    prior_04_negative_selection = _resolve_prior_spec(
-        args.prior_04_negative_selection,
-        output_root=output_root,
-        artifacts_dir=artifacts_dir,
-        stage_folder="04_negative_selection",
-    )
-    prior_05_post_liker_history = _resolve_prior_spec(
-        args.prior_05_post_liker_history,
-        output_root=output_root,
-        artifacts_dir=artifacts_dir,
-        stage_folder="05_post_liker_history",
-    )
-    prior_06_author_statistics = _resolve_prior_spec(
-        args.prior_06_author_statistics,
-        output_root=output_root,
-        artifacts_dir=artifacts_dir,
-        stage_folder="06_author_statistics",
-    )
-    prior_07_dataset_hydration = _resolve_prior_spec(
-        args.prior_07_dataset_hydration,
-        output_root=output_root,
-        artifacts_dir=artifacts_dir,
-        stage_folder="07_dataset_hydration",
-    )
-    if prior_00_source_metadata is not None:
-        ctx.prior_outputs["00_source_metadata"] = prior_00_source_metadata
-    if prior_01_query_selection is not None:
-        ctx.prior_outputs["01_query_selection"] = prior_01_query_selection
-    if prior_02_user_history is not None:
-        ctx.prior_outputs["02_user_history"] = prior_02_user_history
-    if prior_03_post_selection is not None:
-        ctx.prior_outputs["03_post_selection"] = prior_03_post_selection
-    if prior_04_negative_selection is not None:
-        ctx.prior_outputs["04_negative_selection"] = prior_04_negative_selection
-    if prior_05_post_liker_history is not None:
-        ctx.prior_outputs["05_post_liker_history"] = prior_05_post_liker_history
-    if prior_06_author_statistics is not None:
-        ctx.prior_outputs["06_author_statistics"] = prior_06_author_statistics
-    if prior_07_dataset_hydration is not None:
-        ctx.prior_outputs["07_dataset_hydration"] = prior_07_dataset_hydration
-    validate_explicit_prior_pin_consistency(ctx)
-    
     model_type = args.model_type
 
     if model_type == "bst-ranker":
@@ -1054,33 +1073,6 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
         args.stop_after,
         train_key
     )
-
-    # Optional interactive chooser (foreground only)
-    def _maybe_choose_prior(stage_key: str):
-        if not args.pick_prior:
-            return
-        folder = stage_folder[stage_key]
-        base = (artifacts_dir / folder)
-        if not base.exists():
-            return
-        subdirs = [p for p in base.iterdir() if p.is_dir()]
-        if len(subdirs) <= 1:
-            return
-        # Prompt only in foreground mode
-        if bool(args.background):
-            return
-        subdirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        print(f"\nPick prior output for stage '{stage_key}' under {base}:")
-        for i, p in enumerate(subdirs):
-            print(f"  [{i}] {p.name}")
-        try:
-            choice = input("Enter index (blank for latest): ").strip()
-            if choice:
-                idx = int(choice)
-                if 0 <= idx < len(subdirs):
-                    ctx.prior_outputs[folder] = subdirs[idx]
-        except Exception:
-            pass
 
     # Execute selected subset. Keep comparison failures distinct from stage
     # failures so their report describes the operation that actually failed.
@@ -1116,7 +1108,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
             if idx > 0:
                 prev_key = stage_order[idx - 1]
                 if stage_folder[prev_key] not in ctx.prior_outputs:
-                    _maybe_choose_prior(prev_key)
+                    _maybe_choose_prior(args, ctx, prev_key)
             label_map = {
                 'source_metadata': "Stage 00: Build reusable source metadata…",
                 'query_selection': "Stage 1: Select user-hour queries…",
@@ -1181,7 +1173,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--gcs-bucket", type=str, default=argparse.SUPPRESS,
                           help_text="GCS bucket name for ingex data")
     _add_arg_with_default(p_all, "--posts-end", type=str, default=argparse.SUPPRESS,
-                          help_text="UTC source-window end (exclusive); defaults to today's UTC midnight")
+                          help_text="UTC source-window end (exclusive); defaults to the reused source artifact's end when resuming, otherwise today's UTC midnight")
     _add_arg_with_default(p_all, "--posts-start-days-before-end", type=int, default=argparse.SUPPRESS,
                           help_text="Source-window length in days before posts-end")
     _add_arg_with_default(p_all, "--source-metadata-partition-count", type=int,
