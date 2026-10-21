@@ -542,6 +542,8 @@ For each K, `history_length_ndcg_at_{k}.png` shows separate validation and unsee
 
 Use the standalone comparison CLI with one completed Stage 7 artifact and exactly two uniquely named model artifacts. Canonical Stage 8 BST, canonical Stage 8 two-tower, and standard legacy Stage 3 BST artifacts can be mixed in one comparison. Model type is inferred from each artifact's configuration.
 
+Both this command and the training pipeline use `engagement_prediction.evaluation.workflow.run_comparison_workflow`. The shared operation accepts resolved models, a resolved Stage 7 dataset, explicit `ComparisonSettings`, an output directory, a report context, and a logger. It validates the inputs, evaluates both models, and writes local reports. `StandaloneReportContext` and `ProductionReportContext` preserve the entry points' existing validation requirements and report formats. Artifact resolution, Cloud Run discovery, CLI run-directory management, and ClearML publication remain outside this operation; the evaluation algorithm and defaults are unchanged.
+
 ```bash
 pipenv run python ops/compare_model_performance.py \
   --dataset /path/to/07_dataset_hydration/<run-id> \

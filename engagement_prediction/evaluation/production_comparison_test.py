@@ -10,6 +10,7 @@ import pytest
 
 from engagement_prediction.evaluation.artifacts import ModelArtifact, Stage7Artifact
 from engagement_prediction.evaluation.comparison import ComparisonResult
+from engagement_prediction.evaluation import comparison as comparison_engine
 from engagement_prediction.evaluation import production_comparison as comparison
 from engagement_prediction.experiment_tracking import NoOpExperimentTracker
 
@@ -81,7 +82,7 @@ def setup(tmp_path, monkeypatch):
     evaluate = Mock(return_value=result)
     monkeypatch.setattr(comparison, "resolve_model_artifact", resolve_candidate)
     monkeypatch.setattr(comparison, "resolve_stage7_artifact", resolve_dataset)
-    monkeypatch.setattr(comparison, "run_model_comparison", evaluate)
+    monkeypatch.setattr(comparison_engine, "run_model_comparison", evaluate)
     args = SimpleNamespace(
         metrics_top_ks=[30], production_comparison_candidate_chunk_size=1024,
         production_comparison_max_classification_metric_pairs=2000,
