@@ -169,7 +169,11 @@ pipenv run python cli.py --config config.automation.yml --dry-run
 pipenv run python cli.py --config config.automation.yml --posts-end 2026-10-16 --dry-run
 ```
 
-Remove `--dry-run` to execute. An omitted or null `posts_end` resolves once to today's UTC midnight; `--posts-end YYYY-MM-DD` fixes the anchor for a historical window. End dates are exclusive, so the default includes data through yesterday. `--dry-run` also takes precedence over `--background`.
+Remove `--dry-run` to execute. For a fresh run beginning at Stage 0, an omitted or null `posts_end` resolves once to today's UTC midnight; `--posts-end YYYY-MM-DD` fixes the anchor for a historical window. End dates are exclusive, so a fresh run's default includes data through yesterday. `--dry-run` also takes precedence over `--background`.
+
+When resuming data preparation, an omitted `posts_end` instead comes from the Stage 0 ancestor of the selected prior artifacts. For example, `--start-from post_selection` reuses the window anchor associated with its Stage 2 input, even on a later day. Explicit prior pins, the foreground `--pick-prior` chooser, and automatic lineage selection determine which inputs are used. The resolved input paths are pinned alongside the anchor, so a background child cannot switch to newer artifacts. Dry runs read that same lineage without prompting or writing files. Missing dates or inconsistent lineage fail instead of falling back to today.
+
+Only the anchor is inherited; configured day offsets remain in effect. Changing the source-window length while reusing incompatible artifacts still fails the existing window checks, as does an incompatible explicit anchor. To prepare a new window, rerun from Stage 0.
 
 All defaults live in `cli.py`'s `DEFAULTS`. Override these top-level config keys or use the corresponding CLI flags:
 
@@ -194,7 +198,7 @@ Set `holdout_start_days_before_end: null` to disable holdout (requires productio
 
 Only dates consumed by the selected stages are resolved: source-only runs need no split dates, and train-only runs use their prepared dataset and recorded lineage. Relative dates do not change an existing dataset. Partial runs and prior artifact selection remain available through the ordinary CLI options.
 
-For real runs, ClearML overrides are applied before final date resolution. ClearML's `Args` records configured inputs, and `ResolvedDates` records the dates used by selected stages. `run-all.resolved-config.json` saves the fixed anchor and offsets and can be reused with `--config` to calculate the same dates. Calculated timestamps are also saved in each stage's resolved config. Background execution passes its fixed end date to the child so the window cannot shift at midnight.
+For real runs, ClearML overrides are applied before final date resolution. ClearML's `Args` records configured inputs, and `ResolvedDates` records the dates used by selected stages. For inherited anchors, `ResolvedDateSource` and the console log identify the Stage 0 input. `run-all.resolved-config.json` saves the fixed anchor, offsets, and selected prior pins and can be reused with `--config` to calculate the same dates. Calculated timestamps are also saved in each stage's resolved config. Background execution passes its fixed end date and inferred input paths to the child so the window cannot shift at midnight or when newer artifacts appear.
 
 ClearML tracking and GCS model uploads use the existing pipeline. Model review and deployment remain manual. The [systemd setup](ops/systemd/README.md) provides a weekly timer and a service that updates a dedicated checkout to remote `main`, syncs its Pipenv environment, and runs this CLI in the foreground. Installation and timer activation are explicit steps; `config.yml` is never loaded implicitly.
 
