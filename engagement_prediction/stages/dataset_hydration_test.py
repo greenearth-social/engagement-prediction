@@ -21,6 +21,7 @@ from engagement_prediction.data import training_index
 from engagement_prediction.data import user_history
 from engagement_prediction.data.parquet import scan_parquet_artifact
 from engagement_prediction.pipeline import registry
+from engagement_prediction.pipeline.artifacts import PartialArtifactBundle
 from engagement_prediction.pipeline.core import Context
 from engagement_prediction.pipeline import logging as pipeline_logging
 
@@ -251,9 +252,11 @@ def _upstream(tmp_path: Path) -> Path:
     return stage6
 
 
+@pytest.mark.parametrize("max_liker_vocabulary_size", [100, 0])
 def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
     tmp_path,
     monkeypatch,
+    max_liker_vocabulary_size,
 ):
     stage6 = _upstream(tmp_path)
     monkeypatch.setattr(
@@ -279,6 +282,76 @@ def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
         "publish_embeddings_and_post_metadata",
         publish_after_releasing_intermediates,
     )
+    staging_roots = []
+    observed_phases = []
+
+    def observe_cleanup_before(function_name, retired_names):
+        original = getattr(dataset_hydration_artifacts, function_name)
+
+        def run_after_cleanup(**kwargs):
+            if not staging_roots:
+                staging_roots.append(kwargs["selected_metadata_path"].parent)
+            for name in retired_names:
+                assert not (staging_roots[0] / name).exists(), (function_name, name)
+            observed_phases.append(function_name)
+            return original(**kwargs)
+
+        monkeypatch.setattr(dataset_hydration_artifacts, function_name, run_after_cleanup)
+
+    # Inspect actual phase boundaries while running every data transformation.
+    # End-of-stage cleanup alone must not satisfy these peak-disk assertions.
+    phase_retirements = {
+        "materialize_selected_embedding_rows": ("selected_post_routes",),
+        "materialize_usage_routes": (
+            "selected_metadata", "valid_embedding_rows", "embedding_shards",
+        ),
+        "route_hydrated_usage_for_counts": (
+            "positive_routes", "history_routes", "negative_routes",
+        ),
+        "materialize_post_liker_use_windows": (
+            "hydrated_positives", "hydrated_histories", "hydrated_negatives",
+        ),
+        "build_post_liker_user_vocabulary": (
+            "liker_positive_routes", "liker_history_routes", "liker_negative_routes",
+            "post_liker_use_windows",
+        ),
+        "attach_post_liker_user_indices": (
+            "post_liker_support_routes", "post_liker_support_shards",
+            "selected_liker_support.parquet",
+        ),
+        "build_author_vocabulary": ("post_liker_feature_events",),
+        "publish_posts_with_author_indices": (
+            "author_exposure_routes", "eligible_author_shards",
+        ),
+        "attach_author_indices_to_usage": ("hydrated_post_metadata",),
+        "publish_query_artifacts": (
+            "counted_positives", "counted_histories", "counted_negatives",
+        ),
+        "publish_negative_candidates": (
+            "indexed_positives", "indexed_histories", "query_publication",
+        ),
+        "validate_public_bundle": ("indexed_negatives",),
+    }
+    for function_name, retired_names in phase_retirements.items():
+        observe_cleanup_before(function_name, retired_names)
+
+    build_loader_index = training_index.build_loader_index
+
+    def build_with_only_required_staging(**kwargs):
+        indexed_events_path = kwargs["indexed_post_liker_events_path"]
+        assert set(indexed_events_path.parent.iterdir()) == {indexed_events_path}
+        assert list(indexed_events_path.glob("*.parquet"))
+        return build_loader_index(**kwargs)
+
+    monkeypatch.setattr(training_index, "build_loader_index", build_with_only_required_staging)
+    publish = PartialArtifactBundle.publish
+
+    def publish_after_loader_inputs_released(self, **kwargs):
+        assert not list(self.staging_path.iterdir())
+        assert (self.partial_path / "loader_index" / "format.json").is_file()
+        return publish(self, **kwargs)
+
+    monkeypatch.setattr(PartialArtifactBundle, "publish", publish_after_loader_inputs_released)
     logger = pipeline_logging._stage_loggers.pop("07_DATASET_HYDRATION", None)
     if logger:
         for handler in logger.handlers:
@@ -300,7 +373,7 @@ def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
             dataset_hydration_worker_count=2,
             min_author_training_feature_count=1,
             min_post_liker_user_training_event_count=1,
-            max_post_liker_user_vocabulary_size=100,
+            max_post_liker_user_vocabulary_size=max_liker_vocabulary_size,
             _argv=["--stop-after", "dataset_hydration"],
         ),
     )
@@ -331,7 +404,7 @@ def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
     assert summary["embeddings"]["embedding_partition_worker_count"] == 1
     assert summary["parameters"]["min_author_training_feature_count"] == 1
     assert summary["parameters"]["min_post_liker_user_training_event_count"] == 1
-    assert summary["parameters"]["max_post_liker_user_vocabulary_size"] == 100
+    assert summary["parameters"]["max_post_liker_user_vocabulary_size"] == max_liker_vocabulary_size
     assert summary["author_vocabulary"]["training_positive_count"] == 1
     assert summary["author_vocabulary"]["training_history_count"] == 1
     assert summary["author_vocabulary"]["training_negative_count"] == 1
@@ -351,13 +424,14 @@ def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
     assert loader_format["format_version"] == training_index.FORMAT_VERSION
     assert summary["loader_index"]["format_version"] == training_index.FORMAT_VERSION
     assert loader_format["post_liker_event_count"] == 2
-    assert loader_format["post_liker_user_table_num_rows"] == 3
+    assert loader_format["post_liker_user_table_num_rows"] == (3 if max_liker_vocabulary_size else 2)
     post_liker_vocabulary = scan_parquet_artifact(
         Path(result["artifacts"]["post_liker_users_path"])
     ).collect()
-    assert post_liker_vocabulary.to_dicts() == [
+    expected_liker_vocabulary = [
         {"liker_did": "liker", "liker_idx": 2, "training_event_count": 2}
-    ]
+    ] if max_liker_vocabulary_size else []
+    assert post_liker_vocabulary.to_dicts() == expected_liker_vocabulary
     assert summary["loader_index"]["splits"]["train"] == {
         "query_count": 1,
         "history_count": 1,
@@ -388,9 +462,20 @@ def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
         "06_author_statistics",
     }
     assert not list(Path(result["output_dir"]).glob("*.partial"))
+    assert observed_phases == list(phase_retirements)
 
 
-def test_stage_failure_retains_partial_diagnostics_without_publishing(tmp_path, monkeypatch):
+@pytest.mark.parametrize(("function_name", "required_arguments"), [
+    ("write_embedding_shards", ("selected_embedding_rows_path",)),
+    ("attach_prior_counts", (
+        "positive_routes_path", "history_routes_path", "negative_routes_path",
+        "post_liker_use_windows_path",
+    )),
+    ("publish_query_artifacts", ("counted_positives_path", "counted_histories_path")),
+])
+def test_stage_failure_retains_partial_diagnostics_without_publishing(
+    tmp_path, monkeypatch, function_name, required_arguments,
+):
     stage6 = _upstream(tmp_path)
     logger = pipeline_logging._stage_loggers.pop("07_DATASET_HYDRATION", None)
     if logger:
@@ -404,15 +489,20 @@ def test_stage_failure_retains_partial_diagnostics_without_publishing(tmp_path, 
     )
     context.prior_outputs["06_author_statistics"] = stage6
 
-    def fail_embedding_partition(**kwargs):
-        raise RuntimeError("injected embedding partition failure")
+    required_paths = []
+
+    def fail_consumer(**kwargs):
+        required_paths.extend(kwargs[name] for name in required_arguments)
+        assert all(list(path.rglob("*.parquet")) for path in required_paths)
+        raise RuntimeError("injected consumer failure")
 
     monkeypatch.setattr(
-        "engagement_prediction.data.dataset_hydration_artifacts.write_embedding_shards",
-        fail_embedding_partition,
+        dataset_hydration_artifacts,
+        function_name,
+        fail_consumer,
     )
 
-    with pytest.raises(RuntimeError, match="injected embedding partition failure"):
+    with pytest.raises(RuntimeError, match="injected consumer failure"):
         registry.run_stage(
             "dataset_hydration",
             context,
@@ -437,6 +527,8 @@ def test_stage_failure_retains_partial_diagnostics_without_publishing(tmp_path, 
         if not path.name.endswith(".partial")
     ]
     assert list(stage7_dir.glob("hydrated_training_data_*.partial"))
+    assert required_paths
+    assert all(list(path.rglob("*.parquet")) for path in required_paths)
 
 
 def test_loader_index_failure_keeps_outer_bundle_partial(tmp_path, monkeypatch):
@@ -453,7 +545,15 @@ def test_loader_index_failure_keeps_outer_bundle_partial(tmp_path, monkeypatch):
     )
     context.prior_outputs["06_author_statistics"] = stage6
 
+    loader_input_paths = []
+
     def fail_loader_index(**kwargs):
+        loader_input_paths.extend([
+            kwargs["posts_path"],
+            kwargs["query_histories_path"],
+            kwargs["indexed_post_liker_events_path"],
+        ])
+        assert all(list(path.rglob("*.parquet")) for path in loader_input_paths)
         raise RuntimeError("injected loader-index failure")
 
     monkeypatch.setattr(training_index, "build_loader_index", fail_loader_index)
@@ -483,6 +583,8 @@ def test_loader_index_failure_keeps_outer_bundle_partial(tmp_path, monkeypatch):
         if not path.name.endswith(".partial")
     ]
     assert list(stage7_dir.glob("hydrated_training_data_*.partial"))
+    assert loader_input_paths
+    assert all(list(path.rglob("*.parquet")) for path in loader_input_paths)
 
 
 def test_stage_rejects_obsolete_indexed_stage6_schema(tmp_path):

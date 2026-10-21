@@ -8,8 +8,8 @@ content embeddings and creates the final NumPy memmap.
 The implementation uses several disk-backed layouts because different joins
 need different keys: Stage 00 URI partitions for post hydration, Stage 5 URI
 partitions for as-of liker counts, and Stage 2 DID partitions for rebuilding
-query histories. All temporary layouts live under the stage's partial staging
-directory and are removed before the public bundle is atomically published.
+query histories. Temporary layouts are removed after their last successful
+consumer; failures retain the partial bundle and remaining staging inputs.
 """
 
 from __future__ import annotations
@@ -331,6 +331,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         partition_count=stage3_partition_count,
         logger=logger,
     )
+    # Reclaim each layout only after its last consumer has materialized its
+    # outputs. Keep cleanup out of finally blocks so failed consumers retain
+    # their inputs for diagnosis.
+    shutil.rmtree(selected_routes_path)
 
     # Load selected URI keys once, then scan and filter payloads in bounded
     # multi-file batches. Full selected metadata remains partitioned for the
@@ -384,6 +388,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         embedding_dim=embedding_dim,
         partition_count=stage3_partition_count,
     )
+    shutil.rmtree(selected_metadata_path)
+    shutil.rmtree(valid_embedding_rows_path)
 
     # Missing embeddings remove individual uses without replacement. Queries
     # are dropped later only if every positive use disappeared.
@@ -413,6 +419,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         hydrated_negatives_path=hydrated_negatives_path,
         partition_count=stage3_partition_count,
     )
+    for path in (positive_routes_path, history_routes_path, negative_routes_path):
+        shutil.rmtree(path)
 
     # Stage 5 events are the source of truth for all roles. Recomputing counts
     # here gives one strict as-of contract and checks Stage 4 negative counts.
@@ -427,6 +435,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         output_paths=(liker_positive_routes, liker_history_routes, liker_negative_routes),
         partition_count=stage5_partition_count,
     )
+    for path in (hydrated_positives_path, hydrated_histories_path, hydrated_negatives_path):
+        shutil.rmtree(path)
     post_liker_use_windows_path = staging_root / "post_liker_use_windows"
     post_liker_use_window_stats = (
         dataset_hydration_artifacts.materialize_post_liker_use_windows(
@@ -455,6 +465,13 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         partition_count=stage5_partition_count,
         logger=logger,
     )
+    for path in (
+        liker_positive_routes,
+        liker_history_routes,
+        liker_negative_routes,
+        post_liker_use_windows_path,
+    ):
+        shutil.rmtree(path)
 
     logger.info(
         "Phase 7/11: building the training-only liker vocabulary and indexing events"
@@ -473,6 +490,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             logger=logger,
         )
     )
+    shutil.rmtree(post_liker_support_routes_path)
+    shutil.rmtree(post_liker_support_shards_path)
+    # The capped-support file is absent when no users enter the vocabulary.
+    (staging_root / "selected_liker_support.parquet").unlink(missing_ok=True)
     indexed_post_liker_events_path = staging_root / "indexed_post_liker_events"
     indexed_post_liker_event_stats = (
         dataset_hydration_artifacts.attach_post_liker_user_indices(
@@ -482,6 +503,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             partition_count=stage5_partition_count,
         )
     )
+    shutil.rmtree(post_liker_feature_events_path)
 
     logger.info(
         "Phase 8/11: building the training-exposure author vocabulary and applying indices"
@@ -500,6 +522,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         partition_count=author_partition_count,
         logger=logger,
     )
+    shutil.rmtree(author_exposure_routes_path)
+    shutil.rmtree(eligible_author_shards_path)
     authors_df = pl.read_parquet(sorted(authors_path.rglob("*.parquet")))
     post_index_stats = dataset_hydration_artifacts.publish_posts_with_author_indices(
         hydrated_post_metadata_path=hydrated_post_metadata_path,
@@ -507,6 +531,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         posts_path=posts_path,
         partition_count=stage3_partition_count,
     )
+    shutil.rmtree(hydrated_post_metadata_path)
     indexed_positives_path = staging_root / "indexed_positives"
     indexed_histories_path = staging_root / "indexed_histories"
     indexed_negatives_path = staging_root / "indexed_negatives"
@@ -524,6 +549,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         authors_df=authors_df,
         partition_count=stage5_partition_count,
     )
+    for path in (counted_positives_path, counted_histories_path, counted_negatives_path):
+        shutil.rmtree(path)
     post_stats = {**post_metadata_stats, **post_index_stats}
 
     # Histories were relationalized for filtering. Rebuild their lists using
@@ -539,11 +566,15 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         staging_path=staging_root / "query_publication",
         partition_count=stage2_partition_count,
     )
+    shutil.rmtree(indexed_positives_path)
+    shutil.rmtree(indexed_histories_path)
+    shutil.rmtree(staging_root / "query_publication")
     negative_stats = dataset_hydration_artifacts.publish_negative_candidates(
         counted_negatives_path=indexed_negatives_path,
         retained_query_hours=query_stats.pop("retained_query_hours"),
         output_path=negatives_path,
     )
+    shutil.rmtree(indexed_negatives_path)
     author_usage_by_split = (
         dataset_hydration_artifacts.summarize_author_index_usage_by_split(
             queries_path=queries_path,
@@ -581,6 +612,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         output_path=loader_index_path,
         logger=logger,
     )
+    # Liker events are the only staging input needed by the loader-index build.
+    # Its published arrays now own the training representation.
+    shutil.rmtree(indexed_post_liker_events_path)
     runtime_seconds = time.time() - started_at
     summary = {
         "parameters": {
@@ -693,7 +727,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                 for name, path in sorted(manifest_output_paths.items())
             ],
         ]) + "\n"
-    # Exceptions leave the partial bundle and diagnostic staging in place. The
+    # Exceptions leave the partial bundle and remaining diagnostic staging. The
     # registry writes the completed stage manifest only after this returns.
     publication.publish(
         summary=summary,
