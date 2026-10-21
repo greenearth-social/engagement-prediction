@@ -424,7 +424,7 @@ def _build_effective_config_for_background_run(
 def _generate_run_name(args: argparse.Namespace) -> str:
     stages_str = "all"
     if args.start_from is not None or args.stop_after is not None:
-        if args.start_from == args.stop_after:
+        if args.start_from is not None and args.start_from == args.stop_after:
             stages_str = args.start_from
         else:
             if args.start_from is None:
