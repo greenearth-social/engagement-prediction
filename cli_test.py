@@ -339,7 +339,7 @@ def test_query_sampling_defaults():
     assert merged.max_eval_query_hours_per_split == 500_000
     assert merged.max_positives_per_user_hour == 32
     assert merged.max_history_posts_per_query == 32
-    assert merged.user_history_partition_count == 16
+    assert merged.user_history_partition_count == 32
     assert merged.random_candidate_sampling_fraction == 0.10
     assert merged.source_metadata_partition_count == 16
     assert merged.data_partition_worker_count == 4

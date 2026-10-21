@@ -84,7 +84,7 @@ DEFAULTS: Dict[str, Any] = {
     "holdout_start_days_before_end": 3,
     # Stage 2: User history
     "max_history_posts_per_query": 32,
-    "user_history_partition_count": 8,
+    "user_history_partition_count": 32,
     # Stage 3: Post selection
     "random_candidate_sampling_fraction": 0.1,
     # Stage 4: Popularity-aware negative selection
