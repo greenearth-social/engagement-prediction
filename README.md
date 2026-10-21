@@ -70,13 +70,22 @@ Replace `eng-pred-gpu` with the dedicated queue your tasks use. Start the worker
 
 ClearML still checks out the task's code and applies its hyperparameter overrides, but dependencies come from the provisioned worker environment. It does not install the cloned task's recorded requirements or automatically consume `Pipfile.lock` in this mode. Both environment variables are required to prevent changes to the provisioned environment; stop the worker, sync the appropriate lockfile revision, and restart it when dependencies change. See the [ClearML environment variable reference](https://clear.ml/docs/latest/docs/clearml_agent/clearml_agent_env_var/).
 
-## Testing
+## Development Checks
 
-Run tests from this directory with the project Pipenv environment:
+For Python code changes, run Pyright and the relevant tests from this directory with the project Pipenv environment. To run the configured type checks and the full test suite:
 
 ```bash
+pipenv run pyright
 pipenv run pytest -q
 ```
+
+Pyright uses the `[tool.pyright]` settings in [pyproject.toml](pyproject.toml): Python 3.13, `standard` checking mode, and `cli.py` as the initial entry point. Imported project code may also be analyzed. When changing Python files outside the configured scope, check those files explicitly, for example:
+
+```bash
+pipenv run pyright engagement_prediction/stages/post_selection.py
+```
+
+CI runs the configured Pyright check before pytest using the CPU Pipenv environment. Report type-checking and test results separately, including existing diagnostics, failures, or checks that could not run.
 
 To keep pytest temporary files inside the repo:
 
