@@ -31,5 +31,8 @@ jobs:
       - name: Install env from lockfile
         run: pipenv sync --dev
 
+      - name: Type check (pyright)
+        run: pipenv run pyright
+
       - name: Run pytest
         run: pipenv run pytest

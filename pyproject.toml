@@ -1,0 +1,4 @@
+[tool.pyright]
+include = ["cli.py"]
+pythonVersion = "3.13"
+typeCheckingMode = "standard"
