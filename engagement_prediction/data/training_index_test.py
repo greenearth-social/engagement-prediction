@@ -235,6 +235,57 @@ def test_builds_exact_index_with_all_splits_and_relative_embedding_path(tmp_path
         assert table.take(np.array([1, 0])) == ["u2", "u1"]
 
 
+def test_build_without_post_liker_inputs_omits_replay_and_preserves_base_index(tmp_path, monkeypatch):
+    bundle, paths = _hydrated_inputs(tmp_path)
+    build_loader_index(**paths)
+    enabled_metadata = load_loader_index_metadata(paths["output_path"])
+
+    def unexpected_replay_build(**kwargs):
+        raise AssertionError("A bundle without replay inputs must not build replay arrays")
+
+    monkeypatch.setattr(training_index, "_write_global_post_liker_index", unexpected_replay_build)
+    disabled_path = bundle / "loader_index_without_post_likers"
+    stats = build_loader_index(**{
+        **paths,
+        "indexed_post_liker_events_path": None,
+        "post_liker_users_path": None,
+        "output_path": disabled_path,
+    })
+    metadata = load_loader_index_metadata(disabled_path)
+    validation = validate_loader_index(disabled_path)
+
+    assert stats["format_version"] == metadata["format_version"] == validation["format_version"] == 1
+    assert set(metadata["arrays"]) == set(training_index.V1_GLOBAL_ARRAY_DTYPES)
+    assert not list(disabled_path.glob("post_liker_*.npy"))
+    for key in ("post_liker_user_table_num_rows", "post_liker_event_count", "post_liker_post_count"):
+        assert key not in metadata
+        assert stats[key] == validation[key] == 0
+    assert metadata["embedding"] == enabled_metadata["embedding"]
+    assert metadata["author_table_num_rows"] == enabled_metadata["author_table_num_rows"]
+    assert metadata["splits"] == enabled_metadata["splits"]
+    assert metadata["arrow_tables"] == enabled_metadata["arrow_tables"]
+    for path in disabled_path.rglob("*.npy"):
+        np.testing.assert_array_equal(
+            np.load(path, allow_pickle=False),
+            np.load(paths["output_path"] / path.relative_to(disabled_path), allow_pickle=False),
+        )
+    assert stats["total_bytes"] < sum(
+        path.stat().st_size for path in paths["output_path"].rglob("*") if path.is_file()
+    )
+
+
+@pytest.mark.parametrize("missing_path", ["indexed_post_liker_events_path", "post_liker_users_path"])
+def test_build_rejects_incomplete_post_liker_inputs_before_creating_output(tmp_path, missing_path):
+    bundle, paths = _hydrated_inputs(tmp_path)
+    paths[missing_path] = None
+
+    with pytest.raises(ValueError, match="must both be provided or both be absent"):
+        build_loader_index(**paths)
+
+    assert not (bundle / "loader_index").exists()
+    assert not (bundle / "loader_index.partial").exists()
+
+
 def test_utf8_table_supports_multiple_batches_and_pickle_safe_lazy_reopen(tmp_path):
     path = tmp_path / "strings.arrow"
     schema = pa.schema([pa.field("value", pa.string(), nullable=False)])

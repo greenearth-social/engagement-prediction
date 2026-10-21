@@ -288,7 +288,12 @@ def test_embedding_shard_copy_validates_values_during_the_copy():
         )
 
 
-def test_prior_counts_read_each_usage_partition_once(tmp_path, monkeypatch):
+@pytest.mark.parametrize("prepare_post_liker_features", [True, False])
+def test_prior_counts_read_each_usage_partition_once(
+    tmp_path,
+    monkeypatch,
+    prepare_post_liker_features,
+):
     query_hour = datetime(2026, 1, 1, 2, tzinfo=UTC)
     route_paths = {
         "positive": tmp_path / "positive-routes",
@@ -345,16 +350,17 @@ def test_prior_counts_read_each_usage_partition_once(tmp_path, monkeypatch):
         "like_created_at": [datetime(2026, 1, 1, 1, tzinfo=UTC)],
     }).write_parquet(unused_event_part)
     use_windows_path = tmp_path / "post-liker-use-windows"
-    use_windows_partition = use_windows_path / "_post_partition=0"
-    use_windows_partition.mkdir(parents=True)
-    pl.DataFrame({
-        "subject_uri": ["shared", "negative"],
-        "emb_idx": [0, 1],
-        "final_use_query_hour": [query_hour, query_hour],
-        "final_training_use_query_hour": [query_hour, query_hour],
-    }, schema=post_liker_users.POST_LIKER_USE_WINDOW_SCHEMA).write_parquet(
-        use_windows_partition / "part.parquet"
-    )
+    if prepare_post_liker_features:
+        use_windows_partition = use_windows_path / "_post_partition=0"
+        use_windows_partition.mkdir(parents=True)
+        pl.DataFrame({
+            "subject_uri": ["shared", "negative"],
+            "emb_idx": [0, 1],
+            "final_use_query_hour": [query_hour, query_hour],
+            "final_training_use_query_hour": [query_hour, query_hour],
+        }, schema=post_liker_users.POST_LIKER_USE_WINDOW_SCHEMA).write_parquet(
+            use_windows_partition / "part.parquet"
+        )
 
     read_paths = []
     original_read_parquet = dataset_hydration_artifacts.pl.read_parquet
@@ -390,8 +396,10 @@ def test_prior_counts_read_each_usage_partition_once(tmp_path, monkeypatch):
         history_routes_path=route_paths["history"],
         negative_routes_path=route_paths["negative"],
         post_liker_events_path=events_path,
-        post_liker_use_windows_path=use_windows_path,
-        post_liker_feature_events_path=tmp_path / "post-liker-feature-events",
+        post_liker_use_windows_path=use_windows_path if prepare_post_liker_features else None,
+        post_liker_feature_events_path=(
+            tmp_path / "post-liker-feature-events" if prepare_post_liker_features else None
+        ),
         counted_positives_path=tmp_path / "counted-positives",
         counted_histories_path=tmp_path / "counted-histories",
         counted_negatives_path=tmp_path / "counted-negatives",
@@ -402,9 +410,9 @@ def test_prior_counts_read_each_usage_partition_once(tmp_path, monkeypatch):
     assert stats == {
         "post_query_hour_pair_count": 2,
         "raw_post_liker_event_count": 5,
-        "deduplicated_post_liker_event_count": 4,
-        "retained_post_liker_feature_event_count": 3,
-        "training_visible_post_liker_event_count": 3,
+        "deduplicated_post_liker_event_count": 4 if prepare_post_liker_features else 0,
+        "retained_post_liker_feature_event_count": 3 if prepare_post_liker_features else 0,
+        "training_visible_post_liker_event_count": 3 if prepare_post_liker_features else 0,
     }
     assert all(read_paths.count(path) == 1 for path in route_parts)
     assert read_paths.count(event_part) == 1
@@ -419,6 +427,11 @@ def test_prior_counts_read_each_usage_partition_once(tmp_path, monkeypatch):
     assert original_read_parquet(
         tmp_path / "counted-negatives" / "part-00000.parquet"
     ).get_column("prior_like_count").to_list() == [2]
+    if not prepare_post_liker_features:
+        # Raw duplicate events still contribute to all popularity counts above.
+        assert not use_windows_path.exists()
+        assert not (tmp_path / "post-liker-feature-events").exists()
+        return
     feature_events = original_read_parquet(
         tmp_path / "post-liker-feature-events" / "part-00000.parquet"
     )

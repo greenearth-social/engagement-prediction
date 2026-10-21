@@ -136,6 +136,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     embedding_source_batch_size = int(args.embedding_source_batch_size)
     dataset_hydration_worker_count = int(args.dataset_hydration_worker_count)
     min_author_training_feature_count = int(args.min_author_training_feature_count)
+    prepare_post_liker_features = bool(args.prepare_post_liker_features)
     min_post_liker_user_training_event_count = int(
         args.min_post_liker_user_training_event_count
     )
@@ -207,6 +208,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         "post_partitions=%s liker_partitions=%s user_partitions=%s "
         "author_partitions=%s embedding_source_batch_size=%s "
         "dataset_hydration_worker_count=%s min_author_training_feature_count=%s "
+        "prepare_post_liker_features=%s "
         "min_post_liker_user_training_event_count=%s "
         "max_post_liker_user_vocabulary_size=%s",
         source_start.isoformat(),
@@ -220,6 +222,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         embedding_source_batch_size,
         dataset_hydration_worker_count,
         min_author_training_feature_count,
+        prepare_post_liker_features,
         min_post_liker_user_training_event_count,
         max_post_liker_user_vocabulary_size,
     )
@@ -276,7 +279,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "query_histories": dataset_data.QUERY_HISTORY_SCHEMA,
             "hourly_negative_candidates": dataset_data.HOURLY_NEGATIVE_SCHEMA,
             "authors": author_vocabulary.AUTHOR_VOCABULARY_SCHEMA,
-            "post_liker_users": post_liker_users.POST_LIKER_USER_VOCABULARY_SCHEMA,
+            **({
+                "post_liker_users": post_liker_users.POST_LIKER_USER_VOCABULARY_SCHEMA,
+            } if prepare_post_liker_features else {}),
         },
     )
     bundle_path = publication.final_path
@@ -287,7 +292,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     histories_path = publication.public_path("query_histories")
     negatives_path = publication.public_path("hourly_negative_candidates")
     authors_path = publication.public_path("authors")
-    post_liker_users_path = publication.public_path("post_liker_users")
+    post_liker_users_path = (
+        publication.public_path("post_liker_users")
+        if prepare_post_liker_features else None
+    )
     loader_index_path = publication.public_path("loader_index")
     copied_manifests = []
     for prefix, manifest in (
@@ -424,9 +432,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     # Stage 5 events are the source of truth for all roles. Recomputing counts
     # here gives one strict as-of contract and checks Stage 4 negative counts.
-    logger.info(
-        "Phase 6/11: calculating strict as-of counts and retaining model-facing liker events"
-    )
+    logger.info("Phase 6/11: calculating strict as-of counts")
     liker_positive_routes = staging_root / "liker_positive_routes"
     liker_history_routes = staging_root / "liker_history_routes"
     liker_negative_routes = staging_root / "liker_negative_routes"
@@ -437,9 +443,15 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     )
     for path in (hydrated_positives_path, hydrated_histories_path, hydrated_negatives_path):
         shutil.rmtree(path)
-    post_liker_use_windows_path = staging_root / "post_liker_use_windows"
-    post_liker_use_window_stats = (
-        dataset_hydration_artifacts.materialize_post_liker_use_windows(
+    # Popularity always uses raw Stage 5 events. Replay preparation is optional
+    # and independent of whether a later training run enables the model feature.
+    post_liker_use_windows_path = None
+    post_liker_feature_events_path = None
+    post_liker_use_window_stats = None
+    if prepare_post_liker_features:
+        post_liker_use_windows_path = staging_root / "post_liker_use_windows"
+        post_liker_feature_events_path = staging_root / "post_liker_feature_events"
+        post_liker_use_window_stats = dataset_hydration_artifacts.materialize_post_liker_use_windows(
             queries_lf=queries_lf,
             positive_routes_path=liker_positive_routes,
             history_routes_path=liker_history_routes,
@@ -447,11 +459,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             output_path=post_liker_use_windows_path,
             partition_count=stage5_partition_count,
         )
-    )
     counted_positives_path = staging_root / "counted_positives"
     counted_histories_path = staging_root / "counted_histories"
     counted_negatives_path = staging_root / "counted_negatives"
-    post_liker_feature_events_path = staging_root / "post_liker_feature_events"
     count_stats = dataset_hydration_artifacts.attach_prior_counts(
         positive_routes_path=liker_positive_routes,
         history_routes_path=liker_history_routes,
@@ -469,17 +479,23 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         liker_positive_routes,
         liker_history_routes,
         liker_negative_routes,
-        post_liker_use_windows_path,
     ):
         shutil.rmtree(path)
+    if post_liker_use_windows_path is not None:
+        shutil.rmtree(post_liker_use_windows_path)
 
-    logger.info(
-        "Phase 7/11: building the training-only liker vocabulary and indexing events"
-    )
-    post_liker_support_routes_path = staging_root / "post_liker_support_routes"
-    post_liker_support_shards_path = staging_root / "post_liker_support_shards"
-    post_liker_vocabulary_stats = (
-        dataset_hydration_artifacts.build_post_liker_user_vocabulary(
+    post_liker_vocabulary_stats = None
+    indexed_post_liker_event_stats = None
+    indexed_post_liker_events_path = None
+    if prepare_post_liker_features:
+        assert post_liker_feature_events_path is not None
+        assert post_liker_users_path is not None
+        logger.info(
+            "Phase 7/11: building the training-only liker vocabulary and indexing events"
+        )
+        post_liker_support_routes_path = staging_root / "post_liker_support_routes"
+        post_liker_support_shards_path = staging_root / "post_liker_support_shards"
+        post_liker_vocabulary_stats = dataset_hydration_artifacts.build_post_liker_user_vocabulary(
             feature_events_path=post_liker_feature_events_path,
             support_routes_path=post_liker_support_routes_path,
             support_shards_path=post_liker_support_shards_path,
@@ -489,21 +505,20 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             partition_count=author_partition_count,
             logger=logger,
         )
-    )
-    shutil.rmtree(post_liker_support_routes_path)
-    shutil.rmtree(post_liker_support_shards_path)
-    # The capped-support file is absent when no users enter the vocabulary.
-    (staging_root / "selected_liker_support.parquet").unlink(missing_ok=True)
-    indexed_post_liker_events_path = staging_root / "indexed_post_liker_events"
-    indexed_post_liker_event_stats = (
-        dataset_hydration_artifacts.attach_post_liker_user_indices(
+        shutil.rmtree(post_liker_support_routes_path)
+        shutil.rmtree(post_liker_support_shards_path)
+        # The capped-support file is absent when no users enter the vocabulary.
+        (staging_root / "selected_liker_support.parquet").unlink(missing_ok=True)
+        indexed_post_liker_events_path = staging_root / "indexed_post_liker_events"
+        indexed_post_liker_event_stats = dataset_hydration_artifacts.attach_post_liker_user_indices(
             feature_events_path=post_liker_feature_events_path,
             vocabulary_path=post_liker_users_path,
             indexed_events_path=indexed_post_liker_events_path,
             partition_count=stage5_partition_count,
         )
-    )
-    shutil.rmtree(post_liker_feature_events_path)
+        shutil.rmtree(post_liker_feature_events_path)
+    else:
+        logger.info("Phase 7/11: skipping post-liker feature preparation (disabled)")
 
     logger.info(
         "Phase 8/11: building the training-exposure author vocabulary and applying indices"
@@ -615,7 +630,12 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     )
     # Liker events are the only staging input needed by the loader-index build.
     # Its published arrays now own the training representation.
-    shutil.rmtree(indexed_post_liker_events_path)
+    if indexed_post_liker_events_path is not None:
+        shutil.rmtree(indexed_post_liker_events_path)
+    post_liker_user_count = (
+        post_liker_vocabulary_stats["user_count"]
+        if post_liker_vocabulary_stats is not None else 0
+    )
     runtime_seconds = time.time() - started_at
     summary = {
         "parameters": {
@@ -624,6 +644,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "embedding_source_batch_size": embedding_source_batch_size,
             "dataset_hydration_worker_count": dataset_hydration_worker_count,
             "min_author_training_feature_count": min_author_training_feature_count,
+            "prepare_post_liker_features": prepare_post_liker_features,
             "min_post_liker_user_training_event_count": (
                 min_post_liker_user_training_event_count
             ),
@@ -674,9 +695,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "query_histories_path": str(Path(bundle_path.name) / "query_histories"),
             "hourly_negative_candidates_path": str(Path(bundle_path.name) / "hourly_negative_candidates"),
             "authors_path": str(Path(bundle_path.name) / "authors"),
-            "post_liker_users_path": str(
-                Path(bundle_path.name) / "post_liker_users"
-            ),
+            **({
+                "post_liker_users_path": str(Path(bundle_path.name) / "post_liker_users"),
+            } if prepare_post_liker_features else {}),
             "loader_index_path": str(Path(bundle_path.name) / "loader_index"),
             **{
                 name: str(Path(bundle_path.name) / path.name)
@@ -696,6 +717,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             f"{source_stats['embedding_source_worker_count']}",
             f"effective_embedding_partition_worker_count: {embedding_stats['embedding_partition_worker_count']}",
             f"min_author_training_feature_count: {min_author_training_feature_count}",
+            f"prepare_post_liker_features: {prepare_post_liker_features}",
             "min_post_liker_user_training_event_count: "
             f"{min_post_liker_user_training_event_count}",
             "max_post_liker_user_vocabulary_size: "
@@ -703,14 +725,14 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             f"hydrated_post_count: {post_stats['hydrated_post_count']}",
             f"author_vocabulary_count: {vocabulary_stats['eligible_author_count']}",
             f"author_table_num_rows: {vocabulary_stats['public_validation']['author_table_num_rows']}",
-            f"post_liker_user_vocabulary_count: {post_liker_vocabulary_stats['user_count']}",
-            f"post_liker_user_table_num_rows: {post_liker_vocabulary_stats['user_table_num_rows']}",
-            f"retained_post_liker_event_count: {indexed_post_liker_event_stats['event_count']}",
+            f"post_liker_user_vocabulary_count: {post_liker_user_count}",
+            f"post_liker_user_table_num_rows: {loader_index_stats['post_liker_user_table_num_rows']}",
+            f"retained_post_liker_event_count: {loader_index_stats['post_liker_event_count']}",
             f"retained_query_count: {query_stats['retained_query_count']}",
             f"retained_positive_count: {query_stats['retained_positive_count']}",
             f"retained_history_item_count: {query_stats['retained_history_item_count']}",
             f"retained_negative_count: {negative_stats['retained_negative_count']}",
-            f"loader_index_format_version: {training_index.FORMAT_VERSION}",
+            f"loader_index_format_version: {loader_index_stats['format_version']}",
             f"loader_index_total_bytes: {loader_index_stats['total_bytes']}",
             f"loader_index_build_time_seconds: {loader_index_stats['build_time_seconds']:.2f}",
             f"hydrated_training_data_path: {bundle_path.name}",
@@ -721,7 +743,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "query_histories_path: query_histories",
             "hourly_negative_candidates_path: hourly_negative_candidates",
             "authors_path: authors",
-            "post_liker_users_path: post_liker_users",
+            *(["post_liker_users_path: post_liker_users"] if prepare_post_liker_features else []),
             "loader_index_path: loader_index",
             *[
                 f"{name}: {path.name}"
@@ -743,8 +765,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         f"{query_stats['retained_history_item_count']:,}",
         f"{negative_stats['retained_negative_count']:,}",
         f"{vocabulary_stats['eligible_author_count']:,}",
-        f"{post_liker_vocabulary_stats['user_count']:,}",
-        f"{indexed_post_liker_event_stats['event_count']:,}",
+        f"{post_liker_user_count:,}",
+        f"{loader_index_stats['post_liker_event_count']:,}",
         f"{loader_index_stats['total_bytes']:,}",
     )
     return {
@@ -758,7 +780,9 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
             "query_histories_path": str(bundle_path / "query_histories"),
             "hourly_negative_candidates_path": str(bundle_path / "hourly_negative_candidates"),
             "authors_path": str(bundle_path / "authors"),
-            "post_liker_users_path": str(bundle_path / "post_liker_users"),
+            **({
+                "post_liker_users_path": str(bundle_path / "post_liker_users"),
+            } if prepare_post_liker_features else {}),
             "loader_index_path": str(bundle_path / "loader_index"),
             **{
                 name: str(path)

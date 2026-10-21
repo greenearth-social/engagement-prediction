@@ -151,7 +151,8 @@ class HydratedBucketedEngagementDataset(Dataset):
         if use_post_liker_feature and format_version < 2:
             raise ValueError(
                 "The BST post-liker feature requires Stage 7 loader-index format "
-                "version 2; regenerate Stage 7"
+                "version 2; regenerate Stage 7 with --prepare-post-liker-features "
+                "or train with --no-bst-use-post-liker-feature"
             )
 
         self.split = str(split)

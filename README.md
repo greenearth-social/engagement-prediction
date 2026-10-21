@@ -419,6 +419,8 @@ After missing-embedding filtering and zero-positive query attrition, Stage 7 cou
 
 Stage 7 also derives a bounded liker-user vocabulary from exact-deduplicated Stage 5 events that are strictly prior to at least one surviving training use of their post. Users with at least `min_post_liker_user_training_event_count` events (default `2`) compete for `max_post_liker_user_vocabulary_size` rows (default `1,000,000`) by descending support and DID tie-breaking. Selected DIDs receive dense indices from 2; all other valid events remain in the history as `1=UNK`. Events are retained only through each post's final surviving dataset use, while likes at or after a query hour remain unavailable to that query.
 
+`prepare_post_liker_features` defaults to `true` independently of `bst_use_post_liker_feature`. To save preparation time and disk space when training without liker features, pass `--no-prepare-post-liker-features --no-bst-use-post-liker-feature` (or set both config keys to `false`). Stage 7 then skips replay-event preparation, liker-vocabulary construction, and replay index arrays. Stage 5 still runs: its selected posts and raw events remain necessary for hydration and exact popularity counts. The resulting loader index uses format 1; preparing liker features uses format 2. Enabling liker features later requires rerunning Stage 7 with `--prepare-post-liker-features`. The preparation flag has no effect on a training-only run using an existing dataset.
+
 The atomically published `hydrated_training_data_*` bundle contains:
 
 - `embeddings.npy`: an exact-sized `Float32[N, embedding_dim]` NumPy memmap.
@@ -427,8 +429,8 @@ The atomically published `hydrated_training_data_*` bundle contains:
 - `query_histories/`: aligned like-time, embedding-index, and as-of-like-count lists. Each `history_emb_indices` entry resolves its URI and author index through `posts/`, where those values are stored once per post.
 - `hourly_negative_candidates/`: hydrated Stage 4 candidates and their selection source.
 - `authors/`: the Stage 7 vocabulary with dense `author_idx` plus total and positive/history/negative training-feature counts.
-- `post_liker_users/`: the bounded training-only liker vocabulary with `liker_did`, `liker_idx`, and training event support.
-- `loader_index/`: a versioned training projection with read-only NumPy memmaps for numeric query, history, positive, negative, post metadata, and timestamped post-liker events plus memory-mapped Arrow IPC identifier tables.
+- `post_liker_users/`: the bounded training-only liker vocabulary with `liker_did`, `liker_idx`, and training event support, present when `prepare_post_liker_features` is enabled.
+- `loader_index/`: a versioned training projection with read-only NumPy memmaps for numeric query, history, positive, negative, and post metadata plus memory-mapped Arrow IPC identifier tables. Timestamped post-liker event arrays are included when `prepare_post_liker_features` is enabled.
 - exact copied `post_sources_*`, `reply_sources_*`, and `like_sources_*` manifests.
 
 Rows without a valid embedding are removed without backfilling. Their individual history events and negative candidates disappear; positive labels disappear individually, and only queries left with no positive are dropped. Popularity is recomputed from all Stage 5 raw liker events with the strict `like_created_at < query_hour` rule, using the same cumulative hourly counts and backward as-of join as Stage 4. Stage 4 negative counts must agree exactly.
@@ -471,7 +473,7 @@ dataloader_prefetch_factor: 1
 dataloader_persistent_workers: false
 ```
 
-The BST ranker always fuses content embeddings, Stage 7 author indices, time-delta buckets, optional as-of popularity, and a candidate-aware transformer. By default it also replays each unique post's latest 128 strictly prior liker events and forms a time-decayed mean of learned liker-user embeddings. The raw pooled vector passes through its own Linear, GELU, and LayerNorm branch before fusion. Posts with no prior events use a zero raw vector. Author embeddings are mandatory for the canonical model.
+The BST ranker always fuses content embeddings, Stage 7 author indices, time-delta buckets, optional as-of popularity, and a candidate-aware transformer. With `--bst-use-post-liker-feature`, it also replays each unique post's latest 128 strictly prior liker events and forms a time-decayed mean of learned liker-user embeddings. The raw pooled vector passes through its own Linear, GELU, and LayerNorm branch before fusion. Posts with no prior events use a zero raw vector. Author embeddings are mandatory for the canonical model.
 
 ```bash
 pipenv run python cli.py --model-type bst-ranker \

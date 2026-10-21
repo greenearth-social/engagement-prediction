@@ -287,6 +287,45 @@ def test_dataset_hydration_args_merge_from_cli():
         ])
 
 
+@pytest.mark.parametrize(("config_value", "flags", "expected"), [
+    (False, [], False),
+    (False, ["--prepare-post-liker-features"], True),
+    (True, ["--no-prepare-post-liker-features"], False),
+])
+def test_post_liker_preparation_config_and_cli_precedence(tmp_path, config_value, flags, expected):
+    config_path = tmp_path / "preparation.yml"
+    config_path.write_text(f"prepare_post_liker_features: {str(config_value).lower()}\n")
+    merged = cli._merge_args_with_config(cli.build_parser().parse_args([
+        "--config", str(config_path), *flags,
+    ]))
+
+    assert merged.prepare_post_liker_features is expected
+    assert merged.bst_use_post_liker_feature == cli.DEFAULTS["bst_use_post_liker_feature"]
+
+
+def test_post_liker_preparation_flag_does_not_disable_training_on_prior_artifacts():
+    merged = cli._merge_args_with_config(cli.build_parser().parse_args([
+        "--start-from", "train_bst_ranker", "--no-prepare-post-liker-features",
+        "--bst-use-post-liker-feature",
+    ]))
+
+    cli._validate_bst_config(merged)
+
+    assert merged.prepare_post_liker_features is False
+    assert merged.bst_use_post_liker_feature is True
+
+
+@pytest.mark.parametrize("value", ["null", "0", '"false"'])
+def test_post_liker_preparation_rejects_non_boolean_config(tmp_path, value):
+    config_path = tmp_path / "preparation.yml"
+    config_path.write_text(f"prepare_post_liker_features: {value}\n")
+
+    with pytest.raises(ValueError, match="prepare_post_liker_features must be a boolean"):
+        cli._merge_args_with_config(cli.build_parser().parse_args([
+            "--config", str(config_path),
+        ]))
+
+
 def test_data_partition_worker_count_merges_from_cli():
     merged = cli._merge_args_with_config(
         cli.build_parser().parse_args(["--data-partition-worker-count", "8"])
@@ -352,6 +391,7 @@ def test_query_sampling_defaults():
     assert merged.embedding_source_batch_size == 64
     assert merged.dataset_hydration_worker_count == 8
     assert merged.min_author_training_feature_count == 50
+    assert merged.prepare_post_liker_features is True
     assert merged.min_post_liker_user_training_event_count == 10
     assert merged.max_post_liker_user_vocabulary_size == 10_000_000
 

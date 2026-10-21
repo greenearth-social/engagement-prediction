@@ -252,10 +252,13 @@ def _upstream(tmp_path: Path) -> Path:
     return stage6
 
 
-@pytest.mark.parametrize("max_liker_vocabulary_size", [100, 0])
+@pytest.mark.parametrize(("prepare_post_liker_features", "max_liker_vocabulary_size"), [
+    (True, 100), (True, 0), (False, 100),
+])
 def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
     tmp_path,
     monkeypatch,
+    prepare_post_liker_features,
     max_liker_vocabulary_size,
 ):
     stage6 = _upstream(tmp_path)
@@ -332,6 +335,19 @@ def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
         ),
         "validate_public_bundle": ("indexed_negatives",),
     }
+    if not prepare_post_liker_features:
+        def reject_replay_preparation(**kwargs):
+            raise AssertionError("Disabled post-liker preparation must not run")
+
+        for function_name in (
+            "materialize_post_liker_use_windows",
+            "build_post_liker_user_vocabulary",
+            "attach_post_liker_user_indices",
+        ):
+            del phase_retirements[function_name]
+            monkeypatch.setattr(
+                dataset_hydration_artifacts, function_name, reject_replay_preparation
+            )
     for function_name, retired_names in phase_retirements.items():
         observe_cleanup_before(function_name, retired_names)
 
@@ -339,8 +355,13 @@ def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
 
     def build_with_only_required_staging(**kwargs):
         indexed_events_path = kwargs["indexed_post_liker_events_path"]
-        assert set(indexed_events_path.parent.iterdir()) == {indexed_events_path}
-        assert list(indexed_events_path.glob("*.parquet"))
+        if prepare_post_liker_features:
+            assert set(indexed_events_path.parent.iterdir()) == {indexed_events_path}
+            assert list(indexed_events_path.glob("*.parquet"))
+        else:
+            assert indexed_events_path is None
+            assert kwargs["post_liker_users_path"] is None
+            assert not list(staging_roots[0].iterdir())
         return build_loader_index(**kwargs)
 
     monkeypatch.setattr(training_index, "build_loader_index", build_with_only_required_staging)
@@ -372,6 +393,7 @@ def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
             embedding_source_batch_size=64,
             dataset_hydration_worker_count=2,
             min_author_training_feature_count=1,
+            prepare_post_liker_features=prepare_post_liker_features,
             min_post_liker_user_training_event_count=1,
             max_post_liker_user_vocabulary_size=max_liker_vocabulary_size,
             _argv=["--stop-after", "dataset_hydration"],
@@ -407,6 +429,7 @@ def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
     assert summary["embedding_sources"]["embedding_source_worker_count"] == 2
     assert summary["embeddings"]["embedding_partition_worker_count"] == 1
     assert summary["parameters"]["min_author_training_feature_count"] == 1
+    assert summary["parameters"]["prepare_post_liker_features"] is prepare_post_liker_features
     assert summary["parameters"]["min_post_liker_user_training_event_count"] == 1
     assert summary["parameters"]["max_post_liker_user_vocabulary_size"] == max_liker_vocabulary_size
     assert summary["author_vocabulary"]["training_positive_count"] == 1
@@ -425,17 +448,26 @@ def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
     }
     loader_index_path = Path(result["artifacts"]["loader_index_path"])
     loader_format = json.loads((loader_index_path / "format.json").read_text())
-    assert loader_format["format_version"] == training_index.FORMAT_VERSION
-    assert summary["loader_index"]["format_version"] == training_index.FORMAT_VERSION
-    assert loader_format["post_liker_event_count"] == 2
-    assert loader_format["post_liker_user_table_num_rows"] == (3 if max_liker_vocabulary_size else 2)
-    post_liker_vocabulary = scan_parquet_artifact(
-        Path(result["artifacts"]["post_liker_users_path"])
-    ).collect()
-    expected_liker_vocabulary = [
-        {"liker_did": "liker", "liker_idx": 2, "training_event_count": 2}
-    ] if max_liker_vocabulary_size else []
-    assert post_liker_vocabulary.to_dicts() == expected_liker_vocabulary
+    expected_format = training_index.FORMAT_VERSION if prepare_post_liker_features else 1
+    assert loader_format["format_version"] == expected_format
+    assert summary["loader_index"]["format_version"] == expected_format
+    if prepare_post_liker_features:
+        assert loader_format["post_liker_event_count"] == 2
+        assert loader_format["post_liker_user_table_num_rows"] == (3 if max_liker_vocabulary_size else 2)
+        post_liker_vocabulary = scan_parquet_artifact(
+            Path(result["artifacts"]["post_liker_users_path"])
+        ).collect()
+        expected_liker_vocabulary = [
+            {"liker_did": "liker", "liker_idx": 2, "training_event_count": 2}
+        ] if max_liker_vocabulary_size else []
+        assert post_liker_vocabulary.to_dicts() == expected_liker_vocabulary
+    else:
+        assert not (loader_index_path.parent / "post_liker_users").exists()
+        assert not list(loader_index_path.glob("post_liker_*.npy"))
+        assert "post_liker_users_path" not in summary["outputs"]
+        assert summary["post_liker_use_windows"] is None
+        assert summary["post_liker_user_vocabulary"] is None
+        assert summary["indexed_post_liker_events"] is None
     assert summary["loader_index"]["splits"]["train"] == {
         "query_count": 1,
         "history_count": 1,
@@ -515,6 +547,7 @@ def test_stage_failure_retains_partial_diagnostics_without_publishing(
                 embedding_source_batch_size=64,
                 dataset_hydration_worker_count=2,
                 min_author_training_feature_count=1,
+                prepare_post_liker_features=True,
                 min_post_liker_user_training_event_count=1,
                 max_post_liker_user_vocabulary_size=100,
                 _argv=["--stop-after", "dataset_hydration"],
@@ -571,6 +604,7 @@ def test_loader_index_failure_keeps_outer_bundle_partial(tmp_path, monkeypatch):
                 embedding_source_batch_size=64,
                 dataset_hydration_worker_count=2,
                 min_author_training_feature_count=1,
+                prepare_post_liker_features=True,
                 min_post_liker_user_training_event_count=1,
                 max_post_liker_user_vocabulary_size=100,
                 _argv=["--stop-after", "dataset_hydration"],
@@ -617,6 +651,7 @@ def test_stage_rejects_obsolete_indexed_stage6_schema(tmp_path):
                 embedding_source_batch_size=64,
                 dataset_hydration_worker_count=2,
                 min_author_training_feature_count=1,
+                prepare_post_liker_features=True,
                 min_post_liker_user_training_event_count=1,
                 max_post_liker_user_vocabulary_size=100,
                 _argv=["--stop-after", "dataset_hydration"],

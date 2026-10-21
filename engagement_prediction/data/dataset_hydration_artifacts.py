@@ -992,8 +992,8 @@ def attach_prior_counts(
     history_routes_path: Path,
     negative_routes_path: Path,
     post_liker_events_path: Path,
-    post_liker_use_windows_path: Path,
-    post_liker_feature_events_path: Path,
+    post_liker_use_windows_path: Path | None,
+    post_liker_feature_events_path: Path | None,
     counted_positives_path: Path,
     counted_histories_path: Path,
     counted_negatives_path: Path,
@@ -1007,15 +1007,20 @@ def attach_prior_counts(
     cumulative event table is built once per URI partition, while each full
     usage partition is read, counted, and written sequentially. Negative counts
     are cross-checked against Stage 4 before its private column is discarded.
+    Omitting both replay paths skips feature preparation while preserving raw
+    event multiplicity for popularity counts.
     """
 
+    if (post_liker_use_windows_path is None) != (post_liker_feature_events_path is None):
+        raise ValueError("Post-liker use windows and feature output must be provided together")
     for path in (
         counted_positives_path,
         counted_histories_path,
         counted_negatives_path,
-        post_liker_feature_events_path,
     ):
         path.mkdir(parents=True, exist_ok=False)
+    if post_liker_feature_events_path is not None:
+        post_liker_feature_events_path.mkdir(parents=True, exist_ok=False)
     pair_count = 0
     raw_event_count = 0
     deduplicated_event_count = 0
@@ -1054,42 +1059,45 @@ def attach_prior_counts(
         # for all uses in this partition via the shared join-asof algorithm.
         cumulative_likes_df = like_counts.build_cumulative_like_counts(events_df)
 
-        window_parts = _partition_paths(post_liker_use_windows_path, partition_id)
-        windows_df = read_parquet_parts(
-            window_parts,
-            empty=post_liker_users.empty_frame(
-                post_liker_users.POST_LIKER_USE_WINDOW_SCHEMA
-            ),
-        )
-        deduplicated_events_df = events_df.unique(
-            ["subject_uri", "liker_did", "like_created_at"],
-            keep="first",
-        )
-        deduplicated_event_count += deduplicated_events_df.height
-        feature_events_df = (
-            deduplicated_events_df.join(windows_df, on="subject_uri", how="inner")
-            .filter(pl.col("like_created_at") < pl.col("final_use_query_hour"))
-            .with_columns(
-                (
-                    pl.col("final_training_use_query_hour").is_not_null()
-                    & (
-                        pl.col("like_created_at")
-                        < pl.col("final_training_use_query_hour")
-                    )
-                ).alias("is_training_visible")
+        if post_liker_feature_events_path is not None:
+            assert post_liker_use_windows_path is not None
+            window_parts = _partition_paths(post_liker_use_windows_path, partition_id)
+            windows_df = read_parquet_parts(
+                window_parts,
+                empty=post_liker_users.empty_frame(
+                    post_liker_users.POST_LIKER_USE_WINDOW_SCHEMA
+                ),
             )
-            .select(post_liker_users.POST_LIKER_FEATURE_EVENT_COLUMNS)
-            .sort("emb_idx", "like_created_at", "liker_did")
-        )
-        write_parquet_part_if_not_empty(
-            feature_events_df,
-            post_liker_feature_events_path / f"part-{partition_id:05d}.parquet",
-        )
-        retained_feature_event_count += feature_events_df.height
-        training_visible_event_count += int(
-            feature_events_df.get_column("is_training_visible").sum() or 0
-        )
-        del events_df, deduplicated_events_df, feature_events_df, windows_df
+            deduplicated_events_df = events_df.unique(
+                ["subject_uri", "liker_did", "like_created_at"],
+                keep="first",
+            )
+            deduplicated_event_count += deduplicated_events_df.height
+            feature_events_df = (
+                deduplicated_events_df.join(windows_df, on="subject_uri", how="inner")
+                .filter(pl.col("like_created_at") < pl.col("final_use_query_hour"))
+                .with_columns(
+                    (
+                        pl.col("final_training_use_query_hour").is_not_null()
+                        & (
+                            pl.col("like_created_at")
+                            < pl.col("final_training_use_query_hour")
+                        )
+                    ).alias("is_training_visible")
+                )
+                .select(post_liker_users.POST_LIKER_FEATURE_EVENT_COLUMNS)
+                .sort("emb_idx", "like_created_at", "liker_did")
+            )
+            write_parquet_part_if_not_empty(
+                feature_events_df,
+                post_liker_feature_events_path / f"part-{partition_id:05d}.parquet",
+            )
+            retained_feature_event_count += feature_events_df.height
+            training_visible_event_count += int(
+                feature_events_df.get_column("is_training_visible").sum() or 0
+            )
+            del deduplicated_events_df, feature_events_df, windows_df
+        del events_df
 
         pair_frames = []
         for parts, output_path, is_negative in relation_partitions:
@@ -1128,10 +1136,11 @@ def attach_prior_counts(
             partition_count,
             f"{partition_pair_count:,}",
         )
-    ensure_typed_parquet_dataset(
-        post_liker_feature_events_path,
-        post_liker_users.POST_LIKER_FEATURE_EVENT_SCHEMA,
-    )
+    if post_liker_feature_events_path is not None:
+        ensure_typed_parquet_dataset(
+            post_liker_feature_events_path,
+            post_liker_users.POST_LIKER_FEATURE_EVENT_SCHEMA,
+        )
     return {
         "post_query_hour_pair_count": pair_count,
         "raw_post_liker_event_count": raw_event_count,

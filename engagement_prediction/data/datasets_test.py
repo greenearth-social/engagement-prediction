@@ -29,7 +29,7 @@ def _write_dataset(path, name, df):
     df.write_parquet(dataset_path / "part-00000.parquet")
 
 
-def _bundle(tmp_path, *, many_negatives=False, legacy_history_columns=False):
+def _bundle(tmp_path, *, many_negatives=False, legacy_history_columns=False, prepare_post_liker_features=True):
     bundle = tmp_path / "hydrated_training_data_test"
     bundle.mkdir()
     hour = datetime(2026, 1, 1, 12, tzinfo=UTC)
@@ -117,20 +117,21 @@ def _bundle(tmp_path, *, many_negatives=False, legacy_history_columns=False):
         "authors",
         pl.DataFrame({"author_idx": list(range(2, len(post_uris) + 2))}),
     )
-    _write_dataset(
-        bundle,
-        "indexed_post_liker_events",
-        post_liker_users.empty_frame(
-            post_liker_users.INDEXED_POST_LIKER_EVENT_SCHEMA
-        ),
-    )
-    _write_dataset(
-        bundle,
-        "post_liker_users",
-        post_liker_users.empty_frame(
-            post_liker_users.POST_LIKER_USER_VOCABULARY_SCHEMA
-        ),
-    )
+    if prepare_post_liker_features:
+        _write_dataset(
+            bundle,
+            "indexed_post_liker_events",
+            post_liker_users.empty_frame(
+                post_liker_users.INDEXED_POST_LIKER_EVENT_SCHEMA
+            ),
+        )
+        _write_dataset(
+            bundle,
+            "post_liker_users",
+            post_liker_users.empty_frame(
+                post_liker_users.POST_LIKER_USER_VOCABULARY_SCHEMA
+            ),
+        )
     build_loader_index(
         posts_path=bundle / "posts",
         queries_path=bundle / "queries",
@@ -139,8 +140,8 @@ def _bundle(tmp_path, *, many_negatives=False, legacy_history_columns=False):
         hourly_negative_candidates_path=bundle / "hourly_negative_candidates",
         embeddings_path=bundle / "embeddings.npy",
         authors_path=bundle / "authors",
-        indexed_post_liker_events_path=bundle / "indexed_post_liker_events",
-        post_liker_users_path=bundle / "post_liker_users",
+        indexed_post_liker_events_path=(bundle / "indexed_post_liker_events" if prepare_post_liker_features else None),
+        post_liker_users_path=(bundle / "post_liker_users" if prepare_post_liker_features else None),
         output_path=bundle / "loader_index",
         logger=None,
     )
@@ -363,14 +364,39 @@ def test_feature_disabled_does_not_open_format_v2_post_liker_arrays(
     }.intersection(batch)
 
 
-def test_feature_enabled_requires_v2_index_and_positive_replay_cap(tmp_path):
-    bundle = _bundle(tmp_path)
-    metadata_path = bundle / "loader_index" / "format.json"
-    metadata = json.loads(metadata_path.read_text())
-    metadata["format_version"] = 1
-    metadata_path.write_text(json.dumps(metadata))
+@pytest.mark.parametrize("batch_method", ["collate_batch", "collate_two_tower_batch"])
+def test_unprepared_post_liker_features_preserve_non_replay_batches(tmp_path, batch_method):
+    prepared_root = tmp_path / "prepared"
+    unprepared_root = tmp_path / "unprepared"
+    prepared_root.mkdir()
+    unprepared_root.mkdir()
+    prepared_bundle = _bundle(prepared_root)
+    unprepared_bundle = _bundle(unprepared_root, prepare_post_liker_features=False)
+    assert not (unprepared_bundle / "post_liker_users").exists()
+    assert not (unprepared_bundle / "indexed_post_liker_events").exists()
+    assert not list((unprepared_bundle / "loader_index").glob("post_liker_*.npy"))
+    prepared = _dataset(prepared_bundle)
+    unprepared = _dataset(unprepared_bundle)
+    try:
+        assert prepared.loader_index_format_version == 2
+        assert unprepared.loader_index_format_version == 1
+        prepared_batch = getattr(prepared, batch_method)([prepared[0], prepared[1]])
+        unprepared_batch = getattr(unprepared, batch_method)([unprepared[0], unprepared[1]])
+        assert prepared_batch.keys() == unprepared_batch.keys()
+        for name, value in prepared_batch.items():
+            if isinstance(value, torch.Tensor):
+                torch.testing.assert_close(value, unprepared_batch[name], rtol=0, atol=0)
+            else:
+                assert value == unprepared_batch[name]
+    finally:
+        prepared.close()
+        unprepared.close()
 
-    with pytest.raises(ValueError, match="requires Stage 7 loader-index format"):
+
+def test_feature_enabled_requires_v2_index_and_positive_replay_cap(tmp_path):
+    bundle = _bundle(tmp_path, prepare_post_liker_features=False)
+
+    with pytest.raises(ValueError, match="--prepare-post-liker-features"):
         HydratedBucketedEngagementDataset(
             bundle,
             split="train",
