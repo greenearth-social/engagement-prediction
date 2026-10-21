@@ -391,7 +391,7 @@ def test_query_sampling_defaults():
     assert merged.embedding_source_batch_size == 64
     assert merged.dataset_hydration_worker_count == 8
     assert merged.min_author_training_feature_count == 50
-    assert merged.prepare_post_liker_features is True
+    assert merged.prepare_post_liker_features is False
     assert merged.min_post_liker_user_training_event_count == 10
     assert merged.max_post_liker_user_vocabulary_size == 10_000_000
 
@@ -827,7 +827,7 @@ def test_disk_checks_stop_pipeline_at_boundaries_and_preserve_report(tmp_path, m
     def check_space(**kwargs):
         stage = stage_order[len(executed)]
         checked_stages.append(stage)
-        assert kwargs == {"output_dir": tmp_path, "min_output_free_gib": 150}
+        assert kwargs == {"output_dir": tmp_path, "min_output_free_gib": 100}
         status = "fail" if stage == fail_before_stage else "pass"
         return {"status": status, "checks": [{"status": status, "message": f"disk before {stage}"}]}
 

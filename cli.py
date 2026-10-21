@@ -188,7 +188,7 @@ DEFAULTS: Dict[str, Any] = {
     "raw_data_warn_max_ratio": 3.0,
     "raw_data_warn_invalid_timestamp_fraction": 0.01,
     "disk_checks": False,
-    "min_free_output_gib": 150.0,
+    "min_free_output_gib": 100.0,
     # Optional offline holdout comparison against the deployed BST ranker.
     "compare_to_production": False,
     "production_gcp_project": "greenearth-471522",
