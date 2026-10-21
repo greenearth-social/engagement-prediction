@@ -803,19 +803,12 @@ def test_registry_run_writes_query_artifacts_and_manifest(tmp_path, monkeypatch)
     positives = pl.read_parquet(result["artifacts"]["query_positives_path"])
     like_sources = json.loads(Path(result["artifacts"]["like_sources_path"]).read_text())
     summary = json.loads((output_dir / "summary.json").read_text())
-    candidate_query_counts_paths = list(output_dir.glob("_candidate_query_counts_*.parquet"))
 
     assert output_dir.parent.name == "01_query_selection"
-    assert len(candidate_query_counts_paths) == 1
-    candidate_query_counts = pl.read_parquet(candidate_query_counts_paths[0])
-    assert candidate_query_counts.columns == [
-        "did",
-        "query_hour",
-        "user_cohort",
-        "split",
-        "raw_positive_count",
-    ]
-    assert candidate_query_counts["raw_positive_count"].to_list() == [2]
+    assert not list(output_dir.glob("_candidate_query_counts_*.parquet"))
+    assert "candidate_query_counts_file" not in summary["outputs"]
+    assert "candidate_query_counts_file:" not in (output_dir / "stage_info.txt").read_text()
+    assert summary["selection_stats"]["positive_count_distribution"]["candidate"]["train"] == {"2": 1}
     assert queries.columns == ["did", "query_hour", "user_cohort", "split", "positive_count"]
     assert positives.columns == ["did", "query_hour", "subject_uri", "like_created_at"]
     assert queries.height == 1
@@ -914,6 +907,13 @@ def test_partition_failure_does_not_publish_final_artifacts_or_manifest(tmp_path
     assert not list(output_dir.glob("queries_*.parquet"))
     assert not list(output_dir.glob("query_positives_*.parquet"))
     assert list(output_dir.glob("*.partial"))
+    candidate_query_counts_paths = list(output_dir.glob("_candidate_query_counts_*.parquet"))
+    assert len(candidate_query_counts_paths) == 1
+    candidate_query_counts = pl.read_parquet(candidate_query_counts_paths[0])
+    assert candidate_query_counts.columns == [
+        "did", "query_hour", "user_cohort", "split", "raw_positive_count",
+    ]
+    assert candidate_query_counts["raw_positive_count"].to_list() == [1]
 
 
 @pytest.fixture
@@ -976,6 +976,30 @@ def raw_likes_run(tmp_path, monkeypatch):
         tmp_path, posts_path
     )
     return context, args, tracker, like_paths
+
+
+@pytest.mark.parametrize("output_prefix", ["queries_", "query_positives_"])
+def test_final_output_write_failure_retains_candidate_counts(raw_likes_run, monkeypatch, output_prefix):
+    context, args, _, _ = raw_likes_run
+    write_parquet = pl.DataFrame.write_parquet
+
+    def fail_final_write(self, file, *args, **kwargs):
+        if Path(file).name.startswith(output_prefix):
+            raise OSError("final output write failed")
+        return write_parquet(self, file, *args, **kwargs)
+
+    monkeypatch.setattr(pl.DataFrame, "write_parquet", fail_final_write)
+
+    with pytest.raises(OSError, match="final output write failed"):
+        registry.run_stage("query_selection", context, args)
+
+    output_dirs = list((context.artifacts_dir / "01_query_selection").iterdir())
+    assert len(output_dirs) == 1
+    output_dir = output_dirs[0]
+    candidate_paths = list(output_dir.glob("_candidate_query_counts_*.parquet"))
+    assert len(candidate_paths) == 1
+    assert not pl.read_parquet(candidate_paths[0]).is_empty()
+    assert not (output_dir / "manifest.json").exists()
 
 
 def test_raw_likes_coverage_includes_duplicates_invalid_ids_and_warmup(raw_likes_run):
