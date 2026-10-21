@@ -577,6 +577,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     shutil.rmtree(indexed_negatives_path)
     author_usage_by_split = (
         dataset_hydration_artifacts.summarize_author_index_usage_by_split(
+            posts_path=posts_path,
             queries_path=queries_path,
             query_positives_path=positives_path,
             query_histories_path=histories_path,

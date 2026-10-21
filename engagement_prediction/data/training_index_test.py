@@ -90,7 +90,6 @@ def _hydrated_inputs(tmp_path):
         {
             "did": ["u2", "u1"],
             "query_hour": [hour, hour],
-            "history_subject_uris": [[], ["h1", "h1"]],
             "history_like_created_ats": [
                 [],
                 [
@@ -99,7 +98,6 @@ def _hydrated_inputs(tmp_path):
                 ],
             ],
             "history_emb_indices": [[], [2, 2]],
-            "history_author_indices": [[], [4, 4]],
             "history_prior_like_counts": [[], [3, 2]],
         },
         schema=dataset_hydration.QUERY_HISTORY_SCHEMA,
@@ -209,9 +207,13 @@ def test_builds_exact_index_with_all_splits_and_relative_embedding_path(tmp_path
     assert load_index_array(
         paths["output_path"], "history_offsets", split="train"
     ).tolist() == [0, 2, 2]
-    assert load_index_array(
+    history_emb_indices = load_index_array(
         paths["output_path"], "history_emb_indices", split="train"
-    ).tolist() == [2, 2]
+    )
+    assert history_emb_indices.tolist() == [2, 2]
+    assert load_index_array(
+        paths["output_path"], "post_author_idx"
+    )[history_emb_indices].tolist() == [4, 4]
     assert load_index_array(
         paths["output_path"], "positive_emb_indices", split="train"
     ).tolist() == [0, 1]
@@ -225,6 +227,7 @@ def test_builds_exact_index_with_all_splits_and_relative_embedding_path(tmp_path
         post_table_meta["batch_offsets"],
     ) as table:
         assert table.take([3, 0, 3]) == ["n1", "p1", "n1"]
+        assert table.take(history_emb_indices) == ["h1", "h1"]
     did_meta = metadata["splits"]["train"]["arrow_tables"]["query_dids"]
     with MemoryMappedUtf8Table(
         paths["output_path"] / did_meta["path"], did_meta["batch_offsets"]
@@ -350,10 +353,8 @@ def test_shared_query_hour_routes_negatives_to_each_split(tmp_path):
         pl.DataFrame({
             "did": ["val-user", "unseen-user"],
             "query_hour": [hour, hour],
-            "history_subject_uris": [[], []],
             "history_like_created_ats": [[], []],
             "history_emb_indices": [[], []],
-            "history_author_indices": [[], []],
             "history_prior_like_counts": [[], []],
         }, schema=dataset_hydration.QUERY_HISTORY_SCHEMA),
     ])

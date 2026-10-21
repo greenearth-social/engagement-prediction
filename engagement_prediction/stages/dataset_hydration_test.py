@@ -389,7 +389,11 @@ def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
     positives = scan_parquet_artifact(Path(result["artifacts"]["query_positives_path"])).collect()
     assert positives["prior_like_count"].to_list() == [1]
     histories = scan_parquet_artifact(Path(result["artifacts"]["query_histories_path"])).collect()
-    assert histories["history_subject_uris"].to_list() == [["reply"]]
+    assert histories.columns == dataset_hydration.QUERY_HISTORY_COLUMNS
+    assert "history_subject_uris" not in histories.columns
+    assert "history_author_indices" not in histories.columns
+    reply_emb_idx = posts.filter(pl.col("subject_uri") == "reply")["emb_idx"].item()
+    assert histories["history_emb_indices"].to_list() == [[reply_emb_idx]]
     negatives = scan_parquet_artifact(Path(result["artifacts"]["hourly_negative_candidates_path"])).collect()
     assert negatives["prior_like_count"].to_list() == [1]
     authors = scan_parquet_artifact(Path(result["artifacts"]["authors_path"])).collect()

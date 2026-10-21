@@ -158,10 +158,8 @@ def _native_bundle(tmp_path):
     _write_dataset(bundle, "query_histories", pl.DataFrame({
         "did": ["u1", "u2"],
         "query_hour": [hour, hour],
-        "history_subject_uris": [["h1"], []],
         "history_like_created_ats": [[datetime(2026, 1, 1, 10, tzinfo=timezone.utc)], []],
         "history_emb_indices": [[2], []],
-        "history_author_indices": [[4], []],
         "history_prior_like_counts": [[3], []],
     }, schema=dataset_hydration.QUERY_HISTORY_SCHEMA))
     _write_dataset(bundle, "hourly_negative_candidates", pl.DataFrame({

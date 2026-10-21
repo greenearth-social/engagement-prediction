@@ -29,7 +29,7 @@ def _write_dataset(path, name, df):
     df.write_parquet(dataset_path / "part-00000.parquet")
 
 
-def _bundle(tmp_path, *, many_negatives=False):
+def _bundle(tmp_path, *, many_negatives=False, legacy_history_columns=False):
     bundle = tmp_path / "hydrated_training_data_test"
     bundle.mkdir()
     hour = datetime(2026, 1, 1, 12, tzinfo=UTC)
@@ -85,16 +85,19 @@ def _bundle(tmp_path, *, many_negatives=False):
     histories = pl.DataFrame({
         "did": ["u1", "u2"],
         "query_hour": [hour, hour],
-        "history_subject_uris": [["h1", "h1", "h2"], []],
         "history_like_created_ats": [[
             datetime(2026, 1, 1, 10, 30, tzinfo=UTC),
             datetime(2026, 1, 1, 10, 0, tzinfo=UTC),
             datetime(2026, 1, 1, 9, 0, tzinfo=UTC),
         ], []],
         "history_emb_indices": [[emb_idx_by_uri["h1"], emb_idx_by_uri["h1"], emb_idx_by_uri["h2"]], []],
-        "history_author_indices": [[4, 4, 5], []],
         "history_prior_like_counts": [[3, 4, 5], []],
     }, schema=dataset_hydration.QUERY_HISTORY_SCHEMA)
+    if legacy_history_columns:
+        histories = histories.with_columns(
+            pl.Series("history_subject_uris", [["h1", "h1", "h2"], []], dtype=pl.List(pl.String)),
+            pl.Series("history_author_indices", [[4, 4, 5], []], dtype=pl.List(pl.UInt32)),
+        )
     negatives = pl.DataFrame({
         "query_hour": [hour] * len(negative_uris),
         "subject_uri": negative_uris,
@@ -226,6 +229,51 @@ def test_native_dataset_builds_parity_batch_from_memory_mapped_index(tmp_path):
         batch["candidate_post_embeddings"],
         torch.tensor([[1.0, -1.0], [2.0, -2.0], [5.0, -5.0]]),
     )
+
+
+def test_narrow_and_legacy_history_parquet_build_identical_indices_and_batches(tmp_path):
+    narrow_root = tmp_path / "narrow"
+    legacy_root = tmp_path / "legacy"
+    narrow_root.mkdir()
+    legacy_root.mkdir()
+    narrow_bundle = _bundle(narrow_root)
+    legacy_bundle = _bundle(legacy_root, legacy_history_columns=True)
+    narrow_schema = pl.read_parquet_schema(
+        narrow_bundle / "query_histories" / "part-00000.parquet"
+    )
+    assert "history_subject_uris" not in narrow_schema
+    assert "history_author_indices" not in narrow_schema
+
+    # Removing redundant Parquet columns must preserve the persisted loader
+    # contract as well as the tensors and identifiers consumed by training.
+    narrow_index = narrow_bundle / "loader_index"
+    legacy_index = legacy_bundle / "loader_index"
+    narrow_metadata = json.loads((narrow_index / "format.json").read_text())
+    assert narrow_metadata["format_version"] == 2
+    assert narrow_metadata == json.loads((legacy_index / "format.json").read_text())
+    narrow_arrays = {path.relative_to(narrow_index) for path in narrow_index.rglob("*.npy")}
+    legacy_arrays = {path.relative_to(legacy_index) for path in legacy_index.rglob("*.npy")}
+    assert narrow_arrays == legacy_arrays
+    for relative_path in narrow_arrays:
+        np.testing.assert_array_equal(
+            np.load(narrow_index / relative_path, allow_pickle=False),
+            np.load(legacy_index / relative_path, allow_pickle=False),
+        )
+
+    narrow_dataset = _dataset(narrow_bundle)
+    legacy_dataset = _dataset(legacy_bundle)
+    try:
+        narrow_batch = narrow_dataset.collate_batch([narrow_dataset[0], narrow_dataset[1]])
+        legacy_batch = legacy_dataset.collate_batch([legacy_dataset[0], legacy_dataset[1]])
+        assert narrow_batch.keys() == legacy_batch.keys()
+        for name, value in narrow_batch.items():
+            if isinstance(value, torch.Tensor):
+                torch.testing.assert_close(value, legacy_batch[name], rtol=0, atol=0)
+            else:
+                assert value == legacy_batch[name]
+    finally:
+        narrow_dataset.close()
+        legacy_dataset.close()
 
 
 def test_post_liker_collation_replays_each_unique_post_once_with_strict_as_of_cap(

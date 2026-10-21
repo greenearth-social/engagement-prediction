@@ -96,22 +96,20 @@ QUERY_POSITIVE_SCHEMA = {
     "prior_like_count": pl.UInt64,
 }
 
+# Embedding indices identify both URI and author through the canonical posts
+# table; histories retain only the features that vary per event or query.
 QUERY_HISTORY_COLUMNS = [
     "did",
     "query_hour",
-    "history_subject_uris",
     "history_like_created_ats",
     "history_emb_indices",
-    "history_author_indices",
     "history_prior_like_counts",
 ]
 QUERY_HISTORY_SCHEMA = {
     "did": pl.String,
     "query_hour": UTC_DATETIME,
-    "history_subject_uris": pl.List(pl.String),
     "history_like_created_ats": pl.List(UTC_DATETIME),
     "history_emb_indices": pl.List(pl.UInt32),
-    "history_author_indices": pl.List(pl.UInt32),
     "history_prior_like_counts": pl.List(pl.UInt64),
 }
 
@@ -392,6 +390,9 @@ def validate_query_histories(df: pl.DataFrame) -> None:
     """Validate aligned Stage 7 history lists, ordering, and as-of timing."""
 
     validate_frame(df, QUERY_HISTORY_SCHEMA, key=["did", "query_hour"])
+    embedding_indices = df.get_column("history_emb_indices")
+    if embedding_indices.null_count() or embedding_indices.explode(empty_as_null=False).null_count():
+        raise ValueError("Hydrated query histories contain a null embedding index")
     for row in df.iter_rows(named=True):
         lengths = {
             len(row[column])

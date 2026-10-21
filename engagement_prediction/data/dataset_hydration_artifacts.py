@@ -1612,9 +1612,9 @@ def publish_query_artifacts(
 
     History items carry an explicit original position through URI filtering
     and popularity attachment. Sorting on that position before aggregation
-    guarantees that URI, like-time, embedding, author, and count lists remain
-    aligned. Queries with empty histories remain valid; queries with no
-    surviving positive do not.
+    keeps like-time, embedding-index, and count lists aligned. URI and author
+    are recovered from the canonical posts table. Queries with empty histories
+    remain valid; queries with no surviving positive do not.
     """
     query_routes = staging_path / "queries"
     positive_routes = staging_path / "positives"
@@ -1638,7 +1638,10 @@ def publish_query_artifacts(
         positive_routes.mkdir(parents=True, exist_ok=False)
     if history_parts:
         sink_partitioned_parquet(
-            pl.scan_parquet(history_parts).with_columns(
+            pl.scan_parquet(history_parts).select(
+                "did", "query_hour", "_history_position", "like_created_at",
+                "emb_idx", "prior_like_count",
+            ).with_columns(
                 user_history.user_partition_expr(partition_count)
             ),
             output_path=history_routes,
@@ -1681,11 +1684,8 @@ def publish_query_artifacts(
                 "did": pl.String,
                 "query_hour": dataset_hydration.UTC_DATETIME,
                 "_history_position": pl.UInt32,
-                "subject_uri": pl.String,
                 "like_created_at": dataset_hydration.UTC_DATETIME,
                 "emb_idx": pl.UInt32,
-                "post_created_at": dataset_hydration.UTC_DATETIME,
-                "author_idx": pl.UInt32,
                 "prior_like_count": pl.UInt64,
             }),
         )
@@ -1715,10 +1715,8 @@ def publish_query_artifacts(
             "query_hour",
             maintain_order=True,
         ).agg(
-            pl.col("subject_uri").alias("history_subject_uris"),
             pl.col("like_created_at").alias("history_like_created_ats"),
             pl.col("emb_idx").alias("history_emb_indices"),
-            pl.col("author_idx").alias("history_author_indices"),
             pl.col("prior_like_count").alias("history_prior_like_counts"),
         )
         public_histories_df = (
@@ -1728,16 +1726,10 @@ def publish_query_artifacts(
                 how="left",
             )
             .with_columns(
-                pl.col("history_subject_uris").fill_null(
-                    pl.lit([], dtype=pl.List(pl.String))
-                ),
                 pl.col("history_like_created_ats").fill_null(
                     pl.lit([], dtype=pl.List(dataset_hydration.UTC_DATETIME))
                 ),
                 pl.col("history_emb_indices").fill_null(
-                    pl.lit([], dtype=pl.List(pl.UInt32))
-                ),
-                pl.col("history_author_indices").fill_null(
                     pl.lit([], dtype=pl.List(pl.UInt32))
                 ),
                 pl.col("history_prior_like_counts").fill_null(
@@ -1774,7 +1766,7 @@ def publish_query_artifacts(
         if public_histories_df.height:
             totals["retained_history_item_count"] += int(
                 public_histories_df.select(
-                    pl.col("history_subject_uris").list.len().sum()
+                    pl.col("history_emb_indices").list.len().sum()
                 ).item()
                 or 0
             )
@@ -1857,6 +1849,7 @@ def publish_negative_candidates(
 
 def summarize_author_index_usage_by_split(
     *,
+    posts_path: Path,
     queries_path: Path,
     query_positives_path: Path,
     query_histories_path: Path,
@@ -1867,22 +1860,29 @@ def summarize_author_index_usage_by_split(
     queries_lf = scan_parquet_artifact(queries_path).select(
         "did", "query_hour", "split"
     )
+    # Collapse repeated post uses before joining the narrow canonical mapping.
+    # The occurrence weights preserve re-likes and uses across different queries.
+    history_occurrences_lf = (
+        scan_parquet_artifact(query_histories_path)
+        .join(queries_lf, on=["did", "query_hour"], how="inner")
+        .select("split", pl.col("history_emb_indices").alias("emb_idx"))
+        .explode("emb_idx", empty_as_null=False)
+        .group_by("split", "emb_idx")
+        .agg(pl.len().cast(pl.UInt64).alias("feature_count"))
+        .join(
+            scan_parquet_artifact(posts_path).select("emb_idx", "author_idx"),
+            on="emb_idx",
+            how="left",
+        )
+        .select("split", "author_idx", "feature_count")
+    )
     role_frames = {
         "positive": (
             scan_parquet_artifact(query_positives_path)
             .join(queries_lf, on=["did", "query_hour"], how="inner")
-            .select("split", "author_idx")
+            .select("split", "author_idx", pl.lit(1, dtype=pl.UInt64).alias("feature_count"))
         ),
-        "history": (
-            scan_parquet_artifact(query_histories_path)
-            .join(queries_lf, on=["did", "query_hour"], how="inner")
-            .select(
-                "split",
-                pl.col("history_author_indices").alias("author_idx"),
-            )
-            .explode("author_idx", empty_as_null=True)
-            .filter(pl.col("author_idx").is_not_null())
-        ),
+        "history": history_occurrences_lf,
         "negative": (
             scan_parquet_artifact(hourly_negative_candidates_path)
             .join(
@@ -1890,7 +1890,7 @@ def summarize_author_index_usage_by_split(
                 on="query_hour",
                 how="inner",
             )
-            .select("split", "author_idx")
+            .select("split", "author_idx", pl.lit(1, dtype=pl.UInt64).alias("feature_count"))
         ),
     }
     result: dict[str, dict[str, int]] = {}
@@ -1898,8 +1898,10 @@ def summarize_author_index_usage_by_split(
         rows = (
             role_lf.group_by("split")
             .agg(
-                pl.len().alias("feature_count"),
-                (pl.col("author_idx") == AUTHOR_UNK_IDX)
+                pl.col("feature_count").sum(),
+                pl.when(pl.col("author_idx") == AUTHOR_UNK_IDX)
+                .then(pl.col("feature_count"))
+                .otherwise(0)
                 .sum()
                 .alias("unk_count"),
             )
@@ -1959,7 +1961,8 @@ def validate_public_bundle(
             key=["subject_uri"],
         )
         if posts_df.height and (
-            posts_df.get_column("author_idx").min() < AUTHOR_UNK_IDX
+            posts_df.get_column("author_idx").null_count()
+            or posts_df.get_column("author_idx").min() < AUTHOR_UNK_IDX
             or posts_df.get_column("author_idx").max() > max_author_idx
         ):
             raise ValueError("Hydrated posts contain an invalid author index")
@@ -2043,16 +2046,14 @@ def validate_public_bundle(
             ).drop_nulls()
             if values.len() and values.max() >= embedding_count:
                 raise ValueError("Hydrated query artifacts contain an invalid embedding index")
+        # Valid history embedding indices refer to the already-validated posts,
+        # so their author indices inherit the canonical mapping's validation.
         positive_author_indices = positives_df.get_column("author_idx")
-        history_author_indices = histories_df.get_column(
-            "history_author_indices"
-        ).explode(empty_as_null=True).drop_nulls()
-        for values in (positive_author_indices, history_author_indices):
-            if values.len() and (
-                values.min() < AUTHOR_UNK_IDX
-                or values.max() > max_author_idx
-            ):
-                raise ValueError("Hydrated query artifacts contain an invalid author index")
+        if positive_author_indices.len() and (
+            positive_author_indices.min() < AUTHOR_UNK_IDX
+            or positive_author_indices.max() > max_author_idx
+        ):
+            raise ValueError("Hydrated query artifacts contain an invalid author index")
         query_count += queries_df.height
         positive_count += positives_df.height
         history_query_count += histories_df.height

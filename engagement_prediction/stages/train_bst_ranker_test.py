@@ -135,7 +135,6 @@ def _stage7_fixture(tmp_path: Path) -> tuple[Path, Path]:
     histories = pl.DataFrame({
         "did": ["u1", "u2", "u3", "u4"],
         "query_hour": [train_hour, train_hour, val_hour, unseen_hour],
-        "history_subject_uris": [["h1", "h1"], [], ["h1"], ["h1"]],
         "history_like_created_ats": [
             [
                 datetime(2026, 1, 1, 10, tzinfo=timezone.utc),
@@ -146,7 +145,6 @@ def _stage7_fixture(tmp_path: Path) -> tuple[Path, Path]:
             [datetime(2026, 1, 1, 10, tzinfo=timezone.utc)],
         ],
         "history_emb_indices": [[2, 2], [], [2], [2]],
-        "history_author_indices": [[4, 4], [], [4], [4]],
         "history_prior_like_counts": [[0, 1], [], [100], [200]],
     }, schema=dataset_hydration.QUERY_HISTORY_SCHEMA)
     negatives = pl.DataFrame({

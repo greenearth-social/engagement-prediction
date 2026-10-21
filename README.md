@@ -424,7 +424,7 @@ The atomically published `hydrated_training_data_*` bundle contains:
 - `embeddings.npy`: an exact-sized `Float32[N, embedding_dim]` NumPy memmap.
 - `posts/`: the dense embedding index, creation metadata, PAD/UNK-aware author index, and selected-post role flags for each hydrated URI.
 - `queries/` and `query_positives/`: surviving Stage 1 queries and their hydrated positive labels.
-- `query_histories/`: aligned URI, like-time, embedding-index, author-index, and as-of-like-count lists.
+- `query_histories/`: aligned like-time, embedding-index, and as-of-like-count lists. Each `history_emb_indices` entry resolves its URI and author index through `posts/`, where those values are stored once per post.
 - `hourly_negative_candidates/`: hydrated Stage 4 candidates and their selection source.
 - `authors/`: the Stage 7 vocabulary with dense `author_idx` plus total and positive/history/negative training-feature counts.
 - `post_liker_users/`: the bounded training-only liker vocabulary with `liker_did`, `liker_idx`, and training event support.
