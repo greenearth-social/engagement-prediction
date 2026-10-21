@@ -176,3 +176,49 @@ def test_disabled_comparison_keeps_ordinary_pipeline_behavior(tmp_path, monkeypa
 
     assert cli.cmd__run_all_exec(args, context) == 0
     assert not (context.run_dir / "production_comparison").exists()
+
+
+@pytest.mark.parametrize(("candidate_history", "production_history"), [(64, 32), (32, 64)])
+@pytest.mark.parametrize(("embedding_model", "embedding_dim"), [
+    ("all_MiniLM_L12_v2", 384),
+    ("different-model", 384),
+    ("all_MiniLM_L12_v2", 768),
+])
+def test_holdout_validation_uses_pinned_dataset_and_both_model_contracts(
+    tmp_path, monkeypatch, candidate_history, production_history, embedding_model, embedding_dim,
+):
+    from engagement_prediction.evaluation import artifacts, production_comparison
+
+    args = comparison_args(tmp_path, "--start-from", "train")
+    args.max_history_len = candidate_history
+    dataset_dir = tmp_path / "artifacts" / "07_dataset_hydration" / "pinned-run"
+    context = cli.Context(
+        run_dir=tmp_path / "run", artifacts_dir=tmp_path / "artifacts",
+        prior_outputs={"07_dataset_hydration": dataset_dir},
+    )
+    production_model = SimpleNamespace(
+        max_history_len=production_history, embedding_model="all_MiniLM_L12_v2", embedding_dim=384,
+    )
+    dataset = SimpleNamespace(embedding_model=embedding_model, embedding_dim=embedding_dim)
+    resolved_paths = []
+    required_history_limits = []
+
+    def resolve_dataset(path):
+        resolved_paths.append(path)
+        return dataset
+
+    def validate_dataset(resolved, required_history_limit):
+        assert resolved is dataset
+        required_history_limits.append(required_history_limit)
+
+    monkeypatch.setattr(artifacts, "resolve_stage7_artifact", resolve_dataset)
+    monkeypatch.setattr(production_comparison, "validate_holdout_dataset", validate_dataset)
+
+    if (embedding_model, embedding_dim) == (production_model.embedding_model, production_model.embedding_dim):
+        cli._validate_production_comparison_dataset(args, context, production_model)
+    else:
+        with pytest.raises(ValueError, match="Holdout and production content embedding contracts disagree"):
+            cli._validate_production_comparison_dataset(args, context, production_model)
+
+    assert resolved_paths == [dataset_dir]
+    assert required_history_limits == [max(candidate_history, production_history)]

@@ -356,6 +356,8 @@ def _freeze_posts_end(args: argparse.Namespace) -> argparse.Namespace:
     pin_lineage_aligned_inputs(ctx, stages[start], stage_folders)
 
     source_dir = ctx.prior_outputs["00_source_metadata"]
+    # The lineage resolver populated this entry with a concrete artifact path.
+    assert source_dir is not None, "Resolved lineage must include Stage 0 source metadata"
     summary_path = source_dir / "summary.json"
     summary = json.loads(summary_path.read_text())
     from engagement_prediction.data import timestamps
@@ -517,7 +519,10 @@ def _validate_production_comparison_dataset(args: argparse.Namespace, ctx: Conte
     from engagement_prediction.evaluation.artifacts import resolve_stage7_artifact
     from engagement_prediction.evaluation.production_comparison import validate_holdout_dataset
 
-    dataset = resolve_stage7_artifact(ctx.prior_outputs["07_dataset_hydration"])
+    dataset_dir = ctx.prior_outputs["07_dataset_hydration"]
+    # Training inputs have already been pinned before this preflight check.
+    assert dataset_dir is not None, "Production comparison requires a pinned Stage 7 dataset"
+    dataset = resolve_stage7_artifact(dataset_dir)
     validate_holdout_dataset(dataset, max(args.max_history_len, production_model.max_history_len))
     if (dataset.embedding_model, dataset.embedding_dim) != (
         production_model.embedding_model, production_model.embedding_dim,
@@ -676,15 +681,6 @@ def cmd_run_all(args: argparse.Namespace) -> int:
         preview.update({key: getattr(resolved, key) for key in _date_fields_for_run(resolved)})
         print(json.dumps(preview, indent=2, sort_keys=True))
         return 0
-
-    train_key = _get_train_key(args.model_type)
-    stage_order = _get_stage_order_for_model_type(train_key)
-    start_idx, stop_idx, _ = _get_stage_folder_and_start_stop_indices(
-        stage_order,
-        args.start_from,
-        args.stop_after,
-        train_key,
-    )
 
     # Store the single timestamp in Context; for background runs we pass it via env.
     run_timestamp = (os.environ.get("ENGAGEMENT_RUN_TIMESTAMP") or "").strip() or generate_run_timestamp()
@@ -1078,6 +1074,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     # failures so their report describes the operation that actually failed.
     comparison_phase = None
     comparison_logger = None
+    production_snapshot = None
     try:
         # Revalidate after ClearML has applied any remote parameter overrides.
         _validate_checks_config(args)
@@ -1086,7 +1083,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
             comparison_phase = "configuration"
             _validate_production_comparison_config(args)
             comparison_phase = "production snapshot"
-            production_model, production_metadata = _prepare_production_comparison(args, ctx, comparison_logger)
+            production_snapshot = _prepare_production_comparison(args, ctx, comparison_logger)
             comparison_phase = None
         for idx, key in enumerate(stage_order):
             if idx < start_idx or idx > stop_idx:
@@ -1124,14 +1121,15 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
             label = label_map.get(key, f"Stage {idx+1}: {key}…")
             print(f"\n[{idx+1}/{len(stage_order)}] ▶️  {label}")
             pin_lineage_aligned_inputs(ctx, key, stage_folder)
-            if args.compare_to_production and key == train_key:
+            if production_snapshot is not None and key == train_key:
                 comparison_phase = "holdout validation"
-                _validate_production_comparison_dataset(args, ctx, production_model)
+                _validate_production_comparison_dataset(args, ctx, production_snapshot[0])
                 comparison_phase = None
             result = reg.run_stage(key, ctx, args)
-            if args.compare_to_production and key == train_key:
+            if production_snapshot is not None and key == train_key:
                 # The registry has now finalized the candidate's manifest.
                 comparison_phase = "evaluation and reporting"
+                production_model, production_metadata = production_snapshot
                 _run_production_comparison(
                     candidate_dir=result["output_dir"], production_model=production_model,
                     production_metadata=production_metadata, args=args, ctx=ctx, logger=comparison_logger,
