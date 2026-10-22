@@ -244,7 +244,31 @@ Disk checks require `min_free_output_gib` (150 GiB) on the actual output filesys
 
 Reports are written to the pipeline run directory as `raw_data_checks_source_metadata.json`, `raw_data_checks_query_selection.json`, and `disk_checks_<stage>.json`, and attached to ClearML when enabled. Reports include observed values, thresholds, and severity. Failures save their report and mark the ClearML task failed before raising, preventing downstream stages from running; warnings allow the run to continue. If ClearML reporting fails, the local report remains available and the check still fails. Raw-data checks only execute when their ingestion stages run, so reusing artifacts does not recheck their counts.
 
-Cleanup remains manual. Failed partial artifacts are retained for diagnosis. Large files live in `artifacts/`; deleting symlink views under `runs/` alone does not reclaim them.
+After Stage 7 completes, `ops/cleanup_preparation_artifacts.py` can remove the large preparation payloads in its recorded ancestors. Run it offline only when no process needs those inputs and no further preparation will reuse them, including other runs sharing the same ancestors. Pass the completed Stage 7 stage directory, or its run-view symlink, to the required `--stage7` argument. The nested `hydrated_training_data_*` bundle is not accepted.
+
+```bash
+# Preview the exact paths and sizes; dry-run is the default and writes nothing.
+pipenv run python ops/cleanup_preparation_artifacts.py \
+  --stage7 /mnt/data/dave/outputs/artifacts/07_dataset_hydration/STAGE_RUN_ID
+
+# Delete the previewed payloads.
+pipenv run python ops/cleanup_preparation_artifacts.py \
+  --stage7 /mnt/data/dave/outputs/artifacts/07_dataset_hydration/STAGE_RUN_ID --apply
+```
+
+The cleanup allowlist covers these payloads within the selected ancestors:
+
+| Stage | Removable payloads |
+| --- | --- |
+| 0 | `source_metadata_*/post_metadata/` |
+| 1 | `queries_*.parquet`, `query_positives_*.parquet`, and legacy `_candidate_query_counts_*.parquet` if present |
+| 2 | `query_histories_*/`, `history_post_uris_*/` |
+| 3 | `posts/`, `required_posts/`, `candidate_sources/`, `missing_required_posts/` inside `post_universe_*/` |
+| 5 | `post_liker_events/`, `post_liker_posts/` inside `post_liker_histories_*/` |
+
+Stages 4 and 6, all existing metadata, and the completed Stage 7 data remain intact. Applying cleanup writes `cleanup_preparation_report_<UTCtimestamp>_<id>.json` in the supplied Stage 7 directory as an audit record. No data-pruned marker is added: the retained manifests still allow earlier artifacts to be selected automatically, so subsequent preparation that selects them may fail because their payloads are gone. Stage 8 training can continue using the completed Stage 7 dataset and preserved lineage.
+
+Failed partial artifacts remain available for diagnosis. Large files live in `artifacts/`; deleting symlink views under `runs/` alone does not reclaim them.
 
 ### Stage 00: Source Metadata
 
