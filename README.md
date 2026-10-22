@@ -244,7 +244,31 @@ Disk checks require `min_free_output_gib` (150 GiB) on the actual output filesys
 
 Reports are written to the pipeline run directory as `raw_data_checks_source_metadata.json`, `raw_data_checks_query_selection.json`, and `disk_checks_<stage>.json`, and attached to ClearML when enabled. Reports include observed values, thresholds, and severity. Failures save their report and mark the ClearML task failed before raising, preventing downstream stages from running; warnings allow the run to continue. If ClearML reporting fails, the local report remains available and the check still fails. Raw-data checks only execute when their ingestion stages run, so reusing artifacts does not recheck their counts.
 
-Cleanup remains manual. Failed partial artifacts are retained for diagnosis. Large files live in `artifacts/`; deleting symlink views under `runs/` alone does not reclaim them.
+After Stage 7 completes, `ops/cleanup_preparation_artifacts.py` can remove the large preparation payloads in its recorded ancestors. Run it offline only when no process needs those inputs and no further preparation will reuse them, including other runs sharing the same ancestors. Pass the completed Stage 7 stage directory, or its run-view symlink, to the required `--stage7` argument. The nested `hydrated_training_data_*` bundle is not accepted.
+
+```bash
+# Preview the exact paths and sizes; dry-run is the default and writes nothing.
+pipenv run python ops/cleanup_preparation_artifacts.py \
+  --stage7 /mnt/data/dave/outputs/artifacts/07_dataset_hydration/STAGE_RUN_ID
+
+# Delete the previewed payloads.
+pipenv run python ops/cleanup_preparation_artifacts.py \
+  --stage7 /mnt/data/dave/outputs/artifacts/07_dataset_hydration/STAGE_RUN_ID --apply
+```
+
+The cleanup allowlist covers these payloads within the selected ancestors:
+
+| Stage | Removable payloads |
+| --- | --- |
+| 0 | `source_metadata_*/post_metadata/` |
+| 1 | `queries_*.parquet`, `query_positives_*.parquet`, and legacy `_candidate_query_counts_*.parquet` if present |
+| 2 | `query_histories_*/`, `history_post_uris_*/` |
+| 3 | `posts/`, `required_posts/`, `candidate_sources/`, `missing_required_posts/` inside `post_universe_*/` |
+| 5 | `post_liker_events/`, `post_liker_posts/` inside `post_liker_histories_*/` |
+
+Stages 4 and 6, all existing metadata, and the completed Stage 7 data remain intact. Applying cleanup writes `cleanup_preparation_report_<UTCtimestamp>_<id>.json` in the supplied Stage 7 directory as an audit record. No data-pruned marker is added: the retained manifests still allow earlier artifacts to be selected automatically, so subsequent preparation that selects them may fail because their payloads are gone. Stage 8 training can continue using the completed Stage 7 dataset and preserved lineage.
+
+Failed partial artifacts remain available for diagnosis. Large files live in `artifacts/`; deleting symlink views under `runs/` alone does not reclaim them.
 
 ### Stage 00: Source Metadata
 
@@ -419,16 +443,18 @@ After missing-embedding filtering and zero-positive query attrition, Stage 7 cou
 
 Stage 7 also derives a bounded liker-user vocabulary from exact-deduplicated Stage 5 events that are strictly prior to at least one surviving training use of their post. Users with at least `min_post_liker_user_training_event_count` events (default `2`) compete for `max_post_liker_user_vocabulary_size` rows (default `1,000,000`) by descending support and DID tie-breaking. Selected DIDs receive dense indices from 2; all other valid events remain in the history as `1=UNK`. Events are retained only through each post's final surviving dataset use, while likes at or after a query hour remain unavailable to that query.
 
+`prepare_post_liker_features` defaults to `true` independently of `bst_use_post_liker_feature`. To save preparation time and disk space when training without liker features, pass `--no-prepare-post-liker-features --no-bst-use-post-liker-feature` (or set both config keys to `false`). Stage 7 then skips replay-event preparation, liker-vocabulary construction, and replay index arrays. Stage 5 still runs: its selected posts and raw events remain necessary for hydration and exact popularity counts. The resulting loader index uses format 1; preparing liker features uses format 2. Enabling liker features later requires rerunning Stage 7 with `--prepare-post-liker-features`. The preparation flag has no effect on a training-only run using an existing dataset.
+
 The atomically published `hydrated_training_data_*` bundle contains:
 
 - `embeddings.npy`: an exact-sized `Float32[N, embedding_dim]` NumPy memmap.
 - `posts/`: the dense embedding index, creation metadata, PAD/UNK-aware author index, and selected-post role flags for each hydrated URI.
 - `queries/` and `query_positives/`: surviving Stage 1 queries and their hydrated positive labels.
-- `query_histories/`: aligned URI, like-time, embedding-index, author-index, and as-of-like-count lists.
+- `query_histories/`: aligned like-time, embedding-index, and as-of-like-count lists. Each `history_emb_indices` entry resolves its URI and author index through `posts/`, where those values are stored once per post.
 - `hourly_negative_candidates/`: hydrated Stage 4 candidates and their selection source.
 - `authors/`: the Stage 7 vocabulary with dense `author_idx` plus total and positive/history/negative training-feature counts.
-- `post_liker_users/`: the bounded training-only liker vocabulary with `liker_did`, `liker_idx`, and training event support.
-- `loader_index/`: a versioned training projection with read-only NumPy memmaps for numeric query, history, positive, negative, post metadata, and timestamped post-liker events plus memory-mapped Arrow IPC identifier tables.
+- `post_liker_users/`: the bounded training-only liker vocabulary with `liker_did`, `liker_idx`, and training event support, present when `prepare_post_liker_features` is enabled.
+- `loader_index/`: a versioned training projection with read-only NumPy memmaps for numeric query, history, positive, negative, and post metadata plus memory-mapped Arrow IPC identifier tables. Timestamped post-liker event arrays are included when `prepare_post_liker_features` is enabled.
 - exact copied `post_sources_*`, `reply_sources_*`, and `like_sources_*` manifests.
 
 Rows without a valid embedding are removed without backfilling. Their individual history events and negative candidates disappear; positive labels disappear individually, and only queries left with no positive are dropped. Popularity is recomputed from all Stage 5 raw liker events with the strict `like_created_at < query_hour` rule, using the same cumulative hourly counts and backward as-of join as Stage 4. Stage 4 negative counts must agree exactly.
@@ -471,7 +497,7 @@ dataloader_prefetch_factor: 1
 dataloader_persistent_workers: false
 ```
 
-The BST ranker always fuses content embeddings, Stage 7 author indices, time-delta buckets, optional as-of popularity, and a candidate-aware transformer. By default it also replays each unique post's latest 128 strictly prior liker events and forms a time-decayed mean of learned liker-user embeddings. The raw pooled vector passes through its own Linear, GELU, and LayerNorm branch before fusion. Posts with no prior events use a zero raw vector. Author embeddings are mandatory for the canonical model.
+The BST ranker always fuses content embeddings, Stage 7 author indices, time-delta buckets, optional as-of popularity, and a candidate-aware transformer. With `--bst-use-post-liker-feature`, it also replays each unique post's latest 128 strictly prior liker events and forms a time-decayed mean of learned liker-user embeddings. The raw pooled vector passes through its own Linear, GELU, and LayerNorm branch before fusion. Posts with no prior events use a zero raw vector. Author embeddings are mandatory for the canonical model.
 
 ```bash
 pipenv run python cli.py --model-type bst-ranker \

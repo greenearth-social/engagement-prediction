@@ -288,7 +288,12 @@ def test_embedding_shard_copy_validates_values_during_the_copy():
         )
 
 
-def test_prior_counts_read_each_usage_partition_once(tmp_path, monkeypatch):
+@pytest.mark.parametrize("prepare_post_liker_features", [True, False])
+def test_prior_counts_read_each_usage_partition_once(
+    tmp_path,
+    monkeypatch,
+    prepare_post_liker_features,
+):
     query_hour = datetime(2026, 1, 1, 2, tzinfo=UTC)
     route_paths = {
         "positive": tmp_path / "positive-routes",
@@ -345,16 +350,17 @@ def test_prior_counts_read_each_usage_partition_once(tmp_path, monkeypatch):
         "like_created_at": [datetime(2026, 1, 1, 1, tzinfo=UTC)],
     }).write_parquet(unused_event_part)
     use_windows_path = tmp_path / "post-liker-use-windows"
-    use_windows_partition = use_windows_path / "_post_partition=0"
-    use_windows_partition.mkdir(parents=True)
-    pl.DataFrame({
-        "subject_uri": ["shared", "negative"],
-        "emb_idx": [0, 1],
-        "final_use_query_hour": [query_hour, query_hour],
-        "final_training_use_query_hour": [query_hour, query_hour],
-    }, schema=post_liker_users.POST_LIKER_USE_WINDOW_SCHEMA).write_parquet(
-        use_windows_partition / "part.parquet"
-    )
+    if prepare_post_liker_features:
+        use_windows_partition = use_windows_path / "_post_partition=0"
+        use_windows_partition.mkdir(parents=True)
+        pl.DataFrame({
+            "subject_uri": ["shared", "negative"],
+            "emb_idx": [0, 1],
+            "final_use_query_hour": [query_hour, query_hour],
+            "final_training_use_query_hour": [query_hour, query_hour],
+        }, schema=post_liker_users.POST_LIKER_USE_WINDOW_SCHEMA).write_parquet(
+            use_windows_partition / "part.parquet"
+        )
 
     read_paths = []
     original_read_parquet = dataset_hydration_artifacts.pl.read_parquet
@@ -390,8 +396,10 @@ def test_prior_counts_read_each_usage_partition_once(tmp_path, monkeypatch):
         history_routes_path=route_paths["history"],
         negative_routes_path=route_paths["negative"],
         post_liker_events_path=events_path,
-        post_liker_use_windows_path=use_windows_path,
-        post_liker_feature_events_path=tmp_path / "post-liker-feature-events",
+        post_liker_use_windows_path=use_windows_path if prepare_post_liker_features else None,
+        post_liker_feature_events_path=(
+            tmp_path / "post-liker-feature-events" if prepare_post_liker_features else None
+        ),
         counted_positives_path=tmp_path / "counted-positives",
         counted_histories_path=tmp_path / "counted-histories",
         counted_negatives_path=tmp_path / "counted-negatives",
@@ -402,9 +410,9 @@ def test_prior_counts_read_each_usage_partition_once(tmp_path, monkeypatch):
     assert stats == {
         "post_query_hour_pair_count": 2,
         "raw_post_liker_event_count": 5,
-        "deduplicated_post_liker_event_count": 4,
-        "retained_post_liker_feature_event_count": 3,
-        "training_visible_post_liker_event_count": 3,
+        "deduplicated_post_liker_event_count": 4 if prepare_post_liker_features else 0,
+        "retained_post_liker_feature_event_count": 3 if prepare_post_liker_features else 0,
+        "training_visible_post_liker_event_count": 3 if prepare_post_liker_features else 0,
     }
     assert all(read_paths.count(path) == 1 for path in route_parts)
     assert read_paths.count(event_part) == 1
@@ -419,6 +427,11 @@ def test_prior_counts_read_each_usage_partition_once(tmp_path, monkeypatch):
     assert original_read_parquet(
         tmp_path / "counted-negatives" / "part-00000.parquet"
     ).get_column("prior_like_count").to_list() == [2]
+    if not prepare_post_liker_features:
+        # Raw duplicate events still contribute to all popularity counts above.
+        assert not use_windows_path.exists()
+        assert not (tmp_path / "post-liker-feature-events").exists()
+        return
     feature_events = original_read_parquet(
         tmp_path / "post-liker-feature-events" / "part-00000.parquet"
     )
@@ -783,9 +796,183 @@ def test_publish_query_artifacts_drops_only_queries_without_surviving_positives(
         "query_hour": first_hour,
         "positive_count": 1,
     }]
-    assert hydrated_histories.get_column("history_subject_uris").to_list() == [["h1", "h1"]]
+    assert hydrated_histories.columns == [
+        "did",
+        "query_hour",
+        "history_like_created_ats",
+        "history_emb_indices",
+        "history_prior_like_counts",
+    ]
+    assert hydrated_histories.schema == pl.Schema(dataset_hydration.QUERY_HISTORY_SCHEMA)
+    assert hydrated_histories.get_column("history_like_created_ats").to_list() == [[
+        datetime(2026, 1, 1, 11, tzinfo=UTC),
+        datetime(2026, 1, 1, 10, tzinfo=UTC),
+    ]]
     assert hydrated_histories.get_column("history_emb_indices").to_list() == [[1, 1]]
+    assert hydrated_histories.get_column("history_prior_like_counts").to_list() == [[5, 5]]
     assert stats["input_query_count"] == 2
     assert stats["retained_query_count"] == 1
     assert stats["dropped_zero_positive_query_count"] == 1
     assert stats["retained_query_hours"] == [first_hour]
+
+
+@pytest.fixture
+def compact_public_bundle(tmp_path):
+    train_hour = datetime(2026, 1, 1, 12, tzinfo=UTC)
+    val_hour = datetime(2026, 1, 1, 13, tzinfo=UTC)
+    created_at = datetime(2026, 1, 1, 8, tzinfo=UTC)
+    frames = {
+        "posts": pl.DataFrame({
+            "subject_uri": ["p0", "p1", "p2"],
+            "emb_idx": [0, 1, 2],
+            "post_created_at": [created_at] * 3,
+            "author_did": ["known-a", "unknown", "known-b"],
+            "author_idx": [2, 1, 3],
+            "is_reply": [False] * 3,
+            "is_positive": [True, True, False],
+            "is_history": [False, True, True],
+            "is_negative": [False, True, True],
+        }, schema=dataset_hydration.POST_SCHEMA),
+        "queries": pl.DataFrame({
+            "did": ["u1", "u2", "uv"],
+            "query_hour": [train_hour, train_hour, val_hour],
+            "user_cohort": ["seen"] * 3,
+            "split": ["train", "train", "val"],
+            "positive_count": [1] * 3,
+        }, schema=dataset_hydration.QUERY_SCHEMA),
+        "query_positives": pl.DataFrame({
+            "did": ["u1", "u2", "uv"],
+            "query_hour": [train_hour, train_hour, val_hour],
+            "subject_uri": ["p0", "p1", "p0"],
+            "like_created_at": [train_hour, train_hour, val_hour],
+            "emb_idx": [0, 1, 0],
+            "post_created_at": [created_at] * 3,
+            "author_idx": [2, 1, 2],
+            "prior_like_count": [2, 3, 4],
+        }, schema=dataset_hydration.QUERY_POSITIVE_SCHEMA),
+        "query_histories": pl.DataFrame({
+            "did": ["u1", "u2", "uv"],
+            "query_hour": [train_hour, train_hour, val_hour],
+            "history_like_created_ats": [[
+                datetime(2026, 1, 1, 11, tzinfo=UTC),
+                datetime(2026, 1, 1, 10, tzinfo=UTC),
+                datetime(2026, 1, 1, 9, tzinfo=UTC),
+            ], [], []],
+            "history_emb_indices": [[2, 1, 1], [], []],
+            "history_prior_like_counts": [[5, 3, 3], [], []],
+        }, schema=dataset_hydration.QUERY_HISTORY_SCHEMA),
+        "hourly_negative_candidates": pl.DataFrame({
+            "query_hour": [train_hour, val_hour],
+            "subject_uri": ["p2", "p1"],
+            "selection_source": ["popular", "random"],
+            "emb_idx": [2, 1],
+            "post_created_at": [created_at] * 2,
+            "author_idx": [3, 1],
+            "prior_like_count": [5, 3],
+        }, schema=dataset_hydration.HOURLY_NEGATIVE_SCHEMA),
+        "authors": pl.DataFrame({
+            "author_did": ["known-a", "known-b"],
+            "author_idx": [2, 3],
+            "training_feature_count": [1, 2],
+            "training_positive_count": [1, 0],
+            "training_history_count": [0, 1],
+            "training_negative_count": [0, 1],
+        }, schema=author_vocabulary.AUTHOR_VOCABULARY_SCHEMA),
+    }
+    for name, frame in frames.items():
+        _write_part(tmp_path / name, frame)
+    embeddings_path = tmp_path / "embeddings.npy"
+    np.save(embeddings_path, np.ones((3, 2), dtype=np.float32))
+    return {
+        **{f"{name}_path": tmp_path / name for name in frames},
+        "embeddings_path": embeddings_path,
+        "embedding_dim": 2,
+        "min_author_training_feature_count": 1,
+    }
+
+
+def test_author_usage_derives_history_authors_without_losing_duplicate_events(
+    compact_public_bundle,
+):
+    stats = dataset_hydration_artifacts.summarize_author_index_usage_by_split(
+        **{
+            name: compact_public_bundle[name]
+            for name in (
+                "posts_path",
+                "queries_path",
+                "query_positives_path",
+                "query_histories_path",
+                "hourly_negative_candidates_path",
+            )
+        }
+    )
+
+    # Both occurrences of the same UNK-authored post count. Empty lists add none.
+    assert stats == {
+        "train": {
+            "positive_feature_count": 2,
+            "positive_known_count": 1,
+            "positive_unk_count": 1,
+            "history_feature_count": 3,
+            "history_known_count": 1,
+            "history_unk_count": 2,
+            "negative_feature_count": 1,
+            "negative_known_count": 1,
+            "negative_unk_count": 0,
+        },
+        "val": {
+            "positive_feature_count": 1,
+            "positive_known_count": 1,
+            "positive_unk_count": 0,
+            "history_feature_count": 0,
+            "history_known_count": 0,
+            "history_unk_count": 0,
+            "negative_feature_count": 1,
+            "negative_known_count": 0,
+            "negative_unk_count": 1,
+        },
+    }
+
+
+def test_validate_public_bundle_accepts_compact_repeated_and_empty_histories(
+    compact_public_bundle,
+):
+    stats = dataset_hydration_artifacts.validate_public_bundle(**compact_public_bundle)
+
+    assert stats["embedding_count"] == 3
+    assert stats["query_count"] == 3
+    assert stats["history_query_count"] == 3
+
+
+@pytest.mark.parametrize("invalid_index", [3, None])
+def test_validate_public_bundle_rejects_invalid_compact_history_indices(
+    compact_public_bundle,
+    invalid_index,
+):
+    history_part = compact_public_bundle["query_histories_path"] / "part-00000.parquet"
+    histories = pl.read_parquet(history_part).with_columns(
+        pl.Series(
+            "history_emb_indices",
+            [[2, invalid_index, 1], [], []],
+            dtype=pl.List(pl.UInt32),
+        )
+    )
+    histories.write_parquet(history_part)
+
+    with pytest.raises(ValueError, match="embedding index"):
+        dataset_hydration_artifacts.validate_public_bundle(**compact_public_bundle)
+
+
+@pytest.mark.parametrize("invalid_author", [0, 4, None])
+def test_validate_public_bundle_rejects_invalid_canonical_history_author(
+    compact_public_bundle,
+    invalid_author,
+):
+    post_part = compact_public_bundle["posts_path"] / "part-00000.parquet"
+    posts = pl.read_parquet(post_part).with_columns(
+        pl.Series("author_idx", [2, 1, invalid_author], dtype=pl.UInt32)
+    )
+    posts.write_parquet(post_part)
+
+    with pytest.raises(ValueError, match="author index"):
+        dataset_hydration_artifacts.validate_public_bundle(**compact_public_bundle)

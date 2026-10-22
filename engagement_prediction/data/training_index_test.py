@@ -90,7 +90,6 @@ def _hydrated_inputs(tmp_path):
         {
             "did": ["u2", "u1"],
             "query_hour": [hour, hour],
-            "history_subject_uris": [[], ["h1", "h1"]],
             "history_like_created_ats": [
                 [],
                 [
@@ -99,7 +98,6 @@ def _hydrated_inputs(tmp_path):
                 ],
             ],
             "history_emb_indices": [[], [2, 2]],
-            "history_author_indices": [[], [4, 4]],
             "history_prior_like_counts": [[], [3, 2]],
         },
         schema=dataset_hydration.QUERY_HISTORY_SCHEMA,
@@ -209,9 +207,13 @@ def test_builds_exact_index_with_all_splits_and_relative_embedding_path(tmp_path
     assert load_index_array(
         paths["output_path"], "history_offsets", split="train"
     ).tolist() == [0, 2, 2]
-    assert load_index_array(
+    history_emb_indices = load_index_array(
         paths["output_path"], "history_emb_indices", split="train"
-    ).tolist() == [2, 2]
+    )
+    assert history_emb_indices.tolist() == [2, 2]
+    assert load_index_array(
+        paths["output_path"], "post_author_idx"
+    )[history_emb_indices].tolist() == [4, 4]
     assert load_index_array(
         paths["output_path"], "positive_emb_indices", split="train"
     ).tolist() == [0, 1]
@@ -225,11 +227,63 @@ def test_builds_exact_index_with_all_splits_and_relative_embedding_path(tmp_path
         post_table_meta["batch_offsets"],
     ) as table:
         assert table.take([3, 0, 3]) == ["n1", "p1", "n1"]
+        assert table.take(history_emb_indices) == ["h1", "h1"]
     did_meta = metadata["splits"]["train"]["arrow_tables"]["query_dids"]
     with MemoryMappedUtf8Table(
         paths["output_path"] / did_meta["path"], did_meta["batch_offsets"]
     ) as table:
         assert table.take(np.array([1, 0])) == ["u2", "u1"]
+
+
+def test_build_without_post_liker_inputs_omits_replay_and_preserves_base_index(tmp_path, monkeypatch):
+    bundle, paths = _hydrated_inputs(tmp_path)
+    build_loader_index(**paths)
+    enabled_metadata = load_loader_index_metadata(paths["output_path"])
+
+    def unexpected_replay_build(**kwargs):
+        raise AssertionError("A bundle without replay inputs must not build replay arrays")
+
+    monkeypatch.setattr(training_index, "_write_global_post_liker_index", unexpected_replay_build)
+    disabled_path = bundle / "loader_index_without_post_likers"
+    stats = build_loader_index(**{
+        **paths,
+        "indexed_post_liker_events_path": None,
+        "post_liker_users_path": None,
+        "output_path": disabled_path,
+    })
+    metadata = load_loader_index_metadata(disabled_path)
+    validation = validate_loader_index(disabled_path)
+
+    assert stats["format_version"] == metadata["format_version"] == validation["format_version"] == 1
+    assert set(metadata["arrays"]) == set(training_index.V1_GLOBAL_ARRAY_DTYPES)
+    assert not list(disabled_path.glob("post_liker_*.npy"))
+    for key in ("post_liker_user_table_num_rows", "post_liker_event_count", "post_liker_post_count"):
+        assert key not in metadata
+        assert stats[key] == validation[key] == 0
+    assert metadata["embedding"] == enabled_metadata["embedding"]
+    assert metadata["author_table_num_rows"] == enabled_metadata["author_table_num_rows"]
+    assert metadata["splits"] == enabled_metadata["splits"]
+    assert metadata["arrow_tables"] == enabled_metadata["arrow_tables"]
+    for path in disabled_path.rglob("*.npy"):
+        np.testing.assert_array_equal(
+            np.load(path, allow_pickle=False),
+            np.load(paths["output_path"] / path.relative_to(disabled_path), allow_pickle=False),
+        )
+    assert stats["total_bytes"] < sum(
+        path.stat().st_size for path in paths["output_path"].rglob("*") if path.is_file()
+    )
+
+
+@pytest.mark.parametrize("missing_path", ["indexed_post_liker_events_path", "post_liker_users_path"])
+def test_build_rejects_incomplete_post_liker_inputs_before_creating_output(tmp_path, missing_path):
+    bundle, paths = _hydrated_inputs(tmp_path)
+    paths[missing_path] = None
+
+    with pytest.raises(ValueError, match="must both be provided or both be absent"):
+        build_loader_index(**paths)
+
+    assert not (bundle / "loader_index").exists()
+    assert not (bundle / "loader_index.partial").exists()
 
 
 def test_utf8_table_supports_multiple_batches_and_pickle_safe_lazy_reopen(tmp_path):
@@ -350,10 +404,8 @@ def test_shared_query_hour_routes_negatives_to_each_split(tmp_path):
         pl.DataFrame({
             "did": ["val-user", "unseen-user"],
             "query_hour": [hour, hour],
-            "history_subject_uris": [[], []],
             "history_like_created_ats": [[], []],
             "history_emb_indices": [[], []],
-            "history_author_indices": [[], []],
             "history_prior_like_counts": [[], []],
         }, schema=dataset_hydration.QUERY_HISTORY_SCHEMA),
     ])

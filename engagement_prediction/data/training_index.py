@@ -1292,14 +1292,17 @@ def build_loader_index(
     hourly_negative_candidates_path: Path,
     embeddings_path: Path,
     authors_path: Path,
-    indexed_post_liker_events_path: Path,
-    post_liker_users_path: Path,
+    indexed_post_liker_events_path: Path | None,
+    post_liker_users_path: Path | None,
     output_path: Path,
     logger: logging.Logger | None,
 ) -> dict[str, Any]:
-    """Build, validate, and atomically publish a compact Stage 7 loader index."""
+    """Build a v2 replay index, or a v1 index when both replay inputs are absent."""
 
     started_at = time.time()
+    if (indexed_post_liker_events_path is None) != (post_liker_users_path is None):
+        raise ValueError("Post-liker event and vocabulary paths must both be provided or both be absent")
+    format_version = 1 if indexed_post_liker_events_path is None else FORMAT_VERSION
     output_path = Path(output_path)
     partial_path = output_path.with_name(f"{output_path.name}.partial")
     if output_path.exists():
@@ -1343,7 +1346,7 @@ def build_loader_index(
     if logger:
         logger.info(
             "Building loader index v%s: posts=%s embeddings=%s dim=%s",
-            FORMAT_VERSION,
+            format_version,
             f"{post_count:,}",
             f"{embedding_count:,}",
             f"{embedding_dim:,}",
@@ -1360,51 +1363,58 @@ def build_loader_index(
         .item()
     )
     author_table_num_rows = max(int(author_max or 1) + 1, 2)
-    post_liker_user_stats = (
-        scan_parquet_artifact(Path(post_liker_users_path))
-        .select(
-            pl.len().alias("user_count"),
-            pl.col("liker_idx").min().alias("min_liker_idx"),
-            pl.col("liker_idx").max().alias("max_liker_idx"),
-            pl.col("liker_idx").n_unique().alias("unique_liker_idx_count"),
+    post_liker_user_table_num_rows = 0
+    post_liker_event_count = 0
+    post_liker_post_count = 0
+    if indexed_post_liker_events_path is not None and post_liker_users_path is not None:
+        post_liker_user_stats = (
+            scan_parquet_artifact(Path(post_liker_users_path))
+            .select(
+                pl.len().alias("user_count"),
+                pl.col("liker_idx").min().alias("min_liker_idx"),
+                pl.col("liker_idx").max().alias("max_liker_idx"),
+                pl.col("liker_idx").n_unique().alias("unique_liker_idx_count"),
+            )
+            .collect(engine="streaming")
+            .row(0, named=True)
         )
-        .collect(engine="streaming")
-        .row(0, named=True)
-    )
-    post_liker_user_count = int(post_liker_user_stats["user_count"])
-    if post_liker_user_count and (
-        int(post_liker_user_stats["min_liker_idx"]) != 2
-        or int(post_liker_user_stats["max_liker_idx"]) != post_liker_user_count + 1
-        or int(post_liker_user_stats["unique_liker_idx_count"])
-        != post_liker_user_count
-    ):
-        raise ValueError("Stage 7 post-liker user indices must be unique and dense from 2")
-    post_liker_user_table_num_rows = post_liker_user_count + 2
-    indexed_event_parts = sorted(Path(indexed_post_liker_events_path).glob("*.parquet"))
-    liker_arrays, post_liker_event_count, post_liker_post_count = (
-        _write_global_post_liker_index(
-            root=partial_path,
-            event_parts=indexed_event_parts,
-            embedding_count=embedding_count,
-            user_table_num_rows=post_liker_user_table_num_rows,
+        post_liker_user_count = int(post_liker_user_stats["user_count"])
+        if post_liker_user_count and (
+            int(post_liker_user_stats["min_liker_idx"]) != 2
+            or int(post_liker_user_stats["max_liker_idx"]) != post_liker_user_count + 1
+            or int(post_liker_user_stats["unique_liker_idx_count"])
+            != post_liker_user_count
+        ):
+            raise ValueError("Stage 7 post-liker user indices must be unique and dense from 2")
+        post_liker_user_table_num_rows = post_liker_user_count + 2
+        indexed_event_parts = sorted(Path(indexed_post_liker_events_path).glob("*.parquet"))
+        liker_arrays, post_liker_event_count, post_liker_post_count = (
+            _write_global_post_liker_index(
+                root=partial_path,
+                event_parts=indexed_event_parts,
+                embedding_count=embedding_count,
+                user_table_num_rows=post_liker_user_table_num_rows,
+            )
         )
-    )
-    arrays.update(liker_arrays)
+        arrays.update(liker_arrays)
     metadata: dict[str, Any] = {
-        "format_version": FORMAT_VERSION,
+        "format_version": format_version,
         "embedding": {
             "path": os.path.relpath(Path(embeddings_path).resolve(), partial_path.resolve()),
             "dtype": EMBEDDING_DTYPE.str,
             "shape": [embedding_count, embedding_dim],
         },
         "author_table_num_rows": author_table_num_rows,
-        "post_liker_user_table_num_rows": post_liker_user_table_num_rows,
-        "post_liker_event_count": post_liker_event_count,
-        "post_liker_post_count": post_liker_post_count,
         "arrays": arrays,
         "arrow_tables": arrow_tables,
         "splits": {},
     }
+    if format_version >= 2:
+        metadata.update({
+            "post_liker_user_table_num_rows": post_liker_user_table_num_rows,
+            "post_liker_event_count": post_liker_event_count,
+            "post_liker_post_count": post_liker_post_count,
+        })
     if logger:
         logger.info("Routing loader-index queries and negatives once across all splits")
     split_relations = _prepare_all_split_relations(
@@ -1435,7 +1445,7 @@ def build_loader_index(
         path.stat().st_size for path in output_path.rglob("*") if path.is_file()
     )
     stats = {
-        "format_version": FORMAT_VERSION,
+        "format_version": format_version,
         "output_path": str(output_path),
         "total_bytes": int(total_bytes),
         "post_count": post_count,

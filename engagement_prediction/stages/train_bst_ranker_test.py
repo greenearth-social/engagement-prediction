@@ -1,3 +1,4 @@
+from argparse import Namespace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -81,7 +82,7 @@ def _write_dataset(bundle: Path, name: str, frame: pl.DataFrame) -> None:
     frame.write_parquet(path / "part-00000.parquet")
 
 
-def _build_loader_index(bundle: Path) -> None:
+def _build_loader_index(bundle: Path, *, prepare_post_liker_features=True) -> None:
     training_index.build_loader_index(
         posts_path=bundle / "posts",
         queries_path=bundle / "queries",
@@ -90,14 +91,18 @@ def _build_loader_index(bundle: Path) -> None:
         hourly_negative_candidates_path=bundle / "hourly_negative_candidates",
         embeddings_path=bundle / "embeddings.npy",
         authors_path=bundle / "authors",
-        indexed_post_liker_events_path=bundle / "indexed_post_liker_events",
-        post_liker_users_path=bundle / "post_liker_users",
+        indexed_post_liker_events_path=(
+            bundle / "indexed_post_liker_events" if prepare_post_liker_features else None
+        ),
+        post_liker_users_path=(
+            bundle / "post_liker_users" if prepare_post_liker_features else None
+        ),
         output_path=bundle / "loader_index",
         logger=None,
     )
 
 
-def _stage7_fixture(tmp_path: Path) -> tuple[Path, Path]:
+def _stage7_fixture(tmp_path: Path, *, prepare_post_liker_features=True) -> tuple[Path, Path]:
     stage7_dir = tmp_path / "07_dataset_hydration" / "stage7"
     bundle = stage7_dir / "hydrated_training_data_stage7"
     bundle.mkdir(parents=True)
@@ -135,7 +140,6 @@ def _stage7_fixture(tmp_path: Path) -> tuple[Path, Path]:
     histories = pl.DataFrame({
         "did": ["u1", "u2", "u3", "u4"],
         "query_hour": [train_hour, train_hour, val_hour, unseen_hour],
-        "history_subject_uris": [["h1", "h1"], [], ["h1"], ["h1"]],
         "history_like_created_ats": [
             [
                 datetime(2026, 1, 1, 10, tzinfo=timezone.utc),
@@ -146,7 +150,6 @@ def _stage7_fixture(tmp_path: Path) -> tuple[Path, Path]:
             [datetime(2026, 1, 1, 10, tzinfo=timezone.utc)],
         ],
         "history_emb_indices": [[2, 2], [], [2], [2]],
-        "history_author_indices": [[4, 4], [], [4], [4]],
         "history_prior_like_counts": [[0, 1], [], [100], [200]],
     }, schema=dataset_hydration.QUERY_HISTORY_SCHEMA)
     negatives = pl.DataFrame({
@@ -217,7 +220,10 @@ def _stage7_fixture(tmp_path: Path) -> tuple[Path, Path]:
             schema=post_liker_users.INDEXED_POST_LIKER_EVENT_SCHEMA,
         ),
     )
-    _build_loader_index(bundle)
+    if not prepare_post_liker_features:
+        shutil.rmtree(bundle / "post_liker_users")
+        shutil.rmtree(bundle / "indexed_post_liker_events")
+    _build_loader_index(bundle, prepare_post_liker_features=prepare_post_liker_features)
     (stage7_dir / "summary.json").write_text(json.dumps({
         "parameters": {
             "embedding_model": "fixture-model",
@@ -316,13 +322,18 @@ def _assert_history_length_outputs(output_dir, training_results, summary, tracke
     assert plot_path not in [path for _, path in tracker.file_artifacts]
 
 
-@pytest.mark.parametrize("loss_type", ["listwise", "bce"])
+@pytest.mark.parametrize(("loss_type", "prepare_post_liker_features"), [
+    ("listwise", True), ("bce", True), ("listwise", False),
+])
 def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
     tmp_path,
     monkeypatch,
     loss_type,
+    prepare_post_liker_features,
 ):
-    stage7_dir, bundle = _stage7_fixture(tmp_path)
+    stage7_dir, bundle = _stage7_fixture(
+        tmp_path, prepare_post_liker_features=prepare_post_liker_features
+    )
     monkeypatch.setattr(
         train_bst_ranker,
         "resolve_recorded_stage_lineage",
@@ -526,6 +537,7 @@ def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
     )
     assert training_config["batch_size"] == 2
     assert training_config["loss_type"] == loss_type
+    assert training_config["loader_index_format_version"] == (2 if prepare_post_liker_features else 1)
     assert training_config["eval_batch_size"] == 3
     assert training_config["history_length_bucket_boundaries"] == [0, 1, 2]
     assert summary["parameters"]["batch_size"] == 2
@@ -716,6 +728,22 @@ def test_stage8_rejects_stage7_without_loader_index(tmp_path, monkeypatch):
         train_bst_ranker.run(
             _context(tmp_path, _RecordingTracker()),
             _args(save_model=False, plots=False),
+        )
+
+
+def test_stage8_rejects_post_liker_feature_without_prepared_data(tmp_path, monkeypatch):
+    stage7_dir, _ = _stage7_fixture(tmp_path, prepare_post_liker_features=False)
+    monkeypatch.setattr(
+        train_bst_ranker,
+        "resolve_recorded_stage_lineage",
+        lambda *args, **kwargs: {"07_dataset_hydration": stage7_dir},
+    )
+
+    args = Namespace(**vars(_args(save_model=False, plots=False, post_liker_feature=True)))
+    with pytest.raises(ValueError, match="--prepare-post-liker-features.*--no-bst-use-post-liker-feature"):
+        train_bst_ranker.run(
+            _context(tmp_path, _RecordingTracker()),
+            args,
         )
 
 

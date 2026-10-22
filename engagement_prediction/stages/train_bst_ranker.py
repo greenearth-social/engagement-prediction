@@ -255,7 +255,8 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     if use_post_liker_feature and int(loader_index_validation["format_version"]) < 2:
         raise ValueError(
             "BST post-liker features require Stage 7 loader-index format version 2; "
-            "regenerate Stage 7"
+            "regenerate Stage 7 with --prepare-post-liker-features or train with "
+            "--no-bst-use-post-liker-feature"
         )
 
     device = get_device(args.device)

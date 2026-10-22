@@ -5,6 +5,7 @@ import zlib
 
 import numpy as np
 import polars as pl
+import pytest
 
 from engagement_prediction.data import dataset_hydration
 
@@ -122,3 +123,55 @@ def test_hydrated_post_metadata_defers_then_applies_author_vocabulary():
     assert "author_idx" not in hydrated_metadata.columns
     assert result.get_column("author_idx").to_list() == [2, 1]
     assert result.schema == pl.Schema(dataset_hydration.POST_SCHEMA)
+
+
+def test_compact_query_histories_validate_repeated_and_empty_histories():
+    hour = datetime(2026, 1, 1, 12, tzinfo=UTC)
+    histories = pl.DataFrame({
+        "did": ["with-history", "without-history"],
+        "query_hour": [hour, hour],
+        "history_like_created_ats": [[
+            datetime(2026, 1, 1, 11, tzinfo=UTC),
+            datetime(2026, 1, 1, 10, tzinfo=UTC),
+        ], []],
+        "history_emb_indices": [[0, 0], []],
+        "history_prior_like_counts": [[3, 3], []],
+    }, schema=dataset_hydration.QUERY_HISTORY_SCHEMA)
+
+    dataset_hydration.validate_query_histories(histories)
+
+
+@pytest.mark.parametrize(
+    ("column", "values", "message"),
+    [
+        ("history_emb_indices", [0], "not aligned"),
+        ("history_prior_like_counts", [3], "not aligned"),
+        ("history_like_created_ats", [datetime(2026, 1, 1, 11, tzinfo=UTC)], "not aligned"),
+        ("history_emb_indices", None, "embedding index"),
+        ("history_emb_indices", [0, None], "embedding index"),
+        ("history_like_created_ats", [
+            datetime(2026, 1, 1, 10, tzinfo=UTC),
+            datetime(2026, 1, 1, 11, tzinfo=UTC),
+        ], "not reverse chronological"),
+        ("history_like_created_ats", [
+            datetime(2026, 1, 1, 12, tzinfo=UTC),
+            datetime(2026, 1, 1, 10, tzinfo=UTC),
+        ], "same-hour or future"),
+    ],
+)
+def test_compact_query_histories_reject_invalid_lists(column, values, message):
+    histories = pl.DataFrame({
+        "did": ["u1"],
+        "query_hour": [datetime(2026, 1, 1, 12, tzinfo=UTC)],
+        "history_like_created_ats": [[
+            datetime(2026, 1, 1, 11, tzinfo=UTC),
+            datetime(2026, 1, 1, 10, tzinfo=UTC),
+        ]],
+        "history_emb_indices": [[0, 0]],
+        "history_prior_like_counts": [[3, 3]],
+    }, schema=dataset_hydration.QUERY_HISTORY_SCHEMA).with_columns(
+        pl.Series(column, [values], dtype=dataset_hydration.QUERY_HISTORY_SCHEMA[column])
+    )
+
+    with pytest.raises(ValueError, match=message):
+        dataset_hydration.validate_query_histories(histories)

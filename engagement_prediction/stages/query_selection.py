@@ -867,10 +867,13 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     partial_queries_path.replace(queries_path)
     partial_query_positives_path.replace(query_positives_path)
 
+    # Candidate counts also feed lazy diagnostics; release them only after
+    # final rows and statistics are collected and the public files are written.
+    candidate_query_counts_path.unlink()
     sampled_queries_path.unlink()
     shutil.rmtree(provisional_positive_rows_path)
     shutil.rmtree(eligible_positive_rows_path)
-    logger.info("Removed successful post-membership staging data")
+    logger.info("Removed successful query-selection staging data")
 
     runtime_seconds = time.time() - started_at
     summary = {
@@ -900,7 +903,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         },
         "outputs": {
             "like_sources_file": like_sources_path.name,
-            "candidate_query_counts_file": candidate_query_counts_path.name,
             "queries_file": queries_path.name,
             "query_positives_file": query_positives_path.name,
             "query_count": queries_df.height,
@@ -928,7 +930,6 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
                 "positives_absent_from_post_snapshot: "
                 f"{stats['positive_filter_totals']['missing_post_positive_count']}",
                 f"like_sources_file: {like_sources_path.name}",
-                f"candidate_query_counts_file: {candidate_query_counts_path.name}",
                 f"queries_file: {queries_path.name}",
                 f"query_positives_file: {query_positives_path.name}",
             ]

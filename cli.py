@@ -100,6 +100,7 @@ DEFAULTS: Dict[str, Any] = {
     "embedding_source_batch_size": 64,
     "dataset_hydration_worker_count": 8,
     "min_author_training_feature_count": 50,
+    "prepare_post_liker_features": False,
     "min_post_liker_user_training_event_count": 10,
     "max_post_liker_user_vocabulary_size": 10_000_000, # in practice this is around 2MM
     # Stage 8: Model architecture
@@ -187,7 +188,7 @@ DEFAULTS: Dict[str, Any] = {
     "raw_data_warn_max_ratio": 3.0,
     "raw_data_warn_invalid_timestamp_fraction": 0.01,
     "disk_checks": False,
-    "min_free_output_gib": 150.0,
+    "min_free_output_gib": 100.0,
     # Optional offline holdout comparison against the deployed BST ranker.
     "compare_to_production": False,
     "production_gcp_project": "greenearth-471522",
@@ -296,6 +297,8 @@ def _merge_args_with_config(raw_args: argparse.Namespace) -> argparse.Namespace:
             f"Unknown loss_type: {merged['loss_type']!r}. "
             "Choose 'listwise' or 'bce'."
         )
+    if not isinstance(merged["prepare_post_liker_features"], bool):
+        raise ValueError("prepare_post_liker_features must be a boolean")
     merged["history_length_bucket_boundaries"] = validate_history_length_bucket_boundaries(
         merged["history_length_bucket_boundaries"]
     )
@@ -1236,6 +1239,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--min-author-training-feature-count", type=int,
                           default=argparse.SUPPRESS,
                           help_text="Minimum final training-feature occurrences required for a dedicated author index")
+    _add_arg_with_default(p_all, "--prepare-post-liker-features", action=argparse.BooleanOptionalAction,
+                          default=argparse.SUPPRESS,
+                          help_text="Prepare Stage 7 liker replay events, vocabulary, and index arrays; popularity counts remain available when disabled")
     _add_arg_with_default(p_all, "--min-post-liker-user-training-event-count", type=int,
                           default=argparse.SUPPRESS,
                           help_text="Minimum training-visible liker events required for a dedicated liker-user index")
