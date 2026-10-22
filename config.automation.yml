@@ -8,3 +8,5 @@
 output_dir: "/mnt/data/dave/outputs/automated-ranker"
 data_checks: true
 disk_checks: true
+compare_to_production: true
+

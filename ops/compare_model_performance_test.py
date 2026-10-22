@@ -39,6 +39,7 @@ def test_parser_defaults_match_standalone_comparison_contract():
     assert args.author_map == []
     assert args.splits == list(compare_model_performance.DEFAULT_SPLITS)
     assert args.batch_size == 128
+    assert args.additional_batch_negatives is None
     assert args.metrics_top_ks == [30]
     assert args.bst_candidate_chunk_size == 1024
     assert args.device is None
@@ -47,6 +48,14 @@ def test_parser_defaults_match_standalone_comparison_contract():
     assert args.dataloader_prefetch_factor == 2
     assert args.max_history_len is None
     assert args.output_dir == Path("outputs/comparisons")
+
+
+@pytest.mark.parametrize("cap", ["0", "-1"])
+def test_parser_rejects_nonpositive_negative_cap(cap):
+    with pytest.raises(SystemExit):
+        compare_model_performance.build_parser().parse_args([
+            *_required_arguments(), "--additional-batch-negatives", cap,
+        ])
 
 
 @pytest.mark.parametrize("model_count", [0, 1, 3])
@@ -211,7 +220,7 @@ class _FakeComparisonResult:
 
 
 def _patch_comparison_api(monkeypatch, *, run_model_comparison):
-    from engagement_prediction.evaluation import artifacts, comparison, reporting
+    from engagement_prediction.evaluation import artifacts, comparison, workflow_reports
 
     dataset = _FakeDatasetArtifact(Path("/resolved/stage7"))
     models = (
@@ -234,7 +243,6 @@ def _patch_comparison_api(monkeypatch, *, run_model_comparison):
             "candidate": 16,
         },
     )
-    monkeypatch.setattr(comparison, "ComparisonSettings", lambda **kwargs: kwargs)
     monkeypatch.setattr(comparison, "run_model_comparison", run_model_comparison)
 
     def write_metrics_csv(path, **kwargs):
@@ -243,8 +251,8 @@ def _patch_comparison_api(monkeypatch, *, run_model_comparison):
     def write_metric_deltas_csv(path, **kwargs):
         path.write_text("model_a,model_b,split,metric,delta\n")
 
-    monkeypatch.setattr(reporting, "write_metrics_csv", write_metrics_csv)
-    monkeypatch.setattr(reporting, "write_metric_deltas_csv", write_metric_deltas_csv)
+    monkeypatch.setattr(workflow_reports, "write_metrics_csv", write_metrics_csv)
+    monkeypatch.setattr(workflow_reports, "write_metric_deltas_csv", write_metric_deltas_csv)
     monkeypatch.setattr(compare_model_performance, "_resolve_device", lambda value: "cpu")
     monkeypatch.setattr(
         compare_model_performance,
@@ -263,6 +271,7 @@ def test_run_publishes_complete_output_atomically_and_cleans_temporary_files(
     def fake_run_model_comparison(**kwargs):
         observed_temporary_dirs.append(kwargs["temporary_dir"])
         assert kwargs["temporary_dir"].is_dir()
+        assert kwargs["settings"].additional_batch_negatives == 3
         return _FakeComparisonResult(
             metrics_by_model={
                 "baseline": {"val": {"ndcg@30": 0.41234567}},
@@ -291,6 +300,8 @@ def test_run_publishes_complete_output_atomically_and_cleans_temporary_files(
         *_required_arguments(),
         "--output-dir",
         str(tmp_path),
+        "--additional-batch-negatives",
+        "3",
     ])
 
     output_path = compare_model_performance._run(args)
@@ -316,6 +327,7 @@ def test_run_publishes_complete_output_atomically_and_cleans_temporary_files(
     }
     assert metrics["runtime_seconds"] == round(metrics["runtime_seconds"], 5)
     assert metrics["skipped_splits"] == []
+    assert metrics["settings"]["additional_batch_negatives"] == 3
     model_specs = json.loads((output_path / "model_specs.json").read_text())
     assert model_specs["mapping_coverage"]["candidate"][
         "model_known_post_fraction"
@@ -344,7 +356,7 @@ def test_run_passes_matching_author_map_overrides_to_artifact_resolution(
     tmp_path,
     monkeypatch,
 ):
-    from engagement_prediction.evaluation import artifacts, comparison, reporting
+    from engagement_prediction.evaluation import artifacts, comparison, workflow_reports
 
     dataset = _FakeDatasetArtifact(Path("/resolved/stage7"))
     models = (
@@ -367,7 +379,6 @@ def test_run_passes_matching_author_map_overrides_to_artifact_resolution(
             "candidate": 16,
         },
     )
-    monkeypatch.setattr(comparison, "ComparisonSettings", lambda **kwargs: kwargs)
     monkeypatch.setattr(
         comparison,
         "run_model_comparison",
@@ -380,12 +391,12 @@ def test_run_passes_matching_author_map_overrides_to_artifact_resolution(
         ),
     )
     monkeypatch.setattr(
-        reporting,
+        workflow_reports,
         "write_metrics_csv",
         lambda path, **kwargs: path.write_text("model_name,split,metric,value\n"),
     )
     monkeypatch.setattr(
-        reporting,
+        workflow_reports,
         "write_metric_deltas_csv",
         lambda path, **kwargs: path.write_text(
             "model_a,model_b,split,metric,delta\n"

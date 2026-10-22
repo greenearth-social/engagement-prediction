@@ -20,6 +20,13 @@ Failures remain visible in systemd and the journal; there are no automatic retri
 or notifications. Models upload through the existing ClearML/GCS pipeline and are
 never deployed by this service. Cleanup and model review remain manual.
 
+The automation config also enables an offline comparison with the production BST
+ranker using the new model's holdout dataset. The production revision and model
+are captured before data preparation. Review the `production_comparison_review_md`
+artifact in ClearML, or `production_comparison/review.md` in the pipeline run
+directory. Comparison failures fail the run; lower candidate scores are reported
+for human review and do not fail it.
+
 ## Prepare the checkout
 
 First merge the automation changes into `main`. The commands below assume this
@@ -44,6 +51,10 @@ Edit `config.automation.local.yml` for machine-specific overrides, such as outpu
 location, relative date offsets, or training parameters. This ignored file survives
 updates; it is the service's only config file and is merged with `cli.py` defaults.
 It is initially a copy of `config.automation.yml`, not an overlay on that file.
+For an existing local copy, add `compare_to_production`, `production_gcp_project`,
+`production_gcp_region`, and `production_cloud_run_service` from the template to
+enable comparison. These settings require BST models with post-liker features
+disabled. See [comparison behavior and reports](../../README.md#candidate-versus-production).
 Leave `posts_end` omitted/null for moving dates. Leave `dry_run` omitted/false for
 real runs. Do not set reuse/resume options for a fresh full run.
 
@@ -52,6 +63,12 @@ shell. The service sets `HOME` so the existing `~/clearml.conf` and application
 default Google credentials can be used. If the pipeline needs other environment
 variables, supply them through a systemd service override. Do not put secrets in
 the committed unit files.
+
+Production discovery also requires `gcloud` on the service's PATH and credentials
+that can read the Cloud Run service and revision in the configured project/region.
+GCS downloads use application default credentials and require read access to the
+production model bucket. The service's current PATH includes this VM's
+`~/.local/bin/gcloud`. No Cloud Run deployment permission is needed.
 
 ## Install and test without enabling the schedule
 
@@ -70,7 +87,9 @@ systemd-analyze calendar 'Sun *-*-* 06:00:00 UTC'
 For the first service invocation, use a temporary override to append `--dry-run`.
 This still updates the checkout and installs dependencies, but the CLI only prints
 the resolved config/dates; it does not create a ClearML task or run any pipeline
-stages. It therefore does not validate data access, GPU training, or GCS uploads.
+stages. It therefore does not validate data access, GPU training, production
+discovery/downloads, or GCS uploads. Production-dependent history limits are only
+resolved in a real run.
 
 ```bash
 sudo mkdir -p /run/systemd/system/bst-ranker-training.service.d
@@ -96,7 +115,8 @@ journalctl -fu bst-ranker-training.service
 ```
 
 Confirm that the full run succeeds, the expected dates/checks appear in ClearML,
-and model artifacts upload before enabling the schedule:
+model artifacts upload, and the production comparison report is available before
+enabling the schedule:
 
 ```bash
 sudo systemctl enable --now bst-ranker-training.timer

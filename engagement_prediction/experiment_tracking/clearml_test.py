@@ -95,7 +95,7 @@ def test_mark_failed_uses_explicit_status_and_checked_request():
 
     assert calls == [{
         "ignore_errors": False,
-        "status_reason": "Pipeline checks failed",
+        "status_reason": "Pipeline failed",
         "status_message": "likes missing on 2026-01-02",
     }]
 

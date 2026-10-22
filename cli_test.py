@@ -80,6 +80,8 @@ def test_automation_config_enables_checks_and_keeps_full_foreground_run():
     ]))
 
     assert args.data_checks and args.disk_checks
+    assert args.compare_to_production
+    assert args.production_cloud_run_service == "engagement-prediction-inference-prod"
     assert args.background is False
     assert args.start_from is None
     assert args.stop_after is None
@@ -337,7 +339,7 @@ def test_query_sampling_defaults():
     assert merged.max_eval_query_hours_per_split == 500_000
     assert merged.max_positives_per_user_hour == 32
     assert merged.max_history_posts_per_query == 32
-    assert merged.user_history_partition_count == 16
+    assert merged.user_history_partition_count == 32
     assert merged.random_candidate_sampling_fraction == 0.10
     assert merged.source_metadata_partition_count == 16
     assert merged.data_partition_worker_count == 4

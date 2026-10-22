@@ -68,7 +68,7 @@ DEFAULTS: Dict[str, Any] = {
     "embedding_model": "all_MiniLM_L12_v2",
     # Stage 00: Canonical source metadata
     "gcs_bucket": 'greenearth-471522-ingex-extract-prod',
-    # A missing end resolves to today's UTC midnight when preparing source data.
+    # A missing end uses prior data's anchor when resuming, otherwise today's UTC midnight.
     "posts_end": None,
     "posts_start_days_before_end": 37,
     "source_metadata_partition_count": 16,
@@ -84,7 +84,7 @@ DEFAULTS: Dict[str, Any] = {
     "holdout_start_days_before_end": 3,
     # Stage 2: User history
     "max_history_posts_per_query": 32,
-    "user_history_partition_count": 16,
+    "user_history_partition_count": 32,
     # Stage 3: Post selection
     "random_candidate_sampling_fraction": 0.1,
     # Stage 4: Popularity-aware negative selection
@@ -188,6 +188,13 @@ DEFAULTS: Dict[str, Any] = {
     "raw_data_warn_invalid_timestamp_fraction": 0.01,
     "disk_checks": False,
     "min_free_output_gib": 150.0,
+    # Optional offline holdout comparison against the deployed BST ranker.
+    "compare_to_production": False,
+    "production_gcp_project": "greenearth-471522",
+    "production_gcp_region": "us-east1",
+    "production_cloud_run_service": "engagement-prediction-inference-prod",
+    "production_comparison_candidate_chunk_size": 1024,
+    "production_comparison_max_classification_metric_pairs": 2_000_000,
     # Experiment tracking
     "experiment_tracker": "clearml",
     "experiment_project": "Engagement Prediction",
@@ -294,6 +301,7 @@ def _merge_args_with_config(raw_args: argparse.Namespace) -> argparse.Namespace:
     )
     final_ns = argparse.Namespace(**merged)
     _validate_checks_config(final_ns)
+    _validate_production_comparison_config(final_ns)
     # Preserve argparse-injected metadata
     setattr(final_ns, "command", command)
     setattr(final_ns, "func", func)
@@ -316,11 +324,55 @@ def _date_fields_for_run(args: argparse.Namespace) -> Tuple[str, ...]:
 
 
 def _freeze_posts_end(args: argparse.Namespace) -> argparse.Namespace:
+    """Freeze the anchor and, when inheriting it, the exact upstream inputs."""
     args = copy.copy(args)
-    if _date_fields_for_run(args) and args.posts_end is None:
+    if not _date_fields_for_run(args) or args.posts_end is not None:
+        return args
+
+    train_key = _get_train_key(args.model_type)
+    stages = _get_stage_order_for_model_type(train_key)
+    start, _, _ = _get_stage_folder_and_start_stop_indices(
+        stages, args.start_from, args.stop_after, train_key
+    )
+    if start == 0:
         args.posts_end = datetime.now(timezone.utc).replace(
             hour=0, minute=0, second=0, microsecond=0
         ).isoformat()
+        return args
+
+    # Resolve the same upstream chain the first stage will consume. Context
+    # construction and dependency resolution only read metadata; dry runs must
+    # not create output directories or an experiment-tracking task.
+    output_root = _resolve_run_dir(args, run_timestamp="")
+    ctx = Context(
+        run_dir=output_root, artifacts_dir=output_root / "artifacts",
+        runs_dir=output_root / "runs", run_timestamp="", use_latest=True,
+    )
+    _apply_prior_pins(args, ctx, output_root)
+    stage_folders = _get_stage_folder(stages)
+    previous = stages[start - 1]
+    if stage_folders[previous] not in ctx.prior_outputs:
+        _maybe_choose_prior(args, ctx, previous)
+    pin_lineage_aligned_inputs(ctx, stages[start], stage_folders)
+
+    source_dir = ctx.prior_outputs["00_source_metadata"]
+    # The lineage resolver populated this entry with a concrete artifact path.
+    assert source_dir is not None, "Resolved lineage must include Stage 0 source metadata"
+    summary_path = source_dir / "summary.json"
+    summary = json.loads(summary_path.read_text())
+    from engagement_prediction.data import timestamps
+
+    anchor = timestamps.parse_utc_datetime(
+        summary.get("posts_end") if isinstance(summary, dict) else None,
+        field_name=f"posts_end in {summary_path}",
+    )
+    if anchor is None:
+        raise ValueError(f"Cannot inherit posts_end: missing date in {summary_path}")
+    args.posts_end = anchor.isoformat()
+    # Freeze the actual artifact paths along with the anchor, including across
+    # a background handoff. Never reselect a newer chain using the older date.
+    for folder, path in ctx.prior_outputs.items():
+        setattr(args, f"prior_{folder}", str(path))
     return args
 
 
@@ -403,6 +455,110 @@ def _validate_checks_config(args: argparse.Namespace) -> None:
         raise ValueError("raw_data_warn_invalid_timestamp_fraction must be between 0 and 1")
     if args.min_free_output_gib < 0:
         raise ValueError("min_free_output_gib must be non-negative")
+
+
+def _validate_production_comparison_config(args: argparse.Namespace) -> None:
+    if not isinstance(args.compare_to_production, bool):
+        raise ValueError("compare_to_production must be a boolean")
+    if not args.compare_to_production:
+        return
+    if args.model_type != "bst-ranker":
+        raise ValueError("Production comparison supports BST rankers only")
+    if args.bst_use_post_liker_feature:
+        raise ValueError("Production comparison does not support post-liker features")
+    stages = _get_stage_order_for_model_type("train_bst_ranker")
+    start, stop, includes_train = _get_stage_folder_and_start_stop_indices(
+        stages, args.start_from, args.stop_after, "train_bst_ranker"
+    )
+    if not includes_train:
+        raise ValueError("Production comparison requires a run that includes training")
+    if "query_selection" in stages[start:stop + 1] and args.holdout_start_days_before_end is None:
+        raise ValueError("Production comparison requires holdout to be enabled")
+    for name in ("production_gcp_project", "production_gcp_region", "production_cloud_run_service"):
+        value = getattr(args, name)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} is required when compare_to_production is enabled")
+    for name in (
+        "production_comparison_candidate_chunk_size",
+        "production_comparison_max_classification_metric_pairs",
+    ):
+        value = getattr(args, name)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+
+
+def _prepare_production_comparison(args: argparse.Namespace, ctx: Context, logger):
+    from engagement_prediction.evaluation.production import snapshot_production_model
+
+    model, metadata = snapshot_production_model(
+        project=args.production_gcp_project, region=args.production_gcp_region,
+        service=args.production_cloud_run_service,
+        output_dir=Path(ctx.run_dir) / "production_comparison" / "production_snapshot",
+        logger=logger,
+    )
+    if model.embedding_model != args.embedding_model:
+        raise ValueError("Production and candidate must use the same content embedding model")
+    # Preserve enough source history for both models. Each scorer still trims to
+    # its own model limit; this does not change the candidate architecture.
+    args.max_history_posts_per_query = max(
+        args.max_history_posts_per_query, args.max_history_len, model.max_history_len,
+    )
+    resolved_path = Path(ctx.run_dir) / "run-all.resolved-config.json"
+    resolved_path.write_text(json.dumps(
+        {key: getattr(args, key) for key in DEFAULTS}, indent=2, sort_keys=True,
+    ) + "\n")
+    ctx.tracker.log_params(
+        {"max_history_posts_per_query": args.max_history_posts_per_query}, name="Args",
+    )
+    logger.info("Source history limit for comparison: %s; candidate model limit: %s; production model limit: %s",
+                args.max_history_posts_per_query, args.max_history_len, model.max_history_len)
+    return model, metadata
+
+
+def _validate_production_comparison_dataset(args: argparse.Namespace, ctx: Context, production_model) -> None:
+    from engagement_prediction.evaluation.artifacts import resolve_stage7_artifact
+    from engagement_prediction.evaluation.production_comparison import validate_holdout_dataset
+
+    dataset_dir = ctx.prior_outputs["07_dataset_hydration"]
+    # Training inputs have already been pinned before this preflight check.
+    assert dataset_dir is not None, "Production comparison requires a pinned Stage 7 dataset"
+    dataset = resolve_stage7_artifact(dataset_dir)
+    validate_holdout_dataset(dataset, max(args.max_history_len, production_model.max_history_len))
+    if (dataset.embedding_model, dataset.embedding_dim) != (
+        production_model.embedding_model, production_model.embedding_dim,
+    ):
+        raise ValueError("Holdout and production content embedding contracts disagree")
+
+
+def _run_production_comparison(*, candidate_dir, production_model, production_metadata, args, ctx, logger):
+    from engagement_prediction.evaluation.production_comparison import run_production_comparison
+
+    return run_production_comparison(
+        candidate_dir=Path(candidate_dir), production_model=production_model,
+        production_metadata=production_metadata, args=args,
+        output_dir=Path(ctx.run_dir) / "production_comparison", tracker=ctx.tracker, logger=logger,
+    )
+
+
+def _record_production_comparison_failure(ctx: Context, phase: str, error: Exception, logger) -> None:
+    reason = f"Production comparison failed during {phase}: {error}"
+    logger.error("%s", reason)
+    path = Path(ctx.run_dir) / "production_comparison" / "failure.json"
+    # Reporting errors must not hide the original failure or prevent marking the
+    # task failed before ClearML's normal close path attempts completion.
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "status": "failed", "phase": phase, "error": str(error),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }, indent=2, sort_keys=True) + "\n")
+        ctx.tracker.log_file_artifact("production_comparison_failure", path)
+    except Exception as reporting_error:
+        logger.warning("Could not save/upload comparison failure: %s", reporting_error)
+    try:
+        ctx.tracker.mark_failed(reason)
+    except Exception as tracking_error:
+        logger.warning("Could not mark tracker task failed: %s", tracking_error)
 
 
 def _build_effective_config_for_background_run(
@@ -519,9 +675,6 @@ def cmd_run_all(args: argparse.Namespace) -> int:
 
     Creates a run directory up front and backgrounds itself with nohup if --background.
     """
-    # Freeze the anchor before a background handoff; calculate the other dates
-    # after ClearML has had a chance to override the configured offsets.
-    args = _freeze_posts_end(args)
     if args.dry_run:
         resolved = _resolve_date_args(args)
         preview = {key: getattr(resolved, key) for key in DEFAULTS}
@@ -529,19 +682,13 @@ def cmd_run_all(args: argparse.Namespace) -> int:
         print(json.dumps(preview, indent=2, sort_keys=True))
         return 0
 
-    train_key = _get_train_key(args.model_type)
-    stage_order = _get_stage_order_for_model_type(train_key)
-    start_idx, stop_idx, _ = _get_stage_folder_and_start_stop_indices(
-        stage_order,
-        args.start_from,
-        args.stop_after,
-        train_key,
-    )
-
     # Store the single timestamp in Context; for background runs we pass it via env.
     run_timestamp = (os.environ.get("ENGAGEMENT_RUN_TIMESTAMP") or "").strip() or generate_run_timestamp()
 
     if bool(args.background):
+        # Freeze both the anchor and any inherited input chain before handing
+        # off. Foreground runs resolve after ClearML applies its overrides.
+        args = _freeze_posts_end(args)
         _resolve_date_args(args)  # Validate before creating files or spawning a child.
         output_root = _resolve_run_dir(args, run_timestamp=run_timestamp)
         output_root.mkdir(parents=True, exist_ok=True)
@@ -621,7 +768,7 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     args = tracker.connect_args(args, "Args")
     try:
         args = _resolve_date_args(args)
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         try:
             tracker.mark_failed(str(exc))
         finally:
@@ -630,6 +777,10 @@ def cmd_run_all(args: argparse.Namespace) -> int:
     date_fields = _date_fields_for_run(args)
     if date_fields:
         tracker.log_params(params={key: getattr(args, key) for key in date_fields}, name="ResolvedDates")
+        if args.start_from not in (None, "source_metadata") and args.prior_00_source_metadata is not None:
+            source = {"posts_end": args.posts_end, "source_metadata": args.prior_00_source_metadata}
+            tracker.log_params(params=source, name="ResolvedDateSource")
+            print(f"Resolved posts_end={args.posts_end}; Stage 0 input: {args.prior_00_source_metadata}")
 
     output_root = _resolve_run_dir(args, run_timestamp=run_timestamp)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -855,79 +1006,52 @@ def _get_stage_folder_and_start_stop_indices(
     return start_idx, stop_idx, includes_train
 
 
+def _apply_prior_pins(args: argparse.Namespace, ctx: Context, output_root: Path) -> None:
+    """Use the same explicit input selection for date inference and execution."""
+    for name in DEFAULTS:
+        if not name.startswith("prior_"):
+            continue
+        folder = name.removeprefix("prior_")
+        prior = _resolve_prior_spec(
+            getattr(args, name), output_root=output_root,
+            artifacts_dir=ctx.artifacts_dir, stage_folder=folder,
+        )
+        if prior is not None:
+            ctx.prior_outputs[folder] = prior
+    validate_explicit_prior_pin_consistency(ctx)
+
+
+def _maybe_choose_prior(args: argparse.Namespace, ctx: Context, stage_key: str) -> None:
+    """Choose a prior before inferring dates, or before artifact-only execution."""
+    if not args.pick_prior or args.background or args.dry_run:
+        return
+    folder = _get_stage_folder([stage_key])[stage_key]
+    base = Path(ctx.artifacts_dir) / folder
+    if not base.exists():
+        return
+    subdirs = [p for p in base.iterdir() if p.is_dir()]
+    if len(subdirs) <= 1:
+        return
+    subdirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    print(f"\nPick prior output for stage '{stage_key}' under {base}:")
+    for i, p in enumerate(subdirs):
+        print(f"  [{i}] {p.name}")
+    try:
+        choice = input("Enter index (blank for latest): ").strip()
+        if choice:
+            idx = int(choice)
+            if 0 <= idx < len(subdirs):
+                ctx.prior_outputs[folder] = subdirs[idx]
+    except Exception:
+        pass
+
+
 def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
     """Execute the modular pipeline stages in the foreground sequentially."""
     run_dir = Path(ctx.run_dir).resolve()
-    artifacts_dir = Path(ctx.artifacts_dir).resolve()
     output_root = Path(args.output_dir).resolve()
+    _apply_prior_pins(args, ctx, output_root)
 
-    # Apply non-interactive prior pins (paths or stage_run_ids).
-    prior_00_source_metadata = _resolve_prior_spec(
-        args.prior_00_source_metadata,
-        output_root=output_root,
-        artifacts_dir=artifacts_dir,
-        stage_folder="00_source_metadata",
-    )
-    prior_01_query_selection = _resolve_prior_spec(
-        args.prior_01_query_selection,
-        output_root=output_root,
-        artifacts_dir=artifacts_dir,
-        stage_folder="01_query_selection",
-    )
-    prior_02_user_history = _resolve_prior_spec(
-        args.prior_02_user_history,
-        output_root=output_root,
-        artifacts_dir=artifacts_dir,
-        stage_folder="02_user_history",
-    )
-    prior_03_post_selection = _resolve_prior_spec(
-        args.prior_03_post_selection,
-        output_root=output_root,
-        artifacts_dir=artifacts_dir,
-        stage_folder="03_post_selection",
-    )
-    prior_04_negative_selection = _resolve_prior_spec(
-        args.prior_04_negative_selection,
-        output_root=output_root,
-        artifacts_dir=artifacts_dir,
-        stage_folder="04_negative_selection",
-    )
-    prior_05_post_liker_history = _resolve_prior_spec(
-        args.prior_05_post_liker_history,
-        output_root=output_root,
-        artifacts_dir=artifacts_dir,
-        stage_folder="05_post_liker_history",
-    )
-    prior_06_author_statistics = _resolve_prior_spec(
-        args.prior_06_author_statistics,
-        output_root=output_root,
-        artifacts_dir=artifacts_dir,
-        stage_folder="06_author_statistics",
-    )
-    prior_07_dataset_hydration = _resolve_prior_spec(
-        args.prior_07_dataset_hydration,
-        output_root=output_root,
-        artifacts_dir=artifacts_dir,
-        stage_folder="07_dataset_hydration",
-    )
-    if prior_00_source_metadata is not None:
-        ctx.prior_outputs["00_source_metadata"] = prior_00_source_metadata
-    if prior_01_query_selection is not None:
-        ctx.prior_outputs["01_query_selection"] = prior_01_query_selection
-    if prior_02_user_history is not None:
-        ctx.prior_outputs["02_user_history"] = prior_02_user_history
-    if prior_03_post_selection is not None:
-        ctx.prior_outputs["03_post_selection"] = prior_03_post_selection
-    if prior_04_negative_selection is not None:
-        ctx.prior_outputs["04_negative_selection"] = prior_04_negative_selection
-    if prior_05_post_liker_history is not None:
-        ctx.prior_outputs["05_post_liker_history"] = prior_05_post_liker_history
-    if prior_06_author_statistics is not None:
-        ctx.prior_outputs["06_author_statistics"] = prior_06_author_statistics
-    if prior_07_dataset_hydration is not None:
-        ctx.prior_outputs["07_dataset_hydration"] = prior_07_dataset_hydration
-    validate_explicit_prior_pin_consistency(ctx)
-    
     model_type = args.model_type
 
     if model_type == "bst-ranker":
@@ -946,37 +1070,21 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
         train_key
     )
 
-    # Optional interactive chooser (foreground only)
-    def _maybe_choose_prior(stage_key: str):
-        if not args.pick_prior:
-            return
-        folder = stage_folder[stage_key]
-        base = (artifacts_dir / folder)
-        if not base.exists():
-            return
-        subdirs = [p for p in base.iterdir() if p.is_dir()]
-        if len(subdirs) <= 1:
-            return
-        # Prompt only in foreground mode
-        if bool(args.background):
-            return
-        subdirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        print(f"\nPick prior output for stage '{stage_key}' under {base}:")
-        for i, p in enumerate(subdirs):
-            print(f"  [{i}] {p.name}")
-        try:
-            choice = input("Enter index (blank for latest): ").strip()
-            if choice:
-                idx = int(choice)
-                if 0 <= idx < len(subdirs):
-                    ctx.prior_outputs[folder] = subdirs[idx]
-        except Exception:
-            pass
-
-    # Execute selected subset
+    # Execute selected subset. Keep comparison failures distinct from stage
+    # failures so their report describes the operation that actually failed.
+    comparison_phase = None
+    comparison_logger = None
+    production_snapshot = None
     try:
         # Revalidate after ClearML has applied any remote parameter overrides.
         _validate_checks_config(args)
+        if args.compare_to_production:
+            comparison_logger = get_stage_logger("PRODUCTION_COMPARISON", run_dir / "production_comparison.log")
+            comparison_phase = "configuration"
+            _validate_production_comparison_config(args)
+            comparison_phase = "production snapshot"
+            production_snapshot = _prepare_production_comparison(args, ctx, comparison_logger)
+            comparison_phase = None
         for idx, key in enumerate(stage_order):
             if idx < start_idx or idx > stop_idx:
                 continue
@@ -997,7 +1105,7 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
             if idx > 0:
                 prev_key = stage_order[idx - 1]
                 if stage_folder[prev_key] not in ctx.prior_outputs:
-                    _maybe_choose_prior(prev_key)
+                    _maybe_choose_prior(args, ctx, prev_key)
             label_map = {
                 'source_metadata': "Stage 00: Build reusable source metadata…",
                 'query_selection': "Stage 1: Select user-hour queries…",
@@ -1013,7 +1121,24 @@ def cmd__run_all_exec(args: argparse.Namespace, ctx: Context) -> int:
             label = label_map.get(key, f"Stage {idx+1}: {key}…")
             print(f"\n[{idx+1}/{len(stage_order)}] ▶️  {label}")
             pin_lineage_aligned_inputs(ctx, key, stage_folder)
-            reg.run_stage(key, ctx, args)
+            if production_snapshot is not None and key == train_key:
+                comparison_phase = "holdout validation"
+                _validate_production_comparison_dataset(args, ctx, production_snapshot[0])
+                comparison_phase = None
+            result = reg.run_stage(key, ctx, args)
+            if production_snapshot is not None and key == train_key:
+                # The registry has now finalized the candidate's manifest.
+                comparison_phase = "evaluation and reporting"
+                production_model, production_metadata = production_snapshot
+                _run_production_comparison(
+                    candidate_dir=result["output_dir"], production_model=production_model,
+                    production_metadata=production_metadata, args=args, ctx=ctx, logger=comparison_logger,
+                )
+                comparison_phase = None
+    except Exception as exc:
+        if comparison_phase is not None:
+            _record_production_comparison_failure(ctx, comparison_phase, exc, comparison_logger)
+        raise
     finally:
         ctx.tracker.close()
 
@@ -1046,7 +1171,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_arg_with_default(p_all, "--gcs-bucket", type=str, default=argparse.SUPPRESS,
                           help_text="GCS bucket name for ingex data")
     _add_arg_with_default(p_all, "--posts-end", type=str, default=argparse.SUPPRESS,
-                          help_text="UTC source-window end (exclusive); defaults to today's UTC midnight")
+                          help_text="UTC source-window end (exclusive); defaults to the reused source artifact's end when resuming, otherwise today's UTC midnight")
     _add_arg_with_default(p_all, "--posts-start-days-before-end", type=int, default=argparse.SUPPRESS,
                           help_text="Source-window length in days before posts-end")
     _add_arg_with_default(p_all, "--source-metadata-partition-count", type=int,
@@ -1295,6 +1420,18 @@ def build_parser() -> argparse.ArgumentParser:
                           help_text="Check output disk space before data preparation and hydration")
     _add_arg_with_default(p_all, "--min-free-output-gib", type=float, default=argparse.SUPPRESS,
                           help_text="Output filesystem free GiB required before data preparation and hydration")
+    _add_arg_with_default(p_all, "--compare-to-production", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
+                          help_text="Compare the trained BST ranker with production on the candidate holdout")
+    _add_arg_with_default(p_all, "--production-gcp-project", type=str, default=argparse.SUPPRESS,
+                          help_text="Google Cloud project containing the production inference service")
+    _add_arg_with_default(p_all, "--production-gcp-region", type=str, default=argparse.SUPPRESS,
+                          help_text="Cloud Run region of the production inference service")
+    _add_arg_with_default(p_all, "--production-cloud-run-service", type=str, default=argparse.SUPPRESS,
+                          help_text="Cloud Run service whose traffic-serving revision supplies the baseline")
+    _add_arg_with_default(p_all, "--production-comparison-candidate-chunk-size", type=int, default=argparse.SUPPRESS,
+                          help_text="Candidate chunk size for offline BST comparison scoring")
+    _add_arg_with_default(p_all, "--production-comparison-max-classification-metric-pairs", type=int, default=argparse.SUPPRESS,
+                          help_text="Maximum sampled query/post pairs for comparison classification metrics")
     # Experiment tracking
     _add_arg_with_default(p_all, "--experiment-tracker", type=str, choices=["none", "clearml"], default=argparse.SUPPRESS,
                           help_text="Type of experiment tracker to use")

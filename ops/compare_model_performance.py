@@ -4,15 +4,13 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
-import json
 import logging
 from pathlib import Path
 import sys
-import tempfile
 import time
-from typing import Any, Sequence
+from typing import Sequence
 import uuid
 
 
@@ -98,6 +96,8 @@ class ComparisonArgumentParser(argparse.ArgumentParser):
             )
         if parsed.batch_size <= 0:
             self.error("--batch-size must be positive")
+        if parsed.additional_batch_negatives is not None and parsed.additional_batch_negatives <= 0:
+            self.error("--additional-batch-negatives must be positive")
         if any(k <= 0 for k in parsed.metrics_top_ks):
             self.error("--metrics-top-ks values must be positive")
         if len(set(parsed.metrics_top_ks)) != len(parsed.metrics_top_ks):
@@ -166,6 +166,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_BATCH_SIZE,
         help=f"Evaluation batch size (default: {DEFAULT_BATCH_SIZE})",
+    )
+    parser.add_argument(
+        "--additional-batch-negatives",
+        type=int,
+        help="Shared sampled negative cap per batch (default: all stored negatives)",
     )
     parser.add_argument(
         "--metrics-top-ks",
@@ -265,22 +270,6 @@ def _allocate_output_paths(output_parent: Path) -> tuple[str, Path, Path]:
     raise RuntimeError(f"Unable to allocate a comparison run under {output_parent}")
 
 
-def _jsonable(value: Any) -> Any:
-    if is_dataclass(value) and not isinstance(value, type):
-        return _jsonable(asdict(value))
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {str(key): _jsonable(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(item) for item in value]
-    return value
-
-
-def _write_json(path: Path, value: Any) -> None:
-    path.write_text(json.dumps(_jsonable(value), indent=2, sort_keys=True) + "\n")
-
-
 def _configure_logger(log_path: Path) -> logging.Logger:
     logger = logging.getLogger(f"compare_model_performance.{uuid.uuid4().hex}")
     logger.setLevel(logging.INFO)
@@ -318,16 +307,13 @@ def _run(args: argparse.Namespace) -> Path:
     from engagement_prediction.evaluation.artifacts import (
         resolve_model_artifact,
         resolve_stage7_artifact,
-        validate_comparison_contract,
     )
     from engagement_prediction.evaluation.comparison import (
         ComparisonSettings,
-        run_model_comparison,
     )
-    from engagement_prediction.evaluation.reporting import (
-        round_output_floats,
-        write_metric_deltas_csv,
-        write_metrics_csv,
+    from engagement_prediction.evaluation.workflow import (
+        StandaloneReportContext,
+        run_comparison_workflow,
     )
 
     run_id, partial_path, output_path = _allocate_output_paths(args.output_dir)
@@ -348,14 +334,10 @@ def _run(args: argparse.Namespace) -> Path:
             )
             for model in args.model
         )
-        history_lengths = validate_comparison_contract(
-            dataset,
-            models,
-            args.max_history_len,
-        )
         settings = ComparisonSettings(
             splits=tuple(args.splits),
             batch_size=args.batch_size,
+            additional_batch_negatives=args.additional_batch_negatives,
             metrics_top_ks=tuple(args.metrics_top_ks),
             bst_candidate_chunk_size=args.bst_candidate_chunk_size,
             device=device,
@@ -374,86 +356,17 @@ def _run(args: argparse.Namespace) -> Path:
             ",".join(model.name for model in args.model),
             device,
         )
-        with tempfile.TemporaryDirectory(
-            prefix="author-mappings-",
-            dir=partial_path,
-        ) as temporary_dir:
-            result = run_model_comparison(
-                dataset=dataset,
-                models=models,
-                settings=settings,
-                temporary_dir=Path(temporary_dir),
-                logger=logger,
-            )
-
-        runtime_seconds = round_output_floats(time.monotonic() - started)
-        dataset_metadata = dataset.to_dict()
-        model_spec_documents = [model.to_dict() for model in models]
-        output_metrics = round_output_floats(result.metrics_by_model)
-        output_mapping_coverage = round_output_floats(
-            result.mapping_coverage_by_model
-        )
-        metrics_document = {
-            "run_id": run_id,
-            "started_at_utc": started_at.isoformat(),
-            "runtime_seconds": runtime_seconds,
-            "settings": settings,
-            "dataset": dataset_metadata,
-            "models": model_spec_documents,
-            "history_lengths": result.history_lengths,
-            "split_row_counts": result.split_row_counts,
-            "skipped_splits": result.skipped_splits,
-            "mapping_coverage": output_mapping_coverage,
-            "metrics": output_metrics,
-        }
-        _write_json(partial_path / "metrics.json", metrics_document)
-        _write_json(
-            partial_path / "model_specs.json",
-            {
-                "models": model_spec_documents,
-                "history_lengths": history_lengths,
-                "mapping_coverage": output_mapping_coverage,
-            },
-        )
-        write_metrics_csv(
-            partial_path / "metrics.csv",
+        report = run_comparison_workflow(
+            dataset=dataset,
             models=models,
-            metrics_by_model=output_metrics,
-        )
-        write_metric_deltas_csv(
-            partial_path / "metric_deltas.csv",
-            model_a_name=models[0].name,
-            model_b_name=models[1].name,
-            metrics_by_model=output_metrics,
-        )
-        stage_info_lines = [
-            "tool: compare_model_performance",
-            f"run_id: {run_id}",
-            f"started_at_utc: {started_at.isoformat()}",
-            f"runtime_seconds: {runtime_seconds:.5f}",
-            f"dataset: {dataset.root}",
-            f"dataset_bundle: {dataset.bundle_path}",
-            f"model_a: {models[0].name}",
-            f"model_a_type: {models[0].model_type}",
-            f"model_a_artifact_format: {models[0].artifact_format}",
-            f"model_a_path: {models[0].root}",
-            f"model_a_history_len: {result.history_lengths[models[0].name]}",
-            f"model_b: {models[1].name}",
-            f"model_b_type: {models[1].model_type}",
-            f"model_b_artifact_format: {models[1].artifact_format}",
-            f"model_b_path: {models[1].root}",
-            f"model_b_history_len: {result.history_lengths[models[1].name]}",
-            f"device: {device}",
-            f"splits: {', '.join(args.splits)}",
-            f"metrics_top_ks: {', '.join(str(k) for k in args.metrics_top_ks)}",
-            f"batch_size: {args.batch_size}",
-            (
-                "skipped_splits: "
-                + (", ".join(result.skipped_splits) if result.skipped_splits else "none")
+            settings=settings,
+            output_dir=partial_path,
+            report_context=StandaloneReportContext(
+                run_id=run_id, started_at=started_at, started_monotonic=started,
             ),
-        ]
-        (partial_path / "stage_info.txt").write_text("\n".join(stage_info_lines) + "\n")
-        logger.info("Comparison completed successfully in %.5f seconds", runtime_seconds)
+            logger=logger,
+        )
+        logger.info("Comparison completed successfully in %.5f seconds", report["runtime_seconds"])
         _close_logger(logger)
         partial_path.rename(output_path)
         return output_path

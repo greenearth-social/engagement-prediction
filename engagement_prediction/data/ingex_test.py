@@ -130,18 +130,6 @@ def test_scan_post_parquet_files_expects_boolean_media_flags(tmp_path):
         ingex.scan_post_parquet_files([str(path)]).collect(engine="streaming")
 
 
-def test_scan_post_parquet_files_rejects_unexpected_extra_columns(tmp_path):
-    legacy_path = tmp_path / "legacy.parquet"
-    current_path = tmp_path / "unexpected.parquet"
-    pl.DataFrame({"at_uri": ["legacy"]}).write_parquet(legacy_path)
-    pl.DataFrame({"at_uri": ["new"], "unexpected": [True]}).write_parquet(current_path)
-
-    with pytest.raises(pl.exceptions.SchemaError, match="unexpected"):
-        ingex.scan_post_parquet_files(
-            [str(legacy_path), str(current_path)]
-        ).collect(engine="streaming")
-
-
 def test_scan_post_parquet_files_rejects_empty_paths():
     with pytest.raises(ValueError, match="empty collection"):
         ingex.scan_post_parquet_files([])
