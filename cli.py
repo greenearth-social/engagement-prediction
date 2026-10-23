@@ -203,7 +203,7 @@ DEFAULTS: Dict[str, Any] = {
     "experiment_tags": None,
     # ClearML / model registry
     # If set, used as ClearML Task output URI (e.g. gs://...); if None, ClearML uses its default output.
-    "model_output_uri": 'gs://greenearth-471522-engagement-prediction-test',
+    "model_output_uri": 'gs://greenearth-471522-engagement-prediction-model-stage',
 }
 
 
