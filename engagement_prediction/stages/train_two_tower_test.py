@@ -144,16 +144,16 @@ def test_stage8_trains_native_two_tower_and_publishes_serving_artifacts(
         return create_loader(**kwargs)
 
     monkeypatch.setattr(train_two_tower, "_create_loader", record_loader)
-    final_metrics = train_two_tower._final_metrics
+    evaluate_splits = train_two_tower.evaluate_listwise_splits
     final_model_state = {}
 
     def record_final_metrics(**kwargs):
         final_model_state.update({
             name: value.clone() for name, value in kwargs["model"].state_dict().items()
         })
-        return final_metrics(**kwargs)
+        return evaluate_splits(**kwargs)
 
-    monkeypatch.setattr(train_two_tower, "_final_metrics", record_final_metrics)
+    monkeypatch.setattr(train_two_tower, "evaluate_listwise_splits", record_final_metrics)
     run_epoch = two_tower_training.run_two_tower_listwise_epoch
     epoch_calls = []
 

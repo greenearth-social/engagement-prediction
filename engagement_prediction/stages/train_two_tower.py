@@ -150,32 +150,6 @@ def _create_loader(
     )
 
 
-def _final_metrics(
-    *,
-    model: TwoTowerModel,
-    device: str,
-    loss_type: str,
-    loaders: Dict[str, Any],
-    disable_progress: bool,
-    gradient_clip_max_norm: float,
-    metrics_top_ks: list[int],
-    history_length_bucket_boundaries: list[int],
-) -> Dict[str, Dict[str, Any]]:
-    """Evaluate the reloaded best model with deterministic candidate pools."""
-
-    return evaluate_listwise_splits(
-        model=model,
-        epoch_runner=partial(run_two_tower_listwise_epoch, loss_type=loss_type),
-        device=device,
-        loaders=loaders,
-        disable_progress=disable_progress,
-        gradient_clip_max_norm=gradient_clip_max_norm,
-        metrics_top_ks=metrics_top_ks,
-        history_length_bucket_boundaries=history_length_bucket_boundaries,
-        max_batches_by_split={},
-    )
-
-
 def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
     """Train and publish the canonical two-tower Stage 8 artifact."""
 
@@ -441,10 +415,10 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
 
     logger.info("Phase 4/7: evaluating the reloaded best model deterministically")
     train_loader.batch_sampler.set_evaluation_mode(True)
-    final_metrics = _final_metrics(
+    final_metrics = evaluate_listwise_splits(
         model=trained_model,
+        epoch_runner=partial(run_two_tower_listwise_epoch, loss_type=loss_type),
         device=device,
-        loss_type=loss_type,
         loaders={
             "train": train_loader,
             "val": val_loader,
@@ -454,6 +428,7 @@ def run(context: Context, args: argparse.Namespace) -> Dict[str, Any]:
         gradient_clip_max_norm=float(args.gradient_clip_max_norm),
         metrics_top_ks=metrics_top_ks,
         history_length_bucket_boundaries=history_length_bucket_boundaries,
+        max_batches_by_split={},
     )
 
     logger.info("Phase 5/7: validating final checkpoint and serving artifacts")

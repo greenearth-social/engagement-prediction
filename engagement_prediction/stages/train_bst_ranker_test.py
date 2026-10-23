@@ -348,7 +348,7 @@ def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
         return create_loader(**kwargs)
 
     monkeypatch.setattr(train_bst_ranker, "_create_loader", record_loader)
-    final_metrics = train_bst_ranker._final_metrics
+    evaluate_splits = train_bst_ranker.evaluate_listwise_splits
     final_metric_loader_batch_sizes = {}
     final_model_state = {}
 
@@ -360,9 +360,9 @@ def test_stage8_trains_native_dataset_and_publishes_reloadable_checkpoint(
             split: loader.batch_sampler.batch_size
             for split, loader in kwargs["loaders"].items()
         })
-        return final_metrics(**kwargs)
+        return evaluate_splits(**kwargs)
 
-    monkeypatch.setattr(train_bst_ranker, "_final_metrics", record_final_metrics)
+    monkeypatch.setattr(train_bst_ranker, "evaluate_listwise_splits", record_final_metrics)
     run_epoch = bst_training.run_bst_listwise_epoch
     epoch_calls = []
 
