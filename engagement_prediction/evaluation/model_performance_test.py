@@ -93,6 +93,9 @@ def _bst_config(*, max_history_len: int, author_table_num_rows: int) -> dict:
             "popularity_log_mean": 0.0,
             "popularity_log_std": 1.0,
             "use_post_liker_feature": False,
+            "use_target_user_feature": False,
+            "target_user_projection_dim": 2,
+            "target_user_unknown_dropout_rate": 0.0,
             "post_liker_user_table_num_rows": 2,
             "post_liker_user_embedding_dim": 2,
             "post_liker_projection_dim": 2,
@@ -456,7 +459,8 @@ def test_model_resolution_rejects_author_map_override_for_canonical_artifact(
         )
 
 
-def test_model_resolution_rejects_post_liker_feature_enabled_bst(tmp_path):
+@pytest.mark.parametrize("feature", ["post_liker", "target_user"])
+def test_model_resolution_rejects_unsupported_user_feature_enabled_bst(tmp_path, feature):
     stage7, _ = _write_stage7_artifact(tmp_path)
     model_path = _write_model_artifact(
         tmp_path / "canonical-bst-post-likers",
@@ -467,10 +471,10 @@ def test_model_resolution_rejects_post_liker_feature_enabled_bst(tmp_path):
     )
     model_config_path = model_path / "model_config.json"
     model_config = json.loads(model_config_path.read_text())
-    model_config["constructor_args"]["use_post_liker_feature"] = True
+    model_config["constructor_args"][f"use_{feature}_feature"] = True
     model_config_path.write_text(json.dumps(model_config) + "\n")
 
-    with pytest.raises(ValueError, match="does not yet support BST models with post-liker"):
+    with pytest.raises(ValueError, match=f"does not yet support BST models with {feature.replace('_', '-')}"):
         resolve_model_artifact("post-liker-bst", model_path)
 
 
