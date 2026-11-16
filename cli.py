@@ -83,7 +83,7 @@ DEFAULTS: Dict[str, Any] = {
     "val_start_days_before_end": 8,
     "holdout_start_days_before_end": 3,
     # Stage 2: User history
-    "max_history_posts_per_query": 32,
+    "max_history_posts_per_query": 128,
     "user_history_partition_count": 32,
     # Stage 3: Post selection
     "random_candidate_sampling_fraction": 0.1,
@@ -105,7 +105,7 @@ DEFAULTS: Dict[str, Any] = {
     "max_post_liker_user_vocabulary_size": 10_000_000, # in practice this is around 2MM
     # Stage 8: Model architecture
     "model_type": "bst-ranker",
-    "loss_type": "listwise",
+    "loss_type": "bce",
     "epochs": 300,
     "batch_size": 64,
     "learning_rate": 0.0001,
@@ -115,11 +115,11 @@ DEFAULTS: Dict[str, Any] = {
     "two_tower_similarity_temperature": 0.1,
     "two_tower_weight_decay": 0.05,
     "two_tower_dropout_rate": 0.3,
-    "max_history_len": 32,
+    "max_history_len": 64,
     "author_embedding_dim": 16,
     "author_unknown_dropout_rate": 0.25,
     "content_projection_dim": 192,
-    "author_projection_dim": 48,
+    "author_projection_dim": 16,
     "bst_prediction_hidden_dims": [64, 32, 16],
     "bst_additional_batch_negatives": 64,
     "bst_model_dim": 256,
