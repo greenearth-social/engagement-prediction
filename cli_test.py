@@ -377,7 +377,7 @@ def test_query_sampling_defaults():
     assert merged.max_train_query_hours == 10_000_000
     assert merged.max_eval_query_hours_per_split == 500_000
     assert merged.max_positives_per_user_hour == 32
-    assert merged.max_history_posts_per_query == 32
+    assert merged.max_history_posts_per_query == 128
     assert merged.user_history_partition_count == 32
     assert merged.random_candidate_sampling_fraction == 0.10
     assert merged.source_metadata_partition_count == 16
@@ -419,7 +419,7 @@ def test_loss_type_defaults_to_listwise(model_type):
         "--model-type", model_type,
     ]))
 
-    assert args.loss_type == "listwise"
+    assert args.loss_type == "bce"
 
 
 @pytest.mark.parametrize("model_type", ["bst-ranker", "two-tower"])
@@ -437,18 +437,18 @@ def test_loss_type_cli_for_both_models(model_type, loss_type):
 def test_loss_type_cli_overrides_config(tmp_path, command, extension):
     config_path = tmp_path / f"loss.{extension}"
     config_path.write_text(
-        "loss_type: bce\n" if extension == "yml" else json.dumps({"loss_type": "bce"})
+        "loss_type: listwise\n" if extension == "yml" else json.dumps({"loss_type": "listwise"})
     )
     parser = cli.build_parser()
     arguments = ["--config", str(config_path), *command]
 
     configured = cli._merge_args_with_config(parser.parse_args(arguments))
     overridden = cli._merge_args_with_config(parser.parse_args([
-        *arguments, "--loss-type", "listwise",
+        *arguments, "--loss-type", "bce",
     ]))
 
-    assert configured.loss_type == "bce"
-    assert overridden.loss_type == "listwise"
+    assert configured.loss_type == "listwise"
+    assert overridden.loss_type == "bce"
 
 
 def test_invalid_loss_type_cli_is_rejected():
