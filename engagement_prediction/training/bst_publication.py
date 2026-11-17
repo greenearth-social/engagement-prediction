@@ -23,6 +23,7 @@ def publish_ranker_to_tracker(
     author_map_path: Path,
     manifest_path: Path,
     post_liker_feature_enabled: bool,
+    target_user_feature_enabled: bool,
     post_liker_user_map_path: Path | None,
     post_liker_user_embeddings_path: Path | None,
     post_liker_state_config_path: Path | None,
@@ -33,12 +34,24 @@ def publish_ranker_to_tracker(
     registered model and its matching author vocabulary both reached ClearML.
     """
 
-    companion_paths = {
-        POST_LIKER_USER_MAP_ARTIFACT_NAME: post_liker_user_map_path,
+    pooling_paths = {
         POST_LIKER_USER_EMBEDDINGS_ARTIFACT_NAME: post_liker_user_embeddings_path,
         POST_LIKER_STATE_CONFIG_ARTIFACT_NAME: post_liker_state_config_path,
     }
+    companion_paths = {}
+    if post_liker_feature_enabled or target_user_feature_enabled:
+        companion_paths[POST_LIKER_USER_MAP_ARTIFACT_NAME] = post_liker_user_map_path
+    elif post_liker_user_map_path is not None:
+        raise ValueError(
+            "Feature-disabled BST publication must not receive post-liker companions"
+        )
     if post_liker_feature_enabled:
+        companion_paths.update(pooling_paths)
+    elif any(path is not None for path in pooling_paths.values()):
+        raise ValueError(
+            "Feature-disabled BST publication must not receive post-liker pooling companions"
+        )
+    if companion_paths:
         missing_paths = [
             name
             for name, path in companion_paths.items()
@@ -49,10 +62,6 @@ def publish_ranker_to_tracker(
                 "Feature-enabled BST publication requires all local post-liker "
                 f"companions; missing={missing_paths}"
             )
-    elif any(path is not None for path in companion_paths.values()):
-        raise ValueError(
-            "Feature-disabled BST publication must not receive post-liker companions"
-        )
 
     task_id = str(tracker.id or "")
     result: Dict[str, Any] = {
@@ -63,6 +72,7 @@ def publish_ranker_to_tracker(
         "model_registered": False,
         "author_map_uploaded": False,
         "post_liker_feature_enabled": bool(post_liker_feature_enabled),
+        "target_user_feature_enabled": bool(target_user_feature_enabled),
         "post_liker_user_map_uploaded": False,
         "post_liker_user_embeddings_uploaded": False,
         "post_liker_state_config_uploaded": False,
@@ -110,7 +120,7 @@ def publish_ranker_to_tracker(
         result["errors"].append(message)
         logger.warning(message, exc_info=True)
 
-    if post_liker_feature_enabled:
+    if companion_paths:
         result_keys = {
             POST_LIKER_USER_MAP_ARTIFACT_NAME: "post_liker_user_map_uploaded",
             POST_LIKER_USER_EMBEDDINGS_ARTIFACT_NAME: (
@@ -141,9 +151,10 @@ def publish_ranker_to_tracker(
         result["model_registered"],
         result["author_map_uploaded"],
     ]
+    if post_liker_feature_enabled or target_user_feature_enabled:
+        required_uploads.append(result["post_liker_user_map_uploaded"])
     if post_liker_feature_enabled:
         required_uploads.extend([
-            result["post_liker_user_map_uploaded"],
             result["post_liker_user_embeddings_uploaded"],
             result["post_liker_state_config_uploaded"],
         ])
@@ -167,6 +178,16 @@ def publish_ranker_to_tracker(
             ),
             "post_liker_state_config_artifact_name": (
                 POST_LIKER_STATE_CONFIG_ARTIFACT_NAME
+            ),
+        })
+    if target_user_feature_enabled:
+        manifest.update({
+            "ranker_contract_version": 3,
+            "target_user_feature_enabled": True,
+            "post_liker_feature_enabled": bool(post_liker_feature_enabled),
+            "target_user_indices_input_name": "target_user_indices",
+            "post_liker_user_idx_mapping_artifact_name": (
+                POST_LIKER_USER_MAP_ARTIFACT_NAME
             ),
         })
     try:

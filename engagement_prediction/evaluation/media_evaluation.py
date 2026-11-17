@@ -295,6 +295,9 @@ def run_media_evaluation(
         use_post_liker_feature = bool(
             artifact.model_config["constructor_args"]["use_post_liker_feature"]
         )
+        use_target_user_feature = bool(
+            artifact.model_config["constructor_args"].get("use_target_user_feature", False)
+        )
         replay_cap = (
             int(artifact.training_config["bst_max_post_liker_replay_events_per_post"])
             if use_post_liker_feature else None
@@ -304,6 +307,7 @@ def run_media_evaluation(
             "best_epoch": best_epoch,
             "max_history_len": max_history_len,
             "use_post_liker_feature": use_post_liker_feature,
+            "use_target_user_feature": use_target_user_feature,
             "max_post_liker_replay_events_per_post": replay_cap,
             "splits": {},
         }
@@ -316,6 +320,7 @@ def run_media_evaluation(
                     max_history_len=max_history_len,
                     additional_batch_negatives=validation_settings.additional_batch_negatives,
                     use_post_liker_feature=use_post_liker_feature,
+                    use_target_user_feature=use_target_user_feature,
                     max_post_liker_replay_events_per_post=replay_cap,
                     seed=validation_settings.random_seed,
                     logger=logger,

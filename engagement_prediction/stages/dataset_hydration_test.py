@@ -385,20 +385,24 @@ def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
     )
     context.prior_outputs["06_author_statistics"] = stage6
 
-    result = registry.run_stage(
-        "dataset_hydration",
-        context,
-        SimpleNamespace(
-            embedding_model="all_MiniLM_L12_v2",
-            embedding_source_batch_size=64,
-            dataset_hydration_worker_count=2,
-            min_author_training_feature_count=1,
-            prepare_post_liker_features=prepare_post_liker_features,
-            min_post_liker_user_training_event_count=1,
-            max_post_liker_user_vocabulary_size=max_liker_vocabulary_size,
-            _argv=["--stop-after", "dataset_hydration"],
-        ),
+    args = SimpleNamespace(
+        embedding_model="all_MiniLM_L12_v2",
+        embedding_source_batch_size=64,
+        dataset_hydration_worker_count=2,
+        min_author_training_feature_count=1,
+        prepare_post_liker_features=prepare_post_liker_features,
+        min_post_liker_user_training_event_count=1,
+        max_post_liker_user_vocabulary_size=max_liker_vocabulary_size,
+        _argv=["--stop-after", "dataset_hydration"],
     )
+    if prepare_post_liker_features and max_liker_vocabulary_size == 0:
+        with pytest.raises(
+            ValueError,
+            match="requires 1 surviving training-target rows, exceeding max_post_liker_user_vocabulary_size=0",
+        ):
+            registry.run_stage("dataset_hydration", context, args)
+        return
+    result = registry.run_stage("dataset_hydration", context, args)
 
     mmap = np.load(result["artifacts"]["embeddings_path"], mmap_mode="r")
     assert mmap.shape == (3, 384)
@@ -453,17 +457,23 @@ def test_stage_hydrates_memmap_filters_missing_embeddings_and_counts_as_of(
     assert summary["loader_index"]["format_version"] == expected_format
     if prepare_post_liker_features:
         assert loader_format["post_liker_event_count"] == 2
-        assert loader_format["post_liker_user_table_num_rows"] == (3 if max_liker_vocabulary_size else 2)
+        assert loader_format["post_liker_user_table_num_rows"] == 4
         post_liker_vocabulary = scan_parquet_artifact(
             Path(result["artifacts"]["post_liker_users_path"])
         ).collect()
-        expected_liker_vocabulary = [
-            {"liker_did": "liker", "liker_idx": 2, "training_event_count": 2}
-        ] if max_liker_vocabulary_size else []
-        assert post_liker_vocabulary.to_dicts() == expected_liker_vocabulary
+        assert post_liker_vocabulary.to_dicts() == [
+            {"liker_did": "liker", "liker_idx": 2, "training_event_count": 2, "training_target_query_count": 0},
+            {"liker_did": "user", "liker_idx": 3, "training_event_count": 0, "training_target_query_count": 1},
+        ]
+        assert summary["post_liker_user_vocabulary"]["known_training_target_query_count"] == 1
+        assert summary["loader_index"]["target_user_coverage_by_split"]["train"] == {
+            "known_query_count": 1,
+            "unknown_query_count": 0,
+        }
     else:
         assert not (loader_index_path.parent / "post_liker_users").exists()
         assert not list(loader_index_path.glob("post_liker_*.npy"))
+        assert not list(loader_index_path.rglob("query_target_user_indices.npy"))
         assert "post_liker_users_path" not in summary["outputs"]
         assert summary["post_liker_use_windows"] is None
         assert summary["post_liker_user_vocabulary"] is None

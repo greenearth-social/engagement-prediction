@@ -11,6 +11,7 @@ import torch
 
 from engagement_prediction.data.parquet import scan_parquet_artifact
 from engagement_prediction.data.post_liker_users import (
+    LEGACY_POST_LIKER_USER_VOCABULARY_SCHEMA,
     POST_LIKER_USER_PAD_IDX,
     POST_LIKER_USER_UNK_IDX,
     POST_LIKER_USER_VOCABULARY_SCHEMA,
@@ -73,10 +74,20 @@ def load_bst_checkpoint_model(
     if checkpoint_model_config.get("model_type") != _MODEL_TYPE:
         raise ValueError(f"BST checkpoint model_type must be '{_MODEL_TYPE}'")
 
-    constructor_args = _require_mapping(
+    constructor_args = dict(_require_mapping(
         checkpoint_model_config.get("constructor_args"),
         description="BST checkpoint constructor_args",
-    )
+    ))
+    # Older checkpoints predate target-user conditioning. Normalize only at
+    # this loading boundary so model constructors still require explicit args.
+    from cli import DEFAULTS
+
+    for argument in (
+        "use_target_user_feature",
+        "target_user_projection_dim",
+        "target_user_unknown_dropout_rate",
+    ):
+        constructor_args.setdefault(argument, DEFAULTS[f"bst_{argument}"])
     popularity_enabled = checkpoint_popularity_stats.get("enabled")
     if not isinstance(popularity_enabled, bool):
         raise ValueError("BST checkpoint popularity_stats.enabled must be a boolean")
@@ -281,6 +292,13 @@ def _validate_score_parity(
         "author_table_num_rows": eager_model.post_feature_encoder.author_embedding.num_embeddings,
     }
     use_post_liker_feature = bool(eager_model.use_post_liker_feature)
+    target_inputs = {}
+    if eager_model.use_target_user_feature:
+        table_rows = eager_model.post_liker_user_pooler.user_embedding.num_embeddings
+        target_inputs["target_user_indices"] = torch.tensor(
+            [max(table_rows - 1, POST_LIKER_USER_UNK_IDX), POST_LIKER_USER_UNK_IDX],
+            dtype=torch.long,
+        )
     with torch.inference_mode():
         base_cases = (
             ("normal_and_all_masked", False),
@@ -303,20 +321,22 @@ def _validate_score_parity(
                     *inputs,
                     history_vectors,
                     candidate_vectors,
+                    **target_inputs,
                 )
                 scripted_scores = scripted_model.score_candidate_matrix(
                     *inputs,
                     history_vectors,
                     candidate_vectors,
+                    **target_inputs,
                 )
                 eager_event_scores = (
                     eager_model.score_candidate_matrix_from_post_liker_events(
-                        *event_inputs
+                        *event_inputs, **target_inputs
                     )
                 )
                 scripted_event_scores = (
                     scripted_model.score_candidate_matrix_from_post_liker_events(
-                        *event_inputs
+                        *event_inputs, **target_inputs
                     )
                 )
                 for description, scores in (
@@ -331,8 +351,8 @@ def _validate_score_parity(
                             f"max_absolute_difference={difference}"
                         )
             else:
-                eager_scores = eager_model.score_candidate_matrix(*inputs)
-                scripted_scores = scripted_model.score_candidate_matrix(*inputs)
+                eager_scores = eager_model.score_candidate_matrix(*inputs, **target_inputs)
+                scripted_scores = scripted_model.score_candidate_matrix(*inputs, **target_inputs)
             if eager_scores.shape != (2, 3):
                 raise RuntimeError(
                     f"BST export parity case '{case_name}' returned unexpected shape "
@@ -391,20 +411,22 @@ def _validate_score_parity(
                     *normal_inputs,
                     history_vectors,
                     candidate_vectors,
+                    **target_inputs,
                 )
                 scripted_scores = scripted_model.score_candidate_matrix(
                     *normal_inputs,
                     history_vectors,
                     candidate_vectors,
+                    **target_inputs,
                 )
                 eager_event_scores = (
                     eager_model.score_candidate_matrix_from_post_liker_events(
-                        *event_inputs
+                        *event_inputs, **target_inputs
                     )
                 )
                 scripted_event_scores = (
                     scripted_model.score_candidate_matrix_from_post_liker_events(
-                        *event_inputs
+                        *event_inputs, **target_inputs
                     )
                 )
                 if not (
@@ -544,7 +566,7 @@ POST_LIKER_USER_MAP_SCHEMA = {
 }
 
 
-def _write_post_liker_user_map(
+def write_post_liker_user_map(
     *,
     vocabulary_path: Path,
     output_path: Path,
@@ -554,7 +576,10 @@ def _write_post_liker_user_map(
 
     vocabulary_lf = scan_parquet_artifact(Path(vocabulary_path))
     vocabulary_schema = vocabulary_lf.collect_schema()
-    if vocabulary_schema != pl.Schema(POST_LIKER_USER_VOCABULARY_SCHEMA):
+    if vocabulary_schema not in (
+        pl.Schema(POST_LIKER_USER_VOCABULARY_SCHEMA),
+        pl.Schema(LEGACY_POST_LIKER_USER_VOCABULARY_SCHEMA),
+    ):
         raise ValueError(
             "Stage 7 post-liker user vocabulary has an unexpected schema: "
             f"{vocabulary_schema}"
@@ -673,7 +698,7 @@ def export_post_liker_serving_artifacts(
     user_embedding = eager_model.post_liker_user_pooler.user_embedding
     user_table_num_rows = int(user_embedding.num_embeddings)
     user_embedding_dim = int(user_embedding.embedding_dim)
-    map_stats = _write_post_liker_user_map(
+    map_stats = write_post_liker_user_map(
         vocabulary_path=vocabulary_path,
         output_path=user_map_output_path,
         expected_user_table_num_rows=user_table_num_rows,

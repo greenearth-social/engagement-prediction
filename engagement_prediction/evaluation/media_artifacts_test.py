@@ -43,6 +43,7 @@ def stage7(tmp_path):
         "liker_did": ["liker-a", "liker-b"],
         "liker_idx": [2, 3],
         "training_event_count": [1, 1],
+        "training_target_query_count": [0, 0],
     }, schema=post_liker_users.POST_LIKER_USER_VOCABULARY_SCHEMA).write_parquet(
         bundle / "post_liker_users" / "part-00000.parquet"
     )
@@ -85,7 +86,7 @@ def stage7(tmp_path):
     return root, bundle, {**lineage, "07_dataset_hydration": str(root)}
 
 
-def _model(path: Path, stage7, *, use_post_liker_feature: bool) -> Path:
+def _model(path: Path, stage7, *, use_post_liker_feature: bool, use_target_user_feature: bool = False) -> Path:
     stage7_root, bundle, lineage = stage7
     path.mkdir()
     checkpoints = path / "checkpoints"
@@ -93,7 +94,8 @@ def _model(path: Path, stage7, *, use_post_liker_feature: bool) -> Path:
     config = _bst_config(max_history_len=2, author_table_num_rows=6)
     config.update(post_liker_user_pad_idx=0, post_liker_user_unk_idx=1)
     config["constructor_args"]["use_post_liker_feature"] = use_post_liker_feature
-    config["constructor_args"]["post_liker_user_table_num_rows"] = 4 if use_post_liker_feature else 2
+    config["constructor_args"]["use_target_user_feature"] = use_target_user_feature
+    config["constructor_args"]["post_liker_user_table_num_rows"] = 4 if (use_post_liker_feature or use_target_user_feature) else 2
     training_config = {
         "lineage": lineage,
         "stage7_dir": str(stage7_root),
@@ -103,6 +105,7 @@ def _model(path: Path, stage7, *, use_post_liker_feature: bool) -> Path:
         "bst_additional_batch_negatives": 1,
         "random_seed": 42,
         "bst_use_post_liker_feature": use_post_liker_feature,
+        "bst_use_target_user_feature": use_target_user_feature,
         "bst_max_post_liker_replay_events_per_post": 2,
     }
     popularity = {"enabled": False, "log_mean": 0.0, "log_std": 1.0}
@@ -137,7 +140,7 @@ def _model(path: Path, stage7, *, use_post_liker_feature: bool) -> Path:
     pl.read_parquet(bundle / "authors" / "part-00000.parquet").select(
         "author_did", "author_idx"
     ).write_parquet(path / "ranker_author_idx.parquet")
-    if use_post_liker_feature:
+    if use_post_liker_feature or use_target_user_feature:
         shutil.copytree(bundle / "post_liker_users", path / "post_liker_users")
     return path
 
@@ -231,8 +234,10 @@ def test_resolves_symlink_input_aliases(tmp_path, stage7):
 
 
 @pytest.mark.parametrize("kind", ["authors", "post_liker_users"])
-def test_rejects_same_size_different_vocabularies(tmp_path, stage7, kind):
-    path = _model(tmp_path / "model", stage7, use_post_liker_feature=True)
+@pytest.mark.parametrize("target_only", [False, True])
+def test_rejects_same_size_different_vocabularies(tmp_path, stage7, kind, target_only):
+    path = _model(tmp_path / "model", stage7, use_post_liker_feature=not target_only,
+                  use_target_user_feature=target_only)
     if kind == "authors":
         map_path = path / "ranker_author_idx.parquet"
         index_column = "author_idx"
@@ -281,3 +286,11 @@ def test_requires_unique_nonempty_model_names():
     for specs in ([], [("", Path("unused"))], [("same", Path("one")), ("same", Path("two"))]):
         with pytest.raises(ValueError):
             resolve_media_artifacts(specs)
+
+
+@pytest.mark.parametrize("use_post_liker_feature", [False, True])
+def test_resolves_target_user_models_with_shared_vocabulary(tmp_path, stage7, use_post_liker_feature):
+    path = _model(tmp_path / "target-model", stage7,
+                  use_post_liker_feature=use_post_liker_feature, use_target_user_feature=True)
+    _, models, _ = resolve_media_artifacts([("target", path)])
+    assert models[0].model_config["constructor_args"]["use_target_user_feature"] is True
